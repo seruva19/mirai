@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "product": "native sparse-MoE video adapter trainer",
+  "supported_families": ["lingbot_video"],
+  "domains": [
+    {
+      "name": "feature_extensions",
+      "root": "mirai/core",
+      "authority": "mirai/core/features.py",
+      "search_terms": [
+        "FeatureDescriptor",
+        "ExtensionKit",
+        "validate_feature_catalog",
+        "prove_default_path"
+      ]
+    },
+    {
+      "name": "agent_validation",
+      "root": "agent",
+      "authority": "scripts/agent/check.py",
+      "search_terms": [
+        "select_checks",
+        "unowned_paths",
+        "execute_checks",
+        "run_evaluation",
+        "evaluate"
+      ]
+    },
+    {
+      "name": "config",
+      "root": "mirai/config",
+      "authority": "mirai/config/schema.py",
+      "search_terms": ["all_config_keys", "from_dict", "validate_config"]
+    },
+    {
+      "name": "model_providers",
+      "root": "mirai/core/models",
+      "authority": "mirai/core/models/providers.py",
+      "search_terms": ["ModelFamilyProvider", "register_model_family_provider", "ATTENTION_BACKEND_SPECS", "dispatch_attention"]
+    },
+      {
+        "name": "lingbot_video",
+        "root": "mirai/core/models/lingbot_video",
+        "authority": "mirai/core/models/lingbot_video/pipeline.py",
+        "search_terms": ["LingBotVideoPipeline", "LingBotVideoModelFamilyProvider"]
+      },
+      {
+        "name": "model_adapters",
+        "root": "mirai/core/models/adapters",
+        "authority": "mirai/core/models/adapters/lora.py",
+        "search_terms": ["LoRALinear", "LoRAExpertTensorParametrization", "LoRAAllocationPolicy", "TimestepAdapterPolicy"]
+      },
+    {
+      "name": "moe",
+      "root": "mirai/core/moe",
+      "authority": "mirai/core/moe/routing/routers.py",
+      "search_terms": ["RoutingStats", "TokenChoiceRouter", "ExpertChoiceRouter", "LayerRouterPolicy", "ChainOfExpertsExtension", "SelectiveSinkhornController", "PrototypicalRouterExtension", "SaliencyHarnessingRouter", "MixtureOfDepthsSpec", "attention_with_received_scores", "SparseMoECapabilities"]
+    },
+    {
+      "name": "moe_adaptation",
+      "root": "mirai/core/moe/adaptation",
+      "authority": "mirai/core/moe/adaptation/router_training.py",
+      "search_terms": ["RouterTrainingPolicy", "DatasetRoutingPolicy", "ExpertDropoutController", "RouterDistillationController", "SimBalController"]
+    },
+    {
+      "name": "moe_artifacts",
+      "root": "mirai/core/moe/artifacts",
+      "authority": "mirai/core/moe/artifacts/manifest.py",
+      "search_terms": ["MoEArtifactDownloadSpec", "download manifest", "verify_downloaded_snapshot"]
+    },
+    {
+      "name": "moe_calibration",
+      "root": "mirai/core/moe/calibration",
+      "authority": "mirai/core/moe/calibration/prototypes.py",
+      "search_terms": ["PrototypeContributionAccumulator", "MeanExpertOutputAccumulator", "ExpertAffinityAccumulator", "ExpertImportanceAccumulator", "AimerExpertScores", "aimer_expert_scores", "TensorPrecisionPlan", "RouterQuantizationCalibrationArtifact", "FlexMoEActionController", "FlexMoETaylorGradientObserver", "ExpertSelectionReport", "pruning"]
+    },
+      {
+        "name": "moe_monitoring",
+        "root": "mirai/core/moe/monitoring",
+        "authority": "mirai/core/moe/monitoring/health.py",
+        "search_terms": ["DeadlockTracker", "RouterLogitReferenceTracker", "FisherSpecializationSummary", "PreemptiveAttentionMonitor", "RouterMechanismSummary", "moe_gradient_health", "BalanceGradientProbe", "RoutedExpertTensorCapture"]
+      },
+      {
+        "name": "moe_runtime",
+        "root": "mirai/core/moe/runtime",
+        "authority": "mirai/core/moe/runtime/specs.py",
+        "search_terms": ["MoEOptimizationPolicy", "MoETokenChunkPolicy", "ExpertTensorSpec", "MegaBlocksKernelBackend", "resolve_moe_gemm_backend"]
+      },
+      {
+        "name": "moe_storage",
+        "root": "mirai/core/moe/storage",
+        "authority": "mirai/core/moe/storage/aliases.py",
+        "search_terms": ["PrototypeConsolidationPlan", "PhysicalWeightProviderContext", "logical_to_physical", "consolidate_packed_state", "DropUpcyclingSpec", "drop_upcycle_packed_state"]
+      },
+      {
+        "name": "compressed_weights",
+        "root": "mirai/core/models/compressed_weights",
+      "authority": "mirai/core/models/compressed_weights/__init__.py",
+      "search_terms": ["CompressedLinear", "CompressedGroupedExperts", "MixedPrecisionGroupedExperts", "FlexMoENestedPhysicalWeightProvider", "transform_packed_state_flexmoe_nested", "measure_projection_format"]
+      },
+      {
+        "name": "packed_weights",
+        "root": "mirai/core/models/compressed_weights/packed",
+        "authority": "mirai/core/models/compressed_weights/packed/packed_state.py",
+        "search_terms": ["PackedStateResidencyPolicy", "StreamingPackedTensorMapping", "PackedStreamPrefetchRing", "get_range", "save_compressed_weights_packed_state"]
+      },
+        {
+          "name": "weight_quantization",
+          "root": "mirai/core/models/compressed_weights/quantization",
+          "authority": "mirai/core/models/compressed_weights/quantization/quant.py",
+          "search_terms": ["normalize_quant_format", "quantize_blockwise_fp8_weight", "blockwise_fp8_linear", "deepgemm_blockwise_fp8_batched_linear", "quantize_gguf", "quantize_microscaling", "mxfp8_e4m3", "rotated_int8_linear", "learn_groupwise_expert_rotation"]
+        },
+        {
+          "name": "compressed_execution",
+          "root": "mirai/core/models/compressed_weights/execution",
+          "authority": "mirai/core/models/compressed_weights/execution/experts.py",
+          "search_terms": ["CompressedGroupedExperts", "CompressedLinear", "ActiveExpertLoRA", "build_dispatch_plan", "sonic_dispatch_preprocess_available", "run_persistent_dispatch"]
+        },
+        {
+          "name": "expert_factorization",
+          "root": "mirai/core/models/compressed_weights/factorization",
+          "authority": "mirai/core/models/compressed_weights/factorization/shared_basis.py",
+          "search_terms": ["SharedBasisFactors", "MixtureBasisFactors", "PhysicalWeightProvider", "CompressedExpertProjectionSource", "factorize_packed_state_shared_basis", "factorize_packed_state_mixture_basis"]
+        },
+    {
+      "name": "training",
+      "root": "mirai/core/training",
+      "authority": "mirai/core/training/lifecycle/training_session.py",
+      "search_terms": ["TrainingSession", "TrainingPolicy", "DispersiveLossController", "RuntimeContract"]
+    },
+    {
+      "name": "training_runtime",
+      "root": "mirai/core/training/runtime",
+      "authority": "mirai/core/training/runtime/contract.py",
+      "search_terms": ["validate_training_runtime_config", "initialize_trainer_runtime", "CompilationPolicy", "GpuLease"]
+    },
+    {
+      "name": "training_calibration",
+      "root": "mirai/core/training/calibration",
+      "authority": "mirai/core/training/calibration/expert_selection.py",
+      "search_terms": ["calibration", "EVA", "expert selection", "prototype", "quantization", "EAQuant", "FlexMoEActionLearningSession", "run_flexmoe_ranking_session", "run_flexmoe_action_session", "imatrix", "expert precision"]
+    },
+    {
+      "name": "training_data",
+      "root": "mirai/core/training/data",
+      "authority": "mirai/core/training/data/loader.py",
+      "search_terms": ["PreparedTrainingData", "BatchSchema", "sample_batch", "CurriculumSchedule"]
+    },
+    {
+      "name": "training_objectives",
+      "root": "mirai/core/training/objectives",
+      "authority": "mirai/core/training/objectives/engine.py",
+      "search_terms": ["TrainingObjective", "TrainingLossResult", "SharpMoETrajectoryObjective", "loss weighting", "timestep sampling"]
+    },
+    {
+      "name": "training_observability",
+      "root": "mirai/core/training/observability",
+      "authority": "mirai/core/training/observability/events.py",
+      "search_terms": ["TrainingEvent", "TrainingEventBus", "build_step_metrics", "build_rank_callbacks"]
+    },
+    {
+      "name": "training_evaluation",
+      "root": "mirai/core/training/evaluation",
+      "authority": "mirai/core/training/evaluation/eval_gate.py",
+      "search_terms": [
+        "validate_eval_thresholds",
+        "compute_measured_eval_metrics",
+        "EarlyStopState"
+      ]
+    },
+    {
+      "name": "inference_solvers",
+      "root": "mirai/core/inference/solvers",
+      "authority": "mirai/core/inference/solvers/flow.py",
+      "search_terms": ["EulerFlowSolver", "FlowUniPCMultistepSolver", "FlowDPMSolverMultistep"]
+    },
+    {
+      "name": "training_control",
+      "root": "mirai/core/training/control",
+      "authority": "mirai/core/training/control/training_control_contract.py",
+      "search_terms": ["LiveTrainingController", "TrainingControlRequest"]
+    },
+    {
+      "name": "training_release",
+      "root": "mirai/core/training/release",
+      "authority": "mirai/core/training/release/release_evidence_contract.py",
+      "search_terms": ["ReleaseEvidence", "Certification", "PromotionGate"]
+    },
+    {
+      "name": "training_preview",
+      "root": "mirai/core/training/preview",
+      "authority": "mirai/core/training/preview/preview.py",
+      "search_terms": ["generate_preview", "PreviewSolverSpec", "PreviewRuntimeState"]
+    },
+    {
+      "name": "training_residency",
+      "root": "mirai/core/training/residency",
+      "authority": "mirai/core/training/residency/residency_plan.py",
+      "search_terms": ["ResidencyPlan", "BlockSwap", "MemorySafetyPolicy"]
+    },
+    {
+      "name": "training_optim",
+      "root": "mirai/core/training/optim",
+      "authority": "mirai/core/training/optim/optimizer.py",
+      "search_terms": ["build_optimizer", "GradientPolicy", "RouterFP32Master"]
+    },
+      {
+        "name": "dataset",
+        "root": "mirai/core/dataset",
+        "authority": "mirai/core/dataset/cache.py",
+        "search_terms": ["IndexedCacheRecord", "CacheManifest"]
+      },
+      {
+        "name": "dataset_bucketing",
+        "root": "mirai/core/dataset/bucketing",
+        "authority": "mirai/core/dataset/bucketing/bucket_resolve.py",
+        "search_terms": ["choose_resolution_bucket", "choose_frame_bucket", "CarryOverBucketState", "choose_merge_target"]
+      },
+      {
+        "name": "dataset_media",
+        "root": "mirai/core/dataset/media",
+        "authority": "mirai/core/dataset/media/media_preprocessor.py",
+        "search_terms": ["preprocess_video_media_to_pt", "resize_crop_tensor", "select_evenly_spaced_indices_from_pts"]
+      },
+    {
+      "name": "persistence",
+      "root": "mirai/core/persistence",
+      "authority": "mirai/core/persistence/checkpoints.py",
+      "search_terms": ["save_checkpoint", "load_checkpoint", "RunManifest", "migrate"]
+    },
+    {
+      "name": "parity",
+      "root": "mirai/core/parity",
+      "authority": "mirai/core/parity/harness.py",
+      "search_terms": ["ParityResult", "compare_outputs"]
+    },
+    {
+      "name": "inference",
+      "root": "mirai/core/inference",
+      "authority": "mirai/core/inference/session.py",
+      "search_terms": [
+        "InferenceSession",
+        "InferenceConditioningRequest",
+        "PreparedInferenceConditioning",
+        "cfg_mode"
+      ]
+    }
+  ],
+  "dependency_rules": [
+    {
+      "name": "generic_core_must_not_import_lingbot_implementation",
+      "source_roots": [
+        "mirai/config",
+        "mirai/core/dataset",
+        "mirai/core/inference",
+        "mirai/core/moe",
+        "mirai/core/persistence",
+        "mirai/core/training"
+      ],
+      "target_prefixes": [
+        "mirai.core.models.lingbot_video",
+        "mirai.vendors.lingbot_video"
+      ],
+      "exclude_globs": ["**/contracts/**"]
+    },
+    {
+      "name": "native_runtime_must_not_import_diffusers",
+      "source_roots": ["mirai/core"],
+      "target_prefixes": ["diffusers"],
+      "exclude_globs": ["**/contracts/**", "**/testbed/**"]
+    }
+  ],
+  "forbidden_dependencies": [
+    "core orchestration -> concrete model-family implementation",
+    "stable core -> optional feature implementation",
+    "runtime -> diffusers",
+    "feature implementation -> sibling experimental feature"
+  ]
+}

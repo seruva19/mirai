@@ -1,0 +1,11 @@
+include CONFIG_REFERENCE.md
+include requirements-cu126.txt
+include requirements-cu126-linux.txt
+recursive-include assets *.png
+recursive-include agent *.md *.json
+recursive-include configs *.toml
+recursive-include inference *.py *.json
+recursive-include model_support *.md
+recursive-include scripts *.py
+recursive-include tests *.py
+include conftest.py

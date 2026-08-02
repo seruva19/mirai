@@ -1,0 +1,4702 @@
+{
+  "schema_version": 1,
+  "features": [
+    {
+      "name": "accumulation_wide_routing_balance",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/adaptation/global_balance.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "GlobalBatchLoadAccumulator"
+      ],
+      "config_keys": [
+        "model.params.moe_balance_scope"
+      ],
+      "disabled_config": {
+        "model.params.moe_balance_scope": "microbatch"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/global_batch_balance.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Accumulation-wide routing balance",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2501.11873",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "activation_rotated_int8_expert_execution",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/quantization/rotated_int8.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "rotate_activations",
+        "rotated_int8_linear"
+      ],
+      "config_keys": [
+        "memory.frozen_weight_quantization",
+        "memory.moe_kernel_backend"
+      ],
+      "disabled_config": {
+        "memory.frozen_weight_quantization": "none",
+        "memory.moe_kernel_backend": "auto"
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/quantization/rotated_int8.py",
+      "readme_claim": "Activation-rotated INT8 expert execution",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "activation_space_expert_lora",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/expert_tensor_lora.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "ExpertTensorLoRAExecutor"
+      ],
+      "config_keys": [
+        "adapter.target_preset"
+      ],
+      "disabled_config": {
+        "adapter.target_preset": "attn_only"
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/expert_tensor.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Activation-space expert LoRA",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "adam_mini_selected_expert_neuron_partition",
+      "kind": "adapter",
+      "owner": "mirai/core/training/optim/selected_expert_adam_mini.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "SelectedExpertAdamMini",
+        "estimate_selected_expert_adam_mini_state_bytes"
+      ],
+      "config_keys": [
+        "adapter.type",
+        "optimizer.type"
+      ],
+      "disabled_config": {
+        "adapter.type": "lora",
+        "optimizer.type": "adamw"
+      },
+      "contract_paths": [
+        "tests/test_optimizer_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Adam-mini selected-expert neuron partitioning",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2406.16793; https://github.com/zyushun/Adam-mini",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "adapter_conditioning_diagnostics",
+      "kind": "adapter",
+      "owner": "mirai/core/training/calibration/conditioning.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "target_conditioning_diagnostics",
+        "allocation_conditioning_correlation"
+      ],
+      "config_keys": [
+        "adapter.adaptive_rank_plan_path"
+      ],
+      "disabled_config": {
+        "adapter.adaptive_rank_plan_path": ""
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/allocation.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Adapter conditioning diagnostics",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2506.16289",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "adaptive_eva_ranks",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/lora_adaptive_rank.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "AdaptiveRankPlan",
+        "allocate_adaptive_ranks"
+      ],
+      "config_keys": [
+        "adapter.lora_init",
+        "adapter.adaptive_rank_plan_path",
+        "adapter.eva_calibration_steps",
+        "adapter.eva_samples_per_target",
+        "adapter.eva_convergence_threshold"
+      ],
+      "disabled_config": {
+        "adapter.lora_init": "kaiming",
+        "adapter.adaptive_rank_plan_path": ""
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/allocation.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "EVA and adaptive expert ranks",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2410.07170",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "adaptive_noise_level_loss_weighting",
+      "kind": "generic",
+      "owner": "mirai/core/training/objectives/adaptive_weighting.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "NoiseLevelUncertaintyWeighting"
+      ],
+      "config_keys": [
+        "training.loss_weighting"
+      ],
+      "disabled_config": {
+        "training.loss_weighting": "uniform"
+      },
+      "contract_paths": [
+        "mirai/core/training/objectives/contracts/adaptive_weighting.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Adaptive noise-level loss weighting",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2312.02696",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "advanced_lora_initialization",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/lora_initialization.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "initialize_from_principal_weight",
+        "initialize_from_gradient_approximation"
+      ],
+      "config_keys": [
+        "adapter.lora_init"
+      ],
+      "disabled_config": {
+        "adapter.lora_init": "kaiming"
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/timestep.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/models/adapters/lora_initialization.py",
+      "readme_claim": "PiSSA and LoRA-GA initialization",
+      "readme_claims": [
+        "LoftQ initialization"
+      ],
+      "provenance": "https://arxiv.org/abs/2404.02948",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "asynchronous_checkpoint_serialization",
+      "kind": "training_policy",
+      "owner": "mirai/core/persistence/checkpoints.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "AsyncCheckpointWriter"
+      ],
+      "config_keys": [
+        "logging.async_checkpoint",
+        "logging.async_checkpoint_max_gib"
+      ],
+      "disabled_config": {
+        "logging.async_checkpoint": false
+      },
+      "contract_paths": [
+        "tests/test_logging_callbacks_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/persistence/checkpoints.py",
+      "readme_claim": "Asynchronous checkpoint serialization",
+      "readme_claims": [],
+      "provenance": "https://docs.pytorch.org/tutorials/recipes/distributed_async_checkpoint_recipe.html",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "attention_routed_mixture_of_depths",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/depth.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "reference_parity",
+        "held_out_evidence",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "MixtureOfDepthsSpec",
+        "attention_with_received_scores",
+        "select_depth_tokens"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/mixture_of_depths.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/contracts/mixture_of_depths.py",
+      "readme_claim": "Attention-routed Mixture-of-Depths (A-MoD adaptation)",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2412.20875",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "auxiliary_loss_free_balancing",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/adaptation/balance.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "MoEBalancePolicy",
+        "resolve_moe_balance_weights"
+      ],
+      "config_keys": [
+        "model.params.moe_balance_mode",
+        "model.params.moe_bias_update_rate"
+      ],
+      "disabled_config": {
+        "model.params.moe_balance_mode": "aux_loss",
+        "model.params.moe_bias_update_rate": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/runtime_controls.py",
+        "mirai/core/moe/contracts/global_batch_balance.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Auxiliary-loss-free balancing",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2412.19437",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "balance_task_gradient_ratio_telemetry",
+      "kind": "monitoring",
+      "owner": "mirai/core/moe/monitoring/gradient_ratio.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "BalanceGradientProbe",
+        "RouterProbabilityTarget",
+        "measure_balance_task_gradient_ratios"
+      ],
+      "config_keys": [
+        "model.params.moe_balance_grad_ratio_telemetry",
+        "model.params.moe_balance_grad_ratio_threshold"
+      ],
+      "disabled_config": {
+        "model.params.moe_balance_grad_ratio_telemetry": false,
+        "model.params.moe_balance_grad_ratio_threshold": 0.1
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/training_losses.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Balance-to-task router gradient diagnostics",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2509.01322",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "bf16_stochastic_rounding",
+      "kind": "generic",
+      "owner": "mirai/core/training/optim/stochastic_rounding.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "StochasticRoundingAdamW",
+        "stochastic_round_bfloat16"
+      ],
+      "config_keys": [
+        "optimizer.stochastic_rounding"
+      ],
+      "disabled_config": {
+        "optimizer.stochastic_rounding": false
+      },
+      "contract_paths": [
+        "mirai/core/training/optim/contracts/stochastic_rounding.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "BF16 stochastic-rounding updates",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2502.20566",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "block_residency_planning",
+      "kind": "residency",
+      "owner": "mirai/core/training/residency/block_swap.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "BlockSwapManager"
+      ],
+      "config_keys": [
+        "training.blocks_to_swap",
+        "training.block_swap_mode",
+        "memory.block_residency_planner",
+        "memory.block_residency_priority",
+        "memory.weight_residency_strategy"
+      ],
+      "disabled_config": {
+        "training.blocks_to_swap": 0,
+        "memory.weight_residency_strategy": "disabled"
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/block_swap.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/residency/residency_plan.py",
+      "readme_claim": "RAM-to-VRAM block swapping",
+      "readme_claims": [
+        "Routing-aware block residency",
+        "Explicit disk-backed block streaming"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "bounded_h2d_residency_ring",
+      "kind": "residency",
+      "owner": "mirai/core/training/residency/h2d_ring_residency.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "FlatRingResidencyPool"
+      ],
+      "config_keys": [
+        "memory.block_swap_transfer_strategy",
+        "memory.block_swap_prefetch_depth"
+      ],
+      "disabled_config": {
+        "memory.block_swap_transfer_strategy": "per_tensor"
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/h2d_ring.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/residency/block_swap.py",
+      "readme_claim": "Bounded H2D residency ring",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "calibration_free_aimer_expert_pruning",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/moe/calibration/pruning.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "AimerExpertScores",
+        "aimer_expert_scores"
+      ],
+      "config_keys": [
+        "model.params.expert_pruning",
+        "model.params.expert_pruning_criterion"
+      ],
+      "disabled_config": {
+        "model.params.expert_pruning": "off",
+        "model.params.expert_pruning_criterion": "frequency"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/artifact_transforms.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Calibration-free AIMER expert pruning",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2603.18492",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "capability_gated_attention_backends",
+      "kind": "generic",
+      "owner": "mirai/core/models/attention_backends.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "ATTENTION_BACKEND_SPECS",
+        "dispatch_attention",
+        "dispatch_varlen_attention",
+        "probe_attention_backends"
+      ],
+      "config_keys": [
+        "model.attention_backend"
+      ],
+      "disabled_config": {
+        "model.attention_backend": "auto"
+      },
+      "contract_paths": [
+        "mirai/core/models/contracts/attention_backends.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/models/attention_backends.py",
+      "readme_claim": "Capability-gated attention backends",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2603.05451; https://github.com/Dao-AILab/flash-attention",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "checkpoint_preserving_chain_of_experts",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/chain_of_experts.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "held_out_evidence",
+        "documentation"
+      ],
+      "symbols": [
+        "ChainOfExpertsSpec",
+        "ChainOfExpertsExtension"
+      ],
+      "config_keys": [
+        "model.params.moe_chain_of_experts",
+        "model.params.moe_chain_router_rank"
+      ],
+      "disabled_config": {
+        "model.params.moe_chain_of_experts": false,
+        "model.params.moe_chain_router_rank": 0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/chain_of_experts.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/routing/chain_of_experts.py",
+      "readme_claim": "Checkpoint-preserving Chain-of-Experts",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2506.18945",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "compressed_frozen_weights",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/execution/linear.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "CompressedLinear"
+      ],
+      "config_keys": [
+        "memory.frozen_weight_quantization",
+        "memory.frozen_weight_quantization_strategy"
+      ],
+      "disabled_config": {
+        "memory.frozen_weight_quantization": "none",
+        "memory.frozen_weight_quantization_strategy": "disabled"
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py",
+        "mirai/core/moe/contracts/parity.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/quantization/quant.py",
+      "readme_claim": "Compressed frozen linears and routed experts",
+      "readme_claims": [
+        "NF4 frozen-base training",
+        "GGUF low-bit storage",
+        "Microscaling formats"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "compute_budgeted_dynamic_topk",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/routing/dynamic_topk.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "BudgetedDynamicTopK"
+      ],
+      "config_keys": [
+        "model.params.moe_dynamic_topk_min",
+        "model.params.moe_dynamic_topk_average"
+      ],
+      "disabled_config": {
+        "model.params.moe_dynamic_topk_min": 0,
+        "model.params.moe_dynamic_topk_average": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/dynamic_topk.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/routing/dynamic_topk.py",
+      "readme_claim": "Compute-budgeted dynamic top-k",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "conditioned_inference",
+      "kind": "inference",
+      "owner": "mirai/core/inference/conditioning.py",
+      "check": "inference",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "native_execution",
+        "documentation"
+      ],
+      "symbols": [
+        "InferenceConditioningRequest",
+        "PreparedInferenceConditioning",
+        "denoising_schedule_start"
+      ],
+      "config_keys": [
+        "inference.task",
+        "inference.denoising_strength"
+      ],
+      "disabled_config": {
+        "inference.task": "text_to_video",
+        "inference.denoising_strength": 1.0
+      },
+      "contract_paths": [
+        "mirai/core/inference/contracts/conditioning.py",
+        "tests/test_lingbot_native_inference.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/inference/conditioning.py",
+      "readme_claim": "Conditioned inference",
+      "readme_claims": [
+        "Native T2I and TI2V conditioning",
+        "V2V schedule-strength conditioning"
+      ],
+      "provenance": "https://github.com/Robbyant/lingbot-video",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "contrastive_flow_matching",
+      "kind": "generic",
+      "owner": "mirai/core/training/objectives/contrastive_flow.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation",
+        "gradients"
+      ],
+      "symbols": [
+        "ContrastiveFlowLoss",
+        "compute_contrastive_flow_loss",
+        "sample_negative_indices"
+      ],
+      "config_keys": [
+        "training.contrastive_flow_weight"
+      ],
+      "disabled_config": {
+        "training.contrastive_flow_weight": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/training/objectives/contracts/contrastive_flow.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Contrastive flow matching",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2506.05350",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "cross_expert_shared_basis_compression",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/models/compressed_weights/factorization/shared_basis_artifact.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "factorize_packed_state_shared_basis"
+      ],
+      "config_keys": [
+        "model.params.expert_weight_compression"
+      ],
+      "disabled_config": {
+        "model.params.expert_weight_compression": "off"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/artifact_transforms.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Cross-expert shared-basis compression",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "deepgemm_grouped_fp8_experts",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/quantization/deepgemm_fp8.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "deepgemm_blockwise_fp8_batched_linear"
+      ],
+      "config_keys": [
+        "memory.moe_gemm_backend_forward"
+      ],
+      "disabled_config": {
+        "memory.moe_gemm_backend_forward": ""
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py",
+        "tests/test_moe_expert_optimizations.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/quantization/blockwise_fp8.py",
+      "readme_claim": "Native DeepGEMM FP8 experts",
+      "readme_claims": [],
+      "provenance": "https://github.com/deepseek-ai/DeepGEMM; https://arxiv.org/abs/2412.19437",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "deepseek_blockwise_fp8_w8a8",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/quantization/blockwise_fp8.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "BlockwiseFP8Meta",
+        "quantize_blockwise_fp8_weight",
+        "blockwise_fp8_linear",
+        "blockwise_fp8_batched_linear"
+      ],
+      "config_keys": [
+        "memory.frozen_weight_quantization",
+        "memory.frozen_weight_quantization_strategy"
+      ],
+      "disabled_config": {
+        "memory.frozen_weight_quantization": "none",
+        "memory.frozen_weight_quantization_strategy": "disabled"
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/models/compressed_weights/quantization/blockwise_fp8.py",
+      "readme_claim": "Block-scaled FP8 frozen weights",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2412.19437; https://github.com/deepseek-ai/DeepSeek-V3",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "depth_aware_router_policy",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/layer_policy.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "held_out_evidence",
+        "documentation"
+      ],
+      "symbols": [
+        "LayerRouterBand",
+        "LayerRouterPolicy",
+        "LayerRouterSettings"
+      ],
+      "config_keys": [
+        "model.params.moe_layer_router_policy"
+      ],
+      "disabled_config": {
+        "model.params.moe_layer_router_policy": []
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/layer_router_policy.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Depth-aware router policy",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2505.22582; https://arxiv.org/abs/2402.08562; https://arxiv.org/abs/2605.19378",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "diffusion_aware_decoupled_routing",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/routing/decoupled.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "DecoupledRouterConditioner"
+      ],
+      "config_keys": [
+        "model.params.moe_router_timestep_weight"
+      ],
+      "disabled_config": {
+        "model.params.moe_router_timestep_weight": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/decoupled_routing.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/vendors/lingbot_video/transformer_lingbot_video.py",
+      "readme_claim": "Diffusion-aware decoupled routing",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2604.12163",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "direct_selected_expert_tuning",
+      "kind": "adapter",
+      "owner": "mirai/core/training/optim/selected_expert_adamw.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "SelectedExpertAdamW"
+      ],
+      "config_keys": [
+        "adapter.type",
+        "optimizer.selected_expert_ids"
+      ],
+      "disabled_config": {
+        "adapter.type": "lora"
+      },
+      "contract_paths": [
+        "tests/test_optimizer_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/training/optim/selected_expert_adamw.py",
+      "readme_claim": "Direct selected-expert tuning with row-sparse optimizer state",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2407.01906",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "dispersive_representation_regularization",
+      "kind": "training_policy",
+      "owner": "mirai/core/training/policies/dispersive_loss.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation"
+      ],
+      "symbols": [
+        "DispersiveLossController"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/dispersive_loss.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/policies/dispersive_loss.py",
+      "readme_claim": "Dispersive representation regularization",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2506.09027; https://github.com/raywang4/DispLoss",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "diversity_aware_routing",
+      "kind": "training_policy",
+      "owner": "mirai/core/moe/adaptation/diversity.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "DiversityAwareRoutingController"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/diversity.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Diversity-aware routing",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "domain_expert_specialization",
+      "kind": "training_policy",
+      "owner": "mirai/core/moe/adaptation/domain_specialization.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "DomainExpertSpecializationController"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/domain_specialization.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Dataset-domain specialization",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "drop_upcycling_expert_splitting",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/moe/storage/upcycling.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "DropUpcyclingSpec",
+        "drop_upcycle_packed_state",
+        "validate_drop_upcycling_selection"
+      ],
+      "config_keys": [
+        "model.params.expert_upcycling",
+        "model.params.expert_upcycling_copies",
+        "model.params.expert_upcycling_reinit_ratio",
+        "model.params.expert_upcycling_seed"
+      ],
+      "disabled_config": {
+        "model.params.expert_upcycling": "off",
+        "model.params.expert_upcycling_copies": 0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/artifact_transforms.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/storage/upcycling.py",
+      "readme_claim": "Drop-Upcycling expert splitting",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2502.19261; https://github.com/Taishi-N324/Drop-Upcycling",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "eaquant_router_consistency_calibration",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/moe/calibration/router_quantization.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "calibrate_symmetric_int8_router",
+        "save_router_quantization_calibration",
+        "apply_router_quantization_calibration"
+      ],
+      "config_keys": [
+        "model.params.router_quantization_calibration",
+        "memory.router_quantization_calibration_path"
+      ],
+      "disabled_config": {
+        "model.params.router_quantization_calibration": "off",
+        "memory.router_quantization_calibration_path": ""
+      },
+      "contract_paths": [
+        "mirai/core/training/calibration/contracts/router_quantization.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "EAQuant-aligned router calibration",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2506.13329",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "esft_task_affinity_selection",
+      "kind": "adapter",
+      "owner": "mirai/core/moe/calibration/esft.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "ESFTAffinityAccumulator",
+        "ESFTCalibrationCapture",
+        "ESFTSelectionPlan",
+        "build_esft_selection_plan",
+        "select_esft_experts"
+      ],
+      "config_keys": [
+        "adapter.type",
+        "adapter.expert_selection",
+        "adapter.esft_selection_mass",
+        "adapter.esft_calibration_samples",
+        "optimizer.type"
+      ],
+      "disabled_config": {
+        "adapter.type": "lora",
+        "adapter.expert_selection": "all"
+      },
+      "contract_paths": [
+        "tests/test_optimizer_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "ESFT task-affinity expert selection",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2407.01906",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "expert_choice_capacity_schedule",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/routing/expert_choice.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "resolve_capacity_schedule"
+      ],
+      "config_keys": [
+        "model.params.moe_expert_choice_capacity_schedule"
+      ],
+      "disabled_config": {
+        "model.params.moe_expert_choice_capacity_schedule": []
+      },
+      "contract_paths": [
+        "tests/test_sparse_moe_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/routing/expert_choice.py",
+      "readme_claim": "Expert-Choice capacity schedules",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2410.02098",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "expert_choice_coverage_guard",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/routing/expert_choice.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "ExpertChoiceCoverageSummary",
+        "summarize_expert_choice_coverage"
+      ],
+      "config_keys": [
+        "model.params.moe_expert_choice_coverage_alarm_threshold"
+      ],
+      "disabled_config": {
+        "model.params.moe_expert_choice_coverage_alarm_threshold": 0.0
+      },
+      "contract_paths": [
+        "tests/test_sparse_moe_contract.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/routing/expert_choice.py",
+      "readme_claim": "Expert-Choice coverage guard",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2410.02098",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "expert_choice_routing",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/routing/routers.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "route_expert_choice_logits",
+        "ExpertChoiceRoutingDecision"
+      ],
+      "config_keys": [
+        "model.params.moe_routing_mode",
+        "model.params.moe_expert_choice_capacity_factor"
+      ],
+      "disabled_config": {
+        "model.params.moe_routing_mode": "token_choice"
+      },
+      "contract_paths": [
+        "tests/test_sparse_moe_contract.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/routing/routers.py",
+      "readme_claim": "Expert-Choice routing",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2202.09368",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "expert_condenser",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/expert_condenser.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "ExpertCondenserComponent",
+        "write_condenser_state"
+      ],
+      "config_keys": [
+        "adapter.condenser_rank",
+        "adapter.condenser_alpha"
+      ],
+      "disabled_config": {
+        "adapter.condenser_rank": 0
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/expert_tensor.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Always-on expert condenser",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2604.23036",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "expert_dropout",
+      "kind": "training_policy",
+      "owner": "mirai/core/moe/adaptation/dropout.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "ExpertDropoutController"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/expert_dropout.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "No-token-drop expert-output dropout",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2606.31201",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "expert_lora_allocation",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/lora_allocation.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "LoRAAllocationPolicy",
+        "LoRAAllocationPlan"
+      ],
+      "config_keys": [
+        "adapter.target_preset",
+        "adapter.rank_pattern",
+        "adapter.alpha_pattern"
+      ],
+      "disabled_config": {
+        "adapter.rank_pattern": {},
+        "adapter.alpha_pattern": {}
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/allocation.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Expert-aware LoRA allocation",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "expert_prototype_consolidation",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/moe/storage/consolidation.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "consolidate_packed_state"
+      ],
+      "config_keys": [
+        "model.params.expert_consolidation"
+      ],
+      "disabled_config": {
+        "model.params.expert_consolidation": "off"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/artifact_transforms.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Expert prototype consolidation",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "expert_specialization_objectives",
+      "kind": "routing_objective",
+      "owner": "mirai/core/moe/adaptation/specialization_loss.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "router_score_variance_loss"
+      ],
+      "config_keys": [
+        "model.params.moe_router_variance_loss_weight",
+        "model.params.moe_expert_orthogonality_loss_weight",
+        "model.params.moe_swiglu_specialization_loss_weight"
+      ],
+      "disabled_config": {
+        "model.params.moe_router_variance_loss_weight": 0.0,
+        "model.params.moe_expert_orthogonality_loss_weight": 0.0,
+        "model.params.moe_swiglu_specialization_loss_weight": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/specialization.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/moe/adaptation/specialization_loss.py",
+      "readme_claim": "Router variance regularization",
+      "readme_claims": [
+        "Expert-output orthogonality",
+        "SwiGLU expert specialization",
+        "Cross-layer routing coupling"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "expert_touch_guard",
+      "kind": "runtime_guard",
+      "owner": "mirai/core/moe/runtime/touch_guard.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation"
+      ],
+      "symbols": [
+        "ExpertTouchGuardResult",
+        "enforce_expert_touch_guard"
+      ],
+      "config_keys": [
+        "training.moe_expert_touch_guard",
+        "training.moe_expert_touch_max_fraction"
+      ],
+      "disabled_config": {
+        "training.moe_expert_touch_guard": "off",
+        "training.moe_expert_touch_max_fraction": 1.0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/runtime_controls.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Expert-touch guard",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "fisher_rao_specialization_telemetry",
+      "kind": "monitoring",
+      "owner": "mirai/core/moe/monitoring/fisher.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "FisherSpecializationSummary",
+        "fisher_rao_distance_to_uniform",
+        "summarize_fisher_specialization"
+      ],
+      "config_keys": [
+        "model.params.moe_routing_health"
+      ],
+      "disabled_config": {
+        "model.params.moe_routing_health": false
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/routing_health.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/contracts/routing_health.py",
+      "readme_claim": "Fisher-Rao specialization telemetry",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2604.14500",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "fp32_router_master_parameters",
+      "kind": "moe_policy",
+      "owner": "mirai/core/training/optim/router_fp32_master.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "RouterFp32Master"
+      ],
+      "config_keys": [
+        "model.params.router_fp32_master"
+      ],
+      "disabled_config": {
+        "model.params.router_fp32_master": false
+      },
+      "contract_paths": [
+        "mirai/core/training/optim/contracts/router_fp32_master.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "FP32 router master parameters",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "frozen_router_int8_storage",
+      "kind": "compressed_weight",
+      "owner": "mirai/vendors/lingbot_video/transformer_lingbot_video.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "LingBotVideoRouter",
+        "enable_int8_weight"
+      ],
+      "config_keys": [
+        "memory.router_quantization"
+      ],
+      "disabled_config": {
+        "memory.router_quantization": "disabled"
+      },
+      "contract_paths": [
+        "tests/test_sparse_moe_contract.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/vendors/lingbot_video/transformer_lingbot_video.py",
+      "readme_claim": "Frozen-router INT8 storage",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "full_gradient_aligned_lora_optimization",
+      "kind": "adapter",
+      "owner": "mirai/core/training/optim/lora_pro.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "LoRAProAdamW",
+        "lora_pro_correct_gradients"
+      ],
+      "config_keys": [
+        "optimizer.type",
+        "optimizer.lora_pro_damping"
+      ],
+      "disabled_config": {
+        "optimizer.type": "adamw",
+        "optimizer.lora_pro_damping": 1e-08
+      },
+      "contract_paths": [
+        "tests/test_optimizer_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/training/optim/lora_pro.py",
+      "readme_claim": "Full-gradient-aligned LoRA optimization (LoRA-Pro)",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2407.18242",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_checkpoint_persistence",
+      "kind": "generic",
+      "owner": "mirai/core/persistence/checkpoints.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "documentation",
+        "persistence"
+      ],
+      "symbols": [
+        "CheckpointPolicy",
+        "save_checkpoint",
+        "load_checkpoint"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_resume_equivalence.py"
+      ],
+      "default_off": false,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Checkpoint persistence and resume",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_dataset_pipeline",
+      "kind": "generic",
+      "owner": "mirai/core/dataset/cache.py",
+      "check": "dataset",
+      "invariants": [
+        "owner",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "CachedRecord",
+        "build_cache_from_config",
+        "MmapSafetensorsCache"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_dataset_bucketing.py",
+        "tests/test_cache_recovery_and_variants.py",
+        "tests/test_dataset_split.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Dataset bucketing",
+      "readme_claims": [
+        "Native cache pipeline",
+        "Cache integrity",
+        "Dataset composition",
+        "Caption and temporal augmentation"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_inference_sessions",
+      "kind": "generic",
+      "owner": "mirai/core/inference/session.py",
+      "check": "inference",
+      "invariants": [
+        "owner",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "InferenceSession",
+        "decode_pipeline_video"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_inference_session.py",
+        "tests/test_cfg_batching.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Classifier-free guidance",
+      "readme_claims": [
+        "Batch inference sessions"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_inference_solvers",
+      "kind": "generic",
+      "owner": "mirai/core/training/preview/preview_solvers.py",
+      "check": "inference",
+      "invariants": [
+        "owner",
+        "documentation"
+      ],
+      "symbols": [
+        "PreviewSolverRegistry",
+        "resolve_preview_solver"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_preview_solvers.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Inference solvers",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_interactive_training_controls",
+      "kind": "generic",
+      "owner": "mirai/core/training/control/live_control.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "documentation",
+        "persistence"
+      ],
+      "symbols": [
+        "AppliedTrainingControl",
+        "LiveTrainingController"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_training_runtime_policy_contract.py"
+      ],
+      "default_off": false,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Interactive training controls",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_learning_rate_schedulers",
+      "kind": "generic",
+      "owner": "mirai/core/training/optim/scheduler.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "documentation"
+      ],
+      "symbols": [
+        "SchedulerRegistry",
+        "build_scheduler"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_optimizers_schedulers.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Learning-rate schedulers",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_lora_interchange",
+      "kind": "generic",
+      "owner": "mirai/core/models/adapters/lora_interchange.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "documentation"
+      ],
+      "symbols": [
+        "detect_layout",
+        "convert_lora_state_dict"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/interchange.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "LoRA interchange",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_lora_lifecycle",
+      "kind": "generic",
+      "owner": "mirai/core/models/adapters/lora.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "documentation",
+        "persistence"
+      ],
+      "symbols": [
+        "apply_lora_to_linear_modules",
+        "lora_state_dict",
+        "load_lora_state_dict"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/host.py"
+      ],
+      "default_off": false,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "LoRA lifecycle",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_operational_runtime",
+      "kind": "generic",
+      "owner": "mirai/core/training/runtime/trainer.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "TrainerRuntimeSetup",
+        "initialize_trainer_runtime"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_thin_slice_e2e.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Operational runtime controls",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_optimizers",
+      "kind": "generic",
+      "owner": "mirai/core/training/optim/optimizer.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "documentation"
+      ],
+      "symbols": [
+        "build_optimizer",
+        "OptimizerBuildResult"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_optimizers_schedulers.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Optimizers",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_release_certification",
+      "kind": "generic",
+      "owner": "mirai/core/training/release/release_evidence_contract.py",
+      "check": "release",
+      "invariants": [
+        "owner",
+        "documentation"
+      ],
+      "symbols": [
+        "ReleaseEvidenceBundle",
+        "validate_release_evidence_bundle"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_release_evidence_contract.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Release evidence and promotion gates",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_training_math",
+      "kind": "generic",
+      "owner": "mirai/core/training/objectives/engine.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "documentation"
+      ],
+      "symbols": [
+        "TrainingLossResult",
+        "compute_training_loss"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_sparse_moe_contract.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "T2V, I2V, hybrid, and multi-task conditioning",
+      "readme_claims": [
+        "Training objectives",
+        "Robust losses",
+        "Timestep loss weighting",
+        "Loss controls"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_training_observability",
+      "kind": "generic",
+      "owner": "mirai/core/training/observability/callbacks.py",
+      "check": "logging_callbacks",
+      "invariants": [
+        "owner",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "TrainingCallback",
+        "TensorBoardCallback",
+        "WandbCallback"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_logging_callbacks_contract.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Training lifecycle and observability",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "generic_training_step_safety",
+      "kind": "generic",
+      "owner": "mirai/core/training/trainer.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "documentation"
+      ],
+      "symbols": [
+        "Trainer",
+        "compute_loss"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_thin_slice_e2e.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Training-step safety",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "gradient_driven_adaptive_expert_lora",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/lora_gora.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "allocate_gora_ranks",
+        "initialize_gora_module"
+      ],
+      "config_keys": [
+        "adapter.lora_init",
+        "adapter.gora_calibration_steps",
+        "adapter.gora_min_rank",
+        "adapter.gora_max_rank",
+        "adapter.gora_stable_gamma"
+      ],
+      "disabled_config": {
+        "adapter.lora_init": "kaiming",
+        "adapter.gora_calibration_steps": 64,
+        "adapter.gora_min_rank": 0,
+        "adapter.gora_max_rank": 0,
+        "adapter.gora_stable_gamma": 0.05
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/gora.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/training/calibration/gora.py",
+      "readme_claim": "Gradient-driven adaptive expert LoRA (GoRA)",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2502.12171",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "grouped_adjugate_experts",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/adjugate_experts.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "held_out_evidence",
+        "documentation"
+      ],
+      "symbols": [
+        "AdjugateExpertPool",
+        "AdjugateExpertRoutingDecision",
+        "AdjugateExpertTopology",
+        "aggregate_adjugate_group_routes"
+      ],
+      "config_keys": [
+        "model.params.moe_adjugate_experts",
+        "model.params.moe_adjugate_expert_groups",
+        "model.params.moe_adjugate_expert_intermediate_size",
+        "model.params.moe_adjugate_expert_scale"
+      ],
+      "disabled_config": {
+        "model.params.moe_adjugate_experts": false
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/adjugate_experts.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/routing/adjugate_experts.py",
+      "readme_claim": "Grouped adjugate experts",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2508.07785; https://github.com/inclusionAI/GroveMoE",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "hardware_tier_memory_planning",
+      "kind": "residency",
+      "owner": "mirai/config/hardware_tiers.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "HardwareMemoryPlan",
+        "resolve_hardware_memory_plan"
+      ],
+      "config_keys": [
+        "memory.hardware_policy"
+      ],
+      "disabled_config": {
+        "memory.hardware_policy": "disabled"
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/device_residency.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/config/hardware_tiers.py",
+      "readme_claim": "Hardware-tier planning",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "hierarchical_output_expert_merging",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/moe/storage/consolidation.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "consolidate_packed_state"
+      ],
+      "config_keys": [
+        "model.params.expert_consolidation"
+      ],
+      "disabled_config": {
+        "model.params.expert_consolidation": "off"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/hierarchical_consolidation.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Output-hierarchical expert merging",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2410.08589; https://github.com/wazenmai/HC-SMoE",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "imatrix_tensor_precision_calibration",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/moe/calibration/precision.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "TensorPrecisionPlan",
+        "allocate_tensor_precision"
+      ],
+      "config_keys": [
+        "model.params.expert_precision_calibration",
+        "memory.expert_precision_plan_path"
+      ],
+      "disabled_config": {
+        "model.params.expert_precision_calibration": "off",
+        "memory.expert_precision_plan_path": ""
+      },
+      "contract_paths": [
+        "mirai/core/training/calibration/contracts/expert_precision.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/execution/mixed_precision.py",
+      "readme_claim": "Imatrix-calibrated per-tensor mixed-precision expert storage",
+      "readme_claims": [],
+      "provenance": "https://github.com/ggml-org/llama.cpp/tree/master/tools/imatrix; https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "learned_orthogonal_expert_quantization_rotation",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/quantization/learned_rotation.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "learn_groupwise_expert_rotation",
+        "validate_learned_rotation_selection"
+      ],
+      "config_keys": [
+        "model.params.expert_quantization_rotation",
+        "memory.frozen_weight_quantization",
+        "memory.frozen_weight_packed_state_path"
+      ],
+      "disabled_config": {
+        "model.params.expert_quantization_rotation": "off",
+        "memory.frozen_weight_quantization": "none",
+        "memory.frozen_weight_packed_state_path": ""
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/quantization/rotated_int8.py",
+      "readme_claim": "Learned orthogonal expert quantization rotations",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2405.16406; https://github.com/facebookresearch/SpinQuant",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "lingbot_video",
+      "kind": "model_family",
+      "owner": "mirai/core/models/lingbot_video/pipeline.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "gradients",
+        "persistence",
+        "native_execution",
+        "documentation"
+      ],
+      "symbols": [
+        "LingBotVideoModelFamilyProvider",
+        "LingBotVideoPipeline"
+      ],
+      "config_keys": [
+        "model.type"
+      ],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_sparse_moe_contract.py",
+        "tests/test_lingbot_native_inference.py"
+      ],
+      "default_off": false,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Native sparse-MoE pipeline",
+      "readme_claims": [
+        "Provider-based sparse-MoE integration",
+        "Strict snapshot validation",
+        "Structured prompt alignment",
+        "Native text encoder and VAE",
+        "Native refiner staging",
+        "Router runtime integration",
+        "Compressed routed experts"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "lora_fa",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/lora_fa.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "LoRAFAGradientProjector",
+        "apply_lora_fa"
+      ],
+      "config_keys": [
+        "adapter.use_lora_fa"
+      ],
+      "disabled_config": {
+        "adapter.use_lora_fa": false
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/expert_tensor.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "LoRA-FA adapters",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2308.03303",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "low_rank_activation_compression",
+      "kind": "residency",
+      "owner": "mirai/core/training/residency/activation_compression.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "LowRankActivationCompression"
+      ],
+      "config_keys": [
+        "training.activation_compression",
+        "training.activation_compression_rank",
+        "training.activation_compression_min_mib"
+      ],
+      "disabled_config": {
+        "training.activation_compression": false
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/block_swap.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/residency/activation_compression.py",
+      "readme_claim": "Low-rank activation compression",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2509.23472",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "mechanism_driven_preemptive_monitoring",
+      "kind": "monitoring",
+      "owner": "mirai/core/moe/monitoring/preemptive.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "PreemptiveAttentionMonitor",
+        "router_weight_similarity",
+        "per_token_router_entropy",
+        "attention_delta2_singular_values"
+      ],
+      "config_keys": [
+        "model.params.moe_routing_health"
+      ],
+      "disabled_config": {
+        "model.params.moe_routing_health": false
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/routing_health.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/moe/contracts/routing_health.py",
+      "readme_claim": "Mechanism-driven preemptive monitoring",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2606.28116",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "mixed_precision_expert_storage",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/execution/mixed_precision.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "MixedPrecisionGroupedExperts"
+      ],
+      "config_keys": [
+        "memory.expert_precision_plan_path"
+      ],
+      "disabled_config": {
+        "memory.expert_precision_plan_path": ""
+      },
+      "contract_paths": [
+        "tests/test_moe_expert_optimizations.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/execution/experts.py",
+      "readme_claim": "Mixed-precision expert storage",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2505.05799",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "moe_capacity_estimator",
+      "kind": "tooling",
+      "owner": "mirai/core/moe/monitoring/capacity.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "MoECapacitySpec",
+        "estimate_moe_capacity"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "mirai/core/moe/contracts/routing_health.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "MoE capacity estimator",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "moe_token_chunk_checkpointing",
+      "kind": "training_policy",
+      "owner": "mirai/core/moe/runtime/token_chunking.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation"
+      ],
+      "symbols": [
+        "MoETokenChunkPolicy"
+      ],
+      "config_keys": [
+        "training.moe_token_chunk_size"
+      ],
+      "disabled_config": {
+        "training.moe_token_chunk_size": 0
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/moe_token_chunking.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/vendors/lingbot_video/transformer_lingbot_video.py",
+      "readme_claim": "Token-chunk MoE checkpointing",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2511.21431",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "mxfp8_e4m3_round_up_microscaling",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/quantization/microscaling_quant.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "quantize_microscaling",
+        "dequantize_microscaling",
+        "microscaling_stored_bytes"
+      ],
+      "config_keys": [
+        "memory.frozen_weight_quantization"
+      ],
+      "disabled_config": {
+        "memory.frozen_weight_quantization": "none"
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/models/compressed_weights/quantization/microscaling_quant.py",
+      "readme_claim": "MXFP8-E4M3 round-up microscaling",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2506.08027; https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "native_balance_and_router_z_loss",
+      "kind": "routing_objective",
+      "owner": "mirai/core/moe/adaptation/losses.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "token_choice_auxiliary_losses"
+      ],
+      "config_keys": [
+        "model.params.moe_aux_loss_weight",
+        "model.params.moe_router_z_loss_weight"
+      ],
+      "disabled_config": {
+        "model.params.moe_router_z_loss_weight": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/training_losses.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Native balance and router z-loss",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/1701.06538",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "nested_intra_expert_width_pruning",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/models/compressed_weights/flexmoe_nested.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "FlexMoENestedPhysicalWeightProvider",
+        "transform_packed_state_flexmoe_nested"
+      ],
+      "config_keys": [
+        "model.params.flexmoe_calibration",
+        "model.params.expert_weight_compression"
+      ],
+      "disabled_config": {
+        "model.params.flexmoe_calibration": "off",
+        "model.params.expert_weight_compression": "off"
+      },
+      "contract_paths": [
+        "mirai/core/training/calibration/contracts/flexmoe.py",
+        "mirai/core/moe/contracts/artifact_transforms.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/moe/calibration/flexmoe.py",
+      "readme_claim": "Nested intra-expert width pruning",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2606.27866",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "optimized_mixture_basis_expert_compression",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/models/compressed_weights/factorization/mixture_basis_artifact.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "factorize_packed_state_mixture_basis"
+      ],
+      "config_keys": [
+        "model.params.expert_weight_compression"
+      ],
+      "disabled_config": {
+        "model.params.expert_weight_compression": "off"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/artifact_transforms.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/models/compressed_weights/factorization/mixture_basis.py",
+      "readme_claim": "Optimized mixture-of-basis expert compression",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2508.05257; https://github.com/inclusionAI/MoBE",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "packed_expert_artifacts",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/packed/packed_state.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "prepare_compressed_weights_modules_from_manifest",
+        "save_compressed_weights_packed_state"
+      ],
+      "config_keys": [
+        "memory.frozen_weight_packed_state_path"
+      ],
+      "disabled_config": {
+        "memory.frozen_weight_packed_state_path": ""
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/packed/packed_state.py",
+      "readme_claim": "Packed expert artifacts",
+      "readme_claims": [
+        "Direct packed restore",
+        "Aligned expert shards"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "packed_expert_streaming",
+      "kind": "residency",
+      "owner": "mirai/core/models/compressed_weights/packed/packed_stream.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "StreamingPackedTensorMapping"
+      ],
+      "config_keys": [
+        "memory.packed_state_preload",
+        "memory.packed_stream_cache_gib",
+        "memory.packed_stream_backend",
+        "memory.packed_stream_prefetch_depth"
+      ],
+      "disabled_config": {
+        "memory.packed_stream_prefetch_depth": 0
+      },
+      "contract_paths": [
+        "mirai/core/models/compressed_weights/packed/contracts/residency.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/packed/packed_stream.py",
+      "readme_claim": "Explicit disk streaming",
+      "readme_claims": [
+        "Bounded stream cache and prefetch",
+        "GPUDirect Storage transport"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "packed_int8_expert_operation",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/execution/experts.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "CompressedGroupedExperts",
+        "_run_expert_chunk"
+      ],
+      "config_keys": [
+        "memory.expert_weight_access",
+        "memory.frozen_weight_quantization"
+      ],
+      "disabled_config": {
+        "memory.expert_weight_access": "auto",
+        "memory.frozen_weight_quantization": "none"
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/execution/experts.py",
+      "readme_claim": "Packed INT8 expert operation",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "pairwise_expert_combination_balancing",
+      "kind": "routing_objective",
+      "owner": "mirai/core/moe/adaptation/losses.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "router_similarity_loss",
+        "expert_combination_usage"
+      ],
+      "config_keys": [
+        "model.params.moe_router_similarity_loss_weight"
+      ],
+      "disabled_config": {
+        "model.params.moe_router_similarity_loss_weight": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/training_losses.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/adaptation/losses.py",
+      "readme_claim": "Pairwise expert-combination balancing",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2503.16057",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "phi_balancing",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/adaptation/phi_balance.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "PhiBalanceController",
+        "phi_balance_checkpoint_state"
+      ],
+      "config_keys": [
+        "model.params.moe_phi_balance_weight",
+        "model.params.moe_phi_balance_ema_rate",
+        "model.params.moe_phi_balance_potential"
+      ],
+      "disabled_config": {
+        "model.params.moe_phi_balance_weight": 0.0,
+        "model.params.moe_phi_balance_ema_rate": 0.01,
+        "model.params.moe_phi_balance_potential": "negative_entropy"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/runtime_controls.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Phi-balancing",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2605.15403",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "post_compression_router_kd_repair",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/moe/calibration/router_repair.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "diffusion_router_kd_loss",
+        "RouterRepairArtifact",
+        "apply_router_repair_artifact"
+      ],
+      "config_keys": [
+        "model.params.post_compression_router_repair",
+        "model.params.router_repair_artifact_path",
+        "memory.frozen_weight_packed_state_path"
+      ],
+      "disabled_config": {
+        "model.params.post_compression_router_repair": "off",
+        "model.params.router_repair_artifact_path": "",
+        "memory.frozen_weight_packed_state_path": ""
+      },
+      "contract_paths": [
+        "mirai/core/training/calibration/contracts/router_repair.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/training/calibration/router_repair.py",
+      "readme_claim": "Post-compression Router-KD repair",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2603.02217",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "posthoc_adaptive_lora_rank_compression",
+      "kind": "generic",
+      "owner": "mirai/core/models/adapters/para.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "compress_lora_state_para",
+        "expand_para_adapter_payload",
+        "save_para_adapter_safetensors"
+      ],
+      "config_keys": [
+        "adapter.posthoc_rank_compression"
+      ],
+      "disabled_config": {
+        "adapter.posthoc_rank_compression": "off"
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/para.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/models/adapters/para.py",
+      "readme_claim": "Post-hoc adaptive LoRA rank compression",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2604.27796",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "posthoc_power_function_ema",
+      "kind": "generic",
+      "owner": "mirai/core/training/optim/posthoc_ema.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "init_posthoc_ema_state",
+        "update_posthoc_ema_state",
+        "reconstruct_posthoc_ema"
+      ],
+      "config_keys": [
+        "training.posthoc_ema_enabled",
+        "training.posthoc_ema_profile_stds",
+        "training.posthoc_ema_snapshot_every_n_steps"
+      ],
+      "disabled_config": {
+        "training.posthoc_ema_enabled": false,
+        "training.posthoc_ema_profile_stds": [
+          0.05,
+          0.1
+        ],
+        "training.posthoc_ema_snapshot_every_n_steps": 0
+      },
+      "contract_paths": [
+        "mirai/core/training/optim/contracts/posthoc_ema.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Post-hoc power-function EMA",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2312.02696",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "progressive_lower_layer_sparsification",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/progressive_sparsification.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "held_out_evidence",
+        "documentation"
+      ],
+      "symbols": [
+        "ProgressiveSparsificationBand",
+        "ProgressiveSparsificationPolicy"
+      ],
+      "config_keys": [
+        "model.params.moe_progressive_sparsification_transition_step",
+        "model.params.moe_progressive_sparsification_policy"
+      ],
+      "disabled_config": {
+        "model.params.moe_progressive_sparsification_transition_step": 0,
+        "model.params.moe_progressive_sparsification_policy": []
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/progressive_sparsification.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Progressive lower-layer sparsification",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2512.16248; https://github.com/microsoft/ltp-megatron-lm",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "progressive_video_curriculum",
+      "kind": "generic",
+      "owner": "mirai/core/training/data/curriculum.py",
+      "check": "dataset",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "CurriculumSchedule"
+      ],
+      "config_keys": [
+        "training.curriculum"
+      ],
+      "disabled_config": {
+        "training.curriculum": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/data/contracts/progressive_curriculum.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/training/data/curriculum.py",
+      "readme_claim": "Progressive video curriculum",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2511.18870",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "rectified_flow_timestep_sampling",
+      "kind": "generic",
+      "owner": "mirai/core/training/objectives/sampling.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "TimestepSampler",
+        "LogitNormalTimestepSampler",
+        "ModeShiftTimestepSampler",
+        "build_timestep_sampler"
+      ],
+      "config_keys": [
+        "training.timestep_sampling",
+        "training.timestep_sampling_mean",
+        "training.timestep_sampling_std",
+        "training.timestep_sampling_mode_scale"
+      ],
+      "disabled_config": {},
+      "contract_paths": [
+        "mirai/core/training/objectives/contracts/sampling.py"
+      ],
+      "default_off": false,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Rectified-flow timestep sampling",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2403.03206",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "regional_graph_compilation",
+      "kind": "training_policy",
+      "owner": "mirai/core/training/runtime/compilation.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation"
+      ],
+      "symbols": [
+        "CompilationPolicy"
+      ],
+      "config_keys": [
+        "training.compile",
+        "training.compile_scope",
+        "training.compile_mode",
+        "training.compile_dynamic",
+        "training.compile_token_buckets"
+      ],
+      "disabled_config": {
+        "training.compile": false
+      },
+      "contract_paths": [
+        "mirai/core/training/runtime/contracts/compilation.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/runtime/compilation.py",
+      "readme_claim": "Regional graph compilation",
+      "readme_claims": [],
+      "provenance": "https://docs.pytorch.org/docs/stable/generated/torch.compile.html",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "residual_prototypical_routing",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/prototypical.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "held_out_evidence",
+        "documentation"
+      ],
+      "symbols": [
+        "PrototypicalRouterExtension",
+        "routing_contrastive_loss"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/prototypical_routing.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/contracts/prototypical_routing.py",
+      "readme_claim": "Residual prototypical routing (ProMoE adaptation)",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2510.24711",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "role_specific_grouped_gemm",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/moe/runtime/gemm.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "resolve_moe_gemm_backend",
+        "run_grouped_dx"
+      ],
+      "config_keys": [
+        "memory.moe_gemm_backend",
+        "memory.moe_gemm_backend_forward",
+        "memory.moe_gemm_backend_dx",
+        "memory.moe_gemm_backend_dw"
+      ],
+      "disabled_config": {
+        "memory.moe_gemm_backend": "auto"
+      },
+      "contract_paths": [
+        "tests/test_moe_expert_optimizations.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/moe/runtime/gemm.py",
+      "readme_claim": "Framework grouped matrix multiplication",
+      "readme_claims": [
+        "Independent grouped backward selection"
+      ],
+      "provenance": "https://github.com/pytorch/pytorch",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routed_expert_device_cache",
+      "kind": "residency",
+      "owner": "mirai/core/models/compressed_weights/execution/expert_device_cache.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "ExpertDeviceCache"
+      ],
+      "config_keys": [
+        "memory.expert_device_cache_gib"
+      ],
+      "disabled_config": {
+        "memory.expert_device_cache_gib": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/device_residency.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/execution/expert_device_cache.py",
+      "readme_claim": "Routed-expert device cache",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routed_expert_dispatch",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/execution/experts.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "CompressedGroupedExperts"
+      ],
+      "config_keys": [
+        "memory.moe_dispatch",
+        "memory.moe_dispatch_preprocess",
+        "memory.expert_dequant_chunk_size"
+      ],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/execution/experts.py",
+      "readme_claim": "Vectorized token-choice dispatch",
+      "readme_claims": [
+        "On-device dispatch preprocessing",
+        "Triton grouped GEMM",
+        "Persistent grouped GEMM",
+        "Vendored fused MoE kernels",
+        "Re-dequantized expert backward",
+        "Paired and chunked dequantization",
+        "Autograd-complete dispatch operations"
+      ],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "router_distillation",
+      "kind": "training_policy",
+      "owner": "mirai/core/moe/adaptation/distillation.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "RouterDistillationController"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/distillation.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Router distillation",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "router_health_release_reports",
+      "kind": "tooling",
+      "owner": "mirai/core/moe/monitoring/report.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "MetricSummary",
+        "build_router_health_report"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "mirai/core/moe/contracts/routing_health.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Router-health release reports",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "router_stage_schedule",
+      "kind": "training_policy",
+      "owner": "mirai/core/moe/adaptation/stage_schedule.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "RouterStageScheduleController"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/stage_schedule.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Staged router adaptation",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2509.16882",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "router_subset",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/routing/subset.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "RouterSubsetPolicy"
+      ],
+      "config_keys": [
+        "model.params.expert_subset_fraction",
+        "model.params.expert_subset_pool_factor",
+        "model.params.expert_subset_anneal_steps",
+        "model.params.expert_subset_router_kl_weight"
+      ],
+      "disabled_config": {
+        "model.params.expert_subset_fraction": 1.0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/subset_routing.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Annealed expert working sets",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2509.21892",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "router_temperature_schedule",
+      "kind": "training_policy",
+      "owner": "mirai/core/moe/adaptation/temperature.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "RouterTemperatureController"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/router_temperature.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Router temperature schedules and jitter",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2605.15484",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routing_aware_expert_selection",
+      "kind": "adapter",
+      "owner": "mirai/core/moe/calibration/selection.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "ExpertSelectionReport",
+        "apply_routing_topk_selection"
+      ],
+      "config_keys": [
+        "adapter.expert_selection",
+        "adapter.expert_topk_fraction",
+        "adapter.expert_calibration_steps"
+      ],
+      "disabled_config": {
+        "adapter.expert_selection": "all"
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/allocation.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Routing-aware expert selection",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2603.24044",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routing_aware_quantization_calibration",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/moe/calibration/quantization.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "register_quantization_calibration_hooks",
+        "save_quantization_calibration_evidence"
+      ],
+      "config_keys": [
+        "model.params.expert_quantization_calibration"
+      ],
+      "disabled_config": {
+        "model.params.expert_quantization_calibration": "off"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/artifact_transforms.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Routing-aware quantization calibration",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routing_health_telemetry",
+      "kind": "monitoring",
+      "owner": "mirai/core/moe/monitoring/health.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "DeadlockTracker",
+        "DEADLOCK_DEPTH_BANDS",
+        "router_underflow_fraction",
+        "expert_output_cossim"
+      ],
+      "config_keys": [
+        "model.params.moe_routing_health"
+      ],
+      "disabled_config": {
+        "model.params.moe_routing_health": false
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/routing_health.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Routing health telemetry",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2605.19378",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routing_quantization_agreement",
+      "kind": "tooling",
+      "owner": "mirai/core/moe/monitoring/agreement.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "RoutingAgreementReport",
+        "compare_router_selections"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "mirai/core/moe/contracts/routing_health.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Routing quantization agreement reports",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "saliency_harnessing_trajectory_routing",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/saliency.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "held_out_evidence",
+        "documentation"
+      ],
+      "symbols": [
+        "SaliencyHarnessingRouter",
+        "SharpMoESpec"
+      ],
+      "config_keys": [
+        "training.objective",
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.objective": "flow_matching",
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/sharp_moe.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/contracts/sharp_moe.py",
+      "readme_claim": "Saliency-harnessing trajectory routing (SharpMoE adaptation)",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2606.26938",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "scheduled_balance_loss_relaxation",
+      "kind": "moe_policy",
+      "owner": "mirai/core/moe/adaptation/balance_schedule.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "AuxiliaryBalanceLossSchedule"
+      ],
+      "config_keys": [
+        "model.params.moe_balance_loss_disable_step"
+      ],
+      "disabled_config": {
+        "model.params.moe_balance_loss_disable_step": 0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/balance_schedule.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Scheduled balance-loss relaxation",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2604.26340",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "selected_expert_matrix_optimization",
+      "kind": "adapter",
+      "owner": "mirai/core/training/optim/selected_expert_muon.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "SelectedExpertMuon",
+        "SelectedExpertAdaMuon",
+        "orthogonalize_matrix_reference",
+        "orthogonalize_matrix_newton_schulz"
+      ],
+      "config_keys": [
+        "optimizer.type",
+        "optimizer.muon_momentum",
+        "optimizer.muon_nesterov",
+        "optimizer.muon_ns_steps",
+        "optimizer.muon_eps",
+        "optimizer.muon_rms_target",
+        "optimizer.stochastic_rounding"
+      ],
+      "disabled_config": {
+        "optimizer.type": "adamw",
+        "optimizer.muon_momentum": 0.95,
+        "optimizer.muon_nesterov": true,
+        "optimizer.muon_ns_steps": 5,
+        "optimizer.muon_eps": 1e-08,
+        "optimizer.muon_rms_target": 0.2,
+        "optimizer.stochastic_rounding": false
+      },
+      "contract_paths": [
+        "tests/test_optimizer_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/training/optim/selected_expert_muon.py",
+      "readme_claim": "Matrix-geometry selected-expert optimization",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2502.16982; https://arxiv.org/abs/2507.11005",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "selection_margin_telemetry",
+      "kind": "monitoring",
+      "owner": "mirai/core/moe/monitoring/agreement.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "SelectionMarginProbe",
+        "selection_margin",
+        "topk_set_agreement"
+      ],
+      "config_keys": [
+        "model.params.moe_selection_margin"
+      ],
+      "disabled_config": {
+        "model.params.moe_selection_margin": false
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/routing_health.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Selection-margin telemetry",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "selective_activation_checkpointing",
+      "kind": "residency",
+      "owner": "mirai/core/training/residency/selective_checkpoint.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "make_selective_checkpoint_context_fn"
+      ],
+      "config_keys": [
+        "training.gradient_checkpointing"
+      ],
+      "disabled_config": {
+        "training.gradient_checkpointing": "standard"
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/block_swap.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/residency/selective_checkpoint.py",
+      "readme_claim": "Expert-aware activation checkpointing",
+      "readme_claims": [],
+      "provenance": "https://pytorch.org/docs/stable/checkpoint.html",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "selective_activation_residency",
+      "kind": "residency",
+      "owner": "mirai/core/training/residency/activation_offload.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "ActivationOffloadPolicy",
+        "ActivationOffloadRegion",
+        "ActivationOffloadSession",
+        "SelectiveActivationOffload"
+      ],
+      "config_keys": [
+        "training.activation_cpu_offload",
+        "training.activation_cpu_offload_min_mib",
+        "training.activation_cpu_offload_max_gib",
+        "training.activation_cpu_offload_pin_memory",
+        "training.activation_cpu_offload_defer_layers",
+        "training.activation_cpu_offload_prefetch_layers",
+        "training.activation_cpu_offload_view_replay"
+      ],
+      "disabled_config": {
+        "training.activation_cpu_offload": false
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/block_swap.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/residency/activation_offload.py",
+      "readme_claim": "Selective activation residency",
+      "readme_claims": [],
+      "provenance": "https://docs.pytorch.org/devlogs/distributed/2026-06-23-cpu-offloading/",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "selective_sinkhorn_routing",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/selective_sinkhorn.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "held_out_evidence",
+        "documentation"
+      ],
+      "symbols": [
+        "SelectiveSinkhornController",
+        "selective_sinkhorn_transport",
+        "transport_topk_routes"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/selective_sinkhorn.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/moe/contracts/selective_sinkhorn.py",
+      "readme_claim": "Selective Sinkhorn routing",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2511.08972v2",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "similarity_preserving_router_balancing",
+      "kind": "training_policy",
+      "owner": "mirai/core/moe/adaptation/simbal.py",
+      "check": "moe_adaptation",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation"
+      ],
+      "symbols": [
+        "SimBalController"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/simbal.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Similarity-preserving router balancing (SIMBAL)",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2506.14038",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "solo_4_2bit_selected_expert_optimizer_state",
+      "kind": "adapter",
+      "owner": "mirai/core/training/optim/low_bit_state.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "PackedMomentState",
+        "encode_signed_de_4bit",
+        "encode_unsigned_qema_2bit"
+      ],
+      "config_keys": [
+        "adapter.type",
+        "optimizer.type"
+      ],
+      "disabled_config": {
+        "adapter.type": "lora",
+        "optimizer.type": "adamw"
+      },
+      "contract_paths": [
+        "tests/test_optimizer_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/training/optim/low_bit_state.py",
+      "readme_claim": "SOLO 4/2-bit selected-expert optimizer state",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2505.00347; https://github.com/MTandHJ/SOLO",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "sonicmoe_fused_routing_metadata",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/execution/dispatch_preprocess.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "sonic_dispatch_preprocess_available",
+        "build_dispatch_plan"
+      ],
+      "config_keys": [
+        "memory.moe_dispatch_preprocess"
+      ],
+      "disabled_config": {
+        "memory.moe_dispatch_preprocess": "host"
+      },
+      "contract_paths": [
+        "tests/test_moe_expert_optimizations.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/execution/dispatch_preprocess.py",
+      "readme_claim": "Fused SonicMoE routing metadata",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2512.14080; https://github.com/Dao-AILab/sonic-moe",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "sparse_expert_adapter_export",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/sparse_expert_export.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "SparseExpertExportPolicy",
+        "expand_sparse_expert_state"
+      ],
+      "config_keys": [
+        "adapter.sparse_expert_export"
+      ],
+      "disabled_config": {
+        "adapter.sparse_expert_export": false
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/interchange.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Sparse expert adapter checkpoints",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "sparse_high_rank_delta",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/sparse_delta.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "SparseDeltaLinear"
+      ],
+      "config_keys": [
+        "adapter.type",
+        "adapter.sparse_delta_density",
+        "adapter.sparse_delta_selection"
+      ],
+      "disabled_config": {
+        "adapter.type": "lora"
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/timestep.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/models/adapters/sparse_delta.py",
+      "readme_claim": "Fixed-support sparse high-rank deltas",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2406.13175",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "spatiotemporal_routing_consistency",
+      "kind": "routing_objective",
+      "owner": "mirai/core/moe/adaptation/spatiotemporal.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "sampled_spatiotemporal_edges",
+        "spatiotemporal_routing_consistency_loss"
+      ],
+      "config_keys": [
+        "model.params.moe_spatiotemporal_routing_weight",
+        "model.params.moe_spatiotemporal_routing_max_edges"
+      ],
+      "disabled_config": {
+        "model.params.moe_spatiotemporal_routing_weight": 0.0,
+        "model.params.moe_spatiotemporal_routing_max_edges": 4096
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/spatiotemporal_routing.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/adaptation/spatiotemporal.py",
+      "readme_claim": "Spatiotemporal routing consistency",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2505.00792",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "spectral_lora_optimization",
+      "kind": "adapter",
+      "owner": "mirai/core/training/optim/lora_muon.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "LoRAMuon",
+        "lora_muon_factor_directions"
+      ],
+      "config_keys": [
+        "optimizer.type",
+        "optimizer.muon_momentum",
+        "optimizer.lora_muon_gauge_rebalance_interval",
+        "optimizer.lora_muon_gauge_rebalance_alpha"
+      ],
+      "disabled_config": {
+        "optimizer.type": "adamw",
+        "optimizer.muon_momentum": 0.95,
+        "optimizer.lora_muon_gauge_rebalance_interval": 0,
+        "optimizer.lora_muon_gauge_rebalance_alpha": 1.0
+      },
+      "contract_paths": [
+        "tests/test_optimizer_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/training/optim/lora_muon.py",
+      "readme_claim": "Gauge-invariant spectral LoRA optimization (LoRA-Muon)",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2606.12921",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "structured_2_4_expert_execution",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/quantization/structured_sparsity.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "StructuredSparse24GroupedExperts"
+      ],
+      "config_keys": [
+        "memory.expert_structured_sparsity"
+      ],
+      "disabled_config": {
+        "memory.expert_structured_sparsity": "disabled"
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/quantization/structured_sparsity.py",
+      "readme_claim": "2:4 semi-structured frozen-expert execution",
+      "readme_claims": [],
+      "provenance": "https://pytorch.org/docs/stable/sparse.html",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "structured_expert_pruning",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/moe/calibration/pruning.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "ExpertPruningSaliencyAccumulator",
+        "select_pruned_experts",
+        "prune_packed_state"
+      ],
+      "config_keys": [
+        "model.params.expert_pruning",
+        "model.params.expert_pruning_criterion"
+      ],
+      "disabled_config": {
+        "model.params.expert_pruning": "off",
+        "model.params.expert_pruning_criterion": "frequency"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/artifact_transforms.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Structured expert pruning",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2606.15716",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "structured_lora_parameter_dropout",
+      "kind": "generic",
+      "owner": "mirai/core/models/adapters/lora_parameter_dropout.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "apply_lora_parameter_dropout"
+      ],
+      "config_keys": [
+        "adapter.lora_parameter_dropout"
+      ],
+      "disabled_config": {
+        "adapter.lora_parameter_dropout": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/dropout.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/models/adapters/lora_parameter_dropout.py",
+      "readme_claim": "Structured LoRA parameter dropout",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2404.09610",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "structured_then_sparse24_expert_compression",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/models/compressed_weights/quantization/stun_artifact.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "cluster_router_experts",
+        "select_stun_representatives_streaming",
+        "transform_packed_state_stun_sparse24",
+        "pack_sparse24"
+      ],
+      "config_keys": [
+        "model.params.expert_pruning",
+        "model.params.expert_weight_compression"
+      ],
+      "disabled_config": {
+        "model.params.expert_pruning": "off",
+        "model.params.expert_weight_compression": "off"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/artifact_transforms.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/models/compressed_weights/quantization/structured_sparse_provider.py",
+      "readme_claim": "Structured-then-semi-structured expert compression",
+      "readme_claims": [],
+      "provenance": "https://aclanthology.org/2025.acl-long.671/",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "timestep_expert_choice_capacity",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/timestep_capacity.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "held_out_evidence",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "TimestepExpertChoiceCapacityPolicy"
+      ],
+      "config_keys": [
+        "model.params.moe_expert_choice_timestep_capacity_schedule",
+        "model.params.moe_expert_choice_timestep_capacity_span",
+        "training.timestep_sampling",
+        "training.timestep_sampling_mean",
+        "training.timestep_sampling_std",
+        "training.timestep_sampling_mode_scale"
+      ],
+      "disabled_config": {
+        "model.params.moe_expert_choice_timestep_capacity_schedule": "disabled",
+        "model.params.moe_expert_choice_timestep_capacity_span": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/timestep_capacity.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/routing/timestep_capacity.py",
+      "readme_claim": "Timestep-dependent Expert-Choice capacity",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2604.01622",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "timestep_rank_adaptation",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/timestep_axis.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "TimestepAdapterPolicy",
+        "per_sample_rank_mask"
+      ],
+      "config_keys": [
+        "adapter.timestep_rank_schedule",
+        "adapter.timestep_rank_min_fraction",
+        "adapter.tc_gate_hidden_dim"
+      ],
+      "disabled_config": {
+        "adapter.timestep_rank_schedule": "none"
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/timestep.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Timestep-conditioned rank masking",
+      "readme_claims": [
+        "Learned timestep rank gates"
+      ],
+      "provenance": "https://arxiv.org/abs/2507.05964",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "token_adaptive_lightweight_experts",
+      "kind": "routing_topology",
+      "owner": "mirai/core/moe/routing/lightweight_experts.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "held_out_evidence",
+        "documentation"
+      ],
+      "symbols": [
+        "LightweightExpertPool",
+        "LightweightExpertRoutingDecision"
+      ],
+      "config_keys": [
+        "model.params.moe_zero_experts",
+        "model.params.moe_copy_experts",
+        "model.params.moe_constant_experts",
+        "model.params.moe_lightweight_top_k"
+      ],
+      "disabled_config": {
+        "model.params.moe_constant_experts": 0,
+        "model.params.moe_copy_experts": 0,
+        "model.params.moe_lightweight_top_k": 0,
+        "model.params.moe_zero_experts": 0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/lightweight_experts.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Token-adaptive lightweight experts",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2607.24665",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "token_count_aware_flow_shift",
+      "kind": "generic",
+      "owner": "mirai/core/models/flow_shift.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "DynamicFlowShiftPolicy"
+      ],
+      "config_keys": [
+        "model.params.flow_shift",
+        "model.params.flow_shift_mode",
+        "model.params.flow_shift_base_seq_len",
+        "model.params.flow_shift_max_seq_len",
+        "model.params.flow_shift_max"
+      ],
+      "disabled_config": {
+        "model.params.flow_shift_mode": "constant",
+        "model.params.flow_shift_base_seq_len": 256,
+        "model.params.flow_shift_max_seq_len": 4096,
+        "model.params.flow_shift_max": 12.0
+      },
+      "contract_paths": [
+        "mirai/core/models/lingbot_video/contracts/dynamic_flow_shift.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/models/flow_shift.py",
+      "readme_claim": "Token-count-aware flow shifting",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2403.03206",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "train_inference_routing_agreement",
+      "kind": "monitoring",
+      "owner": "mirai/core/moe/monitoring/agreement.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "RoutingSelectionCapture",
+        "RoutingAgreementAccumulator",
+        "build_routing_mode_agreement_evidence"
+      ],
+      "config_keys": [
+        "model.params.moe_routing_agreement_evidence"
+      ],
+      "disabled_config": {
+        "model.params.moe_routing_agreement_evidence": "off"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/routing_health.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Train\u2013inference routing agreement evidence",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2510.11370",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "train_state_cpu_offload",
+      "kind": "residency",
+      "owner": "mirai/core/training/residency/tensor_residency.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "ImmutableModuleResidency",
+        "move_trainable_tensors"
+      ],
+      "config_keys": [
+        "training.optimizer_cpu_offload",
+        "training.gradient_cpu_offload",
+        "memory.trainable_parameter_offload"
+      ],
+      "disabled_config": {
+        "training.optimizer_cpu_offload": false,
+        "training.gradient_cpu_offload": false,
+        "memory.trainable_parameter_offload": false
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/device_residency.py",
+        "mirai/core/training/residency/contracts/pinned_host_budget.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/residency/tensor_residency.py",
+      "readme_claim": "Train-state CPU offload",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "truncation_aware_whitened_expert_factorization",
+      "kind": "artifact_transform",
+      "owner": "mirai/core/moe/calibration/whitening.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "ActivationCovarianceAccumulator",
+        "save_expert_whitening_evidence",
+        "load_expert_whitening_evidence"
+      ],
+      "config_keys": [
+        "model.params.expert_factorization_calibration"
+      ],
+      "disabled_config": {
+        "model.params.expert_factorization_calibration": "off"
+      },
+      "contract_paths": [
+        "mirai/core/training/calibration/contracts/expert_whitening.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/models/compressed_weights/factorization/shared_basis.py",
+      "readme_claim": "Truncation-aware whitened expert factorization",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2403.07378",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "unified_device_residency_ledger",
+      "kind": "residency",
+      "owner": "mirai/core/training/residency/device_residency.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "DeviceResidencyPlanner"
+      ],
+      "config_keys": [
+        "memory.device_residency_budget_gib"
+      ],
+      "disabled_config": {
+        "memory.device_residency_budget_gib": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/device_residency.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/residency/device_residency.py",
+      "readme_claim": "Unified residency ledger",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "weight_decomposed_lora",
+      "kind": "adapter",
+      "owner": "mirai/core/models/adapters/dora.py",
+      "check": "adapters",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "dora_effective_weight",
+        "dora_row_magnitude"
+      ],
+      "config_keys": [
+        "adapter.use_dora"
+      ],
+      "disabled_config": {
+        "adapter.use_dora": false
+      },
+      "contract_paths": [
+        "mirai/core/models/adapters/contracts/expert_tensor.py",
+        "mirai/core/models/adapters/contracts/interchange.py",
+        "mirai/core/models/adapters/contracts/host.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/models/adapters/dora.py",
+      "readme_claim": "Weight-decomposed low-rank adaptation (DoRA)",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2402.09353",
+      "promotion_evidence": ""
+    }
+  ]
+}

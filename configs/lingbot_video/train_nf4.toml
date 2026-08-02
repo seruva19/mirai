@@ -1,0 +1,36 @@
+preset = "lingbot_video_offload"
+
+[model]
+path = "./models/lingbot-video-moe-30b-a3b"
+
+[training]
+max_steps = 1000
+gradient_checkpointing = "aggressive"
+block_swap_mode = "async"
+blocks_to_swap = 48
+
+[adapter]
+type = "lora"
+target_preset = "attn_router_routed_experts"
+rank = 32
+alpha = 32.0
+
+[dataset]
+path = "./data/videos"
+auto_preprocess_cache = true
+preprocess_raw_media_to_pt = true
+enable_bucketing = true
+frame_buckets = [17, 33]
+
+[memory]
+frozen_weight_quantization = "nf4"
+frozen_weight_quantization_strategy = "compressed_weights"
+quantize_experts_on_load = true
+expert_weight_access = "chunked_dequant"
+expert_dequant_chunk_size = 16
+weight_residency_strategy = "block_swap"
+block_swap_prefetch_depth = 1
+
+[logging]
+output_dir = "./outputs/lingbot_lora_nf4"
+save_every_n_steps = 100

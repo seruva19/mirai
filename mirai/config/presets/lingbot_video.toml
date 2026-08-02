@@ -1,0 +1,28 @@
+model.type = "lingbot-video"
+model.path = "./models/lingbot_video"
+model.dtype = "bf16"
+model.attention_backend = "auto"
+
+[model.params]
+variant = "lingbot-video-moe-30b-a3b"
+flow_shift = 3.0
+strict_native_assets = true
+moe_aux_loss_weight = 0.01
+moe_router_z_loss_weight = 0.0
+
+[strategy]
+type = "text_to_video"
+
+[training]
+batch_size = 1
+max_steps = 3
+gradient_checkpointing = "off"
+loss_function = "mse"
+objective = "flow_matching"
+
+[optimizer]
+type = "adamw"
+lr = 0.0001
+
+[logging]
+output_dir = "./outputs/lingbot_video"

@@ -1,0 +1,55 @@
+[model]
+type = "lingbot-video"
+path = "./models/lingbot_video"
+dtype = "bf16"
+attention_backend = "auto"
+
+[model.params]
+variant = "lingbot-video-moe-30b-a3b"
+flow_shift = 3.0
+vae_chunk_size = 8
+strict_native_assets = true
+moe_aux_loss_weight = 0.01
+moe_router_z_loss_weight = 0.0
+
+[strategy]
+type = "text_to_video"
+
+[training]
+batch_size = 1
+gradient_accumulation = 1
+max_steps = 100
+objective = "flow_matching"
+loss_function = "mse"
+gradient_checkpointing = "off"
+
+[optimizer]
+type = "adamw"
+lr = 0.0001
+weight_decay = 0.0
+
+[adapter]
+type = "lora"
+target_preset = "attn_only"
+rank = 16
+alpha = 16.0
+
+[dataset]
+path = "./data"
+cache_path = "./cache/moe_dataset_cache.pt"
+frame_buckets = [9]
+
+[logging]
+output_dir = "./outputs"
+save_every_n_steps = 50
+sample_every_n_steps = 0
+
+[memory]
+frozen_weight_quantization = "none"
+frozen_weight_quantization_strategy = "disabled"
+weight_residency_strategy = "disabled"
+expert_weight_access = "auto"
+expert_dequant_chunk_size = 0
+quantize_experts_on_load = false
+router_quantization = "disabled"
+moe_kernel_backend = "auto"

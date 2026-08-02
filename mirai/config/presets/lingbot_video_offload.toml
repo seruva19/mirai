@@ -1,0 +1,67 @@
+model.type = "lingbot-video"
+model.dtype = "bf16"
+model.attention_backend = "auto"
+
+[model.params]
+variant = "lingbot-video-moe-30b-a3b"
+strict_native_assets = true
+flow_shift = 3.0
+moe_aux_loss_type = "sequence"
+moe_aux_loss_weight = 0.01
+moe_router_z_loss_weight = 0.0001
+moe_bias_update_rate = 0.001
+moe_bias_centering = true
+
+[strategy]
+type = "text_to_video"
+
+[training]
+batch_size = 1
+gradient_accumulation = 1
+max_steps = 1
+gradient_checkpointing = "aggressive"
+gradient_cpu_offload = false
+optimizer_cpu_offload = false
+activation_cpu_offload = false
+# Async mode overlaps the next block transfer with current-block compute.
+block_swap_mode = "async"
+block_swap_backward = true
+blocks_to_swap = 48
+
+[optimizer]
+type = "paged_adamw_8bit"
+allow_fallback = false
+lr = 0.0001
+
+[adapter]
+type = "lora"
+target_preset = "attn_router_routed_experts"
+rank = 32
+alpha = 32.0
+
+[dataset]
+auto_preprocess_cache = true
+preprocess_raw_media_to_pt = true
+max_cache_skip_ratio = 0.5
+frame_buckets = [33]
+
+[logging]
+output_dir = "./outputs/lingbot_video_offload"
+save_every_n_steps = 1
+sample_every_n_steps = 0
+
+[memory]
+frozen_weight_quantization = "int8"
+frozen_weight_quantization_strategy = "compressed_weights"
+quantize_experts_on_load = true
+expert_weight_access = "chunked_dequant"
+# Experts dequantized per call; reduce this value when transient VRAM is limited.
+expert_dequant_chunk_size = 16
+weight_residency_strategy = "block_swap"
+# One block of transfer lookahead.
+block_swap_prefetch_depth = 1
+moe_kernel_backend = "auto"
+cuda_memory_fraction = 0.85
+minimum_system_memory_gib = 16.0
+# PagedAdamW8bit requires trainable parameters to remain on CUDA.
+trainable_parameter_offload = false

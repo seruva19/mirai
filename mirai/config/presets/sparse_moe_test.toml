@@ -1,0 +1,32 @@
+[model]
+type = "sparse_moe_test"
+path = "./models/sparse_moe_test"
+provider_module = "mirai.core.models.testbed.sparse_moe"
+
+[model.params]
+variant = "tiny-video"
+strict_native_assets = false
+num_experts = 4
+experts_per_token = 2
+shared_experts = 1
+hidden_size = 32
+num_layers = 2
+attention_heads = 4
+latent_channels = 1
+expert_capacity_factor = 1.0
+moe_aux_loss_weight = 0.01
+
+[training]
+batch_size = 1
+max_steps = 3
+gradient_checkpointing = "off"
+
+[optimizer]
+type = "prodigy"
+lr = 0.0001
+
+[dataset]
+frame_buckets = [9]
+
+[logging]
+output_dir = "./outputs/sparse_moe_test"

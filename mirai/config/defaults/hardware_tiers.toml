@@ -1,0 +1,24 @@
+# Optional device-memory profiles. Explicit config values take precedence.
+# Profiles are matched in declaration order by compute capability and memory.
+
+[[tier]]
+name = "vram_le_32_gib"
+description = "SM80-SM89 profile with at most 32 GiB device memory."
+compute_capability_min = [8, 0]
+compute_capability_max = [8, 9]
+total_vram_gib_max = 32.0
+expert_dequant_chunk_size = 8
+device_residency_fraction = 0.75
+expert_device_cache_fraction = 0.08
+expert_device_cache_max_gib = 2.0
+
+[[tier]]
+name = "vram_gt_32_gib"
+description = "SM80+ profile with more than 32 GiB device memory."
+compute_capability_min = [8, 0]
+compute_capability_max = [10, 9]
+total_vram_gib_min = 32.0
+expert_dequant_chunk_size = 16
+device_residency_fraction = 0.80
+expert_device_cache_fraction = 0.10
+expert_device_cache_max_gib = 8.0

@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "unit_under_test": "deployed_agent_system",
+  "conditions": ["baseline", "candidate"],
+  "minimum_repetitions_per_task": 3,
+  "fresh_context_per_run": true,
+  "randomize_condition_order": true,
+  "task_classes": [
+    "owner_localization",
+    "diagnosis_without_edit",
+    "default_off_config_extension",
+    "moe_policy_extension",
+    "model_family_integration",
+    "persistence_and_resume_repair",
+    "optimized_reference_parity",
+    "long_horizon_evolution"
+  ],
+  "required_record_fields": [
+    "task_id",
+    "task_class",
+    "run_id",
+    "agent_system_id",
+    "environment_id",
+    "condition_order_index",
+    "trajectory_ref",
+    "hidden_contract_pass",
+    "architecture_pass",
+    "success",
+    "duration_seconds",
+    "input_tokens",
+    "output_tokens",
+    "tool_calls",
+    "files_opened",
+    "irrelevant_files_opened",
+    "checks_run",
+    "irrelevant_checks_run",
+    "owner_rank",
+    "invalid_edits",
+    "regressions"
+  ],
+  "acceptance": {
+    "hidden_contract_pass_rate_must_not_decrease": true,
+    "success_rate_must_not_decrease": true,
+    "candidate_architecture_failures": 0,
+    "minimum_median_time_or_token_reduction": 0.2,
+    "irrelevant_files_opened_must_not_increase": true,
+    "irrelevant_checks_run_must_not_increase": true,
+    "owner_rank_must_not_increase": true,
+    "invalid_edits_must_not_increase": true,
+    "regressions_must_not_increase": true
+  },
+  "runner_contract": {
+    "task_bundle_fields": [
+      "task_id",
+      "task_class",
+      "prompt",
+      "source_subdir",
+      "grader_id"
+    ],
+    "adapter_fields": [
+      "agent_system_id",
+      "environment_id",
+      "argv",
+      "timeout_seconds"
+    ],
+    "adapter_placeholders": [
+      "workspace",
+      "prompt_path",
+      "trace_path",
+      "grade_path",
+      "task_id",
+      "run_id",
+      "condition"
+    ],
+    "grader_result_fields": [
+      "hidden_contract_pass",
+      "architecture_pass",
+      "owner_rank",
+      "invalid_edits",
+      "regressions",
+      "irrelevant_files_opened",
+      "irrelevant_checks_run"
+    ],
+    "hidden_graders_are_external": true,
+    "shell_execution": false
+  }
+}

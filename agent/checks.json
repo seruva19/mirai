@@ -1,0 +1,413 @@
+{
+  "schema_version": 1,
+  "contract_budget": 16,
+  "routing_cases": [
+    {"path": "README.md", "checks": ["publication"]},
+    {"path": "assets/mirai-logo.png", "checks": ["publication"]},
+    {"path": ".github/workflows/ci.yml", "checks": ["agent_validation"]},
+    {"path": "MANIFEST.in", "checks": ["publication", "static"]},
+    {"path": "pyproject.toml", "checks": ["publication", "static"]},
+    {"path": "agent/checks.json", "checks": ["agent_validation"]},
+    {"path": "conftest.py", "checks": ["agent_validation", "static"]},
+    {"path": "tests/test_config.py", "checks": ["agent_validation", "config", "static"]},
+    {"path": "mirai/config/schema.py", "checks": ["config", "static"]},
+    {"path": "mirai/core/moe/routing/subset.py", "checks": ["moe_routing", "static"]},
+    {"path": "mirai/core/moe/routing/chain_of_experts.py", "checks": ["moe_routing", "static"]},
+    {"path": "mirai/core/moe/contracts/chain_of_experts.py", "checks": ["moe_routing", "static"]},
+    {"path": "mirai/core/moe/routing/prototypical.py", "checks": ["moe_routing", "static"]},
+    {"path": "mirai/core/moe/contracts/prototypical_routing.py", "checks": ["moe_adaptation", "moe_routing", "static"]},
+    {"path": "mirai/core/training/policies/prototypical_routing.py", "checks": ["moe_adaptation", "static", "training_lifecycle"]},
+    {"path": "mirai/core/moe/routing/saliency.py", "checks": ["moe_routing", "static"]},
+    {"path": "mirai/core/moe/contracts/sharp_moe.py", "checks": ["moe_adaptation", "moe_routing", "static", "training_lifecycle"]},
+    {"path": "mirai/core/training/objectives/sharp_moe.py", "checks": ["static", "training_lifecycle"]},
+    {"path": "mirai/core/training/policies/sharp_moe.py", "checks": ["moe_adaptation", "static", "training_lifecycle"]},
+    {"path": "mirai/core/moe/routing/depth.py", "checks": ["moe_routing", "static"]},
+    {"path": "mirai/core/moe/contracts/mixture_of_depths.py", "checks": ["moe_adaptation", "moe_routing", "static"]},
+    {"path": "mirai/core/training/policies/mixture_of_depths.py", "checks": ["moe_adaptation", "static", "training_lifecycle"]},
+    {"path": "mirai/core/models/lingbot_video/depth_extensions.py", "checks": ["model_family", "static"]},
+    {"path": "mirai/core/moe/calibration/flexmoe.py", "checks": ["moe_routing", "static"]},
+    {"path": "mirai/core/training/calibration/flexmoe.py", "checks": ["static", "training_lifecycle"]},
+    {"path": "mirai/core/training/calibration/contracts/flexmoe.py", "checks": ["compressed_weights", "static", "training_lifecycle"]},
+    {"path": "mirai/core/moe/monitoring/fisher.py", "checks": ["moe_routing", "static"]},
+    {"path": "mirai/core/moe/monitoring/preemptive.py", "checks": ["moe_routing", "static"]},
+    {"path": "mirai/core/models/lingbot_video/preemptive_monitoring.py", "checks": ["model_family", "static"]},
+    {"path": "mirai/core/training/policies/preemptive_monitoring.py", "checks": ["moe_adaptation", "static", "training_lifecycle"]},
+    {"path": "mirai/core/models/quantization.py", "checks": ["compressed_weights", "static"]},
+    {"path": "mirai/core/models/attention_backends.py", "checks": ["model_family", "static"]},
+    {"path": "mirai/core/models/contracts/attention_backends.py", "checks": ["model_family", "static"]},
+    {"path": "mirai/core/models/compressed_weights/nf4.py", "checks": ["compressed_weights", "static"]},
+    {"path": "mirai/core/models/compressed_weights/packed/packed_stream.py", "checks": ["compressed_weights", "residency", "static"]},
+    {"path": "mirai/core/training/residency/block_swap.py", "checks": ["residency", "static", "training_lifecycle"]},
+    {"path": "mirai/core/models/adapters/lora.py", "checks": ["adapters", "static"]},
+    {"path": "mirai/core/builtins.py", "checks": ["static", "training_lifecycle"]},
+    {"path": "scripts/export_adapter.py", "checks": ["adapters", "static"]},
+    {"path": "scripts/tools/compress_adapter_para.py", "checks": ["adapters", "static"]},
+    {"path": "mirai/core/training/observability/callbacks.py", "checks": ["logging_callbacks", "static", "training_lifecycle"]},
+    {"path": "mirai/core/dataset/cache.py", "checks": ["dataset", "static", "training_lifecycle"]},
+    {"path": "mirai/core/training/optim/optimizer.py", "checks": ["static", "training_optim", "training_lifecycle"]},
+    {"path": "mirai/core/inference/session.py", "checks": ["inference", "static"]},
+    {"path": "scripts/eval.py", "checks": ["static", "training_lifecycle"]},
+    {"path": "scripts/train.py", "checks": ["static", "training_lifecycle"]},
+    {"path": "scripts/tools/calibrate_adaptive_lora_ranks.py", "checks": ["static", "training_lifecycle"]},
+    {"path": "scripts/tools/calibrate_expert_consolidation.py", "checks": ["static", "training_lifecycle"]},
+    {"path": "scripts/tools/calibrate_expert_pruning.py", "checks": ["compressed_weights", "static", "training_lifecycle"]},
+    {"path": "scripts/tools/calibrate_expert_precision.py", "checks": ["compressed_weights", "static", "training_lifecycle"]},
+    {"path": "scripts/tools/calibrate_expert_whitening.py", "checks": ["compressed_weights", "static", "training_lifecycle"]},
+    {"path": "scripts/tools/calibrate_flexmoe.py", "checks": ["compressed_weights", "static", "training_lifecycle"]},
+    {"path": "scripts/tools/calibrate_moe_quantization.py", "checks": ["static", "training_lifecycle"]},
+    {"path": "scripts/tools/calibrate_router_quantization.py", "checks": ["compressed_weights", "static", "training_lifecycle"]},
+    {"path": "mirai/core/moe/calibration/router_quantization.py", "checks": ["compressed_weights", "moe_routing", "static"]},
+    {"path": "mirai/core/training/calibration/contracts/router_quantization.py", "checks": ["compressed_weights", "static", "training_lifecycle"]},
+    {"path": "mirai/core/moe/calibration/imatrix.py", "checks": ["compressed_weights", "moe_routing", "static", "training_lifecycle"]},
+    {"path": "mirai/core/training/calibration/contracts/expert_precision.py", "checks": ["compressed_weights", "static", "training_lifecycle"]},
+    {"path": "scripts/tools/calibrate_routing_agreement.py", "checks": ["moe_routing", "static", "training_lifecycle"]},
+    {"path": "scripts/tools/factorize_experts_mixture_basis.py", "checks": ["compressed_weights", "static"]},
+    {"path": "scripts/tools/factorize_experts_shared_basis.py", "checks": ["compressed_weights", "static"]},
+    {"path": "scripts/tools/plan_expert_consolidation.py", "checks": ["compressed_weights", "static"]},
+    {"path": "mirai/core/moe/contracts/hierarchical_consolidation.py", "checks": ["compressed_weights", "moe_routing", "static"]},
+    {"path": "mirai/core/moe/storage/upcycling.py", "checks": ["compressed_weights", "moe_routing", "static"]},
+    {"path": "scripts/tools/prune_experts.py", "checks": ["compressed_weights", "static"]},
+    {"path": "scripts/tools/upcycle_experts.py", "checks": ["compressed_weights", "static"]},
+    {"path": "scripts/tools/compress_experts_stun_sparse24.py", "checks": ["compressed_weights", "static"]},
+    {"path": "mirai/core/models/compressed_weights/flexmoe_nested.py", "checks": ["compressed_weights", "static"]},
+    {"path": "scripts/tools/compress_experts_flexmoe.py", "checks": ["compressed_weights", "static"]},
+    {"path": "scripts/tools/export_compressed_weights_packed_state.py", "checks": ["compressed_weights", "static"]},
+    {"path": "scripts/tools/estimate_moe_capacity.py", "checks": ["moe_routing", "static"]},
+    {"path": "scripts/tools/router_health_report.py", "checks": ["moe_routing", "static"]},
+    {"path": "scripts/tools/router_quantization_agreement.py", "checks": ["moe_routing", "static"]},
+    {"path": "scripts/agent/probe_moe_runtime.py", "checks": ["compressed_weights", "residency", "static"]},
+    {"path": "scripts/tools/lr_find.py", "checks": ["dataset", "static", "training_lifecycle"]},
+    {"path": "scripts/download.py", "checks": ["publication", "static"]},
+    {"path": "scripts/verify_model_snapshot.py", "checks": ["publication", "static"]},
+    {"path": "mirai/core/models/lingbot_video/pipeline.py", "checks": ["model_family", "static"]},
+    {"path": "mirai/core/models/flow_shift.py", "checks": ["model_family", "static"]},
+    {"path": "mirai/core/training/data/curriculum.py", "checks": ["dataset", "static", "training_lifecycle"]},
+    {"path": "mirai/core/training/strategies/multi_task_video.py", "checks": ["static", "training_lifecycle"]},
+    {
+      "path": "mirai/core/training/release/release_evidence_contract.py",
+      "checks": ["release", "static", "training_lifecycle"]
+    }
+  ],
+  "checks": [
+    {
+      "name": "static",
+      "paths": [
+        "conftest.py",
+        "MANIFEST.in",
+        "pyproject.toml",
+        "mirai/",
+        "scripts/",
+        "inference/",
+        "tests/"
+      ],
+      "commands": [
+        "ruff check ."
+      ],
+      "invariants": [
+        "shipping Python has no undefined names, invalid imports, or selected correctness smells"
+      ],
+      "cost": "fast",
+      "owns_paths": false,
+      "remote_gpu": false
+    },
+    {
+      "name": "publication",
+      "paths": [
+        "README.md",
+        "assets/",
+        "CONFIG_REFERENCE.md",
+        "MANIFEST.in",
+        "pyproject.toml",
+        "model_support/",
+        "configs/",
+        "mirai/core/moe/artifacts/",
+        "scripts/download.py",
+        "scripts/verify_model_snapshot.py",
+        "scripts/tools/benchmark.py"
+      ],
+      "commands": [
+        "python -m pytest tests/test_publication_contract.py -q",
+        "python -m pytest tests/test_config_reference_coverage.py -q",
+        "python -m pytest tests/test_snapshot_verification.py tests/test_sparse_moe_contract.py -q"
+      ],
+      "invariants": [
+        "public tree contains no private or development coordinates",
+        "README local links resolve",
+        "all public configs load",
+        "all schema keys are documented",
+        "model artifact manifests and snapshots preserve required lineage"
+      ],
+      "cost": "fast",
+      "remote_gpu": false
+    },
+    {
+      "name": "agent_validation",
+      "paths": [
+        "AGENTS.md",
+        ".gitignore",
+        ".github/",
+        "agent/",
+        "scripts/agent/check.py",
+        "scripts/agent/evaluate_agent_effectiveness.py",
+        "scripts/agent/feature.py",
+        "scripts/agent/run_agent_evaluation.py",
+        "mirai/core/features.py",
+        "conftest.py",
+        "tests/test_*.py"
+      ],
+      "commands": [
+        "python scripts/agent/architecture.py",
+        "python -m pytest tests/test_agent_validation_contract.py -q"
+      ],
+      "invariants": [
+        "every changed path resolves to an explicit validation owner",
+        "generic core never imports a concrete model-family implementation",
+        "contract routing preserves full expected-check recall and removes at least 80 percent of irrelevant checks",
+        "agent-system promotion requires paired hidden-contract evidence without architecture regression"
+      ],
+      "cost": "fast",
+      "remote_gpu": false
+    },
+    {
+      "name": "config",
+      "paths": ["mirai/config/", "mirai/core/training/runtime/contract.py"],
+      "commands": [
+        "python -m pytest tests/test_config.py tests/test_config_reference_coverage.py tests/test_runtime_policy.py -q"
+      ],
+      "invariants": [
+        "unknown keys fail",
+        "defaults preserve the reference path",
+        "unsupported combinations fail explicitly"
+      ],
+      "cost": "fast",
+      "remote_gpu": false
+    },
+    {
+      "name": "moe_routing",
+        "paths": ["mirai/core/moe/", "mirai/core/models/testbed/", "mirai/core/parity/", "scripts/tools/calibrate_routing_agreement.py", "scripts/tools/estimate_moe_capacity.py", "scripts/tools/router_health_report.py", "scripts/tools/router_quantization_agreement.py"],
+      "commands": [
+        "python -m pytest tests/test_sparse_moe_contract.py mirai/core/moe/contracts/training_losses.py mirai/core/moe/contracts/dynamic_topk.py mirai/core/moe/contracts/spatiotemporal_routing.py mirai/core/moe/contracts/runtime_controls.py mirai/core/moe/contracts/lightweight_experts.py mirai/core/moe/contracts/adjugate_experts.py mirai/core/moe/contracts/decoupled_routing.py mirai/core/moe/contracts/chain_of_experts.py mirai/core/moe/contracts/selective_sinkhorn.py mirai/core/moe/contracts/prototypical_routing.py mirai/core/moe/contracts/sharp_moe.py mirai/core/moe/contracts/mixture_of_depths.py mirai/core/moe/contracts/timestep_capacity.py mirai/core/moe/contracts/layer_router_policy.py mirai/core/moe/contracts/progressive_sparsification.py mirai/core/moe/contracts/balance_schedule.py mirai/core/moe/contracts/global_batch_balance.py mirai/core/moe/contracts/subset_routing.py mirai/core/moe/contracts/routing_health.py mirai/core/moe/contracts/parity.py -q"
+      ],
+      "invariants": [
+        "routing is finite and deterministic under fixed seeds",
+        "empty and skewed experts are valid",
+        "loss and input/adapter gradients match the reference where equivalence is claimed"
+      ],
+      "cost": "fast",
+      "remote_gpu": false
+    },
+    {
+      "name": "moe_adaptation",
+      "paths": ["mirai/core/training/policies/"],
+      "commands": [
+        "python -m pytest mirai/core/training/policies/contracts/specialization.py mirai/core/training/policies/contracts/dispersive_loss.py mirai/core/training/policies/contracts/simbal.py mirai/core/moe/contracts/selective_sinkhorn.py mirai/core/moe/contracts/prototypical_routing.py mirai/core/moe/contracts/sharp_moe.py mirai/core/moe/contracts/mixture_of_depths.py mirai/core/training/policies/contracts/diversity.py mirai/core/training/policies/contracts/expert_dropout.py mirai/core/training/policies/contracts/router_temperature.py mirai/core/training/policies/contracts/distillation.py mirai/core/training/policies/contracts/stage_schedule.py mirai/core/training/policies/contracts/domain_specialization.py mirai/core/training/policies/contracts/moe_token_chunking.py -q"
+      ],
+      "invariants": [
+        "every policy is explicit and default-off",
+        "disabled policies preserve routing and gradients",
+        "policy state is deterministic and checkpoint-safe"
+      ],
+      "cost": "extended",
+      "remote_gpu": false
+    },
+    {
+      "name": "compressed_weights",
+      "paths": [
+        "mirai/core/models/quantization.py",
+        "mirai/core/models/compressed_weights/",
+        "mirai/core/moe/calibration/imatrix.py",
+        "mirai/core/moe/storage/upcycling.py",
+        "scripts/tools/factorize_experts_mixture_basis.py",
+        "scripts/tools/factorize_experts_shared_basis.py",
+        "scripts/tools/plan_expert_consolidation.py",
+        "scripts/tools/calibrate_expert_pruning.py",
+        "scripts/tools/calibrate_expert_precision.py",
+        "scripts/tools/calibrate_expert_whitening.py",
+        "scripts/tools/calibrate_flexmoe.py",
+        "scripts/tools/calibrate_router_quantization.py",
+        "scripts/tools/prune_experts.py",
+        "scripts/tools/upcycle_experts.py",
+        "scripts/tools/compress_experts_stun_sparse24.py",
+        "scripts/tools/compress_experts_flexmoe.py",
+        "scripts/tools/export_compressed_weights_packed_state.py",
+        "scripts/agent/probe_moe_runtime.py"
+      ],
+      "commands": [
+        "python -m pytest tests/test_compressed_weights_quantization.py tests/test_nf4_compressed_weights_quantization.py tests/test_moe_expert_optimizations.py mirai/core/moe/contracts/artifact_transforms.py mirai/core/moe/contracts/hierarchical_consolidation.py mirai/core/moe/contracts/parity.py mirai/core/training/calibration/contracts/expert_precision.py mirai/core/training/calibration/contracts/expert_whitening.py mirai/core/training/calibration/contracts/router_quantization.py mirai/core/training/calibration/contracts/flexmoe.py -q"
+      ],
+      "invariants": [
+        "packed artifacts round-trip with lineage",
+        "frozen BF16 weights are absent from autograd",
+        "optimized and reference outputs and gradients agree"
+      ],
+      "cost": "gpu",
+      "remote_gpu": true
+    },
+    {
+      "name": "residency",
+      "paths": ["mirai/core/training/residency/", "mirai/core/models/compressed_weights/packed/", "scripts/agent/probe_moe_runtime.py"],
+      "commands": [
+        "python -m pytest mirai/core/training/residency/contracts/block_swap.py mirai/core/training/residency/contracts/h2d_ring.py mirai/core/training/residency/contracts/device_residency.py mirai/core/training/residency/contracts/pinned_host_budget.py mirai/core/models/compressed_weights/packed/contracts/residency.py -q"
+      ],
+      "invariants": [
+        "host and device ownership never overlap unexpectedly",
+        "resident bytes remain within configured bounds",
+        "offload preserves outputs and trainable gradients"
+      ],
+      "cost": "gpu",
+      "remote_gpu": true
+    },
+    {
+      "name": "adapters",
+      "paths": ["mirai/core/models/adapters/", "scripts/export_adapter.py", "scripts/tools/compress_adapter_para.py"],
+      "commands": [
+        "python -m pytest mirai/core/models/adapters/contracts/allocation.py mirai/core/models/adapters/contracts/dropout.py mirai/core/models/adapters/contracts/expert_tensor.py mirai/core/models/adapters/contracts/gora.py mirai/core/models/adapters/contracts/para.py mirai/core/models/adapters/contracts/timestep.py mirai/core/models/adapters/contracts/interchange.py mirai/core/models/adapters/contracts/host.py -q"
+      ],
+      "invariants": [
+        "only adapter parameters train",
+        "target/rank/alpha lineage is preserved",
+        "export/import is lossless for supported formats and declared hosts"
+      ],
+      "cost": "fast",
+      "remote_gpu": false
+    },
+    {
+      "name": "logging_callbacks",
+      "paths": ["mirai/core/training/observability/"],
+      "commands": [
+        "python -m pytest tests/test_logging_callbacks_contract.py -q"
+      ],
+      "invariants": [
+        "callbacks emit only supported metric types",
+        "optional logging dependencies fail explicitly when enabled",
+        "callback resources are finalized"
+      ],
+      "cost": "fast",
+      "remote_gpu": false
+    },
+    {
+      "name": "dataset",
+      "paths": ["mirai/core/dataset/", "mirai/core/training/data/", "scripts/cache.py", "scripts/tools/register_dataset.py", "scripts/tools/lr_find.py"],
+      "commands": [
+        "python -m pytest tests/test_dataset_sampling_contract.py tests/test_dataset_bucketing.py tests/test_indexed_cache.py tests/test_cache_recovery_and_variants.py tests/test_cache_registration_lineage.py tests/test_dataset_split.py mirai/core/training/data/contracts/progressive_curriculum.py -q"
+      ],
+      "invariants": [
+        "cache records are atomic, fingerprinted, and lineage-bound",
+        "bucketing, split assignment, and online sampling are deterministic",
+        "corrupt or incompatible records fail or recover explicitly"
+      ],
+      "cost": "fast",
+      "remote_gpu": false
+    },
+    {
+      "name": "training_optim",
+      "paths": ["mirai/core/training/optim/"],
+      "commands": [
+          "python -m pytest tests/test_optimizer_contract.py tests/test_gradient_harness.py tests/test_optimizers_schedulers.py mirai/core/training/optim/contracts/prodigy.py mirai/core/training/optim/contracts/router_fp32_master.py mirai/core/training/optim/contracts/stochastic_rounding.py -q"
+      ],
+      "invariants": [
+        "optional optimizer dependencies obey the configured fallback policy",
+        "optimizer-specific scheduler and warmup constraints are explicit",
+        "optimized updates preserve their declared reference behavior"
+      ],
+      "cost": "fast",
+      "remote_gpu": false
+    },
+    {
+      "name": "training_lifecycle",
+      "paths": [
+        "mirai/core/training/",
+        "mirai/core/moe/calibration/imatrix.py",
+        "mirai/core/dataset/",
+        "mirai/core/persistence/",
+        "mirai/core/builtins.py",
+        "scripts/eval.py",
+        "scripts/train.py",
+        "scripts/tools/calibrate_adaptive_lora_ranks.py",
+        "scripts/tools/calibrate_expert_consolidation.py",
+        "scripts/tools/calibrate_expert_pruning.py",
+        "scripts/tools/calibrate_expert_precision.py",
+        "scripts/tools/calibrate_expert_whitening.py",
+        "scripts/tools/calibrate_flexmoe.py",
+        "scripts/tools/calibrate_moe_quantization.py",
+        "scripts/tools/calibrate_router_quantization.py",
+        "scripts/tools/calibrate_routing_agreement.py",
+        "scripts/tools/repair_router_kd.py",
+        "scripts/tools/reconstruct_posthoc_ema.py",
+        "scripts/tools/lr_find.py"
+      ],
+      "commands": [
+        "python -m pytest mirai/core/training/runtime/contracts/compilation.py -q",
+        "python -m pytest mirai/core/training/objectives/contracts/sampling.py mirai/core/training/objectives/contracts/contrastive_flow.py mirai/core/training/objectives/contracts/adaptive_weighting.py mirai/core/moe/contracts/sharp_moe.py -q",
+        "python -m pytest mirai/core/training/calibration/contracts/router_repair.py -q",
+        "python -m pytest mirai/core/training/calibration/contracts/flexmoe.py -q",
+        "python -m pytest tests/test_training_runtime_policy_contract.py mirai/core/training/optim/contracts/posthoc_ema.py -q",
+        "python -m pytest mirai/core/training/data/contracts/progressive_curriculum.py -q",
+        "python -m pytest tests/test_thin_slice_e2e.py -q",
+        "python -m pytest tests/test_resume_equivalence.py -q",
+        "python -m pytest tests/test_logging_callbacks_contract.py -q",
+        "python -m pytest tests/test_cache_registration_lineage.py -q"
+      ],
+      "invariants": [
+        "cache-to-train-to-resume completes",
+        "resume is equivalent",
+        "runtime policies are deterministic and checkpoint-safe",
+        "artifacts are atomic and lineage-bound"
+      ],
+      "cost": "extended",
+      "remote_gpu": false
+    },
+    {
+      "name": "inference",
+      "paths": ["mirai/core/inference/", "mirai/core/training/preview/", "scripts/infer.py", "inference/"],
+      "commands": [
+        "python -m pytest mirai/core/inference/contracts/conditioning.py tests/test_inference_session.py tests/test_lingbot_native_inference.py tests/test_cfg_batching.py tests/test_preview_solvers.py tests/test_sampler_parity.py -q"
+      ],
+      "invariants": [
+        "single and batched CFG preserve conditioning order",
+        "solver outputs match their reference recurrences",
+        "inference never depends on training-only mutable state"
+      ],
+      "cost": "fast",
+      "remote_gpu": false
+    },
+    {
+      "name": "model_family",
+      "paths": [
+        "mirai/core/models/base.py",
+        "mirai/core/models/native_video.py",
+        "mirai/core/models/attention_backends.py",
+        "mirai/core/models/contracts/attention_backends.py",
+        "mirai/core/models/providers.py",
+        "mirai/core/models/lingbot_video/",
+        "mirai/vendors/lingbot_video/",
+        "inference/lingbot_video/"
+      ],
+      "commands": [
+        "python -m pytest tests/test_sparse_moe_contract.py tests/test_lingbot_native_inference.py tests/test_lingbot_lora_residency.py tests/test_snapshot_verification.py mirai/core/models/contracts/attention_backends.py mirai/core/models/lingbot_video/contracts/dynamic_flow_shift.py -q"
+      ],
+      "invariants": [
+        "runtime is native-only",
+        "latent and conditioning layouts are validated",
+        "released shards and components match",
+        "native loss and adapter gradients are finite"
+      ],
+      "cost": "gpu",
+      "remote_gpu": true
+    },
+    {
+      "name": "release",
+      "paths": ["mirai/core/training/release/"],
+      "commands": [
+        "python -m pytest tests/test_release_evidence_contract.py -q"
+      ],
+      "invariants": [
+        "incomplete evidence fails",
+        "runtime identity is consistent",
+        "the final bundle is self-verifying"
+      ],
+      "cost": "gpu",
+      "remote_gpu": true
+    }
+  ]
+}

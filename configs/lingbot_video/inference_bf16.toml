@@ -1,0 +1,19 @@
+preset = "lingbot_video_inference_bf16"
+
+[model]
+path = "./models/lingbot-video-moe-30b-a3b"
+
+[model.params]
+variant = "lingbot-video-moe-30b-a3b"
+strict_native_assets = true
+
+[inference]
+task = "text_to_video"
+denoising_strength = 1.0
+cfg_mode = "batched"
+prompt_rewriter = "lingbot_json"
+keep_text_encoder_resident = true
+keep_vae_resident = true
+
+[logging]
+output_dir = "./outputs/lingbot_inference"
