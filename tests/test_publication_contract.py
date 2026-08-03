@@ -312,10 +312,8 @@ class PublicationContractTests(unittest.TestCase):
     def test_readme_is_model_agnostic_outside_model_support(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('srcset="assets/mirai-logo-dark-transparent.png"', readme)
-        self.assertIn(
-            'src="assets/mirai-logo-light-transparent.png"',
-            readme,
-        )
+        self.assertIn('srcset="assets/mirai-logo.png"', readme)
+        self.assertIn('src="assets/mirai-logo.png"', readme)
         self.assertIn("**Preview release.**", readme)
         self.assertIn("## Model support", readme)
         self.assertIn("### Generic", readme)

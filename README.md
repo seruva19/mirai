@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/mirai-logo-dark-transparent.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/mirai-logo-light-transparent.png">
-    <img src="assets/mirai-logo-light-transparent.png" alt="Mirai" width="420">
+    <source media="(prefers-color-scheme: light)" srcset="assets/mirai-logo.png">
+    <img src="assets/mirai-logo.png" alt="Mirai" width="420">
   </picture>
 </p>
 

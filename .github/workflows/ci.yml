@@ -65,7 +65,7 @@ jobs:
         run: ruff check .
 
       - name: Install package + dev deps
-        run: python -m pip install -e ".[dev]"
+        run: python -m pip install -e ".[dev,preview,telemetry]"
 
       - name: Full manifest-driven CPU suite
         run: python scripts/agent/check.py --all-local --run --max-cost extended
