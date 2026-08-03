@@ -1,0 +1,15 @@
+[model]
+type = "lingbot-video"
+path = "./models/lingbot_video"
+
+[model.params]
+variant = "lingbot-video-moe-30b-a3b"
+strict_native_assets = true
+latent_channels = 16
+hidden_size = 2048
+num_layers = 48
+attention_heads = 16
+patch_size = 2
+num_experts = 128
+experts_per_token = 8
+shared_experts = 1

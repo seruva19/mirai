@@ -39,7 +39,10 @@ def resolve_compute_dtype(config: Any) -> "torch.dtype":
     if torch is None:  # pragma: no cover
         raise RuntimeError("torch is required to resolve compute dtype.")
     name = str(getattr(config.model, "dtype", "") or "").strip().lower()
-    canonical = _DTYPE_BY_NAME.get(name, "float32")
+    if name not in _DTYPE_BY_NAME:
+        allowed = ", ".join(sorted(key for key in _DTYPE_BY_NAME if key))
+        raise ValueError(f"model.dtype must be one of: {allowed}; got '{name}'.")
+    canonical = _DTYPE_BY_NAME[name]
     return getattr(torch, canonical)
 
 

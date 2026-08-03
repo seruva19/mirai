@@ -24,6 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover
 class GradientAccumulationResult:
     last_metrics: dict[str, Any]
     gradient_offload_ops: int
+    non_finite_loss: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,7 +94,15 @@ def accumulate_training_gradients(
             if not torch.is_tensor(loss):
                 loss = torch.tensor(float(loss), dtype=torch.float32)
             if not torch.isfinite(loss).all():
-                raise SystemExit("NaN/Inf loss detected.")
+                return GradientAccumulationResult(
+                    last_metrics={
+                        "loss": to_python_scalar(loss),
+                        "loss_pre_accum": loss_pre_accum,
+                        "non_finite_loss": True,
+                    },
+                    gradient_offload_ops=int(gradient_offload_ops),
+                    non_finite_loss=True,
+                )
             loss_value = to_python_scalar(loss)
             if callable(on_backward_started):
                 on_backward_started(loss_value)
@@ -130,6 +139,7 @@ def accumulate_training_gradients(
     return GradientAccumulationResult(
         last_metrics=last_metrics,
         gradient_offload_ops=int(gradient_offload_ops),
+        non_finite_loss=False,
     )
 
 
@@ -148,6 +158,7 @@ def apply_optimizer_update(
     skipped_steps: int,
     global_step: int,
     training_policies: Any | None = None,
+    non_finite_source: str = "gradients",
 ) -> OptimizerUpdateResult:
     if bool(non_finite_gradients):
         action, next_skips = resolve_non_finite_policy(
@@ -157,10 +168,11 @@ def apply_optimizer_update(
         )
         if action == "abort":
             raise SystemExit(
-                "Non-finite gradients detected before optimizer.step(). "
+                f"Non-finite {str(non_finite_source)} detected before optimizer.step(). "
                 "Aborting due non_finite_grad_policy='abort'."
             )
         optimizer.zero_grad(set_to_none=True)
+        pipeline.discard_optimizer_step()
         if training_policies is not None:
             training_policies.after_optimizer_step(optimizer, applied=False)
         if bool(pipeline.supports_runtime_offload_flush()):

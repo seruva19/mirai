@@ -26,6 +26,7 @@ from mirai.core.training.lifecycle.session_state import (
     TrainingRunState,
     build_checkpoint_payload,
     init_training_run_state,
+    seed_torch_rng,
 )
 from mirai.core.training.control.live_control import LiveTrainingController
 from mirai.core.training.control.live_control_actions import (
@@ -112,6 +113,9 @@ def create_training_session(
         )
     except ValueError as exc:
         raise SystemExit(str(exc))
+    # Seed process-global Torch RNG before model/adapter construction. The
+    # checkpoint restore below will replace this state on resume.
+    seed_torch_rng(int(config.training.seed))
     trainer = Trainer(config)
     try:
         trainer.pipeline.validate_adapter_artifact_lineage(
@@ -240,6 +244,8 @@ def create_training_session(
     if components.warmup_warning:
         print(f"[warning] {components.warmup_warning}", file=sys.stderr)
 
+    runtime_overrides = build_training_runtime_overrides()
+
     resume_validation = ResumeValidationResult(
         checkpoint_path="",
         checkpoint_global_step=0,
@@ -263,6 +269,8 @@ def create_training_session(
                 model_component_id=str(
                     context.manifest.model_snapshot_meta.get("model_component_id", "")
                 ),
+                runtime_overrides=runtime_overrides,
+                optimizer_result=components.optimizer_result,
             )
         except ValueError as exc:
             raise SystemExit(str(exc))
@@ -286,6 +294,8 @@ def create_training_session(
             model_component_id=str(
                 context.manifest.model_snapshot_meta.get("model_component_id", "")
             ),
+            runtime_overrides=runtime_overrides,
+            optimizer_result=components.optimizer_result,
         )
 
     callback_context = build_session_callback_context(
@@ -336,7 +346,7 @@ def create_training_session(
             callbacks=callback_context.callbacks,
             gradient_accumulation=max(1, int(config.training.gradient_accumulation)),
         ),
-        runtime_overrides=build_training_runtime_overrides(),
+        runtime_overrides=runtime_overrides,
         resumed=bool(resume_path),
         build_ckpt_payload=build_ckpt,
         resume_checkpoint_path=str(resume_validation.checkpoint_path),

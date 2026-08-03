@@ -1097,7 +1097,7 @@ class PipelineGatingTests(unittest.TestCase):
 
         pipeline = self._pipeline(routing_health=True)
         monitor = PreemptiveAttentionMonitor()
-        pipeline.configure_training_policy("preemptive_monitoring", monitor)
+        pipeline.configure_preemptive_monitoring(monitor)
         first = self._forward(pipeline)
         for key in _ATTENTION_MONITOR_KEYS:
             self.assertNotIn(key, first)

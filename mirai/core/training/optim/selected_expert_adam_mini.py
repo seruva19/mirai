@@ -13,7 +13,10 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from mirai.core.training.optim.selected_expert_plan import SelectedExpertPlanBinding
-from mirai.core.training.optim.stochastic_rounding import stochastic_round_bfloat16
+from mirai.core.training.optim.stochastic_rounding import (
+    stochastic_ema_bfloat16_,
+    stochastic_round_bfloat16,
+)
 
 try:
     import torch
@@ -171,21 +174,33 @@ class SelectedExpertAdamMini(torch.optim.Optimizer):
                 state["step"].add_(1)
                 exp_avg = state["exp_avg"]
                 exp_avg_sq_mean = state["exp_avg_sq_mean"]
-                exp_avg.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
-                exp_avg_sq_mean.mul_(beta2).add_(
-                    gradient.square().mean(dim=-1, keepdim=True),
-                    alpha=1.0 - beta2,
+                stochastic_bf16 = (
+                    self.stochastic_rounding
+                    and parameter.dtype == torch.bfloat16
                 )
+                if stochastic_bf16:
+                    stochastic_ema_bfloat16_(
+                        exp_avg,
+                        gradient,
+                        beta=float(beta1),
+                    )
+                    stochastic_ema_bfloat16_(
+                        exp_avg_sq_mean,
+                        gradient.float().square().mean(dim=-1, keepdim=True),
+                        beta=float(beta2),
+                    )
+                else:
+                    exp_avg.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
+                    exp_avg_sq_mean.mul_(beta2).add_(
+                        gradient.square().mean(dim=-1, keepdim=True),
+                        alpha=1.0 - beta2,
+                    )
 
                 step = int(state["step"].item())
                 denominator = exp_avg_sq_mean.sqrt().div_(
                     (1.0 - beta2**step) ** 0.5
                 ).add_(group["eps"])
                 current = parameter.index_select(0, index)
-                stochastic_bf16 = (
-                    self.stochastic_rounding
-                    and parameter.dtype == torch.bfloat16
-                )
                 if stochastic_bf16:
                     current = current.float()
                 if group["weight_decay"]:

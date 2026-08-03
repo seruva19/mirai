@@ -259,7 +259,7 @@ class DispersiveLossTrainingPolicy(TrainingPolicy):
         self.controller = controller
 
     def configure_pipeline(self, pipeline: Any) -> None:
-        pipeline.configure_training_policy(self.name, self.controller)
+        pipeline.configure_dispersive_loss(self.controller)
 
     def checkpoint_metadata(self) -> Mapping[str, Any]:
         return {

@@ -122,7 +122,8 @@ Checkpoint root dir ([`base.py`](mirai/core/models/base.py), active model provid
 
 - **Type:** str
 - **Default:** `"bf16"`
-- **Allowed / range:** —
+- **Allowed / range:** `bf16`, `bfloat16`, `fp16`, `float16`, `f16`, `half`,
+  `fp32`, `float32`, `f32`
 
 Compute/param dtype ([`base.py`](mirai/core/models/base.py), models/*).
 
@@ -132,7 +133,13 @@ Compute/param dtype ([`base.py`](mirai/core/models/base.py), models/*).
 - **Default:** `"auto"`
 - **Allowed / range:** `auto`, `cudnn`, `flash`, `flash3`, `flash4`
 
-Model-agnostic attention kernel policy. `auto` uses PyTorch SDPA for dense/masked attention and selects an available FA4→FA3 kernel for packed variable-length attention. `cudnn` and `flash` force the corresponding PyTorch SDPA backend; `flash3` and `flash4` require the official optional packages and compatible CUDA capability. Explicit backends accept maskless attention only and fail rather than silently falling back.
+Model-agnostic attention kernel policy. `auto` uses PyTorch SDPA for
+dense/masked attention; for packed variable-length attention it selects an
+available FA4→FA3 kernel, then falls back to an exact per-sequence PyTorch SDPA
+reference path. `cudnn` and `flash` force the corresponding PyTorch SDPA
+backend; `flash3` and `flash4` require the official optional packages and
+compatible CUDA capability. Explicit backends accept maskless attention only
+and fail rather than silently falling back.
 
 ### `provider_module`
 
@@ -149,6 +156,20 @@ interpreted by the active model family provider; support varies by family and is
 validated by capability gating. Consumer citations below name the agnostic core
 seam that owns the contract (for example,
 [`specs.py`](mirai/core/moe/runtime/specs.py)), not any one family module.
+
+Out-of-tree providers may define typed options under
+`[model.params.family_params]`. Core preserves this table and delegates its
+validation to `ModelFamilyProvider.validate_family_params`; the base provider
+rejects non-empty values so unsupported options cannot be silently ignored.
+
+### `family_params`
+
+- **Type:** table
+- **Default:** `{}`
+- **Allowed / range:** provider-defined; rejected by the base provider
+
+Provider-owned extension parameters. Values are preserved by the core config
+loader and validated by the active model-family provider.
 
 ### `variant`
 
@@ -172,7 +193,7 @@ Constant flow-matching timestep shift, or the shift at `flow_shift_base_seq_len`
 - **Default:** `"constant"`
 - **Allowed / range:** `constant`, `dynamic`
 
-`constant` preserves the original scalar schedule exactly. `dynamic` derives one shift from each model-family-declared visual patch-token count and uses its post-shift noise level consistently for corruption, model conditioning, timestep-aware adapters, and preview/inference.
+`constant` applies the configured scalar shift consistently to corruption, model conditioning, timestep-aware adapters, and preview/inference. `dynamic` derives one shift from each model-family-declared visual patch-token count and uses the same post-shift noise coordinate across those paths.
 
 ### `flow_shift_base_seq_len`
 
@@ -716,7 +737,7 @@ Per-layer token bound shared by expert-specialization objectives. Deterministic 
 - **Default:** `False`
 - **Allowed / range:** —
 
-Opt-in FP32 master copy of trainable router parameters ([`router_fp32_master.py`](mirai/core/training/optim/router_fp32_master.py); applied by the active model provider). The master accumulates updates before re-materializing the BF16 working copy each step, preventing sub-ULP updates from being discarded. It allocates no state unless `adapter.train_router=true`; runtime validation warns otherwise. The FP32 master is checkpointed for exact resume.
+Opt-in FP32 master copy of trainable router parameters ([`router_fp32_master.py`](mirai/core/training/optim/router_fp32_master.py); applied by the active model provider). The master accumulates updates before re-materializing the BF16 working copy each step, preventing sub-ULP updates from being discarded. It allocates no state unless `adapter.train_router=true`; runtime validation warns otherwise. Its state is checkpointed and validated against the configured trainable routers on restore.
 
 ### `expert_subset_fraction`
 
@@ -1178,7 +1199,7 @@ EMA decay ([`ema.py`](mirai/core/training/optim/ema.py)).
 - **Default:** `False`
 - **Allowed / range:** —
 
-Enables CPU-FP32 power-function EMA profiles over adapter-owned state. The profiles are checkpointed for exact resume and periodically saved for offline reconstruction of arbitrary EMA lengths.
+Enables CPU-FP32 power-function EMA profiles over adapter-owned state. The profiles are required checkpoint state when enabled and are periodically saved for offline reconstruction of arbitrary EMA lengths.
 
 ### `posthoc_ema_profile_stds`
 
@@ -1693,7 +1714,7 @@ zero decay while this policy is enabled.
 
 - **Type:** str
 - **Default:** `"adamw"`
-- **Allowed / range:** registry-driven: `adamw`, `adamw_8bit`, `paged_adamw_8bit`, `prodigy`, `schedule_free_adamw`, `adafactor`, `lion`, `came`, `selected_expert_adamw`, `selected_expert_adamw_4_2bit`, `selected_expert_adam_mini`, `selected_expert_muon`, `selected_expert_adamuon`, `lora_pro_adamw`, `lora_muon`
+- **Allowed / range:** registry-driven: `adamw`, `adamw_8bit`, `paged_adamw_8bit`, `prodigy`, `adafactor`, `lion`, `came`, `selected_expert_adamw`, `selected_expert_adamw_4_2bit`, `selected_expert_adam_mini`, `selected_expert_muon`, `selected_expert_adamuon`, `lora_pro_adamw`, `lora_muon`
 
 Optimizer registry ([`optimizer.py`](mirai/core/training/optim/optimizer.py)). All `selected_expert_*` optimizers bind the exact per-parameter expert plan and store state only for selected expert-axis rows. `selected_expert_adamw_4_2bit` implements [SOLO](https://arxiv.org/abs/2505.00347) for adapter fine-tuning: signed DE4 first moments, unsigned logarithmic QEMA2 second moments, 128-value blocks, quantile 0.1, and `betas=(0.8,0.999)`. Packed codes and FP32 block metadata are persistent; each EMA and parameter update uses temporary FP32 tensors. `selected_expert_adam_mini` adapts the official [Adam-mini v1.1.1 MLP partition](https://github.com/zyushun/Adam-mini) to rank-3 grouped experts: the first moment has shape `[selected_experts,out,in]`, while the second moment has shape `[selected_experts,out,1]`, giving one adaptive rate per expert/output neuron. The exact selection, partition, and stochastic-write policy are checkpoint-bound. `selected_expert_muon` applies the RMS-aligned polar update from [Moonlight](https://arxiv.org/abs/2502.16982) independently to every selected `[out,in]` expert matrix. `selected_expert_adamuon` implements [AdaMuon](https://arxiv.org/abs/2507.11005): `sign` stabilization before the polar operator, an uncorrected element-wise second moment of the orthogonal direction, and per-matrix RMS alignment. Both require rank-3 dense grouped-expert tensors and retain FP32 compact state; they never flatten the expert axis into the matrix geometry. `lora_pro_adamw` applies [LoRA-Pro](https://arxiv.org/abs/2407.18242) Equations 33–34 and Algorithm 2 to dense and grouped-expert LoRA factors. It requires `adapter.type="lora"`, zero weight decay, equal A/B learning rates, optimizer CPU offload disabled, and fixed unmasked factor pairs; DoRA, LoRA-FA, LoRA dropout, scalar/timestep rank schedules, sparse expert selection, condenser factors, and any other unpaired trainable parameters are rejected. Its FP32 first and second moments each have the shape of the equivalent full target weight, including the expert axis, so state memory is `2 × number_of_equivalent_weight_elements × 4` bytes rather than LoRA-sized. `lora_muon` implements [LoRA-Muon](https://arxiv.org/abs/2606.12921) Algorithm 1 for the actual scaled low-rank weight. Polar-Express matrix-sign and inverse-root Newton–Schulz passes update dense and grouped-expert pairs with one FP32 first moment per factor. Standard zero-B LoRA uses the finite one-sided boundary update until both factors are full rank. LoRA-Muon accepts the same fixed, complete, unmasked standard-LoRA surface as LoRA-Pro and rejects unpaired trainables, DoRA, LoRA-FA, factor/rank masks, sparse expert selection, condenser factors, and optimizer CPU offload. Post-hoc sparse export remains supported by both optimizers.
 
@@ -1863,7 +1884,7 @@ Damping exponent for optional scalar gauge rebalancing. It is checkpoint-bound e
 - **Default:** `False`
 - **Allowed / range:** `adamw`, paired-LoRA optimizers, or any `selected_expert_*` optimizer; incompatible with `training.optimizer_cpu_offload=true`
 
-Stochastically round BF16 parameter updates without persistent FP32 master weights. Standard and native-state selected-expert AdamW retain BF16 moments. The SOLO 4/2-bit variant retains packed low-bit moments and uses this switch only for the final BF16 parameter write. LoRA-Pro, LoRA-Muon, selected-expert Muon, and selected-expert AdaMuon retain geometric moments in FP32 and apply stochastic rounding only when writing updated parameters. The global torch RNG is checkpointed for exact resume.
+Stochastically round BF16 parameter updates without persistent FP32 master weights. Standard AdamW, native-state selected-expert AdamW, and selected-expert Adam-mini retain BF16 moments and stochastically round their bounded FP32 EMA updates back to BF16 so sub-ULP moment changes do not deterministically stall. The SOLO 4/2-bit variant retains packed low-bit moments and uses this switch only for the final BF16 parameter write. LoRA-Pro, LoRA-Muon, selected-expert Muon, and selected-expert AdaMuon retain geometric moments in FP32 and apply stochastic rounding only when writing updated parameters. The global torch RNG is required checkpoint state so stochastic writes continue deterministically after restore.
 
 ### `allow_fallback`
 
@@ -2913,7 +2934,7 @@ Frozen transformer-block residency policy ([`device_placement.py`](mirai/core/tr
 - **Default:** `"auto"`
 - **Allowed / range:** `auto`, `disabled`, `full_dequant`, `active_dequant`, `chunked_dequant`, `fused_kernel` ([`specs.py`](mirai/core/moe/runtime/specs.py))
 
-Expert weight access pattern. `fused_kernel` is the packed INT8 expert operation: activation rotation is shared by gate/up, quantized weights feed GEMM directly, scales are applied in the epilogue, and SwiGLU plus activation-space LoRA remain in the same chunk operation. It requires INT8, chunk size > 1, and kernel backend `auto` or `rotated_int8` ([`experts.py`](mirai/core/models/compressed_weights/execution/experts.py), [`rotated_int8.py`](mirai/core/models/compressed_weights/quantization/rotated_int8.py)).
+Expert weight access pattern. With `fused_kernel`, activation rotation is shared by gate/up and the stored INT8 tensors are converted to FP32 GEMM operands at the operation boundary; SwiGLU and activation-space LoRA remain in the same chunk operation. This is compact INT8 storage with reference execution, not a packed-INT8 throughput claim. It requires INT8, chunk size > 1, and kernel backend `auto` or `rotated_int8` ([`experts.py`](mirai/core/models/compressed_weights/execution/experts.py), [`rotated_int8.py`](mirai/core/models/compressed_weights/quantization/rotated_int8.py)).
 
 ### `expert_dequant_chunk_size`
 
@@ -3033,7 +3054,7 @@ Storage transport for explicit packed disk mode. `staged` uses the bounded POSIX
 - **Default:** `0`
 - **Allowed / range:** `0..16`
 
-Bounded asynchronous request slots for packed expert weights. `0` preserves the established disk or RAM demand path without allocating a ring or emitting prefetch telemetry. A positive depth submits the exact w1/w3/w2 fields for the current routed expert chunk, keeps at most `depth` transfers active, queues at most `4 × depth` identities without allocating their payloads, deduplicates identical requests, and consumes them through the established device-transfer result. Disk mode composes with staged or GDS transport. Pageable `ram` preload gathers fields into `depth` reusable contiguous host slots and issues one side-stream H2D per field; slots are reused only after their copy event completes and page locking stays inside the residual `max_pinned_host_gib` budget. `pinned` preload directly coalesces contiguous expert runs; fully fragmented requests bypass prefetch and preserve the per-expert transfer path. Preloaded H2D is enqueued inline to avoid worker-thread overhead. This is exact schedule-aware prefetch, not predicted routing, and creates no artifact writes or SSD cache.
+Bounded asynchronous request slots for canonical packed expert weights. `0` preserves the established disk or RAM demand path without allocating a ring or emitting prefetch telemetry. A positive depth submits the exact `w1`/`w3`/`w2` fields for the current routed expert chunk, keeps at most `depth` transfers active, queues at most `4 × depth` identities without allocating their payloads, deduplicates identical requests, and consumes them through the established device-transfer result. Packed export and import reject provider layouts that do not use this canonical SwiGLU tensor schema. Disk mode composes with staged or GDS transport. Pageable `ram` preload gathers fields into `depth` reusable contiguous host slots and issues one side-stream H2D per field; slots are reused only after their copy event completes and page locking stays inside the residual `max_pinned_host_gib` budget. `pinned` preload directly coalesces contiguous expert runs; fully fragmented requests bypass prefetch and preserve the per-expert transfer path. Preloaded H2D is enqueued inline to avoid worker-thread overhead. This is exact schedule-aware prefetch, not predicted routing, and creates no artifact writes or SSD cache.
 
 ### `moe_dispatch`
 

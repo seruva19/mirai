@@ -22,7 +22,6 @@ from mirai.core.training.calibration import esft as esft_runtime
 from mirai.core.training.optim.optimizer import (
     build_optimizer,
     build_param_groups,
-    scheduler_mode_for_optimizer,
     warmup_optimizer_warning,
 )
 from mirai.core.training.optim.lora_muon import (
@@ -128,17 +127,6 @@ class OptimizerConfigurationTests(unittest.TestCase):
             cfg = load_config(cfg_path)
         self.assertEqual(cfg.optimizer.type, "prodigy")
         self.assertEqual(cfg.training.warmup_steps, 0)
-
-    def test_schedule_free_optimizer_forces_constant_scheduler(self) -> None:
-        mode, warning = scheduler_mode_for_optimizer(
-            optimizer_type="schedule_free_adamw",
-            requested_scheduler="cosine",
-        )
-        self.assertEqual(mode, "constant")
-        self.assertIsNotNone(warning)
-        assert warning is not None
-        self.assertIn("forces scheduler='constant'", warning)
-
 
 @unittest.skipIf(torch is None, "torch not installed")
 class OptimizerRuntimeTests(unittest.TestCase):
@@ -618,31 +606,31 @@ class OptimizerRuntimeTests(unittest.TestCase):
                     allow_fallback=False,
                 )
 
-    def test_schedule_free_update_matches_adamw_reference(self) -> None:
-        schedule_free_parameter = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        adamw_parameter = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        schedule_free_parameter.grad = torch.tensor(0.5, dtype=torch.float32)
-        adamw_parameter.grad = torch.tensor(0.5, dtype=torch.float32)
+    def test_removed_schedule_free_alias_fails_explicitly(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        with self.assertRaisesRegex(ValueError, "Unknown optimizer"):
+            build_optimizer(
+                params=[parameter],
+                optimizer_type="schedule_free_adamw",
+                lr=1e-2,
+                weight_decay=0.0,
+                allow_fallback=True,
+            )
 
-        schedule_free = build_optimizer(
-            params=[schedule_free_parameter],
-            optimizer_type="schedule_free_adamw",
-            lr=1e-2,
-            weight_decay=0.0,
-            allow_fallback=True,
-        ).optimizer
-        adamw = build_optimizer(
-            params=[adamw_parameter],
-            optimizer_type="adamw",
-            lr=1e-2,
-            weight_decay=0.0,
-            allow_fallback=True,
-        ).optimizer
-        schedule_free.step()
-        adamw.step()
-        self.assertTrue(
-            torch.allclose(schedule_free_parameter.detach(), adamw_parameter.detach())
-        )
+    def test_adamw_constructor_failure_is_not_silently_reimplemented(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        with patch(
+            "mirai.core.training.optim.optimizer._TORCH_ADAMW",
+            side_effect=RuntimeError("constructor failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "constructor failed"):
+                build_optimizer(
+                    params=[parameter],
+                    optimizer_type="adamw",
+                    lr=1e-2,
+                    weight_decay=0.0,
+                    allow_fallback=True,
+                )
 
 
 @unittest.skipIf(torch is None, "torch is required")

@@ -49,7 +49,7 @@ class DatasetRoutingTrainingPolicy(TrainingPolicy):
 
     def configure_pipeline(self, pipeline: Any) -> None:
         if self.policy.uses_affinity:
-            pipeline.configure_training_policy(self.name, self.policy)
+            pipeline.configure_dataset_routing(self.policy)
 
     def validate_records(self, records) -> list[str]:
         return self.policy.validate_records(records)

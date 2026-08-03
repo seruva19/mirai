@@ -52,19 +52,14 @@ class LingBotSimBalRuntime:
 
 def configure_lingbot_simbal(
     pipeline: Any,
-    *,
-    policy_name: str,
-    policy: Any,
-) -> bool:
-    if str(policy_name).strip().lower() != "simbal":
-        return False
+    policy: SimBalController,
+) -> None:
     if not isinstance(policy, SimBalController):
         raise TypeError("simbal requires SimBalController.")
     runtime = LingBotSimBalRuntime(policy)
     pipeline._simbal_runtime = runtime
     if getattr(pipeline, "_lora_report", None) is not None:
         runtime.bind(pipeline.transformer)
-    return True
 
 
 def bind_lingbot_simbal(pipeline: Any) -> None:

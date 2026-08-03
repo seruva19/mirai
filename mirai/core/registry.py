@@ -74,14 +74,9 @@ class Registry(Generic[T]):
         return name.strip().lower()
 
 
-ModelRegistry: Registry[type] = Registry("model")
 StrategyRegistry: Registry[type] = Registry("strategy")
 LossRegistry: Registry[Callable] = Registry("loss")
 ObjectiveRegistry: Registry[type] = Registry("objective")
-
-
-def register_model(name: str) -> Callable[[type], type]:
-    return ModelRegistry.decorator(name)
 
 
 def register_strategy(name: str) -> Callable[[type], type]:

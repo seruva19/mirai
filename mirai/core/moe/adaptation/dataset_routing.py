@@ -197,13 +197,12 @@ class DatasetRoutingPolicy:
                 f"Training batch is missing '{ROUTING_DOMAINS_BATCH_KEY}' for "
                 f"dataset routing mode '{self.specialization_mode}'."
             )
-        pipeline.set_training_policy_context(
-            "dataset_routing",
+        pipeline.set_dataset_routing_context(
             DatasetRoutingBatch(
                 domains=domains,
                 step=max(0, int(batch.get("_step", 0))),
                 training=bool(training),
-            ),
+            )
         )
 
     def warmup_scale(self, step: int) -> float:

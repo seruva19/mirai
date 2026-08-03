@@ -31,6 +31,7 @@ from mirai.core.models.adapters.lora_adaptive_rank import allocate_adaptive_rank
 from mirai.core.models.adapters.lora_adaptive_rank import save_adaptive_rank_plan
 from mirai.core.training.calibration.gora import maybe_initialize_gora
 from mirai.core.training.calibration.esft import maybe_initialize_esft
+from mirai.core.training.adapters import normalize_adapter_state
 from mirai.core.training.data.curriculum import CurriculumSchedule
 from mirai.core.training.lifecycle.session_components import (
     build_training_runtime_components,
@@ -42,6 +43,9 @@ from mirai.core.training.trainer import Trainer
 from mirai.vendors.lingbot_video.transformer_lingbot_video import LingBotVideoMLP
 from mirai.vendors.lingbot_video.transformer_lingbot_video import LingBotVideoRouter
 from mirai.vendors.lingbot_video.transformer_lingbot_video import _block_router_auxiliary_terms
+from mirai.vendors.lingbot_video.transformer_lingbot_video import (
+    _torch_grouped_mm_supported,
+)
 
 try:
     import torch
@@ -54,6 +58,47 @@ class LingBotLoRAResidencyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         register_builtin_components()
+
+    def test_family_params_are_rejected_before_pipeline_construction(self) -> None:
+        config = self._config(target_preset="attn_only")
+        config.model.params.family_params = {"unsupported": True}
+        provider = SimpleNamespace(
+            validate_family_params=mock.Mock(return_value=["unsupported family param"]),
+            require_pipeline_type=mock.Mock(
+                side_effect=AssertionError("pipeline must not be constructed")
+            ),
+        )
+        with (
+            mock.patch(
+                "mirai.core.training.trainer.get_model_family_provider",
+                return_value=provider,
+            ),
+            mock.patch(
+                "mirai.core.training.trainer.validate_native_backend_availability"
+            ) as validate_backend,
+        ):
+            with self.assertRaisesRegex(ValueError, "before pipeline construction"):
+                Trainer(config)
+        validate_backend.assert_not_called()
+        provider.require_pipeline_type.assert_not_called()
+
+    def test_torch_grouped_mm_capability_is_not_inferred_from_symbol_only(self) -> None:
+        cuda = torch.device("cuda")
+        with mock.patch.object(
+            torch.cuda,
+            "get_device_capability",
+            return_value=(8, 9),
+        ):
+            self.assertFalse(_torch_grouped_mm_supported(cuda))
+        with mock.patch.object(
+            torch.cuda,
+            "get_device_capability",
+            return_value=(9, 0),
+        ):
+            self.assertEqual(
+                _torch_grouped_mm_supported(cuda),
+                hasattr(torch, "_grouped_mm"),
+            )
 
     def _config(
         self,
@@ -586,6 +631,54 @@ class LingBotLoRAResidencyTests(unittest.TestCase):
             router.e_score_correction_bias.zero_()
         trainer.pipeline.load_adapter_state(state)
         torch.testing.assert_close(router.e_score_correction_bias, expected)
+
+    def test_mutable_router_bias_round_trips_for_non_lora_adapters(self) -> None:
+        for adapter_type in ("selected_expert", "sparse_delta"):
+            with self.subTest(adapter_type=adapter_type):
+                config = self._config()
+                config.adapter.type = adapter_type
+                config.model.params.moe_bias_update_rate = 0.1
+                if adapter_type == "selected_expert":
+                    config.optimizer.type = "selected_expert_adamw"
+                    config.optimizer.selected_expert_ids = [0]
+                trainer = Trainer(config)
+                name, router = next(
+                    (name, module)
+                    for name, module in trainer.pipeline.transformer.named_modules()
+                    if isinstance(module, LingBotVideoRouter)
+                )
+                expected = torch.linspace(
+                    -0.2,
+                    0.2,
+                    steps=router.e_score_correction_bias.numel(),
+                )
+                with torch.no_grad():
+                    router.e_score_correction_bias.copy_(expected)
+                state = trainer.pipeline.state_dict()
+                bias_key = f"moe_router_bias.{name}"
+                self.assertIn(bias_key, state)
+
+                restored = Trainer(copy.deepcopy(config))
+                restored.pipeline.load_adapter_state(normalize_adapter_state(state))
+                restored_router = dict(
+                    restored.pipeline.transformer.named_modules()
+                )[name]
+                torch.testing.assert_close(
+                    restored_router.e_score_correction_bias,
+                    expected,
+                )
+
+    def test_sparse_delta_resume_requires_every_configured_target(self) -> None:
+        config = self._config()
+        config.adapter.type = "sparse_delta"
+        trainer = Trainer(config)
+        state = trainer.pipeline.state_dict()
+        missing_key = next(
+            key for key in state if str(key).startswith("sparse_delta.") and str(key).endswith(".values")
+        )
+        del state[missing_key]
+        with self.assertRaisesRegex(ValueError, "every configured target"):
+            trainer.pipeline.load_state_dict(state)
 
     def test_aggressive_checkpoint_auxiliary_terms_exclude_dense_blocks(self) -> None:
         config = self._config(
@@ -1437,6 +1530,34 @@ class LingBotLoRAResidencyTests(unittest.TestCase):
         config.memory.expert_device_cache_gib = 0.001
         config.memory.device_residency_budget_gib = 0.0005
         with self.assertRaisesRegex(MemoryError, "expert_device_cache"):
+            Trainer(config)
+
+    def test_late_quantization_binds_reserved_expert_cache(self) -> None:
+        config = self._config(
+            quantized=True,
+            expert_weight_access="active_dequant",
+        )
+        config.memory.expert_device_cache_gib = 0.0001
+        config.memory.device_residency_budget_gib = 0.001
+        trainer = Trainer(config)
+        experts = [
+            module
+            for module in trainer.pipeline.transformer.modules()
+            if isinstance(module, CompressedGroupedExperts)
+        ]
+        self.assertTrue(experts)
+        self.assertTrue(
+            all(
+                int(module.expert_device_cache_snapshot()["capacity_bytes"]) > 0
+                for module in experts
+            )
+        )
+
+    def test_expert_cache_rejects_non_int8_storage(self) -> None:
+        config = self._config(quantized=False)
+        config.memory.expert_device_cache_gib = 0.0001
+        config.memory.device_residency_budget_gib = 0.001
+        with self.assertRaisesRegex(ValueError, "requires.*int8"):
             Trainer(config)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")

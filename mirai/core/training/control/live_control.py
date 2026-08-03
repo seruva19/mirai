@@ -150,6 +150,26 @@ class LiveTrainingController:
         self.last_applied_seq = 0
         self.last_request_status: dict[str, Any] | None = None
         self.last_runtime_state: dict[str, object] | None = None
+        prior_status = normalize_live_training_control_status_payload(
+            _load_control_plane_state_row(
+                db_path=self.db_path,
+                namespace=TRAINING_CONTROL_STATUS_NAMESPACE,
+                state_key=self.job_id,
+            ),
+            default_job_id=self.job_id,
+            default_run_id=self.run_id,
+        )
+        if prior_status is not None:
+            self.last_request_status = dict(prior_status)
+            prior_seq = int(prior_status.get("seq", 0) or 0)
+            self.highest_seen_seq = max(self.highest_seen_seq, prior_seq)
+            if str(prior_status.get("state", "")).strip().lower() in {
+                "applied",
+                "rejected",
+                "failed",
+            }:
+                self.last_dispatched_seq = max(self.last_dispatched_seq, prior_seq)
+                self.last_applied_seq = max(self.last_applied_seq, prior_seq)
 
     def _publish_request_status(self, payload: dict[str, Any]) -> None:
         normalized = normalize_live_training_control_status_payload(

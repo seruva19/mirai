@@ -23,6 +23,7 @@ MOE_DISPATCH_PREPROCESS_MODES = ("host", "device", "sonic")
 EXPERT_TENSOR_ROLES = {
     "unknown",
     "router",
+    "input",
     "gate",
     "up",
     "down",
@@ -32,6 +33,9 @@ EXPERT_TENSOR_ROLES = {
 }
 
 EXPERT_TENSOR_AXES = {"expert", "out", "in", "hidden", "intermediate"}
+
+EXPERT_MLP_ACTIVATIONS = {"silu", "gelu", "relu", "identity"}
+EXPERT_MLP_COMBINERS = {"gated_product", "activated"}
 
 EXPERT_WEIGHT_ACCESS_POLICIES = {
     "auto",
@@ -99,6 +103,128 @@ class ExpertTensorSpec:
             raise ValueError(
                 f"ExpertTensorSpec '{self.name}' is routed but has no expert axis."
             )
+
+
+@dataclass(frozen=True)
+class ExpertProjectionRole:
+    """Bind one semantic expert-MLP role to a model-owned tensor name."""
+
+    role: str
+    tensor_name: str
+
+    def __post_init__(self) -> None:
+        role = str(self.role).strip().lower()
+        tensor_name = str(self.tensor_name).strip()
+        if role not in {"input", "gate", "up", "down"}:
+            raise ValueError(f"Unsupported expert projection role {role!r}.")
+        if not tensor_name:
+            raise ValueError("Expert projection tensor_name must be non-empty.")
+        object.__setattr__(self, "role", role)
+        object.__setattr__(self, "tensor_name", tensor_name)
+
+
+@dataclass(frozen=True)
+class ExpertMLPExecutionSpec:
+    """Model-owned projection layout and nonlinearity for grouped experts."""
+
+    projections: tuple[ExpertProjectionRole, ...]
+    activation: str = "silu"
+    combiner: str = "gated_product"
+
+    def __post_init__(self) -> None:
+        projections = tuple(self.projections)
+        roles = [projection.role for projection in projections]
+        names = [projection.tensor_name for projection in projections]
+        if len(roles) != len(set(roles)):
+            raise ValueError("Expert MLP projection roles must be unique.")
+        if len(names) != len(set(names)):
+            raise ValueError("Expert MLP tensor names must be unique.")
+        activation = str(self.activation).strip().lower()
+        combiner = str(self.combiner).strip().lower()
+        if activation not in EXPERT_MLP_ACTIVATIONS:
+            raise ValueError(
+                "Expert MLP activation must be one of: "
+                + ", ".join(sorted(EXPERT_MLP_ACTIVATIONS))
+                + "."
+            )
+        if combiner not in EXPERT_MLP_COMBINERS:
+            raise ValueError(
+                "Expert MLP combiner must be one of: "
+                + ", ".join(sorted(EXPERT_MLP_COMBINERS))
+                + "."
+            )
+        required = (
+            {"gate", "up", "down"}
+            if combiner == "gated_product"
+            else {"input", "down"}
+        )
+        if set(roles) != required:
+            raise ValueError(
+                f"Expert MLP combiner {combiner!r} requires roles "
+                f"{sorted(required)}, got {sorted(roles)}."
+            )
+        object.__setattr__(self, "projections", projections)
+        object.__setattr__(self, "activation", activation)
+        object.__setattr__(self, "combiner", combiner)
+
+    @property
+    def tensor_names(self) -> tuple[str, ...]:
+        return tuple(projection.tensor_name for projection in self.projections)
+
+    @property
+    def uses_gated_product(self) -> bool:
+        return self.combiner == "gated_product"
+
+    def tensor_for_role(self, role: str) -> str:
+        normalized = str(role).strip().lower()
+        for projection in self.projections:
+            if projection.role == normalized:
+                return projection.tensor_name
+        raise KeyError(f"Expert MLP layout has no {normalized!r} projection.")
+
+    @classmethod
+    def from_tensor_specs(
+        cls,
+        specs: Iterable[ExpertTensorSpec],
+        *,
+        activation: str = "silu",
+        combiner: str | None = None,
+    ) -> "ExpertMLPExecutionSpec":
+        routed = tuple(
+            spec
+            for spec in specs
+            if spec.routed and not spec.router and spec.role in {"input", "gate", "up", "down"}
+        )
+        roles = {spec.role for spec in routed}
+        resolved_combiner = str(combiner or "").strip().lower()
+        if not resolved_combiner:
+            if roles == {"gate", "up", "down"}:
+                resolved_combiner = "gated_product"
+            elif roles == {"input", "down"}:
+                resolved_combiner = "activated"
+            else:
+                raise ValueError(
+                    "Cannot infer expert MLP combiner from roles "
+                    f"{sorted(roles)}."
+                )
+        return cls(
+            projections=tuple(
+                ExpertProjectionRole(spec.role, spec.tensor_name) for spec in routed
+            ),
+            activation=activation,
+            combiner=resolved_combiner,
+        )
+
+
+CANONICAL_PACKED_EXPERT_MLP_SPEC = ExpertMLPExecutionSpec(
+    projections=(
+        ExpertProjectionRole("gate", "w1"),
+        ExpertProjectionRole("up", "w3"),
+        ExpertProjectionRole("down", "w2"),
+    ),
+    activation="silu",
+    combiner="gated_product",
+)
 
 
 @dataclass(frozen=True)
@@ -276,6 +402,8 @@ class MoEOptimizationPolicy:
     def requests_runtime_behavior(self) -> bool:
         return (
             self.expert_weight_access not in {"", "auto", "disabled"}
+            or self.expert_device_cache_gib > 0.0
+            or self.device_residency_budget_gib > 0.0
             or self.quantize_experts_on_load
             or self.router_quantization != "disabled"
             or bool(self.router_quantization_calibration_path)

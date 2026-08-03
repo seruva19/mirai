@@ -6,11 +6,73 @@ import unittest
 from pathlib import Path
 
 from mirai.config.loader import load_config
-from mirai.config.schema import ConfigError
+from mirai.config.schema import ConfigError, TrainingConfig
 from mirai.core.training.runtime.contract import validate_training_runtime_config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_explicit_default_family_uses_provider_owned_defaults(self) -> None:
+        cfg = load_config(self._write('[model]\ntype = "lingbot-video"\n'))
+        self.assertEqual(cfg.model.path, "./models/lingbot_video")
+        self.assertEqual(cfg.model.params.variant, "lingbot-video-moe-30b-a3b")
+        self.assertTrue(cfg.model.params.strict_native_assets)
+        self.assertEqual(cfg.model.params.latent_channels, 16)
+        self.assertEqual(cfg.model.params.hidden_size, 2048)
+        self.assertEqual(cfg.model.params.num_layers, 48)
+        self.assertEqual(cfg.model.params.attention_heads, 16)
+        self.assertEqual(cfg.model.params.patch_size, 2)
+        self.assertEqual(cfg.model.params.num_experts, 128)
+        self.assertEqual(cfg.model.params.experts_per_token, 8)
+        self.assertEqual(cfg.model.params.shared_experts, 1)
+
+    def test_custom_provider_params_are_preserved_without_lingbot_defaults(self) -> None:
+        cfg = TrainingConfig.from_dict(
+            {
+                "model": {
+                    "type": "external_family",
+                    "params": {"family_params": {"width": 24, "activation": "gelu"}},
+                }
+            }
+        )
+        self.assertEqual(
+            cfg.model.params.family_params,
+            {"width": 24, "activation": "gelu"},
+        )
+        self.assertEqual(cfg.model.path, "")
+        self.assertEqual(cfg.model.params.variant, "")
+        self.assertFalse(cfg.model.params.strict_native_assets)
+
+    def test_invalid_model_dtype_is_rejected_in_schema(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "model.dtype must be one of"):
+            TrainingConfig.from_dict({"model": {"dtype": "bf61"}})
+
+    def test_runtime_rejects_invalid_memory_policy_enums_early(self) -> None:
+        cases = (
+            ("weight_residency_strategy", "somewhere"),
+            ("expert_weight_access", "somehow"),
+            ("packed_state_preload", "sometimes"),
+        )
+        for key, value in cases:
+            with self.subTest(key=key):
+                cfg = TrainingConfig.from_dict({"memory": {key: value}})
+                with self.assertRaisesRegex(ValueError, key):
+                    validate_training_runtime_config(cfg)
+
+    def test_runtime_rejects_dynamic_topk_with_expert_choice(self) -> None:
+        cfg = TrainingConfig.from_dict(
+            {
+                "model": {
+                    "params": {
+                        "moe_routing_mode": "expert_choice",
+                        "moe_dynamic_topk_min": 1,
+                        "moe_dynamic_topk_average": 1.5,
+                    }
+                }
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "dynamic top-k"):
+            validate_training_runtime_config(cfg)
+
     def _write(self, content: str) -> Path:
         tmp = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False)
         tmp.write(textwrap.dedent(content).strip() + "\n")

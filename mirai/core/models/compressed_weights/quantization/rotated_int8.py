@@ -36,6 +36,67 @@ except ModuleNotFoundError:  # pragma: no cover
 from .quant import _rotate_last_dim
 
 
+if torch is not None:
+
+    class _FrozenActivationRotation(torch.autograd.Function):
+        """Orthogonal activation rotation without retaining a dense matrix."""
+
+        @staticmethod
+        def forward(ctx, x, group_size, rotation):
+            shape = tuple(x.shape)
+            width = int(shape[-1])
+            rows = int(x.numel() // max(width, 1))
+            output = _rotate_last_dim(
+                x.reshape(rows, width).float(),
+                int(group_size),
+                inverse=False,
+                rotation=rotation,
+            )
+            ctx.group_size = int(group_size)
+            ctx.rotation = rotation
+            ctx.input_dtype = x.dtype
+            ctx.input_shape = shape
+            return output.reshape(shape).to(dtype=x.dtype)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            shape = ctx.input_shape
+            width = int(shape[-1])
+            rows = int(grad_output.numel() // max(width, 1))
+            grad_input = _rotate_last_dim(
+                grad_output.reshape(rows, width).float(),
+                ctx.group_size,
+                inverse=True,
+                rotation=ctx.rotation,
+            )
+            return grad_input.reshape(shape).to(dtype=ctx.input_dtype), None, None
+
+
+    class _FrozenRotatedInt8Linear(torch.autograd.Function):
+        """INT8 expert GEMM that reconstructs its FP32 operand in backward."""
+
+        @staticmethod
+        def forward(ctx, x_rot, quantized, scale):
+            raw = torch.bmm(x_rot.float(), quantized.float().transpose(-2, -1))
+            experts, _, outputs = raw.shape
+            output = raw * scale.reshape(experts, 1, outputs).float()
+            ctx.quantized = quantized
+            ctx.scale = scale
+            ctx.input_dtype = x_rot.dtype
+            return output.to(dtype=x_rot.dtype)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            experts = int(grad_output.shape[0])
+            outputs = int(grad_output.shape[-1])
+            scaled_grad = (
+                grad_output.float()
+                * ctx.scale.reshape(experts, 1, outputs).float()
+            )
+            grad_input = torch.bmm(scaled_grad, ctx.quantized.float())
+            return grad_input.to(dtype=ctx.input_dtype), None, None
+
+
 def rotate_activations(
     x: "torch.Tensor",
     group_size: int,
@@ -51,16 +112,7 @@ def rotate_activations(
 
     if int(group_size) <= 0:
         return x
-    shape = tuple(x.shape)
-    k = int(shape[-1])
-    rows = int(x.numel() // max(k, 1))
-    rotated = _rotate_last_dim(
-        x.reshape(rows, k).float(),
-        int(group_size),
-        inverse=False,
-        rotation=rotation,
-    )
-    return rotated.reshape(shape).to(dtype=x.dtype)
+    return _FrozenActivationRotation.apply(x, int(group_size), rotation)
 
 
 def rotated_int8_linear(
@@ -95,8 +147,6 @@ def rotated_int8_linear(
         )
     )
     # FP32/TF32 preserves the unscaled accumulation until the scale epilogue.
-    # BF16 would round the K-term sum before scaling and violate parity.
-    raw = torch.bmm(x_rot.float(), quantized.float().transpose(-2, -1))
-    e, _, n = raw.shape
-    scaled = raw * scale.reshape(e, 1, n).float()
-    return scaled.to(dtype=x_rot.dtype)
+    # The custom backward reconstructs the FP32 operand from frozen INT8 storage
+    # instead of retaining it on the autograd graph.
+    return _FrozenRotatedInt8Linear.apply(x_rot, quantized, scale)

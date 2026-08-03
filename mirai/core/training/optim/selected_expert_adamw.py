@@ -15,6 +15,7 @@ from mirai.core.training.optim.selected_expert_plan import (
     SelectedExpertPlanBinding,
 )
 from mirai.core.training.optim.stochastic_rounding import (
+    stochastic_ema_bfloat16_,
     stochastic_round_bfloat16,
 )
 
@@ -247,12 +248,25 @@ class SelectedExpertAdamW(torch.optim.Optimizer):
                 else:
                     exp_avg = state["exp_avg"]
                     exp_avg_sq = state["exp_avg_sq"]
-                    exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                    exp_avg_sq.mul_(beta2).addcmul_(
-                        grad,
-                        grad,
-                        value=1.0 - beta2,
+                    stochastic_bf16 = (
+                        self.stochastic_rounding
+                        and param.dtype == torch.bfloat16
                     )
+                    if stochastic_bf16:
+                        stochastic_ema_bfloat16_(exp_avg, grad, beta=float(beta1))
+                        stochastic_ema_bfloat16_(
+                            exp_avg_sq,
+                            grad,
+                            beta=float(beta2),
+                            square_observation=True,
+                        )
+                    else:
+                        exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                        exp_avg_sq.mul_(beta2).addcmul_(
+                            grad,
+                            grad,
+                            value=1.0 - beta2,
+                        )
                 step = int(state["step"].item())
                 denom = exp_avg_sq.sqrt().div_((1.0 - beta2**step) ** 0.5).add_(group["eps"])
                 current = param.index_select(0, index)

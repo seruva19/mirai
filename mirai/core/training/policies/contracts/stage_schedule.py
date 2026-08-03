@@ -178,7 +178,7 @@ class RouterStageSchedulePolicyTests(unittest.TestCase):
         controller = RouterStageScheduleController(
             train_start_step=1, freeze_step=2
         )
-        pipeline.configure_training_policy("router_stage_schedule", controller)
+        pipeline.configure_router_stage_schedule(controller)
         pipeline.set_adapter_config(
             AdapterConfig(
                 target_preset="attn_router_routed_experts",
@@ -208,9 +208,7 @@ class RouterStageSchedulePolicyTests(unittest.TestCase):
 
     def test_router_free_target_preset_fails_at_binding(self) -> None:
         pipeline = self._pipeline()
-        pipeline.configure_training_policy(
-            "router_stage_schedule", RouterStageScheduleController()
-        )
+        pipeline.configure_router_stage_schedule(RouterStageScheduleController())
         with self.assertRaisesRegex(ValueError, "router adapter parameter"):
             pipeline.set_adapter_config(
                 AdapterConfig(target_preset="attn_only", rank=2, alpha=2.0)

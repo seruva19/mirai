@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from mirai.config.schema import AdapterConfig, ModelConfig, ModelParams, TrainingConfig
 from mirai.core.builtins import register_builtin_components
+from mirai.core.models.flow import clamp_timesteps, shifted_sigma
 from mirai.core.models.lingbot_video.pipeline import LingBotVideoPipeline
 from mirai.core.moe.routing.saliency import (
     SaliencyHarnessingRouter,
@@ -87,8 +88,7 @@ def _pipeline(*, checkpointing: str = "off") -> LingBotVideoPipeline:
             alpha=2.0,
         )
     )
-    pipeline.configure_training_policy(
-        "sharp_moe",
+    pipeline.configure_sharp_moe(
         SharpMoESpec(trajectory_steps=3, router_hidden_dim=8, seed=19),
     )
     pipeline.set_gradient_checkpointing(checkpointing)
@@ -158,6 +158,10 @@ class _FlowPipeline:
     def apply_noise(self, clean, noise, timesteps):
         t = timesteps.reshape(-1, 1)
         return (1.0 - t) * clean + t * noise
+
+    def prepare_model_timesteps(self, timesteps, *, latents):
+        _ = latents
+        return timesteps
 
     def compute_target(self, *, noise, clean_latents, timesteps):
         _ = timesteps
@@ -287,6 +291,66 @@ def test_recursive_trajectory_uses_previous_detached_clean_prediction() -> None:
         [(value - (noise - clean)).square().mean(dim=1) for value in trajectory.predictions]
     ).mean(dim=0)
     torch.testing.assert_close(terms.per_sample_loss, expected)
+
+
+def test_recursive_trajectory_uses_post_shift_sigma_for_model_and_clean_estimate(
+) -> None:
+    config = _enabled_config()
+    config.training.policy_options["sharp_moe"]["trajectory_steps"] = 2
+    objective = SharpMoETrajectoryObjective()
+    objective.configure(config)
+
+    class _ShiftedPipeline(_FlowPipeline):
+        def prepare_model_timesteps(self, timesteps, *, latents):
+            _ = latents
+            return shifted_sigma(clamp_timesteps(timesteps, 1e-5), 3.0)
+
+        def apply_noise(self, clean, noise, timesteps):
+            sigma = self.prepare_model_timesteps(timesteps, latents=clean).reshape(
+                -1, 1
+            )
+            return (1.0 - sigma) * clean + sigma * noise
+
+    pipeline = _ShiftedPipeline(guidance=[])
+    clean = torch.tensor([[1.0, 2.0]])
+    noise = torch.tensor([[5.0, 6.0]])
+    inputs = TrainingInputs(
+        noisy_latents=clean,
+        timestep=torch.zeros(1),
+        noise=noise,
+        clean_latents=clean,
+        text_embeds={},
+    )
+
+    def predict(step_inputs):
+        pipeline.guidance.append(
+            step_inputs.extra_forward_kwargs["routing_guidance_latents"].clone()
+        )
+        return torch.full_like(
+            step_inputs.noisy_latents, 0.25, requires_grad=True
+        )
+
+    trajectory = objective.predict(
+        inputs=inputs,
+        predict=predict,
+        pipeline=pipeline,
+        config=config,
+        training=True,
+    )
+    raw = trajectory.timesteps[0]
+    sigma = shifted_sigma(clamp_timesteps(raw, 1e-5), 3.0)
+    torch.testing.assert_close(trajectory.inputs[0].timestep, sigma)
+    torch.testing.assert_close(
+        pipeline.guidance[0],
+        (1.0 - sigma.reshape(-1, 1)) * clean + sigma.reshape(-1, 1) * noise,
+    )
+    torch.testing.assert_close(
+        pipeline.guidance[1],
+        (
+            trajectory.inputs[0].noisy_latents
+            - sigma.reshape(-1, 1) * trajectory.predictions[0]
+        ).detach(),
+    )
 
 
 def test_objective_rng_resume_is_exact() -> None:

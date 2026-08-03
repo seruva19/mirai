@@ -10,10 +10,8 @@ from mirai.core.moe.adaptation.domain_specialization import (
 
 
 def configure_lingbot_domain_expert_specialization(
-    pipeline: Any, policy_name: str, policy: Any
-) -> bool:
-    if policy_name != "domain_expert_specialization":
-        return False
+    pipeline: Any, policy: DomainExpertSpecializationController
+) -> None:
     if not isinstance(policy, DomainExpertSpecializationController):
         raise TypeError(
             "LingBot domain expert specialization requires its typed controller."
@@ -67,4 +65,3 @@ def configure_lingbot_domain_expert_specialization(
         raise ValueError(
             "Domain expert specialization requires routed expert LoRA adapters."
         )
-    return True

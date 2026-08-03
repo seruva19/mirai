@@ -196,8 +196,10 @@ def apply_validation_policy(
         next_state.patience_counter = 0
         if log_on_this_rank:
             best_path = Path(ckpt_dir) / "best.pt"
-            save_checkpoint(best_path, build_ckpt_payload(global_step))
             next_state.best_checkpoint_path = str(best_path)
+            payload = build_ckpt_payload(global_step)
+            payload["early_stop_state"] = next_state.to_dict()
+            save_checkpoint(best_path, payload)
             best_checkpoint_saved = True
             best_checkpoint_path = str(best_path)
     else:

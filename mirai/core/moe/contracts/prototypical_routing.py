@@ -111,7 +111,7 @@ def _pipeline(*, checkpointing: str = "off") -> LingBotVideoPipeline:
             alpha=2.0,
         )
     )
-    pipeline.configure_training_policy("prototypical_routing", _spec())
+    pipeline.configure_prototypical_routing(_spec())
     pipeline.set_gradient_checkpointing(checkpointing)
     pipeline.train()
     return pipeline

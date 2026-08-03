@@ -93,7 +93,7 @@ class SelectiveSinkhornTrainingPolicy(TrainingPolicy):
         self.controller = controller
 
     def configure_pipeline(self, pipeline: Any) -> None:
-        pipeline.configure_training_policy(self.name, self.controller)
+        pipeline.configure_selective_sinkhorn(self.controller)
 
     def augment_batch(self, context: BatchAugmentContext) -> Mapping[str, Any]:
         index = (

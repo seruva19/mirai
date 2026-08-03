@@ -192,7 +192,7 @@ class RouterDistillationPolicyTests(unittest.TestCase):
     def test_lingbot_uses_frozen_original_weight_on_same_tokens(self) -> None:
         pipeline = self._pipeline()
         controller = RouterDistillationController(weight=0.5, temperature=2.0)
-        pipeline.configure_training_policy("router_distillation", controller)
+        pipeline.configure_router_distillation(controller)
         pipeline.set_adapter_config(
             AdapterConfig(
                 target_preset="attn_router_routed_experts",
@@ -234,9 +234,7 @@ class RouterDistillationPolicyTests(unittest.TestCase):
 
     def test_router_free_preset_fails_teacher_binding(self) -> None:
         pipeline = self._pipeline()
-        pipeline.configure_training_policy(
-            "router_distillation", RouterDistillationController(weight=0.1)
-        )
+        pipeline.configure_router_distillation(RouterDistillationController(weight=0.1))
         with self.assertRaisesRegex(ValueError, "at least one weight"):
             pipeline.set_adapter_config(
                 AdapterConfig(target_preset="attn_only", rank=2, alpha=2.0)

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from mirai.config.schema import AdapterConfig, ModelConfig, ModelParams, TrainingConfig
 from mirai.core.builtins import register_builtin_components
+from mirai.core.models.attention_backends import attention_backend_status
 from mirai.core.models.lingbot_video.pipeline import LingBotVideoPipeline
 from mirai.core.moe.routing.depth import (
     MixtureOfDepthsSpec,
@@ -46,6 +47,16 @@ def _cpu_varlen_attention(
         v = value[k_start:k_end].transpose(0, 1)
         outputs.append(F.scaled_dot_product_attention(q, k, v).transpose(0, 1))
     return torch.cat(outputs, dim=0)
+
+
+def _cuda_varlen_attention_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    device = torch.device("cuda")
+    return any(
+        attention_backend_status(name, device=device, varlen=True).available
+        for name in ("flash4", "flash3")
+    )
 
 
 def _manual_attention(query, key, value, mask=None):
@@ -108,14 +119,13 @@ def _pipeline(*, checkpointing: str = "off") -> LingBotVideoPipeline:
             alpha=2.0,
         )
     )
-    pipeline.configure_training_policy(
-        "mixture_of_depths",
+    pipeline.configure_mixture_of_depths(
         MixtureOfDepthsSpec(
             capacity_fraction=0.5,
             first_layer=1,
             layer_stride=2,
             attention_query_chunk_size=3,
-        ),
+        )
     )
     pipeline.set_gradient_checkpointing(checkpointing)
     pipeline.train()
@@ -275,7 +285,10 @@ def test_lingbot_evaluation_reuses_the_deterministic_depth_route() -> None:
     assert first_selection.flat_indices.tolist() == second_selection.flat_indices.tolist()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(
+    not _cuda_varlen_attention_available(),
+    reason="CUDA with FlashAttention 3 or 4 varlen support is required",
+)
 def test_lingbot_cuda_bf16_packed_update() -> None:
     pipeline = _pipeline(checkpointing="aggressive").to(
         device="cuda", dtype=torch.bfloat16

@@ -61,6 +61,162 @@ _RUN_KW = dict(seed=7, frames=5, height=64, width=64, steps=2, cfg_scale=1.0)
 
 @unittest.skipIf(torch is None, "torch not installed")
 class InferenceSessionEquivalenceTests(unittest.TestCase):
+    @staticmethod
+    def _refiner_failure_pipeline(*, fail_prompt: bool = False):
+        class _Pipeline:
+            text_offloaded = False
+
+            @staticmethod
+            def release_base_transformer():
+                return None
+
+            @staticmethod
+            def load_vae(*, device):
+                _ = device
+
+            @staticmethod
+            def decode_latents_native(_latents):
+                return torch.zeros(1, 3, 2, 2)
+
+            @staticmethod
+            def encode_video_native(_video, *, generator):
+                _ = generator
+                return torch.zeros(1, 2, 1, 4, 4)
+
+            @staticmethod
+            def offload_vae():
+                return None
+
+            @staticmethod
+            def load_text_encoder(*, device):
+                _ = device
+
+            def encode_prompt(self, prompt, *, device):
+                _ = (prompt, device)
+                if fail_prompt:
+                    raise RuntimeError("prompt failed")
+                return torch.zeros(1, 1, 4)
+
+            def offload_text_encoder(self):
+                self.text_offloaded = True
+
+        return _Pipeline()
+
+    def test_refiner_partial_load_is_released(self) -> None:
+        from mirai.core.models.lingbot_video.refiner import run_refine
+
+        class _Refiner:
+            released = False
+
+            @staticmethod
+            def has_weights():
+                return True
+
+            @staticmethod
+            def load(*, device, dtype):
+                _ = (device, dtype)
+                raise RuntimeError("load failed")
+
+            def release(self):
+                self.released = True
+
+        refiner = _Refiner()
+        with self.assertRaisesRegex(RuntimeError, "load failed"):
+            run_refine(
+                pipeline=self._refiner_failure_pipeline(),
+                refiner=refiner,
+                base_latent=torch.zeros(2, 1, 2, 2),
+                prompt="prompt", negative_prompt="", seed=7,
+                height=4, width=4, steps=2, cfg_scale=1.0,
+                shift=3.0, t_thresh=0.5, sigma_tail_steps=1,
+                scheduler="flow_match_euler", device="cpu",
+            )
+        self.assertTrue(refiner.released)
+
+    def test_refiner_prompt_failure_offloads_text_encoder(self) -> None:
+        from mirai.core.models.lingbot_video.refiner import run_refine
+
+        class _Refiner:
+            released = False
+
+            @staticmethod
+            def has_weights():
+                return True
+
+            @staticmethod
+            def load(*, device, dtype):
+                _ = (device, dtype)
+
+            def release(self):
+                self.released = True
+
+        pipeline = self._refiner_failure_pipeline(fail_prompt=True)
+        refiner = _Refiner()
+        with self.assertRaisesRegex(RuntimeError, "prompt failed"):
+            run_refine(
+                pipeline=pipeline, refiner=refiner,
+                base_latent=torch.zeros(2, 1, 2, 2),
+                prompt="prompt", negative_prompt="", seed=7,
+                height=4, width=4, steps=2, cfg_scale=1.0,
+                shift=3.0, t_thresh=0.5, sigma_tail_steps=1,
+                scheduler="flow_match_euler", device="cpu",
+            )
+        self.assertTrue(pipeline.text_offloaded)
+        self.assertTrue(refiner.released)
+
+    def test_refiner_offloads_vae_when_reencoding_fails(self) -> None:
+        from mirai.core.models.lingbot_video.refiner import run_refine
+
+        class _Pipeline:
+            def __init__(self) -> None:
+                self.base_released = False
+                self.vae_loaded = False
+                self.vae_offloaded = False
+
+            def release_base_transformer(self):
+                self.base_released = True
+
+            def load_vae(self, *, device):
+                self.vae_loaded = device == "cpu"
+
+            def decode_latents_native(self, _latents):
+                return torch.zeros(1, 3, 2, 2)
+
+            def encode_video_native(self, _video, *, generator):
+                _ = generator
+                raise RuntimeError("encode failed")
+
+            def offload_vae(self):
+                self.vae_offloaded = True
+
+        class _Refiner:
+            @staticmethod
+            def has_weights():
+                return True
+
+        pipeline = _Pipeline()
+        with self.assertRaisesRegex(RuntimeError, "encode failed"):
+            run_refine(
+                pipeline=pipeline,
+                refiner=_Refiner(),
+                base_latent=torch.zeros(2, 1, 2, 2),
+                prompt="prompt",
+                negative_prompt="",
+                seed=7,
+                height=4,
+                width=4,
+                steps=2,
+                cfg_scale=1.0,
+                shift=3.0,
+                t_thresh=0.5,
+                sigma_tail_steps=1,
+                scheduler="flow_match_euler",
+                device="cpu",
+            )
+        self.assertTrue(pipeline.base_released)
+        self.assertTrue(pipeline.vae_loaded)
+        self.assertTrue(pipeline.vae_offloaded)
+
     def _infer_cli(self, *, cfg_path, checkpoint, out_path) -> dict:
         result = subprocess.run(
             [
@@ -163,17 +319,60 @@ class InferenceSessionEquivalenceTests(unittest.TestCase):
                 keep_vae_resident=True,
             )
             # On: offload hooks replaced by no-ops so weights stay resident.
+            self.assertIn("load_text_encoder", on.pipeline.__dict__)
             self.assertIn("offload_text_encoder", on.pipeline.__dict__)
             self.assertIn("offload_vae", on.pipeline.__dict__)
             on.generate(prompt="p", out_path=tmpdir / "on.mp4", **_RUN_KW)
             on.close()
             # close() restores the original hooks.
+            self.assertNotIn("load_text_encoder", on.pipeline.__dict__)
             self.assertNotIn("offload_text_encoder", on.pipeline.__dict__)
             self.assertNotIn("offload_vae", on.pipeline.__dict__)
 
             lat_off = torch.load(tmpdir / "off.pt", map_location="cpu", weights_only=True)
             lat_on = torch.load(tmpdir / "on.pt", map_location="cpu", weights_only=True)
             self.assertTrue(torch.equal(lat_off, lat_on))
+
+    def test_merge_request_is_applied_before_reporting_success(self) -> None:
+        from mirai.core.inference.session import InferenceSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.toml"
+            _write_config(cfg_path)
+            session = InferenceSession.from_config(
+                str(cfg_path), merge=True, place_on_device=False
+            )
+            self.assertTrue(session.merge)
+            self.assertTrue(session.pipeline.is_adapter_merged())
+
+    def test_dirty_base_placement_is_restored_once(self) -> None:
+        from mirai.core.inference.session import InferenceSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.toml"
+            _write_config(cfg_path)
+            placements: list[dict] = []
+
+            def _place(pipeline, **kwargs):
+                placements.append(dict(kwargs))
+
+            class _CudaDevice:
+                type = "cuda"
+
+                def __str__(self):
+                    return "cuda"
+
+            session = InferenceSession.from_config(
+                str(cfg_path),
+                place_fn=_place,
+                device_fn=_CudaDevice,
+                dtype_fn=lambda cfg: torch.bfloat16,
+            )
+            self.assertEqual(len(placements), 1)
+            session._base_placement_dirty = True
+            session._ensure_base_placement()
+            session._ensure_base_placement()
+            self.assertEqual(len(placements), 2)
 
 
 @unittest.skipIf(torch is None, "torch not installed")

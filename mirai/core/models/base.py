@@ -13,6 +13,22 @@ from mirai.core.moe.runtime.specs import validate_expert_tensor_specs
 
 if TYPE_CHECKING:
     from mirai.config.schema import TrainingConfig
+    from mirai.core.moe.adaptation.dataset_routing import DatasetRoutingBatch
+    from mirai.core.moe.adaptation.dataset_routing import DatasetRoutingPolicy
+    from mirai.core.moe.adaptation.distillation import RouterDistillationController
+    from mirai.core.moe.adaptation.diversity import DiversityAwareRoutingController
+    from mirai.core.moe.adaptation.domain_specialization import DomainExpertSpecializationController
+    from mirai.core.moe.adaptation.dropout import ExpertDropoutController
+    from mirai.core.moe.adaptation.simbal import SimBalController
+    from mirai.core.moe.adaptation.stage_schedule import RouterStageScheduleController
+    from mirai.core.moe.adaptation.temperature import RouterTemperatureController
+    from mirai.core.moe.monitoring.preemptive import PreemptiveAttentionMonitor
+    from mirai.core.moe.routing.depth import MixtureOfDepthsSpec
+    from mirai.core.moe.routing.prototypical import PrototypicalRoutingSpec
+    from mirai.core.moe.routing.saliency import SharpMoESpec
+    from mirai.core.moe.routing.selective_sinkhorn import SelectiveSinkhornController
+    from mirai.core.moe.runtime.token_chunking import MoETokenChunkPolicy
+    from mirai.core.training.policies.dispersive_loss import DispersiveLossController
     from mirai.core.training.runtime.compilation import (
         CompilationRegion,
         TokenBucketPlan,
@@ -44,17 +60,7 @@ class ModelExtensionCapabilities:
     adapter_allocation_policy: bool = False
     adapter_initialization: bool = False
     adapter_training_policy: bool = False
-    lightweight_expert_pool: bool = False
-    grouped_adjugate_experts: bool = False
-    progressive_sparsification: bool = False
-    chain_of_experts: bool = False
-    balance_loss_schedule: bool = False
-    decoupled_router_input: bool = False
-    dynamic_flow_shift: bool = False
-    saliency_guided_routing: bool = False
-    mixture_of_depths: bool = False
     preview_latent_decode: bool = False
-    native_inference: bool = False
     validation_inference: bool = False
 
 
@@ -175,23 +181,78 @@ class BasePipeline(ABC):
                 f"{type(self).__name__} does not implement MoE optimization policy controls."
             )
 
-    def configure_training_policy(self, name: str, policy: Any) -> None:
-        """Install a model-runtime policy through a named provider seam."""
-        _ = policy
+    def _unsupported_training_policy(self, name: str) -> None:
         raise ValueError(
             f"{type(self).__name__} does not implement training policy '{name}'."
         )
 
-    def set_training_policy_context(
-        self,
-        name: str,
-        context: Any,
+    def configure_mixture_of_depths(self, policy: MixtureOfDepthsSpec) -> None:
+        _ = policy
+        self._unsupported_training_policy("mixture_of_depths")
+
+    def configure_dispersive_loss(self, policy: DispersiveLossController) -> None:
+        _ = policy
+        self._unsupported_training_policy("dispersive_loss")
+
+    def configure_simbal(self, policy: SimBalController) -> None:
+        _ = policy
+        self._unsupported_training_policy("simbal")
+
+    def configure_preemptive_monitoring(self, policy: PreemptiveAttentionMonitor) -> None:
+        _ = policy
+        self._unsupported_training_policy("preemptive_monitoring")
+
+    def configure_moe_token_chunking(self, policy: MoETokenChunkPolicy) -> None:
+        _ = policy
+        self._unsupported_training_policy("moe_token_chunking")
+
+    def configure_domain_expert_specialization(
+        self, policy: DomainExpertSpecializationController
     ) -> None:
-        """Install one policy's typed per-batch runtime context."""
+        _ = policy
+        self._unsupported_training_policy("domain_expert_specialization")
+
+    def configure_router_distillation(self, policy: RouterDistillationController) -> None:
+        _ = policy
+        self._unsupported_training_policy("router_distillation")
+
+    def configure_router_stage_schedule(
+        self, policy: RouterStageScheduleController
+    ) -> None:
+        _ = policy
+        self._unsupported_training_policy("router_stage_schedule")
+
+    def configure_diversity_routing(self, policy: DiversityAwareRoutingController) -> None:
+        _ = policy
+        self._unsupported_training_policy("diversity_routing")
+
+    def configure_expert_dropout(self, policy: ExpertDropoutController) -> None:
+        _ = policy
+        self._unsupported_training_policy("expert_dropout")
+
+    def configure_router_temperature(self, policy: RouterTemperatureController) -> None:
+        _ = policy
+        self._unsupported_training_policy("router_temperature")
+
+    def configure_selective_sinkhorn(self, policy: SelectiveSinkhornController) -> None:
+        _ = policy
+        self._unsupported_training_policy("selective_sinkhorn")
+
+    def configure_prototypical_routing(self, policy: PrototypicalRoutingSpec) -> None:
+        _ = policy
+        self._unsupported_training_policy("prototypical_routing")
+
+    def configure_sharp_moe(self, policy: SharpMoESpec) -> None:
+        _ = policy
+        self._unsupported_training_policy("sharp_moe")
+
+    def configure_dataset_routing(self, policy: DatasetRoutingPolicy) -> None:
+        _ = policy
+        self._unsupported_training_policy("dataset_routing")
+
+    def set_dataset_routing_context(self, context: DatasetRoutingBatch) -> None:
         _ = context
-        raise ValueError(
-            f"{type(self).__name__} does not implement training policy '{name}'."
-        )
+        self._unsupported_training_policy("dataset_routing_context")
 
     def get_training_auxiliary_losses(self) -> dict[str, Any]:
         """Return per-forward auxiliary training losses such as router balance."""
@@ -226,13 +287,10 @@ class BasePipeline(ABC):
         return bool(self.get_model_extension_capabilities().rank_schedule_progress)
 
     def supports_balance_loss_schedule_progress(self) -> bool:
-        return bool(self.get_model_extension_capabilities().balance_loss_schedule)
+        return False
 
     def supports_preview_latent_decode(self) -> bool:
         return bool(self.get_model_extension_capabilities().preview_latent_decode)
-
-    def supports_native_inference(self) -> bool:
-        return bool(self.get_model_extension_capabilities().native_inference)
 
     def supports_validation_inference(self) -> bool:
         return bool(self.get_model_extension_capabilities().validation_inference)
@@ -518,6 +576,9 @@ class BasePipeline(ABC):
 
     def finish_optimizer_step(self) -> None:
         """Restore trainable parameter residency after optimizer execution."""
+
+    def discard_optimizer_step(self) -> None:
+        """Discard pipeline-owned gradients/state after a skipped update."""
 
     def get_block_swap_state(self) -> dict[str, Any]:
         """Return current block-swap/offload state when supported."""

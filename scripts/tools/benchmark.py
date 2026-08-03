@@ -20,7 +20,7 @@ from mirai.config.runtime_policy import runtime_policy_summary
 from mirai.core.builtins import register_builtin_components
 from mirai.core.dataset.cache import build_cache, load_cache
 from mirai.core.models.providers import model_supports_native_cache_encoding
-from mirai.core.registry import ModelRegistry
+from mirai.core.models.providers import get_model_family_provider
 from mirai.core.training.data.batches import sample_batch
 from mirai.core.training.data.schema import resolve_training_batch_schema
 from mirai.core.training.runtime.cli import (
@@ -414,7 +414,10 @@ def _cmd_module_profile(args: argparse.Namespace, cfg) -> dict:
 def _family_supports_quantized_frozen_weights(cfg) -> bool:
     """Probe whether the configured family implements quantized frozen weights."""
     try:
-        model_cls = ModelRegistry.get(str(cfg.model.type))
+        provider = get_model_family_provider(str(cfg.model.type))
+        if provider is None:
+            return False
+        model_cls = provider.require_pipeline_type()
         factory = getattr(model_cls, "from_training_config", None)
         pipeline = factory(cfg) if callable(factory) else model_cls(cfg.model)
         return bool(pipeline.supports_quantized_frozen_weights())

@@ -16,6 +16,37 @@ except ModuleNotFoundError:  # pragma: no cover
 
 @unittest.skipIf(torch is None, "torch not installed")
 class ResumeEquivalenceTests(unittest.TestCase):
+    def _assert_state_tree_equal(self, left, right, *, path: str = "root") -> None:
+        if torch.is_tensor(left) or torch.is_tensor(right):
+            self.assertTrue(
+                torch.is_tensor(left) and torch.is_tensor(right),
+                path,
+            )
+            self.assertTrue(torch.equal(left, right), path)
+            return
+        if isinstance(left, dict) or isinstance(right, dict):
+            self.assertIsInstance(left, dict, path)
+            self.assertIsInstance(right, dict, path)
+            self.assertEqual(set(left), set(right), path)
+            for key in sorted(left, key=str):
+                self._assert_state_tree_equal(
+                    left[key],
+                    right[key],
+                    path=f"{path}.{key}",
+                )
+            return
+        if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+            self.assertEqual(type(left), type(right), path)
+            self.assertEqual(len(left), len(right), path)
+            for index, (left_item, right_item) in enumerate(zip(left, right)):
+                self._assert_state_tree_equal(
+                    left_item,
+                    right_item,
+                    path=f"{path}[{index}]",
+                )
+            return
+        self.assertEqual(left, right, path)
+
     def _write_config(
         self,
         *,
@@ -42,6 +73,16 @@ class ResumeEquivalenceTests(unittest.TestCase):
                 batch_size = 1
                 gradient_accumulation = 1
                 seed = 999
+                gradient_cpu_offload = true
+                ema_enabled = true
+                ema_decay = 0.95
+                posthoc_ema_enabled = true
+                posthoc_ema_profile_stds = [0.05, 0.1]
+                posthoc_ema_snapshot_every_n_steps = 1
+
+                [optimizer]
+                type = "adamw"
+                stochastic_rounding = true
 
                 [logging]
                 output_dir = "{out_dir.as_posix()}"
@@ -72,6 +113,8 @@ class ResumeEquivalenceTests(unittest.TestCase):
 
     def test_interrupted_resume_matches_uninterrupted(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
+        split_step = 4
+        final_step = 24
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             data_dir = tmpdir / "data"
@@ -91,21 +134,21 @@ class ResumeEquivalenceTests(unittest.TestCase):
                 data_dir=data_dir,
                 cache_path=cache_path,
                 out_dir=full_out,
-                max_steps=6,
+                max_steps=final_step,
             )
             self._write_config(
                 path=cfg_part,
                 data_dir=data_dir,
                 cache_path=cache_path,
                 out_dir=resumed_out,
-                max_steps=3,
+                max_steps=split_step,
             )
             self._write_config(
                 path=cfg_resume,
                 data_dir=data_dir,
                 cache_path=cache_path,
                 out_dir=resumed_out,
-                max_steps=6,
+                max_steps=final_step,
             )
 
             self._run(
@@ -121,7 +164,7 @@ class ResumeEquivalenceTests(unittest.TestCase):
                 [sys.executable, "scripts/train.py", "--config", str(cfg_part)],
             )
 
-            resume_ckpt = resumed_out / "checkpoints" / "step_3.pt"
+            resume_ckpt = resumed_out / "checkpoints" / f"step_{split_step}.pt"
             self._run(
                 repo_root,
                 [
@@ -137,10 +180,41 @@ class ResumeEquivalenceTests(unittest.TestCase):
             resumed_last = torch.load(resumed_out / "checkpoints" / "last.pt", map_location="cpu")
 
             self.assertEqual(int(full_last["global_step"]), int(resumed_last["global_step"]))
-            full_pipe = full_last["trainer_state"]["pipeline"]
-            resumed_pipe = resumed_last["trainer_state"]["pipeline"]
-            self.assertTrue(torch.allclose(full_pipe["lora_a"], resumed_pipe["lora_a"]))
-            self.assertTrue(torch.allclose(full_pipe["lora_b"], resumed_pipe["lora_b"]))
+            state_keys = (
+                "trainer_state",
+                "strategy_metadata",
+                "optimizer_state",
+                "scheduler_state",
+                "rng_state",
+                "torch_rng_state",
+                "skipped_steps",
+                "consecutive_skipped_steps",
+                "early_stop_state",
+                "ema_state",
+                "posthoc_ema_state",
+            )
+            for key in state_keys:
+                self._assert_state_tree_equal(
+                    full_last[key],
+                    resumed_last[key],
+                    path=key,
+                )
+            # Compare the complete post-resume trajectory, not only the endpoint.
+            for step in range(split_step + 1, final_step + 1):
+                full_step = torch.load(
+                    full_out / "checkpoints" / f"step_{step}.pt",
+                    map_location="cpu",
+                )
+                resumed_step = torch.load(
+                    resumed_out / "checkpoints" / f"step_{step}.pt",
+                    map_location="cpu",
+                )
+                for key in state_keys:
+                    self._assert_state_tree_equal(
+                        full_step[key],
+                        resumed_step[key],
+                        path=f"step_{step}.{key}",
+                    )
 
 
 if __name__ == "__main__":

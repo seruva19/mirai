@@ -64,7 +64,13 @@ def load_config(path: str | Path) -> TrainingConfig:
     user_data = _load_toml(config_path)
     preset_name = user_data.get("preset")
     if not preset_name:
-        return TrainingConfig.from_dict(user_data)
+        config_dir = Path(__file__).resolve().parent
+        defaults_path = _resolve_defaults_path(
+            config_dir=config_dir,
+            user_data=user_data,
+        )
+        defaults_data = _load_toml(defaults_path) if defaults_path is not None else {}
+        return TrainingConfig.from_dict(_deep_merge(defaults_data, user_data))
 
     config_dir = Path(__file__).resolve().parent
     preset_path = config_dir / "presets" / f"{preset_name}.toml"

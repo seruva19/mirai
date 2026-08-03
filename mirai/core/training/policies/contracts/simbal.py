@@ -53,8 +53,7 @@ def _pipeline(*, router_target: bool = True) -> LingBotVideoPipeline:
             ),
         )
     )
-    pipeline.configure_training_policy(
-        "simbal",
+    pipeline.configure_simbal(
         SimBalController(SimBalSpec(weight=0.1)),
     )
     pipeline.set_adapter_config(

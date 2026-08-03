@@ -47,6 +47,51 @@ logger = logging.getLogger(__name__)
 
 
 if torch is not None:
+    class _FrozenCompressedLinear(torch.autograd.Function):
+        """Dense frozen projection that re-materializes its weight in backward."""
+
+        @staticmethod
+        def forward(ctx, x, owner):
+            weight = owner._materialize_weight(dtype=x.dtype, device=x.device)
+            output = F.linear(x, weight)
+            ctx.owner = owner
+            ctx.input_dtype = x.dtype
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            weight = ctx.owner._materialize_weight(
+                dtype=ctx.input_dtype,
+                device=grad_output.device,
+            )
+            grad_input = grad_output.to(dtype=ctx.input_dtype) @ weight
+            return grad_input, None
+
+
+    class _FrozenDequantExpertLinear(torch.autograd.Function):
+        """Per-expert frozen projection without retaining its dense weight."""
+
+        @staticmethod
+        def forward(ctx, x, weight, owner, key, expert_idx):
+            output = x @ weight.transpose(-2, -1)
+            ctx.owner = owner
+            ctx.key = str(key)
+            ctx.expert_idx = int(expert_idx)
+            ctx.input_dtype = x.dtype
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            weight = ctx.owner._dequantize_expert(
+                ctx.key,
+                ctx.expert_idx,
+                dtype=ctx.input_dtype,
+                device=grad_output.device,
+            )
+            grad_input = grad_output.to(dtype=ctx.input_dtype) @ weight
+            return grad_input, None, None, None, None
+
+
     class _FrozenDequantBatchedLinear(torch.autograd.Function):
         """Batched linear against frozen quantized experts, re-dequantized in backward.
 
@@ -78,6 +123,45 @@ if torch is not None:
             )
             grad_input = torch.bmm(grad_output.to(dtype=ctx.weight_dtype), weight)
             return grad_input, None, None, None
+
+
+    class _FrozenDequantMegaBlocksLinear(torch.autograd.Function):
+        """MegaBlocks grouped linear without retaining its floating weight stack."""
+
+        @staticmethod
+        def forward(ctx, x, owner, key, counts, grouped_gemm_ops):
+            weight = owner._dequantize(str(key), dtype=x.dtype, device=x.device)
+            batch_sizes = counts.detach().to(device="cpu", dtype=torch.int64)
+            output = grouped_gemm_ops.gmm(x, weight, batch_sizes, trans_b=True)
+            ctx.owner = owner
+            ctx.key = str(key)
+            ctx.counts = tuple(int(value) for value in batch_sizes.tolist())
+            ctx.input_dtype = x.dtype
+            ctx.input_shape = tuple(int(dim) for dim in x.shape)
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            weight = ctx.owner._dequantize(
+                ctx.key,
+                dtype=ctx.input_dtype,
+                device=grad_output.device,
+            )
+            grad_input = torch.empty(
+                ctx.input_shape,
+                dtype=ctx.input_dtype,
+                device=grad_output.device,
+            )
+            offset = 0
+            for expert_idx, count in enumerate(ctx.counts):
+                end = offset + count
+                if count:
+                    grad_input[offset:end] = (
+                        grad_output[offset:end].to(dtype=ctx.input_dtype)
+                        @ weight[expert_idx]
+                    )
+                offset = end
+            return grad_input, None, None, None, None
 
     class _FrozenDequantBatchedLinearPair(torch.autograd.Function):
         """Two frozen linears (same input ``x``) sharing one paired dequant.
@@ -630,47 +714,58 @@ class CompressedLinear(nn.Module):
 
     @property
     def weight(self) -> torch.Tensor:
+        device = self._stored_weight_device()
+        dtype = (
+            self.weight_scale.dtype
+            if self._quant_format == "int8" and self.weight_scale.is_floating_point()
+            else torch.get_default_dtype()
+        )
+        return self._materialize_weight(dtype=dtype, device=device)
+
+    def _stored_weight_device(self) -> torch.device:
         if self._quant_format == "nf4":
-            return self._nf4_weight(dtype=torch.get_default_dtype(), device=self.weight_nf4.device)
+            return self.weight_nf4.device
+        if self._quant_format in MICROSCALING_FORMATS:
+            return self.weight_mx.device
+        if self._quant_format in BLOCKWISE_FP8_FORMATS:
+            return self.weight_fp8.device
+        return self.weight_int8.device
+
+    def _materialize_weight(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self._quant_format == "nf4":
+            return self._nf4_weight(dtype=dtype, device=device)
         if self._quant_format in MICROSCALING_FORMATS:
             return dequantize_microscaling(
                 self.weight_mx,
                 self.weight_mx_scale,
                 self.weight_mx_global,
                 self._microscaling_meta,
-                dtype=torch.get_default_dtype(),
-                device=self.weight_mx.device,
+                dtype=dtype,
+                device=device,
             )
         if self._quant_format in BLOCKWISE_FP8_FORMATS:
             return dequantize_blockwise_fp8_weight(
                 self.weight_fp8,
                 self.weight_fp8_scale,
                 self._blockwise_fp8_meta,
-                dtype=torch.get_default_dtype(),
-                device=self.weight_fp8.device,
+                dtype=dtype,
+                device=device,
             )
-        dtype = self.weight_scale.dtype if self.weight_scale.is_floating_point() else torch.get_default_dtype()
         return _dequantize_weight(
             self.weight_int8,
             self.weight_scale,
             group_size=self.quantization_group_size,
             dtype=dtype,
-            device=self.weight_int8.device,
+            device=device,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._quant_format == "nf4":
-            weight = self._nf4_weight(dtype=x.dtype, device=x.device)
-        elif self._quant_format in MICROSCALING_FORMATS:
-            weight = dequantize_microscaling(
-                self.weight_mx,
-                self.weight_mx_scale,
-                self.weight_mx_global,
-                self._microscaling_meta,
-                dtype=x.dtype,
-                device=x.device,
-            )
-        elif self._quant_format in BLOCKWISE_FP8_FORMATS:
+        if self._quant_format in BLOCKWISE_FP8_FORMATS:
             output = blockwise_fp8_linear(
                 x,
                 self.weight_fp8,
@@ -683,16 +778,9 @@ class CompressedLinear(nn.Module):
                 else None
             )
             return output if bias is None else output + bias
-        else:
-            weight = _dequantize_weight(
-                self.weight_int8,
-                self.weight_scale,
-                group_size=self.quantization_group_size,
-                dtype=x.dtype,
-                device=x.device,
-            )
+        output = _FrozenCompressedLinear.apply(x, self)
         bias = self.bias.to(device=x.device, dtype=x.dtype) if self.bias is not None else None
-        return F.linear(x, weight, bias)
+        return output if bias is None else output + bias
 
     def extra_repr(self) -> str:
         if self._quant_format == "nf4":

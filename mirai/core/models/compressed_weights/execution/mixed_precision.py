@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from mirai.core.moe.runtime.specs import CANONICAL_PACKED_EXPERT_MLP_SPEC
+
 try:
     import torch
     import torch.nn as nn
@@ -106,6 +108,16 @@ class MixedPrecisionGroupedExperts(nn.Module):
         if torch is None:  # pragma: no cover
             raise RuntimeError("MixedPrecisionGroupedExperts requires torch.")
         super().__init__()
+        execution_spec = getattr(
+            base,
+            "mirai_expert_mlp_spec",
+            CANONICAL_PACKED_EXPERT_MLP_SPEC,
+        )
+        if execution_spec != CANONICAL_PACKED_EXPERT_MLP_SPEC:
+            raise ValueError(
+                "Mixed-precision grouped experts currently support only the "
+                "canonical gated-product execution layout."
+            )
         experts = int(getattr(base, "num_experts"))
         self.num_experts = experts
         parametrizations = getattr(base, "parametrizations", None)

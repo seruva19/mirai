@@ -40,6 +40,29 @@ def _validate_no_control_path(path_key: str, value: str) -> str:
     return text
 
 
+_MODEL_DTYPE_NAMES = frozenset(
+    {
+        "fp32",
+        "float32",
+        "f32",
+        "fp16",
+        "float16",
+        "f16",
+        "half",
+        "bf16",
+        "bfloat16",
+    }
+)
+
+
+def _validate_model_dtype(value: Any) -> str:
+    dtype = str(value).strip().lower()
+    if dtype not in _MODEL_DTYPE_NAMES:
+        allowed = ", ".join(sorted(_MODEL_DTYPE_NAMES))
+        raise ConfigError(f"model.dtype must be one of: {allowed}; got '{value}'.")
+    return dtype
+
+
 def _parse_expert_choice_capacity_schedule(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ConfigError(
@@ -286,6 +309,9 @@ class ModelParams:
     # Component subfolder that owns the trainable denoiser checkpoint when a
     # model root packages multiple DiT components.
     denoiser_subfolder: str = "transformer"
+    # Provider-owned extension namespace. Core preserves its typed TOML value
+    # tree and delegates semantic validation to the active provider.
+    family_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -820,6 +846,7 @@ class TrainingConfig:
             "expert_precision_calibration",
             "text_encoder_path",
             "denoiser_subfolder",
+            "family_params",
         }
         if "moe_boundary" in model_params_table:
             raise ConfigError(
@@ -827,6 +854,9 @@ class TrainingConfig:
                 "consumed by the trainer. Remove it from your config."
             )
         _forbid_unknown("model.params", model_params_table, model_params_allowed)
+        family_params = model_params_table.get("family_params", {})
+        if not isinstance(family_params, dict):
+            raise ConfigError("Expected table at 'model.params.family_params'.")
 
         strategy_table = _expect_table("strategy", payload.get("strategy", {}))
         strategy_allowed = {"type", "params"}
@@ -1175,8 +1205,16 @@ class TrainingConfig:
         }
         _forbid_unknown("memory", memory_table, memory_allowed)
 
+        product_model_defaults = "type" not in model_table
+        model_type = str(model_table.get("type", "lingbot-video")).strip().lower()
         model_path = _validate_no_control_path(
-            "model.path", str(model_table.get("path", "./models/lingbot_video"))
+            "model.path",
+            str(
+                model_table.get(
+                    "path",
+                    "./models/lingbot_video" if product_model_defaults else "",
+                )
+            ),
         )
         provider_module = _validate_no_control_path(
             "model.provider_module", str(model_table.get("provider_module", ""))
@@ -1199,14 +1237,17 @@ class TrainingConfig:
             str(memory_table.get("expert_precision_plan_path", "")),
         )
         model = ModelConfig(
-            type=str(model_table.get("type", "lingbot-video")),
+            type=model_type,
             path=model_path,
-            dtype=str(model_table.get("dtype", "bf16")),
+            dtype=_validate_model_dtype(model_table.get("dtype", "bf16")),
             attention_backend=str(model_table.get("attention_backend", "auto")),
             provider_module=provider_module,
             params=ModelParams(
                 variant=str(
-                    model_params_table.get("variant", "lingbot-video-moe-30b-a3b")
+                    model_params_table.get(
+                        "variant",
+                        "lingbot-video-moe-30b-a3b" if product_model_defaults else "",
+                    )
                 ),
                 flow_shift=float(model_params_table.get("flow_shift", 3.0)),
                 flow_shift_mode=str(
@@ -1224,7 +1265,7 @@ class TrainingConfig:
                 vae_chunk_size=int(model_params_table.get("vae_chunk_size", 16)),
                 lora_dropout=float(model_params_table.get("lora_dropout", 0.0)),
                 strict_native_assets=bool(
-                    model_params_table.get("strict_native_assets", True)
+                    model_params_table.get("strict_native_assets", product_model_defaults)
                 ),
                 moe_expert_backend=str(
                     model_params_table.get("moe_expert_backend", "grouped_mm")
@@ -1533,6 +1574,7 @@ class TrainingConfig:
                 ),
                 text_encoder_path=str(model_params_table.get("text_encoder_path", "")),
                 denoiser_subfolder=str(model_params_table.get("denoiser_subfolder", "transformer")),
+                family_params=dict(family_params),
             ),
         )
         _mp = model.params

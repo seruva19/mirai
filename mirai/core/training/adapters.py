@@ -388,6 +388,12 @@ def normalize_adapter_state(
     if fmt == "peft" and "adapter_state" in payload and isinstance(payload["adapter_state"], dict):
         return dict(payload["adapter_state"])
 
+    if fmt == "auto" and payload.get("adapter_type") in {
+        "selected_expert",
+        "sparse_delta",
+    }:
+        return dict(payload)
+
     if fmt in {"auto", "peft"} and "lora_a" in payload and "lora_b" in payload:
         out = {"lora_a": _to_scalar_tensor(payload["lora_a"]), "lora_b": _to_scalar_tensor(payload["lora_b"])}
         if "lora_alpha" in payload:

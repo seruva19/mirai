@@ -188,6 +188,11 @@ class InferenceSession:
         forward_fn: Any = None,
         compile_enabled: bool = False,
         compile_warning: str = "",
+        place_on_device: bool = True,
+        place_fn: Any = None,
+        compute_device: Any = None,
+        compute_dtype: Any = None,
+        residency_strategy: str = "disabled",
     ) -> None:
         self.trainer = trainer
         self.pipeline = trainer.pipeline
@@ -208,6 +213,12 @@ class InferenceSession:
         self._forward_fn = forward_fn
         self._resident_text_encoder = False
         self._resident_vae = False
+        self._place_on_device = bool(place_on_device)
+        self._place_fn = place_fn
+        self._compute_device = compute_device
+        self._compute_dtype = compute_dtype
+        self._residency_strategy = str(residency_strategy)
+        self._base_placement_dirty = False
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -265,24 +276,36 @@ class InferenceSession:
                 normalize_adapter_state(adapter_payload, lora_format=lora_format)
             )
         trainer.pipeline.eval()
-        effective_scale = 1.0 if merge else lora_scale
-        trainer.pipeline.set_lora_scale(effective_scale)
+        trainer.pipeline.set_lora_scale(lora_scale)
+        merge_applied = False
+        if merge:
+            if not bool(trainer.pipeline.supports_adapter_merge_unmerge()):
+                raise RuntimeError(
+                    f"{type(trainer.pipeline).__name__} does not support adapter "
+                    "merge/unmerge; --merge cannot be honored."
+                )
+            merge_applied = bool(trainer.pipeline.merge_adapter())
+            if not merge_applied:
+                raise RuntimeError("Adapter merge was requested but did not complete.")
+        effective_scale = 1.0 if merge_applied else lora_scale
 
         inference_mode = resolve_inference_mode(trainer.pipeline)
+        compute_device = _device_fn()
+        compute_dtype = _dtype_fn(cfg)
+        residency_strategy = str(
+            getattr(trainer, "weight_residency_strategy", "disabled")
+        )
         if place_on_device:
             # Same placement contract as training: without it the denoiser
             # stays in host RAM and the denoise loop silently runs on CPU
             # (hours instead of minutes for a real MoE family). CPU-only
             # hosts keep the pre-placement fp32 semantics.
-            compute_device = _device_fn()
             if compute_device.type == "cuda":
                 _place_fn(
                     trainer.pipeline,
                     device=compute_device,
-                    dtype=_dtype_fn(cfg),
-                    residency_strategy=str(
-                        getattr(trainer, "weight_residency_strategy", "disabled")
-                    ),
+                    dtype=compute_dtype,
+                    residency_strategy=residency_strategy,
                 )
 
         # Resolve the compiled forward once after placement so torch.compile
@@ -324,11 +347,16 @@ class InferenceSession:
             lora_scale=lora_scale,
             effective_scale=effective_scale,
             lora_format=lora_format,
-            merge=bool(merge),
+            merge=merge_applied,
             compile_mode=requested_mode,
             forward_fn=forward_fn,
             compile_enabled=compile_enabled,
             compile_warning=compile_warning,
+            place_on_device=place_on_device,
+            place_fn=_place_fn,
+            compute_device=compute_device,
+            compute_dtype=compute_dtype,
+            residency_strategy=residency_strategy,
         )
         component_residency = resolve_inference_component_residency(
             config_text_encoder=bool(cfg.inference.keep_text_encoder_resident),
@@ -344,13 +372,16 @@ class InferenceSession:
 
     # -- resident-weight seams ---------------------------------------------
     # These opt-in flags leave the pipeline unchanged when disabled. When
-    # enabled, the offload hook is replaced so the text encoder or VAE remains
+    # enabled, the load/offload hooks are replaced so the text encoder or VAE remains
     # on the compute device across generate() calls. close() restores the hooks
     # and offloads the resident modules.
     def _make_text_encoder_resident(self) -> None:
         if self._resident_text_encoder:
             return
+        self.pipeline.load_text_encoder(device=str(self._compute_device))
+        self._orig_load_text_encoder = self.pipeline.load_text_encoder
         self._orig_offload_text_encoder = self.pipeline.offload_text_encoder
+        self.pipeline.load_text_encoder = lambda *, device=None: None
         self.pipeline.offload_text_encoder = lambda: None
         self._resident_text_encoder = True
 
@@ -364,6 +395,7 @@ class InferenceSession:
     def close(self) -> None:
         """Restore any resident-weight hooks and offload the held modules."""
         if self._resident_text_encoder:
+            del self.pipeline.load_text_encoder
             del self.pipeline.offload_text_encoder
             self._resident_text_encoder = False
             try:
@@ -377,6 +409,24 @@ class InferenceSession:
                 self.pipeline.offload_vae()
             except Exception:
                 pass
+
+    def _ensure_base_placement(self) -> None:
+        """Restore the base transformer after an on-demand refiner released it."""
+
+        if not self._base_placement_dirty:
+            return
+        if (
+            self._place_on_device
+            and self._place_fn is not None
+            and getattr(self._compute_device, "type", "cpu") == "cuda"
+        ):
+            self._place_fn(
+                self.pipeline,
+                device=self._compute_device,
+                dtype=self._compute_dtype,
+                residency_strategy=self._residency_strategy,
+            )
+        self._base_placement_dirty = False
 
     # -- refiner pre-flight ------------------------------------------------
     def _validate_refine_request(self, refine: dict, *, frames: int) -> None:
@@ -434,6 +484,8 @@ class InferenceSession:
         device before the refiner is loaded (VRAM realism).
         """
         decode_latent_path = str(decode_latent or "").strip()
+        if not decode_latent_path:
+            self._ensure_base_placement()
         from mirai.core.inference.conditioning import (
             TEXT_TO_IMAGE,
             TEXT_TO_VIDEO,
@@ -556,9 +608,13 @@ class InferenceSession:
             torch.save(pred.detach().cpu(), out_path.with_suffix(".pt"))
         refined = False
         if refine and ran_denoise_loop and not decode_latent_path:
-            device = resolve_compute_device()
-            dtype = resolve_compute_dtype(self.cfg) if device.type == "cuda" else None
+            device = self._compute_device
+            dtype = self._compute_dtype if device.type == "cuda" else None
             _refine_t0 = _sync_perf_counter() if timings is not None else 0.0
+            # The family refiner releases the base transformer before loading its
+            # own weights. Mark placement dirty before entering so a failed refine
+            # is also recoverable by the next generate() call.
+            self._base_placement_dirty = True
             pred = self.pipeline.refine_inference_latent(
                 base_latent=pred,
                 request=refine,

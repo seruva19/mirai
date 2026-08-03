@@ -2019,33 +2019,6 @@
       "promotion_evidence": ""
     },
     {
-      "name": "generic_release_certification",
-      "kind": "generic",
-      "owner": "mirai/core/training/release/release_evidence_contract.py",
-      "check": "release",
-      "invariants": [
-        "owner",
-        "documentation"
-      ],
-      "symbols": [
-        "ReleaseEvidenceBundle",
-        "validate_release_evidence_bundle"
-      ],
-      "config_keys": [],
-      "disabled_config": {},
-      "contract_paths": [
-        "tests/test_release_evidence_contract.py"
-      ],
-      "default_off": false,
-      "stateful": false,
-      "optimized": false,
-      "reference_path": "",
-      "readme_claim": "Release evidence and promotion gates",
-      "readme_claims": [],
-      "provenance": "",
-      "promotion_evidence": ""
-    },
-    {
       "name": "generic_training_math",
       "kind": "generic",
       "owner": "mirai/core/training/objectives/engine.py",
@@ -2368,6 +2341,34 @@
       "promotion_evidence": ""
     },
     {
+      "name": "expert_layout_provider_boundary",
+      "kind": "generic",
+      "owner": "mirai/core/models/providers.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "default_path",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "ModelFamilyProvider"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/runtime/specs.py",
+      "readme_claim": "Provider-declared expert execution",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "lingbot_video",
       "kind": "model_family",
       "owner": "mirai/core/models/lingbot_video/pipeline.py",
@@ -2398,7 +2399,6 @@
       "reference_path": "",
       "readme_claim": "Native sparse-MoE pipeline",
       "readme_claims": [
-        "Provider-based sparse-MoE integration",
         "Strict snapshot validation",
         "Structured prompt alignment",
         "Native text encoder and VAE",
@@ -4327,10 +4327,7 @@
         "documentation"
       ],
       "symbols": [
-        "cluster_router_experts",
-        "select_stun_representatives_streaming",
-        "transform_packed_state_stun_sparse24",
-        "pack_sparse24"
+        "transform_packed_state_stun_sparse24"
       ],
       "config_keys": [
         "model.params.expert_pruning",

@@ -51,6 +51,14 @@ def _resolve_relative_import(path: Path, *, root: Path, node: ast.ImportFrom) ->
 def _imports(path: Path, *, root: Path) -> list[tuple[int, str]]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     imports: list[tuple[int, str]] = []
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                aliases[str(alias.asname or alias.name.split(".", 1)[0])] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            for alias in node.names:
+                aliases[str(alias.asname or alias.name)] = f"{node.module}.{alias.name}"
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imports.extend((int(node.lineno), alias.name) for alias in node.names)
@@ -62,6 +70,22 @@ def _imports(path: Path, *, root: Path) -> list[tuple[int, str]]:
             )
             if module:
                 imports.append((int(node.lineno), module))
+        elif isinstance(node, ast.Call) and node.args:
+            function_name = ""
+            if isinstance(node.func, ast.Attribute) and isinstance(
+                node.func.value, ast.Name
+            ):
+                owner = aliases.get(node.func.value.id, node.func.value.id)
+                function_name = f"{owner}.{node.func.attr}"
+            elif isinstance(node.func, ast.Name):
+                function_name = aliases.get(node.func.id, node.func.id)
+            module_arg = node.args[0]
+            if (
+                function_name in {"importlib.import_module", "import_module", "__import__"}
+                and isinstance(module_arg, ast.Constant)
+                and isinstance(module_arg.value, str)
+            ):
+                imports.append((int(node.lineno), module_arg.value))
     return imports
 
 

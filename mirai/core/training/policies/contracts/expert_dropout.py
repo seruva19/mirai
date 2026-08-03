@@ -155,7 +155,7 @@ class ExpertDropoutTrainingPolicyTests(unittest.TestCase):
         controller = ExpertDropoutController(
             probability=0.4, start_step=1, end_step=2
         )
-        pipeline.configure_training_policy("expert_dropout", controller)
+        pipeline.configure_expert_dropout(controller)
         pipeline.train()
         router = pipeline._moe_router_modules[0]
         tokens = torch.randn(8, 16)

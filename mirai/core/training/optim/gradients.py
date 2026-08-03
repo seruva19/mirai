@@ -49,18 +49,16 @@ def offload_gradients_to_cpu(params) -> int:
         grad = getattr(param, "grad", None)
         if grad is None:
             continue
-        cpu_grad = grad.detach().to(device="cpu", dtype=torch.float32)
+        cpu_grad = grad.detach().to(device="cpu", dtype=torch.float32).clone()
         existing = getattr(param, "_mirai_cpu_grad", None)
         if isinstance(existing, torch.Tensor):
             existing.add_(cpu_grad)
         else:
             param._mirai_cpu_grad = cpu_grad  # type: ignore[attr-defined]
-        # A Parameter may only own a gradient on the same device. CPU parameters
-        # expose the accumulated gradient directly; CUDA parameters release it.
-        if param.device.type == "cpu":
-            param.grad = param._mirai_cpu_grad.to(dtype=param.dtype)  # type: ignore[attr-defined]
-        else:
-            param.grad = None
+        # Always release the autograd-owned buffer. In particular, exposing the
+        # CPU accumulator as ``param.grad`` would make the next backward update
+        # that same storage before it is added here, doubling prior microbatches.
+        param.grad = None
         moved += 1
     return moved
 

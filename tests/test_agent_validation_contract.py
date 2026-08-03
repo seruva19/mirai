@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import subprocess
@@ -14,9 +15,11 @@ from unittest.mock import patch
 from scripts.agent.check import (
     _feature_owned_paths,
     _git_changed_paths,
+    _run_command,
     environment_fingerprint,
     execute_checks,
     load_manifest,
+    select_checks,
     select_local_checks,
     self_check,
     unowned_paths,
@@ -27,6 +30,7 @@ from scripts.agent.evaluate_agent_effectiveness import _self_check as evaluator_
 from scripts.agent.run_agent_evaluation import _ignore_copy, run_evaluation
 from scripts.agent.feature import create_feature
 from mirai.core.features import load_feature_catalog
+from mirai.core.features import _defined_python_symbols
 from mirai.core.features import load_routing_topology_evidence
 from mirai.core.features import EXTENSION_KITS
 from mirai.core.features import FeatureDescriptor
@@ -46,6 +50,41 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AgentValidationContractTests(unittest.TestCase):
+    def test_generic_schema_does_not_branch_on_a_concrete_model_family(self) -> None:
+        tree = ast.parse(
+            (ROOT / "mirai" / "config" / "schema.py").read_text(encoding="utf-8")
+        )
+        concrete_family = "lingbot-video"
+        family_comparisons = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Compare)
+            and any(
+                isinstance(value, ast.Constant)
+                and value.value == concrete_family
+                for value in (node.left, *node.comparators)
+            )
+        ]
+        self.assertEqual(
+            family_comparisons,
+            [],
+            "generic config schema must not branch on a concrete model family",
+        )
+
+    def test_training_policy_provider_seam_is_typed(self) -> None:
+        base_source = (ROOT / "mirai" / "core" / "models" / "base.py").read_text(
+            encoding="utf-8"
+        )
+        family_root = ROOT / "mirai" / "core" / "models" / "lingbot_video"
+        family_sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(family_root.glob("*.py"))
+        )
+        self.assertNotIn("def configure_training_policy(", base_source)
+        self.assertNotIn("def set_training_policy_context(", base_source)
+        self.assertNotIn("policy_name: str", family_sources)
+        self.assertNotIn("policy: Any", family_sources)
+
     def test_dependency_boundaries_are_executable_and_fail_closed(self) -> None:
         self.assertEqual(scan_dependency_rules(), ())
         with tempfile.TemporaryDirectory() as tmp:
@@ -65,7 +104,11 @@ class AgentValidationContractTests(unittest.TestCase):
                             {
                                 "name": "no_family_leak",
                                 "source_roots": ["mirai/core/runtime"],
-                                "target_prefixes": ["mirai.core.models.family_x"],
+                                "target_prefixes": [
+                                    "mirai.core.models.family_x",
+                                    "mirai.core.models.family_y",
+                                    "mirai.core.models.family_z",
+                                ],
                                 "exclude_globs": [],
                             }
                         ]
@@ -79,6 +122,45 @@ class AgentValidationContractTests(unittest.TestCase):
             )
             self.assertEqual(len(violations), 1)
             self.assertEqual(violations[0].path, "mirai/core/runtime/leak.py")
+
+            (source / "dynamic_leak.py").write_text(
+                "import importlib\n"
+                "importlib.import_module('mirai.core.models.family_x.pipeline')\n",
+                encoding="utf-8",
+            )
+            (source / "aliased_dynamic_leak.py").write_text(
+                "import importlib as il\n"
+                "from importlib import import_module as load\n"
+                "il.import_module('mirai.core.models.family_y.pipeline')\n"
+                "load('mirai.core.models.family_z.pipeline')\n",
+                encoding="utf-8",
+            )
+            violations = scan_dependency_rules(
+                root=root,
+                architecture_path=architecture,
+            )
+            self.assertEqual(len(violations), 4)
+            dynamic = next(
+                item
+                for item in violations
+                if Path(item.path).name == "dynamic_leak.py"
+            )
+            self.assertEqual(
+                dynamic.imported_module,
+                "mirai.core.models.family_x.pipeline",
+            )
+            aliased = [
+                item
+                for item in violations
+                if Path(item.path).name == "aliased_dynamic_leak.py"
+            ]
+            self.assertEqual(
+                {item.imported_module for item in aliased},
+                {
+                    "mirai.core.models.family_y.pipeline",
+                    "mirai.core.models.family_z.pipeline",
+                },
+            )
 
     def test_feature_catalog_is_complete_and_mechanically_valid(self) -> None:
         self.assertEqual(set(EXTENSION_KITS), set(FeatureKind))
@@ -109,6 +191,23 @@ class AgentValidationContractTests(unittest.TestCase):
             "mirai/core/moe/routing/subset.py",
             _feature_owned_paths()["moe_routing"],
         )
+
+    def test_feature_symbols_must_be_real_python_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            owner = Path(tmp) / "owner.py"
+            owner.write_text(
+                "# PhantomSymbol is not implemented.\n"
+                "def container():\n"
+                "    def NestedOnly():\n"
+                "        pass\n"
+                "class RealSymbol:\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+            symbols = _defined_python_symbols(owner)
+            self.assertIn("RealSymbol", symbols)
+            self.assertNotIn("PhantomSymbol", symbols)
+            self.assertNotIn("NestedOnly", symbols)
 
     def test_feature_cli_creation_writes_the_requested_catalog_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,6 +311,21 @@ class AgentValidationContractTests(unittest.TestCase):
             evidence = load_routing_topology_evidence(evidence_path)
             self.assertAlmostEqual(evidence.mean_quality_delta, 0.1)
 
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+            payload["candidate_artifact_fingerprint"] = "baseline-sha256"
+            evidence_path.write_text(json.dumps(payload), encoding="utf-8")
+            issues = validate_routing_topology_promotion(root=root, feature=promoted)
+            self.assertEqual(
+                issues[0].code,
+                "promotion_evidence_identical_artifacts",
+            )
+
+            payload["candidate_artifact_fingerprint"] = "candidate-sha256"
+            payload["pairs"][0]["candidate"] = 1.1
+            evidence_path.write_text(json.dumps(payload), encoding="utf-8")
+            issues = validate_routing_topology_promotion(root=root, feature=promoted)
+            self.assertEqual(issues[0].code, "quality_non_regression_failed")
+
     def test_reusable_feature_proofs_reject_contract_drift(self) -> None:
         prove_default_path(lambda: (1, 2), lambda: (1, 2), compare=lambda a, b: a == b)
         prove_reference_parity(lambda: 3.0, lambda: 3.0, compare=lambda a, b: a == b)
@@ -302,6 +416,70 @@ class AgentValidationContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "incomplete")
         self.assertEqual(result["checks"][0]["status"], "gpu_required")
 
+    def test_gpu_contracts_cannot_pass_without_cuda(self) -> None:
+        with patch("scripts.agent.check.cuda_available", return_value=False):
+            result = execute_checks(
+                [
+                    {
+                        "name": "gpu_probe",
+                        "cost": "gpu",
+                        "remote_gpu": True,
+                        "invariants": ["native execution"],
+                        "commands": ["python -c pass"],
+                    }
+                ],
+                allow_remote_gpu=True,
+                max_cost="gpu",
+            )
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["checks"][0]["status"], "gpu_unavailable")
+
+    def test_gpu_contracts_cannot_pass_when_pytest_skips(self) -> None:
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout="1 passed, 2 skipped in 0.01s\n",
+            stderr="",
+        )
+        with patch("scripts.agent.check.subprocess.run", return_value=completed):
+            command = _run_command(
+                "python -m pytest tests/test_probe.py -q",
+                report_pytest_skips=True,
+            )
+        self.assertEqual(command["skipped_tests"], 2)
+        self.assertIn("-rs", command["argv"])
+
+        with (
+            patch("scripts.agent.check.cuda_available", return_value=True),
+            patch("scripts.agent.check._run_command", return_value=command),
+        ):
+            result = execute_checks(
+                [
+                    {
+                        "name": "gpu_probe",
+                        "cost": "gpu",
+                        "remote_gpu": True,
+                        "invariants": ["native execution"],
+                        "commands": ["python -m pytest tests/test_probe.py -q"],
+                    }
+                ],
+                allow_remote_gpu=True,
+                max_cost="gpu",
+            )
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["checks"][0]["status"], "skipped_gpu_tests")
+
+    def test_ci_workflow_uses_executable_contract_commands(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("branches: [main]", workflow)
+        self.assertIn("mirai/core/models/adapters/contracts/host.py", workflow)
+        self.assertIn("-q -m production_contract", workflow)
+        self.assertNotIn("pytest tests/ -q -m production_contract", workflow)
+        self.assertIn("--all-local --run --max-cost extended", workflow)
+        self.assertNotIn("--max-cost wave", workflow)
+
     def test_all_local_selection_covers_colocated_contracts_without_gpu(self) -> None:
         checks = select_local_checks(load_manifest())
         self.assertTrue(checks)
@@ -314,6 +492,17 @@ class AgentValidationContractTests(unittest.TestCase):
             commands,
         )
         self.assertIn("mirai/core/moe/contracts/training_losses.py", commands)
+
+    def test_expert_execution_spec_changes_route_to_compressed_contracts(self) -> None:
+        selected = {
+            check["name"]
+            for check in select_checks(
+                load_manifest(),
+                ["mirai/core/moe/runtime/specs.py"],
+            )
+        }
+        self.assertIn("compressed_weights", selected)
+        self.assertIn("moe_routing", selected)
 
     def test_manifest_commands_are_executable_and_own_every_probe(self) -> None:
         payload = load_manifest()

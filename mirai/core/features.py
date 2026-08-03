@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import MISSING, dataclass, fields
 from enum import Enum
 import json
 import math
 from pathlib import Path
+import shlex
 from typing import Any, Callable, Iterable, Mapping, TypeVar
 
 
@@ -505,6 +507,25 @@ def validate_routing_topology_promotion(
                 evidence.feature,
             ),
         )
+    if (
+        evidence.baseline_artifact_fingerprint
+        == evidence.candidate_artifact_fingerprint
+    ):
+        return (
+            FeatureValidationIssue(
+                feature.name,
+                "promotion_evidence_identical_artifacts",
+                evidence.baseline_artifact_fingerprint,
+            ),
+        )
+    if evidence.mean_quality_delta < 0.0:
+        return (
+            FeatureValidationIssue(
+                feature.name,
+                "quality_non_regression_failed",
+                f"mean_quality_delta={evidence.mean_quality_delta}",
+            ),
+        )
     return ()
 
 
@@ -624,6 +645,30 @@ def model_page_feature_claims(document: str) -> tuple[str, ...]:
     return tuple(claims)
 
 
+def _defined_python_symbols(path: Path) -> set[str]:
+    """Return symbols actually bound by a Python owner module."""
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    symbols: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbols.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            symbols.add(node.name)
+            symbols.update(
+                child.name
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    symbols.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            symbols.add(node.target.id)
+    return symbols
+
+
 def validate_feature_catalog(
     *,
     root: Path,
@@ -696,9 +741,9 @@ def validate_feature_catalog(
         elif not feature.symbols:
             add(feature, "missing_symbol_contract", feature.owner)
         else:
-            owner_text = owner_path.read_text(encoding="utf-8")
+            owner_symbols = _defined_python_symbols(owner_path)
             for symbol in feature.symbols:
-                if symbol not in owner_text:
+                if symbol not in owner_symbols:
                     add(feature, "missing_owner_symbol", symbol)
         if FeatureInvariant.CONFIG in feature.invariants and not feature.config_keys:
             add(feature, "missing_config_gate", "feature declares no config key")
@@ -708,11 +753,16 @@ def validate_feature_catalog(
         if check is None:
             add(feature, "unknown_check", feature.check)
         else:
-            command_text = " ".join(str(value) for value in check["commands"])
+            command_paths = {
+                token.replace("\\", "/")
+                for command in check["commands"]
+                for token in shlex.split(str(command), posix=True)
+                if token.endswith(".py")
+            }
             for contract_path in feature.contract_paths:
                 if not (root / contract_path).is_file():
                     add(feature, "missing_contract", contract_path)
-                elif contract_path not in command_text:
+                elif contract_path not in command_paths:
                     add(feature, "contract_not_executed", contract_path)
         for config_key in feature.config_keys:
             if config_key not in known_config:

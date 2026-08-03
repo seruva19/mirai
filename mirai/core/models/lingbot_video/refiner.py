@@ -319,8 +319,9 @@ def run_refine(
     into the standard native VAE decode path. Model access is entirely through
     the pipeline's provider hooks.
 
-    The base DiT is released before refiner assets are loaded. It is not restored
-    by this operation, so refinement terminates the current denoising session.
+    The base DiT is released before refiner assets are loaded. This operation
+    does not restore it; the owning inference session must restore placement
+    before a subsequent base denoise.
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("torch is required for the LingBot-Video refiner.")
@@ -345,14 +346,16 @@ def run_refine(
 
     # (a) upscale: decode base latent -> pixels -> bicubic resize -> VAE re-encode.
     pipeline.load_vae(device=str(compute_device))
-    frames = pipeline.decode_latents_native([base_latent])  # [T,3,H,W] in [0,1]
-    video = frames.permute(1, 0, 2, 3).unsqueeze(0).contiguous()  # [1,3,T,H,W]
-    # Bicubic overshoots at sharp edges (values slip just outside [0,1]), and
-    # the VAE encoder's pixel-range detection rejects such frames — clamp back
-    # to the decode range before re-encoding.
-    video = resize_video_bicubic(video, int(height), int(width)).clamp_(0.0, 1.0)
-    x_up = pipeline.encode_video_native(video, generator=generator)  # [1,C,T,H,W] DiT space
-    pipeline.offload_vae()
+    try:
+        frames = pipeline.decode_latents_native([base_latent])  # [T,3,H,W] in [0,1]
+        video = frames.permute(1, 0, 2, 3).unsqueeze(0).contiguous()  # [1,3,T,H,W]
+        # Bicubic overshoots at sharp edges (values slip just outside [0,1]), and
+        # the VAE encoder's pixel-range detection rejects such frames — clamp back
+        # to the decode range before re-encoding.
+        video = resize_video_bicubic(video, int(height), int(width)).clamp_(0.0, 1.0)
+        x_up = pipeline.encode_video_native(video, generator=generator)  # [1,C,T,H,W] DiT space
+    finally:
+        pipeline.offload_vae()
     x_up = x_up.to(device=compute_device)
 
     # (b) re-noise at t_thresh with the SAME seeded generator.
@@ -362,47 +365,58 @@ def run_refine(
     latents = prepare_refiner_latent(x_up, noise, float(t_thresh))
 
     # Base DiT was already released above (before the VAE stage).
-    refiner.load(device=str(compute_device), dtype=dtype)
+    try:
+        refiner.load(device=str(compute_device), dtype=dtype)
+        # (e) same prompt + negative prompt conditioning as the base pass.
+        pipeline.load_text_encoder(device="cpu")
+        try:
+            context = _as_context_tensor(
+                pipeline.encode_prompt(prompt, device=str(compute_device)), compute_device
+            )
+            context_null = _as_context_tensor(
+                pipeline.encode_prompt(negative_prompt or "", device=str(compute_device)),
+                compute_device,
+            )
+        finally:
+            pipeline.offload_text_encoder()
 
-    # (e) same prompt + negative prompt conditioning as the base pass.
-    pipeline.load_text_encoder(device="cpu")
-    context = _as_context_tensor(
-        pipeline.encode_prompt(prompt, device=str(compute_device)), compute_device
-    )
-    context_null = _as_context_tensor(
-        pipeline.encode_prompt(negative_prompt or "", device=str(compute_device)),
-        compute_device,
-    )
-    pipeline.offload_text_encoder()
+        # (d) tail grid via the preview solver registry, restricted to [t_thresh, 0].
+        sigmas = compute_refiner_sigmas(
+            num_inference_steps=int(steps),
+            shift=float(shift),
+            t_thresh=float(t_thresh),
+            tail_steps=int(sigma_tail_steps),
+        )
+        solver = build_refiner_solver(
+            str(scheduler),
+            sigmas,
+            shift=float(shift),
+            device=str(compute_device),
+        )
 
-    # (d) tail grid via the preview solver registry, restricted to [t_thresh, 0].
-    sigmas = compute_refiner_sigmas(
-        num_inference_steps=int(steps),
-        shift=float(shift),
-        t_thresh=float(t_thresh),
-        tail_steps=int(sigma_tail_steps),
-    )
-    solver = build_refiner_solver(str(scheduler), sigmas, shift=float(shift), device=str(compute_device))
-
-    scale = float(cfg_scale)
-    if compute_device.type == "cuda":
-        autocast_ctx: Any = torch.amp.autocast("cuda", dtype=torch.bfloat16)
-    else:
-        autocast_ctx = contextlib.nullcontext()
-    with torch.no_grad(), autocast_ctx:
-        for sigma in solver.timesteps:
-            timestep = sigma.reshape(1).to(compute_device)
-            if scale <= 1.0:
-                v_out = pipeline.refiner_forward(latents, timestep, {"t5": context})
-            else:
-                v_cond = pipeline.refiner_forward(latents, timestep, {"t5": context})
-                v_uncond = pipeline.refiner_forward(latents, timestep, {"t5": context_null})
-                v_out = v_uncond + scale * (v_cond - v_uncond)
-            result = solver.step(v_out.squeeze(0), timestep, latents.squeeze(0))
-            prev = result.prev_sample
-            latents = prev.unsqueeze(0) if prev.ndim == 4 else prev
-
-    refiner.release()
+        scale = float(cfg_scale)
+        autocast_ctx: Any = (
+            torch.amp.autocast("cuda", dtype=dtype)
+            if compute_device.type == "cuda"
+            and dtype in {torch.float16, torch.bfloat16}
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), autocast_ctx:
+            for sigma in solver.timesteps:
+                timestep = sigma.reshape(1).to(compute_device)
+                if scale <= 1.0:
+                    v_out = pipeline.refiner_forward(latents, timestep, {"t5": context})
+                else:
+                    v_cond = pipeline.refiner_forward(latents, timestep, {"t5": context})
+                    v_uncond = pipeline.refiner_forward(
+                        latents, timestep, {"t5": context_null}
+                    )
+                    v_out = v_uncond + scale * (v_cond - v_uncond)
+                result = solver.step(v_out.squeeze(0), timestep, latents.squeeze(0))
+                prev = result.prev_sample
+                latents = prev.unsqueeze(0) if prev.ndim == 4 else prev
+    finally:
+        refiner.release()
     refined = latents.squeeze(0) if latents.ndim == 5 else latents  # [C,T,H,W]
     return refined.detach().float()
 

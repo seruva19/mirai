@@ -92,12 +92,8 @@ class LingBotDispersiveLossRuntime:
 
 def configure_lingbot_dispersive_loss(
     pipeline: Any,
-    *,
-    policy_name: str,
-    policy: Any,
-) -> bool:
-    if str(policy_name).strip().lower() != "dispersive_loss":
-        return False
+    policy: DispersiveLossController,
+) -> None:
     if not isinstance(policy, DispersiveLossController):
         raise TypeError("dispersive_loss requires DispersiveLossController.")
     runtime = LingBotDispersiveLossRuntime(policy)
@@ -107,7 +103,6 @@ def configure_lingbot_dispersive_loss(
         raise ValueError("LingBot transformer does not expose representation capture.")
     setter(runtime)
     pipeline._dispersive_loss_runtime = runtime
-    return True
 
 
 __all__ = [

@@ -9,12 +9,8 @@ from mirai.core.moe.routing.depth import MixtureOfDepthsSpec
 
 def configure_lingbot_depth_policy(
     pipeline: Any,
-    *,
-    policy_name: str,
-    policy: Any,
-) -> bool:
-    if policy_name != "mixture_of_depths":
-        return False
+    policy: MixtureOfDepthsSpec,
+) -> None:
     if not isinstance(policy, MixtureOfDepthsSpec):
         raise TypeError("mixture_of_depths requires MixtureOfDepthsSpec.")
     spec = policy.validate()
@@ -34,7 +30,6 @@ def configure_lingbot_depth_policy(
         block.attn._mirai_attention_query_chunk_size = int(
             spec.attention_query_chunk_size
         )
-    return True
 
 
 def mixture_of_depths_diagnostics(transformer: Any) -> dict[str, float]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -10,8 +11,10 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from mirai.config.loader import load_config
+from scripts.download import _resolve_hf_token
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +64,12 @@ def _public_text_files() -> list[Path]:
 
 
 class PublicationContractTests(unittest.TestCase):
+    def test_public_model_download_does_not_require_credentials(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch.dict(
+            sys.modules, {"huggingface_hub": None}
+        ):
+            self.assertIsNone(_resolve_hf_token())
+
     def test_distribution_archives_preserve_the_public_runtime_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory) / "source"
@@ -109,6 +118,7 @@ class PublicationContractTests(unittest.TestCase):
                 "README.md",
                 "CONFIG_REFERENCE.md",
                 "assets/mirai-logo-dark.png",
+                "assets/mirai-logo-light-transparent.png",
                 "assets/mirai-logo.png",
                 "agent/AGENTS.md",
                 "agent/architecture.json",
@@ -118,6 +128,7 @@ class PublicationContractTests(unittest.TestCase):
             }
             self.assertEqual(required_source_paths - source_names, set())
             self.assertIn("mirai/config/defaults/moe.toml", wheel_names)
+            self.assertIn("mirai/config/defaults/lingbot_video.toml", wheel_names)
             self.assertTrue(
                 any(
                     name.endswith("mirai/vendors/lingbot_video/LICENSE")
@@ -301,7 +312,10 @@ class PublicationContractTests(unittest.TestCase):
     def test_readme_is_model_agnostic_outside_model_support(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('srcset="assets/mirai-logo-dark-transparent.png"', readme)
-        self.assertIn('src="assets/mirai-logo.png"', readme)
+        self.assertIn(
+            'src="assets/mirai-logo-light-transparent.png"',
+            readme,
+        )
         self.assertIn("**Preview release.**", readme)
         self.assertIn("## Model support", readme)
         self.assertIn("### Generic", readme)
@@ -368,6 +382,12 @@ class PublicationContractTests(unittest.TestCase):
             config = load_config(path)
             self.assertEqual(config.model.type, "lingbot-video")
             if config.memory.frozen_weight_quantization == "none":
+                self.assertEqual(
+                    config.optimizer.type,
+                    "adamw",
+                    f"{path.relative_to(ROOT)} must remain runnable without an "
+                    "optional low-bit optimizer dependency",
+                )
                 self.assertFalse(
                     config.memory.quantize_experts_on_load,
                     f"{path.relative_to(ROOT)} enables expert quantization without a quantized format",

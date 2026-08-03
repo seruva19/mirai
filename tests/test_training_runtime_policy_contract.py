@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
+from mirai.config.schema import TrainingConfig
 from mirai.core.persistence.checkpoints import load_checkpoint, save_checkpoint
 from mirai.core.training.data.curriculum import CurriculumSchedule
 from mirai.core.training.evaluation.early_stop import EarlyStopState
 from mirai.core.training.optim.gradients import resolve_non_finite_policy
+from mirai.core.training.observability.metrics import apply_validation_policy
+from mirai.core.training.lifecycle.session_state import seed_torch_rng
+from mirai.core.training.lifecycle.resume_validation import (
+    optimizer_implementation_identity,
+    validate_resume_checkpoint_compatibility,
+)
+from mirai.core.training.runtime.execution import (
+    accumulate_training_gradients,
+    apply_optimizer_update,
+)
+from mirai.core.training.objectives.engine import TrainingLossResult
 from mirai.core.training.control.live_control import (
     TRAINING_CONTROL_REQUESTS_NAMESPACE,
     LiveTrainingController,
@@ -17,11 +31,178 @@ from mirai.core.training.control.live_control import (
 from mirai.core.training.control.live_control_schema import (
     build_live_training_control_request_payload,
 )
+from mirai.core.training.control.live_control_actions import (
+    build_training_runtime_overrides,
+    load_training_runtime_overrides_state,
+    training_runtime_overrides_state_dict,
+)
 from mirai.core.training.observability.events import TrainingEventBus
 from scripts.tools.lr_find import _compute_recommended_lr
 
 
 class TrainingRuntimePolicyTests(unittest.TestCase):
+    @staticmethod
+    def _resume_payload(config: TrainingConfig) -> dict:
+        return {
+            "global_step": 1,
+            "config": asdict(config),
+            "dataset_snapshot_id": "dataset",
+            "cache_snapshot_id": "cache",
+            "model_snapshot_id": "model",
+            "metadata": {"schema_version": 1},
+        }
+
+    def test_resume_contract_rejects_behavior_changes(self) -> None:
+        cases = (
+            ("seed", 99),
+            ("warmup_steps", 3),
+            ("max_grad_norm", 0.5),
+            ("ema_enabled", True),
+            ("activation_compression", True),
+            ("curriculum", {"profiles": [{"start_step": 0}]}),
+        )
+        for field, changed in cases:
+            with self.subTest(field=field):
+                checkpoint_config = TrainingConfig()
+                current = TrainingConfig()
+                setattr(current.training, field, changed)
+                with self.assertRaisesRegex(ValueError, "training"):
+                    validate_resume_checkpoint_compatibility(
+                        payload=self._resume_payload(checkpoint_config),
+                        config=current,
+                        resume_path="checkpoint.pt",
+                        dataset_snapshot_id="dataset",
+                        cache_snapshot_id="cache",
+                        model_snapshot_id="model",
+                    )
+
+    def test_resume_contract_binds_nonconstant_scheduler_horizon(self) -> None:
+        checkpoint_config = TrainingConfig()
+        checkpoint_config.optimizer.scheduler = "cosine"
+        current = TrainingConfig()
+        current.optimizer.scheduler = "cosine"
+        current.training.max_steps += 1
+        with self.assertRaisesRegex(ValueError, "training"):
+            validate_resume_checkpoint_compatibility(
+                payload=self._resume_payload(checkpoint_config),
+                config=current,
+                resume_path="checkpoint.pt",
+                dataset_snapshot_id="dataset",
+                cache_snapshot_id="cache",
+                model_snapshot_id="model",
+            )
+
+    def test_resume_rejects_optimizer_implementation_change(self) -> None:
+        import torch
+
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        result = SimpleNamespace(
+            optimizer=torch.optim.AdamW([parameter]),
+            resolved_type="adamw",
+            used_fallback=False,
+        )
+        payload = self._resume_payload(TrainingConfig())
+        payload["optimizer_identity"] = {
+            **optimizer_implementation_identity(result),
+            "resolved_type": "came",
+        }
+        with self.assertRaisesRegex(ValueError, "optimizer implementation mismatch"):
+            validate_resume_checkpoint_compatibility(
+                payload=payload,
+                config=TrainingConfig(),
+                resume_path="checkpoint.pt",
+                dataset_snapshot_id="dataset",
+                cache_snapshot_id="cache",
+                model_snapshot_id="model",
+                optimizer_result=result,
+            )
+
+    def test_non_finite_loss_is_returned_to_the_configured_skip_policy(self) -> None:
+        import torch
+
+        class Trainer:
+            @staticmethod
+            def compute_loss_result(_batch):
+                scalar = torch.tensor(float("nan"), requires_grad=True)
+                vector = scalar.reshape(1)
+                return TrainingLossResult(
+                    loss=scalar,
+                    loss_pre_accum=scalar,
+                    per_sample_loss=vector,
+                    per_sample_loss_normalized=vector,
+                    loss_weights=torch.ones_like(vector),
+                    weighted_loss=vector,
+                    timesteps=torch.zeros_like(vector),
+                )
+
+        result = accumulate_training_gradients(
+            trainer=Trainer(),
+            grad_accum=1,
+            build_batch=lambda _index: {},
+            params=[],
+            gradient_cpu_offload=False,
+        )
+
+        self.assertTrue(result.non_finite_loss)
+        self.assertTrue(result.last_metrics["non_finite_loss"])
+
+    def test_live_runtime_overrides_round_trip_through_checkpoint_state(self) -> None:
+        source = build_training_runtime_overrides()
+        source.sample_every_n_steps_override = 7
+        source.val_every_n_steps_override = 11
+        restored = build_training_runtime_overrides()
+
+        load_training_runtime_overrides_state(
+            restored,
+            training_runtime_overrides_state_dict(source),
+        )
+
+        self.assertEqual(restored.sample_every_n_steps_override, 7)
+        self.assertEqual(restored.val_every_n_steps_override, 11)
+
+    def test_fresh_run_torch_seed_is_deterministic(self) -> None:
+        import torch
+
+        seed_torch_rng(731)
+        first = torch.rand(4)
+        seed_torch_rng(731)
+        torch.testing.assert_close(torch.rand(4), first, rtol=0.0, atol=0.0)
+
+    def test_non_finite_skip_discards_pipeline_owned_step_state(self) -> None:
+        import torch
+
+        class Pipeline:
+            discarded = False
+
+            def discard_optimizer_step(self):
+                self.discarded = True
+
+            @staticmethod
+            def supports_runtime_offload_flush():
+                return False
+
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        parameter.grad = torch.tensor(float("inf"))
+        pipeline = Pipeline()
+        result = apply_optimizer_update(
+            params=[parameter],
+            optimizer=optimizer,
+            scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0),
+            pipeline=pipeline,
+            max_grad_norm=1.0,
+            optimizer_cpu_offload=False,
+            non_finite_gradients=True,
+            non_finite_grad_policy="skip_step",
+            consecutive_skipped_steps=0,
+            max_consecutive_skipped_steps=5,
+            skipped_steps=0,
+            global_step=0,
+        )
+        self.assertFalse(result.advanced)
+        self.assertTrue(pipeline.discarded)
+        self.assertIsNone(parameter.grad)
+
     def test_curriculum_switches_profiles_and_filters_records(self) -> None:
         schedule = CurriculumSchedule.from_config(
             {
@@ -76,6 +257,36 @@ class TrainingRuntimePolicyTests(unittest.TestCase):
         self.assertEqual(restored.patience_counter, 3)
         self.assertEqual(restored.best_checkpoint_path, "outputs/checkpoints/step_42.pt")
         self.assertAlmostEqual(restored.best_val_loss, 0.123, places=12)
+
+    def test_best_checkpoint_contains_the_new_early_stop_state(self) -> None:
+        initial = EarlyStopState(
+            best_val_loss=float("inf"),
+            best_step=-1,
+            patience_counter=0,
+            best_checkpoint_path="",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = apply_validation_policy(
+                step_metrics={},
+                val_loss=0.25,
+                early_stop_state=initial,
+                global_step=7,
+                early_stop_patience=3,
+                log_on_this_rank=True,
+                ckpt_dir=tmp,
+                build_ckpt_payload=lambda step: {
+                    "global_step": step,
+                    "early_stop_state": initial.to_dict(),
+                },
+            )
+            payload = load_checkpoint(Path(tmp) / "best.pt")
+
+        restored = EarlyStopState.from_dict(payload["early_stop_state"])
+        self.assertTrue(result.best_checkpoint_saved)
+        self.assertEqual(restored.best_step, 7)
+        self.assertEqual(restored.patience_counter, 0)
+        self.assertEqual(restored.best_checkpoint_path, str(Path(tmp) / "best.pt"))
+        self.assertAlmostEqual(restored.best_val_loss, 0.25, places=12)
 
     def test_non_finite_skip_policy_has_a_stall_guard(self) -> None:
         consecutive = 0
@@ -146,6 +357,17 @@ class TrainingRuntimePolicyTests(unittest.TestCase):
             )
             self.assertEqual(status["state"], "applied")
             self.assertEqual(status["result"]["effective_sample_interval_every_n_steps"], 7)
+
+            restarted = LiveTrainingController(
+                db_path=db_path,
+                job_id="job",
+                run_id="run-restarted",
+                event_bus=TrainingEventBus(run_id="run-restarted", job_id="job"),
+                callbacks=[],
+                gradient_accumulation=2,
+            )
+            self.assertIsNone(restarted.poll_pending_request(global_step=1))
+            self.assertEqual(restarted.highest_seen_seq, 1)
 
     def test_lr_finder_selects_the_steepest_log_space_loss_drop(self) -> None:
         points = [

@@ -74,7 +74,7 @@ def test_policy_implements_square_root_rule_and_upper_clamp() -> None:
     )
 
 
-def test_constant_provider_path_returns_original_timestep_object() -> None:
+def test_constant_provider_uses_one_shift_for_corruption_and_conditioning() -> None:
     config = TrainingConfig.from_dict(
         {
             "model": {
@@ -89,9 +89,27 @@ def test_constant_provider_path_returns_original_timestep_object() -> None:
         }
     )
     pipeline = LingBotVideoPipeline.from_training_config(config)
+    config.adapter.timestep_rank_schedule = "tlora"
+    pipeline.set_adapter_config(config.adapter)
     latents = torch.zeros(1, 1, 2, 2, 2)
+    noise = torch.ones_like(latents)
     timesteps = torch.tensor([0.25])
-    assert pipeline.prepare_model_timesteps(timesteps, latents=latents) is timesteps
+    expected_sigma = shifted_sigma(timesteps, 3.0)
+    torch.testing.assert_close(
+        pipeline.apply_noise(latents, noise, timesteps),
+        expected_sigma.reshape(1, 1, 1, 1, 1).expand_as(latents),
+    )
+    torch.testing.assert_close(
+        pipeline.prepare_model_timesteps(timesteps, latents=latents),
+        expected_sigma,
+    )
+    pipeline(
+        pipeline.apply_noise(latents, noise, timesteps),
+        expected_sigma,
+        {"t5": torch.zeros(1, 1, 12)},
+    )
+    adapter_stats = pipeline.get_training_diagnostics()["timestep_adapter"]
+    assert adapter_stats["sigma"] == pytest.approx(expected_sigma.tolist())
 
 
 def test_provider_uses_one_shift_for_corruption_conditioning_and_inference() -> None:

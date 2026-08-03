@@ -12,6 +12,7 @@ from mirai.core.models.providers import get_model_family_provider
 from mirai.core.moe.runtime.touch_guard import EXPERT_TOUCH_GUARD_MODES
 from mirai.core.moe.runtime.kernels import megablocks_runtime_available
 from mirai.core.moe.runtime.kernels import normalize_moe_kernel_backend
+from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
 from mirai.core.training.optim.optimizer import (
     OptimizerRegistry,
     SELECTED_EXPERT_OPTIMIZER_TYPES,
@@ -104,6 +105,11 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
 
     routing_mode = str(config.model.params.moe_routing_mode).strip().lower()
     if routing_mode == "expert_choice":
+        _check(
+            int(config.model.params.moe_dynamic_topk_min) == 0
+            and float(config.model.params.moe_dynamic_topk_average) == 0.0,
+            "Expert-Choice routing cannot be combined with token-choice dynamic top-k.",
+        )
         _check(
             float(config.model.params.expert_subset_fraction) == 1.0,
             "Expert-Choice routing cannot be combined with token-choice expert subsets.",
@@ -623,6 +629,16 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
         "optimizer.stochastic_rounding=true requires "
         "training.optimizer_cpu_offload=false; FP32 CPU shadow weights would "
         "bypass BF16 stochastic updates.",
+    )
+    try:
+        MoEOptimizationPolicy.from_memory_config(config.memory)
+    except ValueError as exc:
+        errors.append(str(exc))
+    _check(
+        str(config.memory.weight_residency_strategy).strip().lower()
+        in {"disabled", "block_swap", "stream_disk"},
+        "memory.weight_residency_strategy must be one of: disabled, block_swap, "
+        "stream_disk.",
     )
     try:
         resolved_moe_kernel = normalize_moe_kernel_backend(config.memory.moe_kernel_backend)

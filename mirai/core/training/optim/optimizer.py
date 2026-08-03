@@ -170,153 +170,6 @@ def build_cpu_offload_optimizer(optimizer: torch.optim.Optimizer) -> CPUOffloadO
     return CPUOffloadOptimizer(optimizer)
 
 
-class _LiteAdamW:
-    """Minimal AdamW-compatible optimizer used when torch.optim setup fails."""
-
-    def __init__(
-        self,
-        params: Any,
-        *,
-        lr: float,
-        weight_decay: float,
-        betas: tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-8,
-    ) -> None:
-        self.state: dict[Any, dict[str, torch.Tensor]] = {}
-        self._betas = (float(betas[0]), float(betas[1]))
-        self._eps = float(eps)
-        self.param_groups = self._coerce_param_groups(
-            params=params,
-            default_lr=float(lr),
-            default_weight_decay=float(weight_decay),
-        )
-
-    def _coerce_param_groups(
-        self,
-        *,
-        params: Any,
-        default_lr: float,
-        default_weight_decay: float,
-    ) -> list[dict[str, Any]]:
-        if isinstance(params, list) and params and isinstance(params[0], dict):
-            out = []
-            for group in params:
-                group_copy = dict(group)
-                group_copy.setdefault("lr", default_lr)
-                group_copy.setdefault("weight_decay", default_weight_decay)
-                group_copy.setdefault("betas", self._betas)
-                group_copy.setdefault("eps", self._eps)
-                group_copy.setdefault("step", 0)
-                out.append(group_copy)
-            return out
-        return [
-            {
-                "params": list(params),
-                "lr": default_lr,
-                "weight_decay": default_weight_decay,
-                "betas": self._betas,
-                "eps": self._eps,
-                "step": 0,
-            }
-        ]
-
-    @torch.no_grad()
-    def step(self, closure=None):  # type: ignore[override]
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        for group in self.param_groups:
-            beta1, beta2 = group.get("betas", self._betas)
-            eps = float(group.get("eps", self._eps))
-            lr = float(group.get("lr", 0.0))
-            weight_decay = float(group.get("weight_decay", 0.0))
-            step = int(group.get("step", 0)) + 1
-            group["step"] = step
-            bias_correction1 = 1.0 - (float(beta1) ** step)
-            bias_correction2 = 1.0 - (float(beta2) ** step)
-            for param in group.get("params", []):
-                if param.grad is None:
-                    continue
-                grad = param.grad
-                if grad.is_sparse:
-                    raise RuntimeError("Sparse gradients are not supported by _LiteAdamW.")
-                state = self.state.setdefault(
-                    param,
-                    {
-                        "exp_avg": torch.zeros_like(param, memory_format=torch.preserve_format),
-                        "exp_avg_sq": torch.zeros_like(param, memory_format=torch.preserve_format),
-                    },
-                )
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-                exp_avg.mul_(float(beta1)).add_(grad, alpha=1.0 - float(beta1))
-                exp_avg_sq.mul_(float(beta2)).addcmul_(grad, grad, value=1.0 - float(beta2))
-                if weight_decay != 0.0:
-                    param.add_(param, alpha=-(lr * weight_decay))
-                denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
-                step_size = lr / bias_correction1
-                param.addcdiv_(exp_avg, denom, value=-step_size)
-        return loss
-
-    def zero_grad(self, set_to_none: bool = True) -> None:
-        for group in self.param_groups:
-            for param in group.get("params", []):
-                grad = getattr(param, "grad", None)
-                if grad is None:
-                    continue
-                if set_to_none:
-                    param.grad = None
-                else:
-                    grad.zero_()
-
-    def state_dict(self) -> dict[str, Any]:
-        packed_state: dict[int, dict[str, torch.Tensor]] = {}
-        param_index: dict[Any, int] = {}
-        idx = 0
-        for group in self.param_groups:
-            for param in group.get("params", []):
-                if param not in param_index:
-                    param_index[param] = idx
-                    idx += 1
-        for param, state in self.state.items():
-            if param in param_index:
-                packed_state[param_index[param]] = {
-                    key: value.detach().clone()
-                    for key, value in state.items()
-                }
-        groups: list[dict[str, Any]] = []
-        for group in self.param_groups:
-            group_copy = {key: value for key, value in group.items() if key != "params"}
-            group_copy["params"] = [param_index[p] for p in group.get("params", []) if p in param_index]
-            groups.append(group_copy)
-        return {"state": packed_state, "param_groups": groups}
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        groups = list(state_dict.get("param_groups", []))
-        state = dict(state_dict.get("state", {}))
-        flat_params: list[Any] = []
-        for group in self.param_groups:
-            flat_params.extend(group.get("params", []))
-        restored_state: dict[Any, dict[str, torch.Tensor]] = {}
-        for key, value in state.items():
-            idx = int(key)
-            if 0 <= idx < len(flat_params):
-                restored_state[flat_params[idx]] = {
-                    name: tensor.detach().clone()
-                    for name, tensor in dict(value).items()
-                }
-        self.state = restored_state
-        for i, group in enumerate(self.param_groups):
-            if i >= len(groups):
-                continue
-            src = groups[i]
-            for key, value in src.items():
-                if key == "params":
-                    continue
-                group[key] = value
-
-
 def _iter_optimizer_params(opt_params: Any) -> Any:
     for item in opt_params:
         if isinstance(item, dict):
@@ -349,12 +202,9 @@ def _safe_adamw(
     weight_decay: float,
     has_param_groups: bool,
 ) -> Any:
-    try:
-        if has_param_groups:
-            return _TORCH_ADAMW(opt_params, lr=lr)
-        return _TORCH_ADAMW(opt_params, lr=lr, weight_decay=weight_decay)
-    except Exception:
-        return _LiteAdamW(opt_params, lr=lr, weight_decay=weight_decay)
+    if has_param_groups:
+        return _TORCH_ADAMW(opt_params, lr=lr)
+    return _TORCH_ADAMW(opt_params, lr=lr, weight_decay=weight_decay)
 
 
 def warmup_optimizer_warning(*, optimizer_type: str, warmup_steps: int) -> str | None:
@@ -365,25 +215,6 @@ def warmup_optimizer_warning(*, optimizer_type: str, warmup_steps: int) -> str |
             "of Prodigy dynamics; this is usually discouraged. Prefer warmup_steps=0."
         )
     return None
-
-
-def scheduler_mode_for_optimizer(
-    *,
-    optimizer_type: str,
-    requested_scheduler: str,
-) -> tuple[str, str | None]:
-    key = optimizer_type.strip().lower()
-    if key == "schedule_free_adamw":
-        mode = "constant"
-        requested = requested_scheduler.strip().lower()
-        if requested and requested != "constant":
-            return (
-                mode,
-                "optimizer.type='schedule_free_adamw' forces scheduler='constant'. "
-                f"Requested '{requested_scheduler}' was overridden.",
-            )
-        return mode, None
-    return requested_scheduler, None
 
 
 def _is_router_parameter(name: str) -> bool:
@@ -766,21 +597,6 @@ def _build_prodigy(ctx: _OptimizerBuildContext) -> OptimizerBuildResult:
     return OptimizerBuildResult(optimizer=opt, resolved_type="prodigy", used_fallback=False)
 
 
-@register_optimizer("schedule_free_adamw")
-def _build_schedule_free_adamw(ctx: _OptimizerBuildContext) -> OptimizerBuildResult:
-    opt = _safe_adamw(
-        opt_params=ctx.opt_params,
-        lr=ctx.lr,
-        weight_decay=ctx.weight_decay,
-        has_param_groups=ctx.has_param_groups,
-    )
-    return OptimizerBuildResult(
-        optimizer=opt,
-        resolved_type="schedule_free_adamw",
-        used_fallback=False,
-    )
-
-
 @register_optimizer("adamw_8bit")
 def _build_adamw_8bit(ctx: _OptimizerBuildContext) -> OptimizerBuildResult:
     try:
@@ -888,6 +704,11 @@ def _build_came(ctx: _OptimizerBuildContext) -> OptimizerBuildResult:
             opt = CAME(ctx.opt_params, lr=ctx.lr)
         return OptimizerBuildResult(optimizer=opt, resolved_type="came", used_fallback=False)
     except (ModuleNotFoundError, AttributeError) as exc_came:
+        if not ctx.allow_fallback:
+            raise RuntimeError(
+                "optimizer.type='came' requested but pytorch_optimizer.CAME "
+                "is unavailable and optimizer.allow_fallback=false."
+            ) from exc_came
         # First fallback: adafactor (same memory-efficient spirit)
         try:
             try:
@@ -915,12 +736,7 @@ def _build_came(ctx: _OptimizerBuildContext) -> OptimizerBuildResult:
             return OptimizerBuildResult(
                 optimizer=opt, resolved_type="adafactor", used_fallback=True
             )
-        except Exception as exc_af:
-            if not ctx.allow_fallback:
-                raise RuntimeError(
-                    "optimizer.type='came' requested but pytorch_optimizer is unavailable "
-                    "and adafactor fallback also failed."
-                ) from exc_af
+        except Exception:
             warnings.warn(
                 "optimizer.type='came' and adafactor both unavailable; falling back to adamw.",
                 stacklevel=2,

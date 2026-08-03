@@ -56,6 +56,13 @@ def _resume_contract_from_config(config: Any) -> dict[str, Any]:
     # equal when the current config leaves that field at its default. Without this,
     # every added adapter field silently breaks resume for pre-existing checkpoints.
     adapter_payload = _with_defaults(payload.get("adapter", {}), asdict(AdapterConfig()))
+    scheduler = str(optimizer_payload.get("scheduler", "constant")).strip().lower()
+    # Extending a constant-scheduler run does not alter any already-applied
+    # update. Other schedulers derive their trajectory from max_steps, so their
+    # horizon is checkpoint-bound.
+    training_contract = dict(training_payload)
+    if scheduler == "constant":
+        training_contract.pop("max_steps", None)
     return {
         "model": {
             "type": model_payload.get("type"),
@@ -71,80 +78,19 @@ def _resume_contract_from_config(config: Any) -> dict[str, Any]:
             for key, value in adapter_payload.items()
             if key not in {"init_from"}
         },
-        "training": {
-            key: value
-            for key, value in training_payload.items()
-            if key
-            in {
-                "batch_size",
-                "gradient_accumulation",
-                "loss_function",
-                "objective",
-                "contrastive_flow_weight",
-                "loss_weighting",
-                "min_snr_gamma",
-                "timestep_eps",
-                "timestep_sampling",
-                "timestep_sampling_mean",
-                "timestep_sampling_std",
-                "timestep_sampling_mode_scale",
-                "prior_loss_weight",
-                "prior_ratio",
-                "gradient_checkpointing",
-                "noise_offset",
-                "loss_bucket_normalization",
-                "blocks_to_swap",
-                "block_swap_mode",
-                "optimizer_cpu_offload",
-                "gradient_cpu_offload",
-                "activation_cpu_offload",
-                "activation_cpu_offload_defer_layers",
-                "activation_cpu_offload_prefetch_layers",
-                "activation_cpu_offload_view_replay",
-                "masked_loss",
-                "compile",
-                "block_swap_backward",
-                "policy_modules",
-                "policy_options",
-            }
-        },
-        "dataset": {
-            key: value
-            for key, value in dataset_payload.items()
-            if key
-            in {
-                "online_tag_shuffle",
-                "online_tag_shuffle_dropout",
-                "online_tag_shuffle_keep_first_n_tags",
-                "online_temporal_resampling",
-                "clips_per_video",
-                "tag_shuffle_variants",
-                "mask_extension",
-                "moe_routing",
-            }
-        },
-        "memory": {
-            key: value
-            for key, value in memory_payload.items()
-            if key
-            in {
-                "frozen_weight_quantization",
-                "frozen_weight_quantization_strategy",
-                "frozen_weight_packed_state_path",
-                "expert_precision_plan_path",
-                "quantization_block_size",
-                "weight_residency_strategy",
-                "expert_weight_access",
-                "expert_dequant_chunk_size",
-                "quantize_experts_on_load",
-                "router_quantization",
-                "router_quantization_calibration_path",
-                "moe_kernel_backend",
-                "cuda_memory_fraction",
-                "minimum_system_memory_gib",
-                "trainable_parameter_offload",
-            }
-        },
+        "training": training_contract,
+        "dataset": dataset_payload,
+        "memory": memory_payload,
+    }
+
+
+def optimizer_implementation_identity(optimizer_result: Any) -> dict[str, Any]:
+    optimizer = optimizer_result.optimizer
+    optimizer_type = type(optimizer)
+    return {
+        "resolved_type": str(optimizer_result.resolved_type),
+        "used_fallback": bool(optimizer_result.used_fallback),
+        "implementation": f"{optimizer_type.__module__}.{optimizer_type.__qualname__}",
     }
 
 
@@ -164,12 +110,49 @@ def validate_resume_checkpoint_compatibility(
     model_snapshot_id: str,
     config_snapshot_id: str = "",
     model_component_id: str = "",
+    optimizer_result: Any | None = None,
 ) -> ResumeValidationResult:
     errors: list[str] = []
     warnings: list[str] = []
     metadata = payload.get("metadata")
     metadata_dict = metadata if isinstance(metadata, dict) else {}
     lineage_verified = True
+    schema_version = int(metadata_dict.get("schema_version", 1) or 1)
+    if schema_version >= 2:
+        required_state = (
+            "trainer_state",
+            "strategy_metadata",
+            "optimizer_state",
+            "scheduler_state",
+            "rng_state",
+            "torch_rng_state",
+            "skipped_steps",
+            "consecutive_skipped_steps",
+            "early_stop_state",
+            "optimizer_identity",
+            "runtime_overrides",
+        )
+        for key in required_state:
+            if key not in payload or payload.get(key) is None:
+                errors.append(
+                    f"checkpoint schema v{schema_version} is missing required '{key}'."
+                )
+        checkpoint_config_payload = payload.get("config")
+        checkpoint_training = (
+            checkpoint_config_payload.get("training", {})
+            if isinstance(checkpoint_config_payload, dict)
+            else {}
+        )
+        if bool(checkpoint_training.get("ema_enabled", False)) and not isinstance(
+            payload.get("ema_state"), dict
+        ):
+            errors.append("EMA-enabled checkpoint is missing required 'ema_state'.")
+        if bool(checkpoint_training.get("posthoc_ema_enabled", False)) and not isinstance(
+            payload.get("posthoc_ema_state"), dict
+        ):
+            errors.append(
+                "Post-hoc-EMA-enabled checkpoint is missing required 'posthoc_ema_state'."
+            )
 
     for key in (
         "manifest_sha256",
@@ -244,6 +227,23 @@ def validate_resume_checkpoint_compatibility(
                 errors.append(
                     f"resume contract mismatch in section '{section}'."
                 )
+
+    if optimizer_result is not None:
+        observed_identity = payload.get("optimizer_identity")
+        expected_identity = optimizer_implementation_identity(optimizer_result)
+        if isinstance(observed_identity, dict):
+            if observed_identity != expected_identity:
+                errors.append(
+                    "optimizer implementation mismatch: checkpoint has "
+                    f"{observed_identity!r}, current run resolved {expected_identity!r}."
+                )
+        elif schema_version >= 2:
+            errors.append("checkpoint is missing optimizer implementation identity.")
+        else:
+            warnings.append(
+                "Legacy checkpoint has no optimizer implementation identity; "
+                "backend equivalence could not be verified."
+            )
 
     if errors:
         raise ValueError(

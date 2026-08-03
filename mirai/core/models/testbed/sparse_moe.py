@@ -28,7 +28,6 @@ from mirai.core.moe.routing.contracts import RoutingStats, SparseMoECapabilities
 from mirai.core.moe.monitoring.summary import summarize_routing_stats
 from mirai.core.moe.adaptation.balance import resolve_moe_balance_weights
 from mirai.core.moe.routing.layers import SparseMoEFeedForward
-from mirai.core.registry import register_model
 from mirai.core.tensors import is_torch_tensor
 from mirai.core.training.residency.block_swap import BlockSwapManager
 
@@ -176,7 +175,6 @@ class TinySparseMoEDenoiser(nn.Module):
         return output, aux_loss, stats
 
 
-@register_model("sparse_moe_test")
 class SparseMoETestPipeline(nn.Module, NativeVideoPipeline):
     """Small native sparse-MoE denoiser used to validate trainer semantics."""
 
@@ -752,5 +750,6 @@ register_model_family_provider(
         release_supported=False,
         release_eligible=False,
         batched_cfg_inference=True,
+        pipeline_type=SparseMoETestPipeline,
     ),
 )

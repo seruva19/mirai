@@ -202,7 +202,15 @@ def run_pre_postprocessed_training_step(
     )
     if bool(config.training.gradient_cpu_offload) and not consumes_offloaded_gradients:
         restore_gradients_from_cpu(session.params)
-    non_finite_gradients = has_non_finite_gradients(session.params)
+    non_finite_source = (
+        "loss"
+        if accumulation_result.non_finite_loss
+        else "gradients"
+    )
+    non_finite_gradients = bool(
+        accumulation_result.non_finite_loss
+        or has_non_finite_gradients(session.params)
+    )
     if not non_finite_gradients:
         emit_event(
             session.event_bus,
@@ -225,6 +233,7 @@ def run_pre_postprocessed_training_step(
         skipped_steps=int(run_state.skipped_steps),
         global_step=int(run_state.global_step),
         training_policies=getattr(trainer, "training_policies", None),
+        non_finite_source=non_finite_source,
     )
     if not optimizer_update_result.advanced:
         emit_event(
@@ -238,6 +247,7 @@ def run_pre_postprocessed_training_step(
                 "consecutive_skips": int(
                     optimizer_update_result.consecutive_skipped_steps
                 ),
+                "source": non_finite_source,
             },
         )
         run_state.consecutive_skipped_steps = (

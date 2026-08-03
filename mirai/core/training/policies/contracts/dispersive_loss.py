@@ -108,7 +108,7 @@ def _pipeline(*, checkpointing: str = "off") -> LingBotVideoPipeline:
             chunk_features=19,
         )
     )
-    pipeline.configure_training_policy("dispersive_loss", controller)
+    pipeline.configure_dispersive_loss(controller)
     pipeline.set_gradient_checkpointing(checkpointing)
     pipeline.train()
     return pipeline

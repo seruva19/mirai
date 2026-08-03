@@ -22,7 +22,7 @@ from mirai.config.schema import TrainingConfig
 from mirai.core.models.providers import load_configured_model_provider_module
 from mirai.core.moe.monitoring.agreement import compare_router_selections
 from mirai.core.moe.runtime.specs import normalize_router_quantization_policy
-from mirai.core.registry import ModelRegistry
+from mirai.core.models.providers import get_model_family_provider
 from mirai.core.training.trainer import _instantiate_model_pipeline
 from mirai.vendors.lingbot_video.transformer_lingbot_video import LingBotVideoRouter
 
@@ -69,7 +69,10 @@ def build_router_quantization_agreement(
         config,
         entrypoint="router-quantization-agreement",
     )
-    model_cls = ModelRegistry.get(config.model.type)
+    provider = get_model_family_provider(config.model.type)
+    if provider is None:
+        raise ValueError(f"Unknown model family '{config.model.type}'.")
+    model_cls = provider.require_pipeline_type()
     pipeline = _instantiate_model_pipeline(model_cls, config)
     training_model = pipeline.get_training_model()
     if training_model is None:

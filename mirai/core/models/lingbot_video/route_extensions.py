@@ -167,43 +167,58 @@ def bind_lingbot_route_extensions(
     )
 
 
-def configure_lingbot_route_policy(
-    pipeline: Any,
-    *,
-    policy_name: str,
-    policy: Any,
-) -> bool:
-    if policy_name == "diversity_routing" and isinstance(
-        policy, DiversityAwareRoutingController
-    ):
-        pipeline._diversity_routing_controller = policy
-    elif policy_name == "expert_dropout" and isinstance(
-        policy, ExpertDropoutController
-    ):
-        pipeline._expert_dropout_controller = policy
-    elif policy_name == "router_temperature" and isinstance(
-        policy, RouterTemperatureController
-    ):
-        pipeline._router_temperature_controller = policy
-    elif policy_name == "selective_sinkhorn" and isinstance(
-        policy, SelectiveSinkhornController
-    ):
-        pipeline._selective_sinkhorn_controller = policy
-    elif policy_name == "prototypical_routing" and isinstance(
-        policy, PrototypicalRoutingSpec
-    ):
-        pipeline._prototypical_routing_spec = policy
-        pipeline.transformer._mirai_prototypical_routing_enabled = True
-    elif policy_name == "sharp_moe" and isinstance(policy, SharpMoESpec):
-        pipeline._sharp_moe_spec = policy
-        pipeline.transformer._mirai_sharp_moe_enabled = True
-    else:
-        return False
+def _finish_route_policy_configuration(pipeline: Any) -> None:
     pipeline._collect_moe_router_modules()
-    return True
+
+
+def configure_lingbot_diversity_routing(
+    pipeline: Any, policy: DiversityAwareRoutingController
+) -> None:
+    pipeline._diversity_routing_controller = policy
+    _finish_route_policy_configuration(pipeline)
+
+
+def configure_lingbot_expert_dropout(
+    pipeline: Any, policy: ExpertDropoutController
+) -> None:
+    pipeline._expert_dropout_controller = policy
+    _finish_route_policy_configuration(pipeline)
+
+
+def configure_lingbot_router_temperature(
+    pipeline: Any, policy: RouterTemperatureController
+) -> None:
+    pipeline._router_temperature_controller = policy
+    _finish_route_policy_configuration(pipeline)
+
+
+def configure_lingbot_selective_sinkhorn(
+    pipeline: Any, policy: SelectiveSinkhornController
+) -> None:
+    pipeline._selective_sinkhorn_controller = policy
+    _finish_route_policy_configuration(pipeline)
+
+
+def configure_lingbot_prototypical_routing(
+    pipeline: Any, policy: PrototypicalRoutingSpec
+) -> None:
+    pipeline._prototypical_routing_spec = policy
+    pipeline.transformer._mirai_prototypical_routing_enabled = True
+    _finish_route_policy_configuration(pipeline)
+
+
+def configure_lingbot_sharp_moe(pipeline: Any, policy: SharpMoESpec) -> None:
+    pipeline._sharp_moe_spec = policy
+    pipeline.transformer._mirai_sharp_moe_enabled = True
+    _finish_route_policy_configuration(pipeline)
 
 
 __all__ = [
     "bind_lingbot_route_extensions",
-    "configure_lingbot_route_policy",
+    "configure_lingbot_diversity_routing",
+    "configure_lingbot_expert_dropout",
+    "configure_lingbot_prototypical_routing",
+    "configure_lingbot_router_temperature",
+    "configure_lingbot_selective_sinkhorn",
+    "configure_lingbot_sharp_moe",
 ]

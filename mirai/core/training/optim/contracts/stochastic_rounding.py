@@ -48,6 +48,29 @@ def test_adamw_updates_bfloat16_without_persistent_fp32_master() -> None:
     assert set(state) == {"step", "exp_avg", "exp_avg_sq"}
 
 
+def test_bfloat16_second_moment_does_not_stall_below_one_ulp() -> None:
+    torch.manual_seed(13)
+    parameter = torch.nn.Parameter(torch.zeros(65_536, dtype=torch.bfloat16))
+    optimizer = StochasticRoundingAdamW(
+        [parameter],
+        lr=0.0,
+        betas=(0.9, 0.999),
+    )
+    state = optimizer.state[parameter]
+    state["step"] = torch.tensor(0, dtype=torch.int64)
+    state["exp_avg"] = torch.zeros_like(parameter)
+    state["exp_avg_sq"] = torch.ones_like(parameter)
+    parameter.grad = torch.full_like(parameter, 2.0**0.5)
+
+    optimizer.step()
+
+    observed = state["exp_avg_sq"].float()
+    squared_gradient = float(parameter.grad[0].float().square())
+    expected_mean = 0.999 + 0.001 * squared_gradient
+    assert bool((observed != 1.0).any())
+    assert abs(float(observed.mean()) - expected_mean) < 2.5e-4
+
+
 def test_global_rng_checkpoint_restores_exact_stochastic_updates() -> None:
     torch.manual_seed(19)
     parameter = torch.nn.Parameter(torch.ones(8_192, dtype=torch.bfloat16))

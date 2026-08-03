@@ -194,12 +194,9 @@ class DomainExpertSpecializationTests(unittest.TestCase):
             affinity_threshold=0.5,
             min_experts=1,
         )
-        self.assertTrue(
-            configure_lingbot_domain_expert_specialization(
-                SimpleNamespace(transformer=root),
-                "domain_expert_specialization",
-                controller,
-            )
+        configure_lingbot_domain_expert_specialization(
+            SimpleNamespace(transformer=root),
+            controller,
         )
         controller.load_state_dict(
             {

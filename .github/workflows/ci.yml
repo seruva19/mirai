@@ -41,7 +41,10 @@ jobs:
           tests/test_config_reference_coverage.py -q
 
       - name: Production contracts
-        run: python -m pytest tests/ -q -m production_contract
+        run: >-
+          python -m pytest
+          mirai/core/models/adapters/contracts/host.py
+          -q -m production_contract
 
   full:
     name: full CPU suite
@@ -64,5 +67,27 @@ jobs:
       - name: Install package + dev deps
         run: python -m pip install -e ".[dev]"
 
-      - name: Full manifest-driven CPU wave
-        run: python scripts/agent/check.py --all-local --run --max-cost wave
+      - name: Full manifest-driven CPU suite
+        run: python scripts/agent/check.py --all-local --run --max-cost extended
+
+  windows-smoke:
+    name: Windows config + publication smoke
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install package + dev deps
+        run: python -m pip install -e ".[dev]"
+
+      - name: Validate Windows-facing config and publication surfaces
+        run: >-
+          python -m pytest
+          tests/test_config.py
+          tests/test_config_reference_coverage.py
+          tests/test_publication_contract.py -q

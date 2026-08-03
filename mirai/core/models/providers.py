@@ -7,6 +7,7 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 from mirai.core.registry import Registry
+from mirai.core.moe.runtime.specs import ExpertMLPExecutionSpec
 
 if TYPE_CHECKING:
     from mirai.config.schema import TrainingConfig
@@ -94,6 +95,15 @@ class ModelFamilyProvider:
     batched_cfg_inference: bool = False
     inference_tasks: tuple[str, ...] = ("text_to_video",)
     dataset_caption_formats: tuple[str, ...] = ("raw",)
+    expert_mlp_execution_spec: ExpertMLPExecutionSpec | None = None
+    pipeline_type: type[Any] | None = None
+
+    def require_pipeline_type(self) -> type[Any]:
+        if self.pipeline_type is None:
+            raise ValueError(
+                f"Model family '{self.model_type}' registered no pipeline type."
+            )
+        return self.pipeline_type
 
     def is_native_model(self) -> bool:
         return bool(self.native)
@@ -182,6 +192,11 @@ class ModelFamilyProvider:
         return notes
 
     def validate_runtime_compatibility(self, cfg: "TrainingConfig") -> list[str]:
+        family_errors = self.validate_family_params(
+            dict(getattr(cfg.model.params, "family_params", {}) or {})
+        )
+        if family_errors:
+            return list(family_errors)
         caption_format = str(getattr(cfg.dataset, "caption_format", "raw"))
         try:
             self.validate_dataset_caption_format(caption_format)
@@ -236,6 +251,15 @@ class ModelFamilyProvider:
             return [
                 f"Model family '{self.model_type}' does not support "
                 "model.params.moe_balance_loss_disable_step."
+            ]
+        return []
+
+    def validate_family_params(self, params: dict[str, Any]) -> list[str]:
+        """Validate the provider-owned ``model.params.family_params`` table."""
+        if params:
+            return [
+                f"Model family '{self.model_type}' does not declare provider-owned "
+                "model.params.family_params."
             ]
         return []
 

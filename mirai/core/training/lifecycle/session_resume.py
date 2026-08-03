@@ -33,6 +33,8 @@ def apply_resume_checkpoint(
     model_snapshot_id: str,
     config_snapshot_id: str = "",
     model_component_id: str = "",
+    runtime_overrides: Any | None = None,
+    optimizer_result: Any | None = None,
 ) -> ResumeApplicationResult:
     payload = load_checkpoint(resume_path)
     validation = validate_resume_checkpoint_compatibility(
@@ -44,6 +46,7 @@ def apply_resume_checkpoint(
         model_snapshot_id=str(model_snapshot_id),
         config_snapshot_id=str(config_snapshot_id),
         model_component_id=str(model_component_id),
+        optimizer_result=optimizer_result,
     )
     trainer.load_state_dict(payload.get("trainer_state", {}))
     optimizer.load_state_dict(payload.get("optimizer_state", {}))
@@ -56,6 +59,15 @@ def apply_resume_checkpoint(
         rng=rng,
         config=config,
     )
+    if runtime_overrides is not None:
+        from mirai.core.training.control.live_control_actions import (
+            load_training_runtime_overrides_state,
+        )
+
+        load_training_runtime_overrides_state(
+            runtime_overrides,
+            payload.get("runtime_overrides"),
+        )
     return ResumeApplicationResult(
         run_state=restored_state,
         validation=validation,

@@ -15,14 +15,11 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 def configure_lingbot_router_distillation(
-    pipeline: Any, *, policy_name: str, policy: Any
-) -> bool:
-    if policy_name != "router_distillation" or not isinstance(
-        policy, RouterDistillationController
-    ):
-        return False
+    pipeline: Any, policy: RouterDistillationController
+) -> None:
+    if not isinstance(policy, RouterDistillationController):
+        raise TypeError("router_distillation requires RouterDistillationController.")
     pipeline._router_distillation_controller = policy
-    return True
 
 
 def bind_lingbot_router_distillation(pipeline: Any) -> None:

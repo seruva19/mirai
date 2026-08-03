@@ -6,7 +6,10 @@ from dataclasses import dataclass
 import math
 from typing import Any
 
-from mirai.core.moe.routing.contracts import RoutingStats
+from mirai.core.moe.routing.contracts import (
+    RoutingStats,
+    assignment_distribution_entropy,
+)
 from mirai.core.moe.routing.expert_choice import ExpertChoiceRoutingPolicy
 
 try:
@@ -149,11 +152,12 @@ def route_expert_choice_logits(
         .reshape(batch, -1)
         .to(torch.int64),
     )
-    expert_fraction = torch.full(
-        (num_experts,),
-        1.0 / float(num_experts),
-        device=logits.device,
-        dtype=torch.float32,
+    expert_counts = active_slots.expand(
+        batch, num_experts, capacity
+    ).sum(dim=(0, 2)).float()
+    expert_fraction = expert_counts / expert_counts.sum().clamp_min(1.0)
+    expert_fraction_values = tuple(
+        float(value) for value in expert_fraction.detach().cpu().tolist()
     )
     mean_probability = scores.mean(dim=(0, 1))
     zero = logits.sum() * 0.0
@@ -163,7 +167,6 @@ def route_expert_choice_logits(
         if float(z_loss_weight)
         else zero
     )
-    entropy = -(mean_probability * mean_probability.clamp_min(1e-20).log()).sum()
     covered = token_multiplicity > 0
     return ExpertChoiceRoutingDecision(
         expert_token_indices=expert_token_indices,
@@ -177,12 +180,12 @@ def route_expert_choice_logits(
             selected_tokens=int(
                 int(num_experts) * int(sample_capacities.sum().item())
             ),
-            expert_fraction=tuple(float(v) for v in expert_fraction.detach().cpu()),
+            expert_fraction=expert_fraction_values,
             mean_router_probability=tuple(
                 float(v) for v in mean_probability.detach().cpu()
             ),
-            dead_experts=0,
-            routing_entropy=float(entropy.detach().cpu().item()),
+            dead_experts=int((expert_counts == 0).sum().item()),
+            routing_entropy=assignment_distribution_entropy(expert_fraction_values),
         ),
         coverage=ExpertChoiceCoverageStats(
             capacity_per_expert=capacity,
@@ -246,19 +249,21 @@ class TokenChoiceRouter(nn.Module):
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
         selected = F.one_hot(topk_indices.reshape(-1), num_classes=self.num_experts).float()
         expert_fraction = selected.mean(dim=0)
+        expert_fraction_values = tuple(
+            float(value) for value in expert_fraction.detach().cpu().tolist()
+        )
         mean_probability = scores.mean(dim=0)
         load_balance = self.num_experts * torch.sum(expert_fraction * mean_probability)
         log_z = torch.logsumexp(logits, dim=-1)
         z_loss = (log_z.square().mean() * self.z_loss_weight) if self.z_loss_weight else logits.sum() * 0.0
-        entropy = -(mean_probability * mean_probability.clamp_min(1e-20).log()).sum()
         stats = RoutingStats(
             layer=self.layer_name,
             tokens=int(batch * seq_len),
             selected_tokens=int(batch * seq_len * self.experts_per_token),
-            expert_fraction=tuple(float(v) for v in expert_fraction.detach().cpu().tolist()),
+            expert_fraction=expert_fraction_values,
             mean_router_probability=tuple(float(v) for v in mean_probability.detach().cpu().tolist()),
             dead_experts=int((expert_fraction.detach() == 0).sum().item()),
-            routing_entropy=float(entropy.detach().cpu().item()),
+            routing_entropy=assignment_distribution_entropy(expert_fraction_values),
         )
         return RoutingDecision(
             topk_indices=topk_indices,

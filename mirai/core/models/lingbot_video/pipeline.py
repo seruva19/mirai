@@ -87,7 +87,14 @@ from mirai.core.models.lingbot_video.preemptive_monitoring import (
 )
 from mirai.core.moe.monitoring.preemptive import PreemptiveAttentionMonitor
 from mirai.core.models.lingbot_video.route_extensions import bind_lingbot_route_extensions
-from mirai.core.models.lingbot_video.route_extensions import configure_lingbot_route_policy
+from mirai.core.models.lingbot_video.route_extensions import (
+    configure_lingbot_diversity_routing,
+    configure_lingbot_expert_dropout,
+    configure_lingbot_prototypical_routing,
+    configure_lingbot_router_temperature,
+    configure_lingbot_selective_sinkhorn,
+    configure_lingbot_sharp_moe,
+)
 from mirai.core.models.lingbot_video.router_stage import bind_lingbot_router_stage_policy
 from mirai.core.models.lingbot_video.router_stage import configure_lingbot_router_stage_policy
 from mirai.core.models.lingbot_video.router_distillation import bind_lingbot_router_distillation
@@ -130,7 +137,11 @@ from mirai.core.models.adapters.tc_lora import TimestepGateHypernet
 from mirai.core.models.adapters.tc_lora import gate_summary
 from mirai.core.models.moe_dit_common import as_latent_tensor
 from mirai.core.models.native_video import NativeVideoPipeline, VideoLatentLayout
-from mirai.core.models.providers import ModelFamilyProvider, register_model_family_provider
+from mirai.core.models.providers import (
+    ModelFamilyProvider,
+    get_model_family_provider,
+    register_model_family_provider,
+)
 from mirai.core.models.providers import NativeCacheEncoderConfig
 from mirai.core.moe.routing.contracts import SparseMoECapabilities
 from mirai.core.moe.routing.adjugate_experts import (
@@ -175,6 +186,8 @@ from mirai.core.moe.monitoring.summary import (
 )
 from mirai.core.moe.artifacts.manifest import DEFAULT_DOWNLOAD_MANIFEST
 from mirai.core.moe.runtime.specs import ExpertTensorSpec
+from mirai.core.moe.runtime.specs import ExpertMLPExecutionSpec
+from mirai.core.moe.runtime.specs import ExpertProjectionRole
 from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
 from mirai.core.moe.runtime.specs import normalize_expert_weight_access_policy
 from mirai.core.training.runtime.compilation import (
@@ -225,8 +238,12 @@ from mirai.core.moe.calibration.imatrix import ExpertImportanceCalibrationTarget
 from mirai.core.training.optim.router_fp32_master import RouterFp32Master
 from mirai.core.moe.adaptation.dataset_routing import DatasetRoutingBatch
 from mirai.core.moe.adaptation.dataset_routing import DatasetRoutingPolicy
+from mirai.core.moe.adaptation.domain_specialization import (
+    DomainExpertSpecializationController,
+)
 from mirai.core.moe.adaptation.diversity import DiversityAwareRoutingController
 from mirai.core.moe.adaptation.dropout import ExpertDropoutController
+from mirai.core.moe.adaptation.simbal import SimBalController
 from mirai.core.moe.adaptation.temperature import RouterTemperatureController
 from mirai.core.moe.routing.dynamic_topk import BudgetedDynamicTopK
 from mirai.core.moe.routing.selective_sinkhorn import SelectiveSinkhornController
@@ -256,6 +273,7 @@ from mirai.core.moe.adaptation.distillation import RouterDistillationController
 from mirai.core.moe.runtime.specs import validate_expert_tensor_specs
 from mirai.core.moe.runtime.kernels import build_moe_kernel_backend
 from mirai.core.moe.runtime.token_chunking import MoETokenChunkPolicy
+from mirai.core.training.policies.dispersive_loss import DispersiveLossController
 from mirai.core.moe.adaptation import phi_balance as phi_balance_state
 from mirai.core.moe.routing.subset import RouterSubsetPolicy
 from mirai.core.moe.monitoring.health import DeadlockTracker
@@ -266,7 +284,6 @@ from mirai.core.moe.monitoring.drift import router_drift_checkpoint_state
 from mirai.core.moe.adaptation.router_training import RouterAdapterBinding
 from mirai.core.moe.adaptation.router_training import RouterTrainingPolicy
 from mirai.core.moe.artifacts.verification import verify_downloaded_snapshot
-from mirai.core.registry import register_model
 from mirai.core.training.residency.block_swap import BlockSwapManager
 from mirai.core.training.residency.device_residency import DeviceResidencyPlanner
 from mirai.core.training.residency.residency_plan import block_scores_from_router_loads
@@ -294,6 +311,17 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 logger = logging.getLogger(__name__)
+
+
+LINGBOT_EXPERT_MLP_EXECUTION_SPEC = ExpertMLPExecutionSpec(
+    projections=(
+        ExpertProjectionRole("gate", "w1"),
+        ExpertProjectionRole("up", "w3"),
+        ExpertProjectionRole("down", "w2"),
+    ),
+    activation="silu",
+    combiner="gated_product",
+)
 
 
 VALID_VARIANTS = {
@@ -781,7 +809,7 @@ class LingBotVideoModelFamilyProvider(ModelFamilyProvider):
             expert_precision_calibration=True,
             routing_mode_agreement_evidence=True,
             post_compression_router_repair=True,
-            config_defaults_name="moe",
+            config_defaults_name="lingbot_video",
             release_supported=True,
             release_eligible=True,
             inference_prompt_rewriters=("lingbot_json",),
@@ -793,6 +821,7 @@ class LingBotVideoModelFamilyProvider(ModelFamilyProvider):
                 "video_to_video",
             ),
             dataset_caption_formats=("raw", "lingbot_json"),
+            expert_mlp_execution_spec=LINGBOT_EXPERT_MLP_EXECUTION_SPEC,
         )
 
     def resolve_dataset_caption(self, caption: str, *, caption_format: str) -> str:
@@ -1139,7 +1168,6 @@ class LingBotVideoModelFamilyProvider(ModelFamilyProvider):
         return targets
 
 
-@register_model("lingbot-video")
 class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPipeline):
     """Native LingBot-Video denoiser training pipeline for cached latents/text."""
 
@@ -1171,6 +1199,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             if memory_config is not None
             else MoEOptimizationPolicy()
         )
+        self._expert_device_cache = ExpertDeviceCache()
         self.transformer_config = _transformer_config(model_config)
         aux_loss_type = str(model_config.params.moe_aux_loss_type).strip().lower()
         self._moe_aux_loss_type = (
@@ -1562,6 +1591,14 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         else:
             self.transformer = LingBotVideoTransformer3DModel(**self.transformer_config)
         set_lingbot_video_runtime_options(self.transformer, self._runtime_options)
+        provider_spec = get_model_family_provider("lingbot-video").expert_mlp_execution_spec
+        if provider_spec != LINGBOT_EXPERT_MLP_EXECUTION_SPEC:
+            raise RuntimeError(
+                "LingBot provider expert execution spec is absent or inconsistent."
+            )
+        for module in self.transformer.modules():
+            if _is_lingbot_grouped_experts(module):
+                module.mirai_expert_mlp_spec = provider_spec
         attention_backend = str(model_config.attention_backend).strip().lower()
         for module in self.transformer.modules():
             if isinstance(module, LingBotVideoAttention):
@@ -1662,6 +1699,9 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             replace_grouped_experts=True,
             quant_format=quant_format,
             nf4_blocksize=self._nf4_blocksize,
+            expert_mlp_execution_spec=get_model_family_provider(
+                "lingbot-video"
+            ).expert_mlp_execution_spec,
         )
         if prepare_report.replaced_modules <= 0:
             raise ValueError(
@@ -1677,6 +1717,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             tensor_handlers=handlers,
         )
         self._compressed_weights_report = prepare_report
+        self._bind_compressed_expert_runtime_policy()
         if prepare_report.grouped_expert_modules > 0:
             for module_name, module in list(self.transformer.named_modules()):
                 if isinstance(module, CompressedGroupedExperts) and not module.is_fully_loaded():
@@ -1746,6 +1787,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         )
         if prepared.replaced_modules <= 0 or report.replaced_modules <= 0:
             raise ValueError("LingBot-Video packed compressed_weights state contained no modules.")
+        self._bind_compressed_expert_runtime_policy()
         self._synchronize_packed_expert_topology()
         missing = [
             key
@@ -2065,8 +2107,6 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         return self._flow_shift_policy.shifts_for_token_counts(counts)
 
     def prepare_model_timesteps(self, timesteps: Any, *, latents: Any) -> Any:
-        if not self._flow_shift_policy.enabled:
-            return timesteps
         clean = _as_lingbot_latents(
             latents,
             self.transformer_config,
@@ -2077,9 +2117,11 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             dtype=clean.dtype,
             device=clean.device,
         ).reshape(clean.shape[0])
-        shifts = self._flow_shifts_for_latents(clean).to(
-            dtype=timestep_tensor.dtype
-        )
+        shifts: Any = float(self.model_config.params.flow_shift)
+        if self._flow_shift_policy.enabled:
+            shifts = self._flow_shifts_for_latents(clean).to(
+                dtype=timestep_tensor.dtype
+            )
         return shifted_sigma(
             clamp_timesteps(timestep_tensor, 1e-5),
             shifts,
@@ -2155,24 +2197,16 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             encoder_hidden_states,
             encoder_attention_mask,
         )
-        runtime_sigmas = (
-            timestep_tensor.detach().float().clamp(1e-5, 1.0 - 1e-5)
-            if self._flow_shift_policy.enabled
-            else None
-        )
+        # ``forward`` receives the model-conditioning coordinate. Both constant
+        # and dynamic training paths now pass post-shift sigma, as do inference
+        # solvers, so downstream timestep-aware policies must consume it as-is.
+        runtime_sigmas = timestep_tensor.detach().float().clamp(1e-5, 1.0 - 1e-5)
         timestep_adapter_stats = self._sync_timestep_adapter_masks(
             timestep_tensor,
             sigmas=runtime_sigmas,
         )
         if self._timestep_capacity_policy.enabled:
-            self._expert_choice_runtime_sigmas = (
-                runtime_sigmas
-                if runtime_sigmas is not None
-                else shifted_sigma(
-                    clamp_timesteps(timestep_tensor.detach().float(), 1e-5),
-                    float(self.model_config.params.flow_shift),
-                )
-            )
+            self._expert_choice_runtime_sigmas = runtime_sigmas
             self._expert_choice_runtime_flow_shifts = (
                 self._flow_shifts_for_latents(latents)
                 if self._flow_shift_policy.enabled
@@ -2817,6 +2851,10 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 "Dynamic top-k requires moe_dynamic_topk_min <= "
                 "moe_dynamic_topk_average <= experts_per_token."
             )
+        if self._moe_routing_mode == "expert_choice" and dynamic_min > 0:
+            errors.append(
+                "Expert-Choice routing cannot be combined with token-choice dynamic top-k."
+            )
         if float(params.moe_bias_update_rate) < 0.0:
             errors.append("model.params.moe_bias_update_rate must be >= 0.")
         hidden = int(self.transformer_config.get("hidden_size", 0))
@@ -2915,16 +2953,6 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             adapter_allocation_policy=True,
             adapter_initialization=True,
             adapter_training_policy=True,
-            lightweight_expert_pool=True,
-            grouped_adjugate_experts=True,
-            progressive_sparsification=True,
-            chain_of_experts=True,
-            balance_loss_schedule=True,
-            decoupled_router_input=True,
-            dynamic_flow_shift=True,
-            saliency_guided_routing=True,
-            mixture_of_depths=True,
-            native_inference=True,
         )
 
     def uses_previous_clean_routing_guidance(self) -> bool:
@@ -3804,60 +3832,71 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
     def set_expert_choice_progress(self, *, step: int) -> None:
         self._expert_choice_step = int(step)
 
-    def configure_training_policy(self, name: str, policy: Any) -> None:
-        policy_name = str(name).strip().lower()
-        if configure_lingbot_depth_policy(
-            self,
-            policy_name=policy_name,
-            policy=policy,
-        ):
-            return
-        if configure_lingbot_dispersive_loss(
-            self,
-            policy_name=policy_name,
-            policy=policy,
-        ):
-            return
-        if configure_lingbot_simbal(
-            self,
-            policy_name=policy_name,
-            policy=policy,
-        ):
-            return
-        if policy_name == "preemptive_monitoring":
-            if not isinstance(policy, PreemptiveAttentionMonitor):
-                raise TypeError(
-                    "preemptive_monitoring requires PreemptiveAttentionMonitor."
+    def configure_mixture_of_depths(self, policy: MixtureOfDepthsSpec) -> None:
+        configure_lingbot_depth_policy(self, policy)
+
+    def configure_dispersive_loss(self, policy: DispersiveLossController) -> None:
+        configure_lingbot_dispersive_loss(self, policy)
+
+    def configure_simbal(self, policy: SimBalController) -> None:
+        configure_lingbot_simbal(self, policy)
+
+    def configure_preemptive_monitoring(
+        self, policy: PreemptiveAttentionMonitor
+    ) -> None:
+        self._preemptive_attention_monitor = policy
+
+    def configure_moe_token_chunking(self, policy: MoETokenChunkPolicy) -> None:
+        for block in self.transformer.blocks:
+            setter = getattr(block.ffn, "set_token_chunk_policy", None)
+            if not callable(setter):
+                raise ValueError(
+                    "LingBot-Video MoE block does not expose token chunking."
                 )
-            self._preemptive_attention_monitor = policy
-            return
-        if policy_name == "moe_token_chunking":
-            if not isinstance(policy, MoETokenChunkPolicy):
-                raise TypeError(
-                    "moe_token_chunking requires MoETokenChunkPolicy."
-                )
-            for block in self.transformer.blocks:
-                setter = getattr(block.ffn, "set_token_chunk_policy", None)
-                if not callable(setter):
-                    raise ValueError(
-                        "LingBot-Video MoE block does not expose token chunking."
-                    )
-                setter(policy)
-            return
-        if configure_lingbot_domain_expert_specialization(self, policy_name, policy):
-            return
-        if configure_lingbot_router_distillation(self, policy_name=policy_name, policy=policy):
-            return
-        if configure_lingbot_router_stage_policy(
-            self, policy_name=policy_name, policy=policy
-        ):
-            return
-        if configure_lingbot_route_policy(
-            self, policy_name=policy_name, policy=policy
-        ):
-            return
-        if policy_name != "dataset_routing" or not isinstance(policy, DatasetRoutingPolicy):
-            return super().configure_training_policy(name, policy)
+            setter(policy)
+
+    def configure_domain_expert_specialization(
+        self, policy: DomainExpertSpecializationController
+    ) -> None:
+        configure_lingbot_domain_expert_specialization(self, policy)
+
+    def configure_router_distillation(
+        self, policy: RouterDistillationController
+    ) -> None:
+        configure_lingbot_router_distillation(self, policy)
+
+    def configure_router_stage_schedule(
+        self, policy: RouterStageScheduleController
+    ) -> None:
+        configure_lingbot_router_stage_policy(self, policy)
+
+    def configure_diversity_routing(
+        self, policy: DiversityAwareRoutingController
+    ) -> None:
+        configure_lingbot_diversity_routing(self, policy)
+
+    def configure_expert_dropout(self, policy: ExpertDropoutController) -> None:
+        configure_lingbot_expert_dropout(self, policy)
+
+    def configure_router_temperature(
+        self, policy: RouterTemperatureController
+    ) -> None:
+        configure_lingbot_router_temperature(self, policy)
+
+    def configure_selective_sinkhorn(
+        self, policy: SelectiveSinkhornController
+    ) -> None:
+        configure_lingbot_selective_sinkhorn(self, policy)
+
+    def configure_prototypical_routing(
+        self, policy: PrototypicalRoutingSpec
+    ) -> None:
+        configure_lingbot_prototypical_routing(self, policy)
+
+    def configure_sharp_moe(self, policy: SharpMoESpec) -> None:
+        configure_lingbot_sharp_moe(self, policy)
+
+    def configure_dataset_routing(self, policy: DatasetRoutingPolicy) -> None:
         errors = policy.validate_model_contract(
             num_experts=int(self.transformer_config.get("num_experts", 0)),
             top_k=int(self.transformer_config.get("num_experts_per_tok", 0)),
@@ -3866,11 +3905,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             raise ValueError("Invalid LingBot dataset routing policy:\n- " + "\n- ".join(errors))
         self._dataset_routing_policy = policy
 
-    def set_training_policy_context(self, name: str, context: Any) -> None:
-        if str(name).strip().lower() != "dataset_routing" or not isinstance(
-            context, DatasetRoutingBatch
-        ):
-            return super().set_training_policy_context(name, context)
+    def set_dataset_routing_context(self, context: DatasetRoutingBatch) -> None:
         domains = context.domains
         step = context.step
         training = context.training
@@ -3971,10 +4006,114 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 kl_weight=float(policy.kl_weight),
             )
 
+    def _mutable_routing_state_dict(
+        self,
+        *,
+        include_router_bias: bool = True,
+    ) -> dict[str, Any]:
+        state: dict[str, Any] = {}
+        if include_router_bias:
+            for name, module in self.transformer.named_modules():
+                if isinstance(module, LingBotVideoRouter):
+                    state[f"moe_router_bias.{name}"] = (
+                        module.e_score_correction_bias.detach().cpu().clone()
+                    )
+        self._ensure_router_fp32_master()
+        if self._router_fp32_master:
+            for name, tensor in self._router_fp32_master.state_dict().items():
+                state[f"router_fp32_master.{name}"] = tensor
+        if self._routing_health_enabled:
+            state.update(router_drift_checkpoint_state(self._router_drift_tracker))
+        state.update(
+            phi_balance_state.optional_phi_balance_checkpoint_state(
+                self._phi_balance_controller
+            )
+        )
+        return state
+
+    def _load_mutable_routing_state(self, state: dict[str, Any]) -> None:
+        modules = dict(self.transformer.named_modules())
+        adapter_type = str(state.get("adapter_type", "lora")).strip().lower()
+        checkpoint_owned = str(state.get("model_type", "")).strip().lower() == "lingbot-video"
+        require_router_bias = (
+            adapter_type not in {"selected_expert", "sparse_delta"}
+            or self._moe_bias_update_rate > 0.0
+        )
+        expected_bias_keys = (
+            {
+                f"moe_router_bias.{name}"
+                for name, module in modules.items()
+                if isinstance(module, LingBotVideoRouter)
+            }
+            if require_router_bias
+            else set()
+        )
+        provided_bias_keys = {
+            str(key) for key in state if str(key).startswith("moe_router_bias.")
+        }
+        if checkpoint_owned and provided_bias_keys != expected_bias_keys:
+            missing = sorted(expected_bias_keys - provided_bias_keys)
+            extra = sorted(provided_bias_keys - expected_bias_keys)
+            raise ValueError(
+                "Mutable router-bias state must match the configured routers "
+                f"exactly (missing={missing[:4]}, extra={extra[:4]})."
+            )
+        with torch.no_grad():
+            for key, value in state.items():
+                if not str(key).startswith("moe_router_bias."):
+                    continue
+                name = str(key)[len("moe_router_bias.") :]
+                router = modules.get(name)
+                if not isinstance(router, LingBotVideoRouter):
+                    raise ValueError(
+                        f"Adapter state contains correction bias for unknown router '{name}'."
+                    )
+                tensor = torch.as_tensor(value).to(
+                    device=router.e_score_correction_bias.device,
+                    dtype=router.e_score_correction_bias.dtype,
+                )
+                if tensor.shape != router.e_score_correction_bias.shape:
+                    raise ValueError(
+                        f"Router correction bias '{name}' has shape {tuple(tensor.shape)}, "
+                        f"expected {tuple(router.e_score_correction_bias.shape)}."
+                    )
+                router.e_score_correction_bias.copy_(tensor)
+        prefix = "router_fp32_master."
+        master_state = {
+            str(key)[len(prefix) :]: value
+            for key, value in state.items()
+            if str(key).startswith(prefix)
+        }
+        self._ensure_router_fp32_master()
+        expected_master_keys = (
+            set(self._router_fp32_master.state_dict())
+            if self._router_fp32_master
+            else set()
+        )
+        if checkpoint_owned and set(master_state) != expected_master_keys:
+            missing = sorted(expected_master_keys - set(master_state))
+            extra = sorted(set(master_state) - expected_master_keys)
+            raise ValueError(
+                "Router FP32-master state must match the configured trainable "
+                f"routers exactly (missing={missing[:4]}, extra={extra[:4]})."
+            )
+        if self._router_fp32_master:
+            self._router_fp32_master.load_state_dict(master_state)
+        load_router_drift_checkpoint_state(self._router_drift_tracker, state)
+        phi_balance_state.load_optional_phi_balance_checkpoint_state(
+            self._phi_balance_controller, state
+        )
+
     def load_adapter_state(self, state: dict[str, Any]) -> None:
         payload = state.get("adapter_state") if isinstance(state, dict) else None
         if isinstance(payload, dict):
             state = payload
+        if isinstance(state, dict) and state.get("adapter_type") in {
+            "selected_expert",
+            "sparse_delta",
+        }:
+            self.load_state_dict(state)
+            return
         if self._lora_report is None:
             raise ValueError(
                 "LingBot-Video adapter config must be applied before loading "
@@ -4016,43 +4155,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             }
             if gate_state:
                 self._tc_gate.load_state_dict(gate_state)
-        modules = dict(self.transformer.named_modules())
-        with torch.no_grad():
-            for key, value in state.items():
-                if not str(key).startswith("moe_router_bias."):
-                    continue
-                name = str(key)[len("moe_router_bias.") :]
-                router = modules.get(name)
-                if not isinstance(router, LingBotVideoRouter):
-                    raise ValueError(
-                        f"Adapter state contains correction bias for unknown router '{name}'."
-                    )
-                tensor = torch.as_tensor(value).to(
-                    device=router.e_score_correction_bias.device,
-                    dtype=router.e_score_correction_bias.dtype,
-                )
-                if tensor.shape != router.e_score_correction_bias.shape:
-                    raise ValueError(
-                        f"Router correction bias '{name}' has shape {tuple(tensor.shape)}, "
-                        f"expected {tuple(router.e_score_correction_bias.shape)}."
-                    )
-                router.e_score_correction_bias.copy_(tensor)
-        # fp32 router master (opt-in): restore masters and re-materialize the
-        # working copies so resume continues the sub-ULP accumulation exactly.
-        prefix = "router_fp32_master."
-        master_state = {
-            str(key)[len(prefix) :]: value
-            for key, value in state.items()
-            if str(key).startswith(prefix)
-        }
-        if master_state:
-            self._ensure_router_fp32_master()
-            if self._router_fp32_master:
-                self._router_fp32_master.load_state_dict(master_state)
-        load_router_drift_checkpoint_state(self._router_drift_tracker, state)
-        phi_balance_state.load_optional_phi_balance_checkpoint_state(
-            self._phi_balance_controller, state
-        )
+        self._load_mutable_routing_state(state)
 
     def get_adapter_quantization_modules(self) -> list[Any]:
         return [module for _, module in iter_lora_modules(self.transformer)]
@@ -4100,7 +4203,14 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 or isinstance(module, CompressedGroupedExperts)
             ):
                 continue
-            for tensor_name, role in (("w1", "gate"), ("w2", "down"), ("w3", "up")):
+            execution_spec = getattr(
+                module,
+                "mirai_expert_mlp_spec",
+                LINGBOT_EXPERT_MLP_EXECUTION_SPEC,
+            )
+            for projection in execution_spec.projections:
+                tensor_name = projection.tensor_name
+                role = projection.role
                 specs.append(
                     ExpertTensorSpec(
                         name=f"{module_name}.{tensor_name}",
@@ -4139,6 +4249,14 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                         module.enable_int8_weight()
         access = _expert_access_from_policy(policy)
         self._moe_optimization_policy = policy
+        if (
+            float(policy.expert_device_cache_gib) > 0.0
+            and self._frozen_weight_quantization != "int8"
+        ):
+            raise ValueError(
+                "memory.expert_device_cache_gib > 0 requires "
+                "memory.frozen_weight_quantization='int8'."
+            )
         if policy.kernel_backend == "megablocks" and access != "full_dequant":
             raise ValueError(
                 "LingBot-Video MegaBlocks requires expert_weight_access='full_dequant'; "
@@ -4195,12 +4313,18 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         self._device_residency_planner = DeviceResidencyPlanner(
             int(policy.device_residency_budget_gib * (1024**3))
         )
-        device_cache = ExpertDeviceCache(
+        self._expert_device_cache = ExpertDeviceCache(
             int(policy.expert_device_cache_gib * (1024**3))
         )
         self._device_residency_planner.replace(
-            "expert_device_cache", device_cache.snapshot()["capacity_bytes"]
+            "expert_device_cache",
+            self._expert_device_cache.snapshot()["capacity_bytes"],
         )
+        self._bind_compressed_expert_runtime_policy()
+
+    def _bind_compressed_expert_runtime_policy(self) -> None:
+        policy = self._moe_optimization_policy
+        access = _expert_access_from_policy(policy)
         for module_name, module in self.transformer.named_modules():
             if isinstance(module, (CompressedGroupedExperts, MixedPrecisionGroupedExperts)):
                 module.set_expert_weight_access_policy(
@@ -4209,7 +4333,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 )
                 bind_cache = getattr(module, "bind_expert_device_cache", None)
                 if callable(bind_cache):
-                    bind_cache(device_cache, namespace=module_name)
+                    bind_cache(self._expert_device_cache, namespace=module_name)
 
     def enable_quantized_frozen_weights(
         self,
@@ -4328,11 +4452,15 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             rotation_checkpoint_interval=rotation_checkpoint_interval,
             rotation_device=rotation_device,
             rotation_max_workspace_gib=rotation_max_workspace_gib,
+            expert_mlp_execution_spec=get_model_family_provider(
+                "lingbot-video"
+            ).expert_mlp_execution_spec,
         )
         combined = combine_compressed_weights_reports(self._compressed_weights_report, report)
         if combined is None or combined.replaced_modules <= 0:
             raise ValueError("LingBot-Video compressed_weights found no quantizable frozen weights.")
         self._compressed_weights_report = combined
+        self._bind_compressed_expert_runtime_policy()
         if precision_plan_path:
             mixed_backend = build_moe_kernel_backend(
                 "torch_chunked",
@@ -4773,6 +4901,21 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 dtype=self._compute_autocast_dtype,
             )
 
+    def discard_optimizer_step(self) -> None:
+        """Discard mutable state accumulated by a skipped optimizer step."""
+        self._pending_router_loads = {}
+        master = self._router_fp32_master
+        if master:
+            master.clear_working_grads()
+        if self._global_batch_load_accumulator is not None:
+            self._global_batch_load_accumulator.reset()
+        if self._trainable_parameter_offload:
+            move_trainable_tensors(
+                self.transformer,
+                device="cpu",
+                dtype=self._compute_autocast_dtype,
+            )
+
     def _global_batch_prime_injected_fractions(self) -> None:
         """Set each router's injected load fraction from the window-so-far.
 
@@ -4876,6 +5019,11 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             state.update(export_adjugate_expert_state(self.transformer))
             state.update(export_prototypical_routing_state(self.transformer))
             state.update(export_sharp_moe_state(self.transformer))
+            state.update(
+                self._mutable_routing_state_dict(
+                    include_router_bias=self._moe_bias_update_rate > 0.0
+                )
+            )
             return state
         if self._sparse_delta_tuning:
             state: dict[str, Any] = {
@@ -4893,17 +5041,17 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             state.update(export_adjugate_expert_state(self.transformer))
             state.update(export_prototypical_routing_state(self.transformer))
             state.update(export_sharp_moe_state(self.transformer))
+            state.update(
+                self._mutable_routing_state_dict(
+                    include_router_bias=self._moe_bias_update_rate > 0.0
+                )
+            )
             return state
         if self._lora_report is not None:
             state = lora_state_dict(
                 self.transformer,
                 sparse_expert_export=self._sparse_expert_export,
             )
-            for name, module in self.transformer.named_modules():
-                if isinstance(module, LingBotVideoRouter):
-                    state[f"moe_router_bias.{name}"] = (
-                        module.e_score_correction_bias.detach().cpu().clone()
-                    )
             state.update(export_lightweight_expert_state(self.transformer))
             state.update(export_adjugate_expert_state(self.transformer))
             state.update(export_decoupled_routing_state(self.transformer))
@@ -4915,20 +5063,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 # module, so lora_state_dict skips them). Round-trips on resume.
                 for gate_key, gate_value in self._tc_gate.state_dict().items():
                     state[f"tc_gate.{gate_key}"] = gate_value.detach().cpu().clone()
-            # fp32 router master (opt-in): persist so resume is exact — the bf16
-            # working copy alone would have dropped the sub-ULP fraction that had
-            # accumulated in the master. Absent when the feature is inert.
-            self._ensure_router_fp32_master()
-            if self._router_fp32_master:
-                for name, tensor in self._router_fp32_master.state_dict().items():
-                    state[f"router_fp32_master.{name}"] = tensor
-            if self._routing_health_enabled:
-                state.update(router_drift_checkpoint_state(self._router_drift_tracker))
-            state.update(
-                phi_balance_state.optional_phi_balance_checkpoint_state(
-                    self._phi_balance_controller
-                )
-            )
+            state.update(self._mutable_routing_state_dict())
             state["model_type"] = "lingbot-video"
             state["adapter_type"] = self._adapter_type
             state["target_preset"] = self._lora_report.target_preset
@@ -5004,24 +5139,44 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             load_adjugate_expert_state(self.transformer, state)
             load_prototypical_routing_state(self.transformer, state)
             load_sharp_moe_state(self.transformer, state)
+            self._load_mutable_routing_state(state)
             return None
         if isinstance(state, dict) and state.get("adapter_type") == "sparse_delta":
             modules = dict(self.transformer.named_modules())
-            for key, value in state.items():
-                if not key.startswith("sparse_delta.") or not key.endswith(".values"):
-                    continue
-                name = key[len("sparse_delta.") : -len(".values")]
-                module = modules.get(name)
-                if not isinstance(module, SparseDeltaLinear):
-                    raise ValueError(
-                        f"Sparse-delta checkpoint target '{name}' is not configured."
-                    )
+            sparse_modules = {
+                name: module
+                for name, module in modules.items()
+                if isinstance(module, SparseDeltaLinear)
+            }
+            expected_keys = {
+                f"sparse_delta.{name}.{field}"
+                for name in sparse_modules
+                for field in ("values", "indices")
+            }
+            provided_keys = {
+                str(key) for key in state if str(key).startswith("sparse_delta.")
+            }
+            if provided_keys != expected_keys:
+                missing = sorted(expected_keys - provided_keys)
+                extra = sorted(provided_keys - expected_keys)
+                raise ValueError(
+                    "Sparse-delta checkpoint must contain every configured target "
+                    f"exactly (missing={missing[:4]}, extra={extra[:4]})."
+                )
+            for name, module in sorted(sparse_modules.items()):
+                key = f"sparse_delta.{name}.values"
+                value = state[key]
                 indices_key = f"sparse_delta.{name}.indices"
-                if indices_key not in state or not torch.equal(
-                    module.indices.cpu(), state[indices_key].cpu()
+                indices = state[indices_key]
+                if not isinstance(indices, torch.Tensor) or not torch.equal(
+                    module.indices.cpu(), indices.cpu()
                 ):
                     raise ValueError(
                         f"Sparse-delta support mismatch for target '{name}'."
+                    )
+                if not isinstance(value, torch.Tensor) or value.shape != module.values.shape:
+                    raise ValueError(
+                        f"Sparse-delta values shape mismatch for target '{name}'."
                     )
                 module.values.data.copy_(
                     value.to(device=module.values.device, dtype=module.values.dtype)
@@ -5029,6 +5184,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             load_adjugate_expert_state(self.transformer, state)
             load_prototypical_routing_state(self.transformer, state)
             load_sharp_moe_state(self.transformer, state)
+            self._load_mutable_routing_state(state)
             return None
         adapter_payload = state.get("adapter_state") if isinstance(state, dict) else None
         if isinstance(adapter_payload, dict):
@@ -5046,4 +5202,6 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         return super().load_state_dict(state, strict=bool(strict))
 
 
-register_model_family_provider("lingbot-video", LingBotVideoModelFamilyProvider("lingbot-video"))
+_lingbot_provider = LingBotVideoModelFamilyProvider("lingbot-video")
+_lingbot_provider.pipeline_type = LingBotVideoPipeline
+register_model_family_provider("lingbot-video", _lingbot_provider)

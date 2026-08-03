@@ -66,7 +66,7 @@ class MixtureOfDepthsTrainingPolicy(TrainingPolicy):
         self.spec = spec.validate()
 
     def configure_pipeline(self, pipeline: Any) -> None:
-        pipeline.configure_training_policy(self.name, self.spec)
+        pipeline.configure_mixture_of_depths(self.spec)
 
     def checkpoint_metadata(self) -> Mapping[str, Any]:
         return {

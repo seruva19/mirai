@@ -30,6 +30,35 @@ def build_training_runtime_overrides() -> TrainingRuntimeOverrides:
     return TrainingRuntimeOverrides()
 
 
+def training_runtime_overrides_state_dict(
+    overrides: TrainingRuntimeOverrides,
+) -> dict[str, int | None]:
+    return {
+        "sample_every_n_steps_override": overrides.sample_every_n_steps_override,
+        "val_every_n_steps_override": overrides.val_every_n_steps_override,
+    }
+
+
+def load_training_runtime_overrides_state(
+    overrides: TrainingRuntimeOverrides,
+    state: Any,
+) -> None:
+    if not isinstance(state, dict):
+        return
+    for key in (
+        "sample_every_n_steps_override",
+        "val_every_n_steps_override",
+    ):
+        value = state.get(key)
+        if value is not None:
+            value = int(value)
+            if value < 0:
+                raise ValueError(
+                    f"Checkpoint runtime override '{key}' must be non-negative."
+                )
+        setattr(overrides, key, value)
+
+
 def resolve_effective_sample_every_n_steps(session: Any) -> int:
     override = getattr(session.runtime_overrides, "sample_every_n_steps_override", None)
     if override is not None:

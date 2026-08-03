@@ -25,7 +25,7 @@ from mirai.core.models.compressed_weights.packed.packed_storage_alignment import
     GDS_STORAGE_ALIGNMENT_BYTES,
 )
 from mirai.core.models.providers import load_configured_model_provider_module
-from mirai.core.registry import ModelRegistry
+from mirai.core.models.providers import get_model_family_provider
 from mirai.core.training.trainer import _instantiate_model_pipeline
 from mirai.core.training.runtime.gpu_lease import acquire_gpu_lease
 from mirai.core.training.runtime.gpu_lease import resolve_lease_lock_path
@@ -90,7 +90,10 @@ def export_compressed_weights_packed_state_from_config(
         entrypoint="export-compressed-weights",
     )
 
-    model_cls = ModelRegistry.get(config.model.type)
+    provider = get_model_family_provider(config.model.type)
+    if provider is None:
+        raise ValueError(f"Unknown model family '{config.model.type}'.")
+    model_cls = provider.require_pipeline_type()
     pipeline = _instantiate_model_pipeline(model_cls, config)
     caps = pipeline.get_memory_feature_capabilities()
     if not bool(caps.quantized_frozen_weights):

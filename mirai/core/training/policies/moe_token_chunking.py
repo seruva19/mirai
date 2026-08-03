@@ -26,7 +26,7 @@ class MoETokenChunkTrainingPolicy(TrainingPolicy):
             raise ValueError(
                 "training.moe_token_chunk_size requires a native sparse-MoE model."
             )
-        pipeline.configure_training_policy(self.name, self.controller)
+        pipeline.configure_moe_token_chunking(self.controller)
 
     def checkpoint_metadata(self) -> dict[str, Any]:
         return {"token_chunk_size": int(self.controller.token_chunk_size)}

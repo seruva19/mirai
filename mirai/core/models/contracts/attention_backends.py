@@ -105,6 +105,53 @@ def test_external_fixed_and_varlen_dispatch_use_registered_interfaces(
     )
 
 
+def test_auto_varlen_falls_back_to_sdpa_with_output_and_gradient_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(227)
+    values = [
+        torch.randn(7, 3, 8, dtype=torch.float64, requires_grad=True)
+        for _ in range(3)
+    ]
+    references = [value.detach().clone().requires_grad_(True) for value in values]
+    cu = torch.tensor([0, 2, 7], dtype=torch.int32)
+
+    original_status = attention.attention_backend_status
+
+    def no_external(name: str, **kwargs: object) -> AttentionBackendStatus:
+        if name in {"flash3", "flash4"}:
+            return AttentionBackendStatus(name, False, "missing test kernel", None)
+        return original_status(name, **kwargs)
+
+    monkeypatch.setattr(attention, "attention_backend_status", no_external)
+    observed = attention.dispatch_varlen_attention(
+        *values,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=5,
+        max_seqlen_k=5,
+        backend="auto",
+    )
+    expected = torch.cat(
+        [
+            attention.dispatch_attention(
+                references[0][start:end].unsqueeze(0),
+                references[1][start:end].unsqueeze(0),
+                references[2][start:end].unsqueeze(0),
+                backend="auto",
+            ).squeeze(0)
+            for start, end in ((0, 2), (2, 7))
+        ],
+        dim=0,
+    )
+    observed.square().mean().backward()
+    expected.square().mean().backward()
+
+    torch.testing.assert_close(observed, expected, rtol=0.0, atol=0.0)
+    for value, reference in zip(values, references):
+        torch.testing.assert_close(value.grad, reference.grad, rtol=0.0, atol=0.0)
+
+
 def test_unavailable_explicit_backend_fails_with_probe_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,4 +1,4 @@
-preset = "lingbot_video_offload"
+preset = "lingbot_video"
 
 [model]
 path = "./models/lingbot-video-moe-30b-a3b"

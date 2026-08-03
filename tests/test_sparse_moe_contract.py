@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ from mirai.config.schema import (
 )
 from mirai.core.builtins import register_builtin_components
 from mirai.core.models.lingbot_video.pipeline import LingBotVideoPipeline
+from mirai.core.models.lingbot_video.router_runtime import _routing_stats
 from mirai.core.models.providers import get_model_family_provider
 from mirai.core.models.testbed import TinySparseMoEDenoiser
 from mirai.core.moe.calibration.pruning import ExpertPruningRoutedOutputObserver
@@ -84,6 +86,34 @@ class SparseMoEContractTests(unittest.TestCase):
         self.assertEqual(decision.stats.tokens, 10)
         self.assertEqual(len(decision.stats.expert_fraction), 3)
 
+    def test_native_routing_entropy_uses_assignment_distribution(self) -> None:
+        router = LingBotVideoRouter(
+            hidden_size=4,
+            num_experts=3,
+            top_k=2,
+            score_func="softmax",
+            norm_topk_prob=True,
+            n_group=None,
+            topk_group=None,
+            route_scale=7.0,
+        )
+        router.last_top_indices = torch.tensor([[0, 0], [0, 1], [0, 2]])
+        router.last_top_scores = torch.tensor(
+            [[6.0, 1.0], [3.5, 3.5], [0.25, 6.75]]
+        )
+        router.last_scores = torch.tensor(
+            [[0.9, 0.05, 0.05], [0.8, 0.1, 0.1], [0.7, 0.15, 0.15]]
+        )
+
+        stats = _routing_stats(torch.nn.Sequential(router))[0]
+        expected_fractions = (4.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0)
+        expected_entropy = -sum(
+            fraction * math.log(fraction) for fraction in expected_fractions
+        )
+
+        self.assertEqual(stats.tokens_per_expert, (4, 1, 1))
+        self.assertAlmostEqual(stats.routing_entropy, expected_entropy)
+
     def test_cpu_bfloat16_testbed_accepts_float32_inputs(self) -> None:
         config = self._lingbot_tiny_config().model
         model = TinySparseMoEDenoiser(config).to(dtype=torch.bfloat16)
@@ -133,6 +163,11 @@ class SparseMoEContractTests(unittest.TestCase):
         self.assertEqual(float(decision.load_balance_loss.detach()), 0.0)
         self.assertEqual(decision.stats.tokens, 12)
         self.assertEqual(decision.stats.selected_tokens, 18)
+        self.assertEqual(
+            decision.stats.tokens_per_expert,
+            (6, 6, 6),
+        )
+        self.assertAlmostEqual(decision.stats.routing_entropy, math.log(3.0))
         self.assertEqual(decision.coverage.capacity_per_expert, 3)
         self.assertEqual(
             decision.coverage.covered_tokens + decision.coverage.uncovered_tokens,
@@ -171,6 +206,28 @@ class SparseMoEContractTests(unittest.TestCase):
                 self.assertAlmostEqual(sum(selected_weights), 1.0, places=6)
         self.assertEqual(decision.coverage.per_sample_covered_tokens[0], 3)
         self.assertGreaterEqual(decision.coverage.multiply_selected_tokens, 1)
+
+    def test_expert_choice_padding_is_excluded_from_assignment_stats(self) -> None:
+        logits = torch.tensor(
+            [
+                [[20.0, -20.0, -20.0]] * 4,
+                [[20.0, -20.0, -20.0]] * 4,
+            ]
+        )
+        decision = route_expert_choice_logits(
+            logits,
+            capacity_factor=1.0,
+            capacity_per_sample=torch.tensor([1, 2]),
+            route_scale=1.0,
+            layer_name="expert_choice.padding",
+            output_dtype=torch.float32,
+        )
+
+        self.assertEqual(decision.stats.selected_tokens, 9)
+        self.assertEqual(decision.stats.tokens_per_expert, (3, 3, 3))
+        self.assertEqual(decision.stats.dead_experts, 0)
+        self.assertAlmostEqual(decision.stats.routing_entropy, math.log(3.0))
+        self.assertLess(decision.coverage.coverage_fraction, 1.0)
 
     def test_expert_choice_ffn_preserves_shape_and_aux_loss(self) -> None:
         layer = ExpertChoiceMoEFeedForward(

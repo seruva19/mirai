@@ -10,16 +10,11 @@ from mirai.core.moe.adaptation.router_training import RouterAdapterBinding
 
 def configure_lingbot_router_stage_policy(
     pipeline: Any,
-    *,
-    policy_name: str,
-    policy: Any,
-) -> bool:
-    if policy_name != "router_stage_schedule" or not isinstance(
-        policy, RouterStageScheduleController
-    ):
-        return False
+    policy: RouterStageScheduleController,
+) -> None:
+    if not isinstance(policy, RouterStageScheduleController):
+        raise TypeError("router_stage_schedule requires RouterStageScheduleController.")
     pipeline._router_stage_schedule_controller = policy
-    return True
 
 
 def bind_lingbot_router_stage_policy(

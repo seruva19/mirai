@@ -74,7 +74,7 @@ class DomainExpertSpecializationTrainingPolicy(TrainingPolicy):
         self.metadata_key = str(metadata_key)
 
     def configure_pipeline(self, pipeline: Any) -> None:
-        pipeline.configure_training_policy(self.name, self.controller)
+        pipeline.configure_domain_expert_specialization(self.controller)
 
     def validate_records(self, records) -> list[str]:
         missing = sum(

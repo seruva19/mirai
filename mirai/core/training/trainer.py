@@ -7,10 +7,12 @@ from typing import Any
 
 from mirai.config.runtime_policy import validate_native_backend_availability
 from mirai.config.schema import TrainingConfig
-from mirai.core.models.providers import load_configured_model_provider_module
+from mirai.core.models.providers import (
+    get_model_family_provider,
+    load_configured_model_provider_module,
+)
 from mirai.core.registry import (
     LossRegistry,
-    ModelRegistry,
     ObjectiveRegistry,
     StrategyRegistry,
 )
@@ -62,8 +64,22 @@ class Trainer:
         load_training_policy_modules(
             getattr(config.training, "policy_modules", ())
         )
+        provider = get_model_family_provider(config.model.type)
+        if provider is None:
+            raise ValueError(
+                f"Model family '{config.model.type}' has no registered provider."
+            )
+        family_param_errors = provider.validate_family_params(
+            dict(getattr(config.model.params, "family_params", {}) or {})
+        )
+        if family_param_errors:
+            joined = "\n".join(f"- {message}" for message in family_param_errors)
+            raise ValueError(
+                "[trainer] Model-family parameter validation failed before "
+                f"pipeline construction:\n{joined}"
+            )
         validate_native_backend_availability(config, entrypoint="trainer")
-        model_cls = ModelRegistry.get(config.model.type)
+        model_cls = provider.require_pipeline_type()
         strategy_cls = StrategyRegistry.get(config.strategy.type)
         self.loss_fn = LossRegistry.get(config.training.loss_function)
         self.objective = ObjectiveRegistry.get(config.training.objective)()
@@ -443,13 +459,19 @@ class Trainer:
         return self._activation_offload_session.diagnostics()
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            raise ValueError("Checkpoint trainer_state must be a mapping.")
         self.pipeline.load_state_dict(state.get("pipeline", {}))
         timestep_sampler_state = state.get("timestep_sampler")
         if isinstance(timestep_sampler_state, dict):
             self.timestep_sampler.load_state_dict(timestep_sampler_state)
+        else:
+            raise ValueError("Checkpoint trainer_state has no timestep sampler state.")
         noise_state = state.get("noise_generator")
         if isinstance(noise_state, dict):
             self.noise_generator.load_state_dict(noise_state)
+        else:
+            raise ValueError("Checkpoint trainer_state has no noise-generator state.")
         policy_state = state.get("training_policies")
         if isinstance(policy_state, dict):
             self.training_policies.load_state_dict(policy_state)

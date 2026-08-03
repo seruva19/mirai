@@ -54,7 +54,7 @@ class ExpertDropoutTrainingPolicy(TrainingPolicy):
         self.controller = controller
 
     def configure_pipeline(self, pipeline: Any) -> None:
-        pipeline.configure_training_policy(self.name, self.controller)
+        pipeline.configure_expert_dropout(self.controller)
 
     def augment_batch(self, context: BatchAugmentContext) -> Mapping[str, Any]:
         return {EXPERT_DROPOUT_STEP_BATCH_KEY: int(context.step)}

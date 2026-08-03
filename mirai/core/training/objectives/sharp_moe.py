@@ -128,20 +128,24 @@ class SharpMoETrajectoryObjective(FlowMatchingObjective):
                 inputs.noise,
                 step_timesteps,
             )
+            model_timesteps = pipeline.prepare_model_timesteps(
+                step_timesteps,
+                latents=inputs.clean_latents,
+            )
             guidance = noisy.detach() if previous_clean is None else previous_clean
             extra = dict(inputs.extra_forward_kwargs)
             extra["routing_guidance_latents"] = guidance
             step_inputs = replace(
                 inputs,
                 noisy_latents=noisy,
-                timestep=step_timesteps,
+                timestep=model_timesteps,
                 objective_timestep=step_timesteps,
                 extra_forward_kwargs=extra,
             )
             prediction = predict(step_inputs)
             previous_clean = (
                 noisy
-                - _broadcast_timesteps(step_timesteps, prediction) * prediction
+                - _broadcast_timesteps(model_timesteps, prediction) * prediction
             ).detach()
             predictions.append(prediction)
             prepared_inputs.append(step_inputs)

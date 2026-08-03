@@ -5,6 +5,7 @@ import unittest
 from mirai.config.schema import ModelConfig, ModelParams, StrategyConfig, TrainingConfig, TrainingSection
 from mirai.core.builtins import register_builtin_components
 from mirai.core.parity.gradient_harness import run_gradient_harness
+from mirai.core.training.optim.gradients import offload_gradients_to_cpu
 
 try:
     import torch
@@ -14,6 +15,18 @@ except ModuleNotFoundError:  # pragma: no cover
 
 @unittest.skipIf(torch is None, "torch not installed")
 class GradientHarnessTests(unittest.TestCase):
+    def test_cpu_gradient_offload_accumulates_each_microbatch_once(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        (parameter * 2.0).backward()
+        offload_gradients_to_cpu([parameter])
+        self.assertIsNone(parameter.grad)
+        (parameter * 3.0).backward()
+        offload_gradients_to_cpu([parameter])
+        torch.testing.assert_close(
+            parameter._mirai_cpu_grad,  # type: ignore[attr-defined]
+            torch.tensor(5.0),
+        )
+
     def test_parameter_deltas_are_deterministic(self) -> None:
         register_builtin_components()
         cfg = TrainingConfig(

@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 from pathlib import Path
 import platform
+import re
 import shlex
 import subprocess
 import sys
@@ -21,6 +22,16 @@ MANIFEST_PATH = ROOT / "agent" / "checks.json"
 FEATURE_CATALOG_PATH = ROOT / "agent" / "features.json"
 OUTPUT_TAIL_CHARS = 6000
 COST_ORDER = {"fast": 0, "extended": 1, "gpu": 2}
+
+
+def cuda_available() -> bool:
+    """Return whether this interpreter can execute CUDA validation contracts."""
+
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available())
 
 
 def environment_fingerprint() -> dict[str, Any]:
@@ -78,6 +89,11 @@ def _feature_owned_paths() -> dict[str, set[str]]:
                 *(
                     _normalized_path(path)
                     for path in feature.get("contract_paths", ())
+                ),
+                *(
+                    {_normalized_path(feature["reference_path"])}
+                    if str(feature.get("reference_path", "")).strip()
+                    else set()
                 ),
             }
         )
@@ -205,8 +221,24 @@ def _command_argv(command: str) -> list[str]:
     return argv
 
 
-def _run_command(command: str) -> dict[str, Any]:
+def _pytest_skip_count(output: str) -> int:
+    summaries = [
+        int(match.group(1))
+        for match in re.finditer(r"\b(\d+)\s+skipped\b", output)
+    ]
+    if summaries:
+        return max(summaries)
+    return sum(
+        int(match.group(1))
+        for match in re.finditer(r"^SKIPPED \[(\d+)\]", output, re.MULTILINE)
+    )
+
+
+def _run_command(command: str, *, report_pytest_skips: bool = False) -> dict[str, Any]:
     argv = _command_argv(command)
+    is_pytest = len(argv) >= 3 and argv[1:3] == ["-m", "pytest"]
+    if report_pytest_skips and is_pytest and "-rs" not in argv:
+        argv.append("-rs")
     started = time.perf_counter()
     result = subprocess.run(
         argv,
@@ -215,9 +247,15 @@ def _run_command(command: str) -> dict[str, Any]:
         text=True,
         check=False,
     )
+    combined_output = f"{result.stdout}\n{result.stderr}"
     return {
         "argv": argv,
         "returncode": int(result.returncode),
+        "skipped_tests": (
+            _pytest_skip_count(combined_output)
+            if report_pytest_skips and is_pytest
+            else 0
+        ),
         "duration_seconds": round(time.perf_counter() - started, 6),
         "stdout_tail": result.stdout[-OUTPUT_TAIL_CHARS:],
         "stderr_tail": result.stderr[-OUTPUT_TAIL_CHARS:],
@@ -254,14 +292,37 @@ def execute_checks(
                 }
             )
             continue
-        command_results = [_run_command(command) for command in check["commands"]]
+        if check["remote_gpu"] and not cuda_available():
+            results.append(
+                {
+                    "name": check["name"],
+                    "status": "gpu_unavailable",
+                    "cost": check["cost"],
+                    "invariants": check["invariants"],
+                    "commands": [],
+                }
+            )
+            continue
+        command_results = [
+            _run_command(
+                command,
+                report_pytest_skips=bool(check["remote_gpu"]),
+            )
+            for command in check["commands"]
+        ]
+        failed = any(item["returncode"] != 0 for item in command_results)
+        skipped_gpu_tests = bool(check["remote_gpu"]) and any(
+            item["skipped_tests"] > 0 for item in command_results
+        )
         results.append(
             {
                 "name": check["name"],
                 "status": (
-                    "passed"
-                    if all(item["returncode"] == 0 for item in command_results)
-                    else "failed"
+                    "failed"
+                    if failed
+                    else "skipped_gpu_tests"
+                    if skipped_gpu_tests
+                    else "passed"
                 ),
                 "cost": check["cost"],
                 "invariants": check["invariants"],
@@ -273,7 +334,11 @@ def execute_checks(
         "failed"
         if "failed" in statuses
         else "incomplete"
-        if any(status.endswith("_required") for status in statuses)
+        if any(
+            status.endswith("_required")
+            or status in {"gpu_unavailable", "skipped_gpu_tests"}
+            for status in statuses
+        )
         else "passed"
     )
     return {

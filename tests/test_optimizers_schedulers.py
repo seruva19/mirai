@@ -155,6 +155,23 @@ class TestCameOptimizer(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 _build("came", allow_fallback=False)
 
+    def test_came_does_not_substitute_available_adafactor_when_fallback_disabled(
+        self,
+    ) -> None:
+        adafactor = types.SimpleNamespace(Adafactor=object())
+
+        def fake_import(name: str):
+            if name == "pytorch_optimizer":
+                return types.SimpleNamespace()
+            if name == "transformers.optimization":
+                return adafactor
+            raise ModuleNotFoundError(name)
+
+        with patch("importlib.import_module", side_effect=fake_import) as import_module:
+            with self.assertRaisesRegex(RuntimeError, "allow_fallback=false"):
+                _build("came", allow_fallback=False)
+        self.assertEqual(import_module.call_count, 1)
+
 
 @unittest.skipIf(torch is None, "torch not installed")
 class TestAdamw8bitFallback(unittest.TestCase):

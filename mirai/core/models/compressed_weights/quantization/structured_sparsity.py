@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from mirai.core.moe.runtime.specs import CANONICAL_PACKED_EXPERT_MLP_SPEC
+
 try:
     import torch
     import torch.nn as nn
@@ -98,6 +100,16 @@ class StructuredSparse24GroupedExperts(nn.Module):
 
     def __init__(self, base: Any, *, backend: str = "auto") -> None:
         super().__init__()
+        execution_spec = getattr(
+            base,
+            "mirai_expert_mlp_spec",
+            CANONICAL_PACKED_EXPERT_MLP_SPEC,
+        )
+        if execution_spec != CANONICAL_PACKED_EXPERT_MLP_SPEC:
+            raise ValueError(
+                "Structured 2:4 grouped experts currently support only the "
+                "canonical gated-product execution layout."
+            )
         self.num_experts = int(getattr(base, "num_experts"))
         self.backend = str(backend).strip().lower()
         self._sparse_cache: dict[tuple[str, int, str, Any], Any] = {}

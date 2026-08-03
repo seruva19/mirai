@@ -116,16 +116,18 @@ def _required_extra_batch_keys(
 
 
 def _registered_model_class(model_type: str) -> Any | None:
-    from mirai.core.registry import ModelRegistry
+    from mirai.core.models.providers import get_model_family_provider
 
-    if not ModelRegistry.has(model_type):
+    provider = get_model_family_provider(model_type)
+    if provider is None:
         try:
             from mirai.core.builtins import register_builtin_components
 
             register_builtin_components()
         except Exception:
             return None
-    return ModelRegistry.get(model_type) if ModelRegistry.has(model_type) else None
+        provider = get_model_family_provider(model_type)
+    return provider.pipeline_type if provider is not None else None
 
 
 def validate_records_against_schema(

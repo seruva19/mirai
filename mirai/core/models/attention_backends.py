@@ -132,8 +132,10 @@ def attention_backend_status(
             )
         return AttentionBackendStatus(
             resolved,
-            False,
-            "; ".join(f"{status.name}: {status.reason}" for status in candidates),
+            True,
+            "PyTorch SDPA packed reference fallback ("
+            + "; ".join(f"{status.name}: {status.reason}" for status in candidates)
+            + ")",
             capability,
         )
     if capability is None:
@@ -263,7 +265,7 @@ def dispatch_varlen_attention(
     max_seqlen_k: int,
     backend: str,
 ) -> torch.Tensor:
-    """Execute packed THD attention through FA3/FA4 with explicit capability checks."""
+    """Execute packed THD attention through FA3/FA4 or an SDPA reference path."""
     name = normalize_attention_backend(backend)
     candidates = ("flash4", "flash3") if name == "auto" else (name,)
     if any(candidate not in {"flash3", "flash4"} for candidate in candidates):
@@ -290,6 +292,49 @@ def dispatch_varlen_attention(
             causal=False,
         )
         return result[0] if isinstance(result, tuple) else result
+    if name == "auto":
+        if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+            raise ValueError(
+                "Packed attention expects THD query, key, and value tensors."
+            )
+        if key.shape != value.shape:
+            raise ValueError("Packed attention key and value tensors must have equal shapes.")
+        if query.shape[1:] != key.shape[1:]:
+            raise ValueError("Packed attention tensors must share head dimensions.")
+        if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
+            raise ValueError("Packed attention cumulative sequence lengths must be 1D.")
+        if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+            raise ValueError("Packed query and key batches must have equal size.")
+        q_offsets = tuple(int(value) for value in cu_seqlens_q.tolist())
+        k_offsets = tuple(int(value) for value in cu_seqlens_k.tolist())
+        if (
+            not q_offsets
+            or q_offsets[0] != 0
+            or k_offsets[0] != 0
+            or q_offsets[-1] != query.shape[0]
+            or k_offsets[-1] != key.shape[0]
+        ):
+            raise ValueError("Packed attention cumulative sequence lengths are inconsistent.")
+        outputs: list[torch.Tensor] = []
+        for index in range(len(q_offsets) - 1):
+            q_start, q_end = q_offsets[index : index + 2]
+            k_start, k_end = k_offsets[index : index + 2]
+            if q_end < q_start or k_end <= k_start:
+                raise ValueError(
+                    "Packed attention sequence lengths must be non-negative and "
+                    "keys non-empty."
+                )
+            if q_end == q_start:
+                continue
+            outputs.append(
+                dispatch_attention(
+                    query[q_start:q_end].unsqueeze(0),
+                    key[k_start:k_end].unsqueeze(0),
+                    value[k_start:k_end].unsqueeze(0),
+                    backend="auto",
+                ).squeeze(0)
+            )
+        return torch.cat(outputs, dim=0) if outputs else query.clone()
     raise RuntimeError(
         "No packed variable-length attention backend is available ("
         + "; ".join(failures)

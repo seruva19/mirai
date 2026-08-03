@@ -251,17 +251,17 @@
       "name": "generic_core_must_not_import_lingbot_implementation",
       "source_roots": [
         "mirai/config",
-        "mirai/core/dataset",
-        "mirai/core/inference",
-        "mirai/core/moe",
-        "mirai/core/persistence",
-        "mirai/core/training"
+        "mirai/core"
       ],
       "target_prefixes": [
         "mirai.core.models.lingbot_video",
         "mirai.vendors.lingbot_video"
       ],
-      "exclude_globs": ["**/contracts/**"]
+      "exclude_globs": [
+        "mirai/core/builtins.py",
+        "mirai/core/models/lingbot_video/**",
+        "**/contracts/**"
+      ]
     },
     {
       "name": "native_runtime_must_not_import_diffusers",

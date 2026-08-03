@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Iterable, Mapping
 
-from mirai.core.moe.runtime.specs import normalize_expert_weight_access_policy
+from mirai.core.moe.runtime.specs import (
+    CANONICAL_PACKED_EXPERT_MLP_SPEC,
+    ExpertMLPExecutionSpec,
+    normalize_expert_weight_access_policy,
+)
 
 try:
     import torch
@@ -35,6 +39,34 @@ from .quantization.learned_rotation import (
 logger = logging.getLogger(__name__)
 
 
+def _module_expert_mlp_spec(
+    module: Any,
+    explicit: ExpertMLPExecutionSpec | None = None,
+) -> ExpertMLPExecutionSpec | None:
+    module_spec = getattr(module, "mirai_expert_mlp_spec", None)
+    if module_spec is not None and not isinstance(module_spec, ExpertMLPExecutionSpec):
+        raise TypeError("mirai_expert_mlp_spec must be an ExpertMLPExecutionSpec.")
+    if explicit is not None and not isinstance(explicit, ExpertMLPExecutionSpec):
+        raise TypeError("Explicit expert MLP spec must be an ExpertMLPExecutionSpec.")
+    if module_spec is not None and explicit is not None and module_spec != explicit:
+        raise ValueError(
+            "Module expert MLP execution spec does not match the provider-declared spec."
+        )
+    return module_spec if module_spec is not None else explicit
+
+
+def _require_canonical_transform(
+    spec: ExpertMLPExecutionSpec,
+    *,
+    transform: str,
+) -> None:
+    if spec != CANONICAL_PACKED_EXPERT_MLP_SPEC:
+        raise ValueError(
+            f"{transform} currently supports only the canonical gated-product "
+            "expert layout."
+        )
+
+
 def apply_structured_2_4_experts(root: nn.Module, *, backend: str = "auto") -> int:
     """Replace every native grouped-expert host and return the replacement count."""
 
@@ -45,7 +77,9 @@ def apply_structured_2_4_experts(root: nn.Module, *, backend: str = "auto") -> i
         for child_name, child in list(parent.named_children()):
             if isinstance(child, StructuredSparse24GroupedExperts):
                 continue
-            if is_dense_grouped_expert_module(child):
+            spec = _module_expert_mlp_spec(child)
+            if is_dense_grouped_expert_module(child, execution_spec=spec):
+                _require_canonical_transform(spec, transform="Structured 2:4 experts")
                 setattr(
                     parent,
                     child_name,
@@ -59,14 +93,21 @@ def apply_structured_2_4_experts(root: nn.Module, *, backend: str = "auto") -> i
     return replaced
 
 
-def is_dense_grouped_expert_module(module: Any) -> bool:
+def is_dense_grouped_expert_module(
+    module: Any,
+    *,
+    execution_spec: ExpertMLPExecutionSpec | None = None,
+) -> bool:
     """Return whether ``module`` exposes Mirai's dense grouped-expert contract."""
 
     if isinstance(module, CompressedGroupedExperts):
         return False
     if not hasattr(module, "num_experts"):
         return False
-    for key in ("w1", "w2", "w3"):
+    spec = _module_expert_mlp_spec(module, execution_spec)
+    if spec is None:
+        return False
+    for key in spec.tensor_names:
         if not hasattr(module, key):
             return False
         value = getattr(module, key)
@@ -93,6 +134,7 @@ def _quantize_grouped_expert_module(
     rotation_checkpoint_interval: int = 25,
     rotation_device: Any = "cpu",
     rotation_max_workspace_gib: float = 2.0,
+    execution_spec: ExpertMLPExecutionSpec,
 ) -> CompressedGroupedExperts:
     replacement = CompressedGroupedExperts.from_empty(
         num_experts=int(getattr(module, "num_experts")),
@@ -101,11 +143,12 @@ def _quantize_grouped_expert_module(
         expert_dequant_chunk_size=expert_dequant_chunk_size,
         quant_format=quant_format,
         nf4_blocksize=nf4_blocksize,
+        execution_spec=execution_spec,
     )
     parametrizations = getattr(module, "parametrizations", None)
     adapters: list[tuple[str, Any]] = []
     reference_weights: dict[str, Any] = {}
-    for key in ("w1", "w2", "w3"):
+    for key in execution_spec.tensor_names:
         source = getattr(module, key)
         if parametrizations is not None and hasattr(parametrizations, key):
             chain = getattr(parametrizations, key)
@@ -126,6 +169,10 @@ def _quantize_grouped_expert_module(
     rotations: dict[str, Any] = {}
     rotation_report: dict[str, Any] | None = None
     if learn_rotations:
+        _require_canonical_transform(
+            execution_spec,
+            transform="Learned expert rotations",
+        )
         if normalize_quant_format(quant_format) != "int8":
             raise ValueError("Learned expert rotations require INT8 quantization.")
         group_w1 = best_group_size(
@@ -258,6 +305,7 @@ def prepare_compressed_weights_modules_for_checkpoint_load(
     replace_grouped_experts: bool = True,
     quant_format: str = "int8",
     nf4_blocksize: int = NF4_BLOCKSIZE,
+    expert_mlp_execution_spec: ExpertMLPExecutionSpec | None = None,
 ) -> tuple[CompressedWeightReport, dict[str, Callable[[torch.Tensor], None]]]:
     if torch is None:  # pragma: no cover
         raise RuntimeError("compressed_weights quantization requires torch.")
@@ -308,7 +356,11 @@ def prepare_compressed_weights_modules_for_checkpoint_load(
                         source=source
                     )
                 continue
-            if is_dense_grouped_expert_module(child) and replace_grouped_experts:
+            execution_spec = _module_expert_mlp_spec(child, expert_mlp_execution_spec)
+            if (
+                is_dense_grouped_expert_module(child, execution_spec=execution_spec)
+                and replace_grouped_experts
+            ):
                 if quant_format != "int8":
                     replacement = CompressedGroupedExperts.from_empty(
                         num_experts=int(getattr(child, "num_experts")),
@@ -317,6 +369,7 @@ def prepare_compressed_weights_modules_for_checkpoint_load(
                         expert_dequant_chunk_size=expert_dequant_chunk_size,
                         quant_format=quant_format,
                         nf4_blocksize=nf4_blocksize,
+                        execution_spec=execution_spec,
                     )
                 else:
                     replacement = CompressedGroupedExperts(
@@ -326,12 +379,13 @@ def prepare_compressed_weights_modules_for_checkpoint_load(
                         expert_dequant_chunk_size=expert_dequant_chunk_size,
                         quant_format=quant_format,
                         nf4_blocksize=nf4_blocksize,
+                        execution_spec=execution_spec,
                     )
                 setattr(parent, child_name, replacement)
                 expert_count += 1
-                tensor_count += 3
+                tensor_count += len(execution_spec.tensor_names)
                 quantized_numel += replacement.frozen_quantized_numel()
-                for key in ("w1", "w2", "w3"):
+                for key in execution_spec.tensor_names:
                     handlers[f"{child_prefix}.{key}"] = lambda source, module=replacement, name=key: module.load_dense_weight(
                         name, source
                     )
@@ -370,6 +424,9 @@ def quantize_compressed_weights_modules(
     rotation_checkpoint_interval: int = 25,
     rotation_device: Any = "cpu",
     rotation_max_workspace_gib: float = 2.0,
+    expert_mlp_execution_spec: ExpertMLPExecutionSpec | None = (
+        CANONICAL_PACKED_EXPERT_MLP_SPEC
+    ),
 ) -> CompressedWeightReport:
     if torch is None:  # pragma: no cover
         raise RuntimeError("compressed_weights quantization requires torch.")
@@ -421,7 +478,8 @@ def quantize_compressed_weights_modules(
                 tensor_count += 1
                 quantized_numel += replacement.frozen_quantized_numel()
                 continue
-            if is_dense_grouped_expert_module(child):
+            execution_spec = _module_expert_mlp_spec(child, expert_mlp_execution_spec)
+            if is_dense_grouped_expert_module(child, execution_spec=execution_spec):
                 tensor_formats = (
                     expert_tensor_formats.get(child_prefix)
                     if expert_tensor_formats is not None
@@ -433,6 +491,10 @@ def quantize_compressed_weights_modules(
                         f"{child_prefix!r}."
                     )
                 if tensor_formats is not None:
+                    _require_canonical_transform(
+                        execution_spec,
+                        transform="Mixed-precision expert plans",
+                    )
                     replacement = MixedPrecisionGroupedExperts(
                         child,
                         formats={
@@ -458,8 +520,13 @@ def quantize_compressed_weights_modules(
                         rotation_checkpoint_interval=rotation_checkpoint_interval,
                         rotation_device=rotation_device,
                         rotation_max_workspace_gib=rotation_max_workspace_gib,
+                        execution_spec=execution_spec,
                     )
                 else:
+                    _require_canonical_transform(
+                        execution_spec,
+                        transform="Mixed-precision expert plans",
+                    )
                     replacement = MixedPrecisionGroupedExperts(
                         child,
                         formats=tuple(expert_formats),
@@ -467,7 +534,7 @@ def quantize_compressed_weights_modules(
                     )
                 setattr(parent, child_name, replacement)
                 expert_count += 1
-                tensor_count += 3
+                tensor_count += len(execution_spec.tensor_names)
                 quantized_numel += replacement.frozen_quantized_numel()
                 continue
             visit(child, child_prefix)

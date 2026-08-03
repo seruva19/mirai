@@ -47,7 +47,11 @@ def parse_args() -> argparse.Namespace:
         default="transformer.attn",
         help="Comma-separated target module names",
     )
-    p.add_argument("--model-path", default="./models/lingbot_video", help="Base model path metadata")
+    p.add_argument(
+        "--model-path",
+        default="",
+        help="Optional base-model path metadata for the exported adapter",
+    )
     p.add_argument("--merge", action="store_true", help="Export merged base scalar checkpoint")
     p.add_argument("--base-scale", type=float, default=1.0, help="Base scalar before merge")
     p.add_argument(

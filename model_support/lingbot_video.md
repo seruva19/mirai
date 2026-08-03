@@ -4,10 +4,24 @@ Native training and inference support targets the sparse-MoE 30B-A3B release.
 The provider loads attributed native modules directly; Diffusers is not a runtime
 dependency.
 
+## Download
+
+Download the public snapshot without a token:
+
+```bash
+python scripts/download.py \
+  --variant lingbot-video-moe-30b-a3b \
+  --output-dir models/lingbot-video-moe-30b-a3b
+```
+
+Set `HF_TOKEN` only when the selected repository requires authentication.
+
 ## Presets
 
 LingBot Video provides three family presets. They are deep-merged over the
-shared `defaults/moe.toml` layer before values from the user config are applied.
+family-neutral `defaults/moe.toml` training layer before values from the user
+config are applied; model identity, paths, and architecture defaults come from
+the LingBot preset itself.
 
 ### [`lingbot_video.toml`](../mirai/config/presets/lingbot_video.toml)
 
@@ -61,7 +75,8 @@ Available examples:
 - [`train_bf16.toml`](../configs/lingbot_video/train_bf16.toml) — BF16 frozen
   base with native routed-expert execution.
 - [`train_nf4.toml`](../configs/lingbot_video/train_nf4.toml) — NF4 compressed
-  frozen base with chunked expert reconstruction.
+  frozen base with chunked expert reconstruction. This example uses the
+  Linux-only bitsandbytes optimizer from `requirements-cu126-linux.txt`.
 
 Set `[model].path`, `[dataset].path`, and `[logging].output_dir`, then run:
 
@@ -86,36 +101,15 @@ Supported adapter targets include attention, router projections, shared MLPs,
 and routed expert projections. Raw video may be bucketed and encoded through the
 family-owned native VAE and structured text-conditioning path.
 
-Generic packed-weight providers bind to LingBot's native expert roles without a
-family-specific switch: `w1/w3` are the gate/up projections and `w2` is the
-down projection. Consequently, mixture-basis artifacts optimize only the native
-gate/up pair and retain the packed down projection unchanged.
-Learned INT8 rotation export likewise binds one shared transform to the native
-gate/up pair and a separate transform to down, allowing the generic packed
-execution path to rotate the common hidden input once. The controlling key
-remains generic and is therefore documented only in `CONFIG_REFERENCE.md`.
-AIMER scoring consumes the same family mapping (`w1=gate`, `w3=up`, `w2=down`)
-as one combined expert vector; its generic criterion and CLI controls likewise
-remain in `CONFIG_REFERENCE.md`.
-MXFP8-E4M3 applies through the same model-agnostic compressed-weight boundary:
-all three native expert projections retain their family roles while their
-frozen tensors use independent 32-value blocks and packed scale metadata. Its
-shared selection key is documented only in `CONFIG_REFERENCE.md`.
-DeepSeek-style block-scaled FP8 uses that same boundary with 128×128 expert
-weight scales, dynamic 1×128 activation scales, and FP32 partial accumulation.
-The family contributes only its native w1/w2/w3 projection mapping; the format,
-artifact, execution, and gradient contracts remain model-agnostic.
-LingBot's native BSHD attention and packed sequence metadata are adapted to the
-shared attention-backend registry. The provider adds no family-specific backend
-value; all accepted choices and capability rules remain in
-`CONFIG_REFERENCE.md`.
-The generic SOLO 4/2-bit and Adam-mini optimizers consume LingBot's
-provider-owned per-parameter selected-expert row plan without a family branch.
-Their optimizer types and state semantics remain in `CONFIG_REFERENCE.md`.
-Drop-Upcycling artifacts use the same generic grouped-expert roles. The packed
-loader expands the native router and expert axes together, then the provider
-synchronizes its execution metadata before adapter injection; no LingBot-only
-upcycling key or dispatch path exists.
+LingBot declares its routed-expert computation as `w1` gate, `w3` up, and `w2`
+down with a SiLU gated-product combiner. Shared compressed execution consumes
+those semantic roles rather than inferring tensor names. Packed artifacts,
+learned rotations, FlexMoE transforms, and other layout-specific tools validate
+the canonical LingBot graph and reject incompatible expert layouts explicitly.
+
+LingBot's native BSHD attention and packed sequence metadata use the shared
+attention-backend registry. Supported choices and capability rules are listed
+in [`CONFIG_REFERENCE.md`](../CONFIG_REFERENCE.md).
 
 The provider supports text-to-video, first-frame image-to-video, hybrid
 conditioning, and progressive multi-task training. Hybrid batches must contain
@@ -258,7 +252,8 @@ defaults.
   [(repo)](https://github.com/Robbyant/lingbot-video)
 - **Router runtime integration** — Balance objectives, dataset specialization,
   subset schedules, iterative expert communication, distillation, and routing
-  diagnostics attach through typed family hooks.
+  diagnostics attach through LingBot-owned runtime hooks and shared policy
+  objects.
 - **Compressed routed experts** — Native expert modules support packed restore,
   bounded dequantization, vectorized dispatch, and adapter gradients.
 

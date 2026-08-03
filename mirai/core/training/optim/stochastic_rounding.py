@@ -47,6 +47,39 @@ def stochastic_round_bfloat16(values: Any) -> Any:
     )
 
 
+@torch.no_grad()
+def stochastic_ema_bfloat16_(
+    state: Any,
+    observation: Any,
+    *,
+    beta: float,
+    square_observation: bool = False,
+    update_chunk_size: int = DEFAULT_UPDATE_CHUNK_SIZE,
+) -> None:
+    """Update a BF16 EMA through bounded FP32 chunks and unbiased writes."""
+
+    if not isinstance(state, torch.Tensor) or state.dtype != torch.bfloat16:
+        raise TypeError("stochastic_ema_bfloat16_ expects BF16 tensor state.")
+    if not isinstance(observation, torch.Tensor) or observation.shape != state.shape:
+        raise ValueError("Stochastic EMA observation must match the state shape.")
+    if not 0.0 <= float(beta) < 1.0:
+        raise ValueError("Stochastic EMA beta must be in [0, 1).")
+    if int(update_chunk_size) <= 0:
+        raise ValueError("Stochastic EMA update_chunk_size must be positive.")
+    state_flat = state.reshape(-1)
+    observation_flat = observation.reshape(-1)
+    for start in range(0, int(state_flat.numel()), int(update_chunk_size)):
+        end = min(start + int(update_chunk_size), int(state_flat.numel()))
+        observed = observation_flat[start:end].float()
+        if square_observation:
+            observed.square_()
+        updated = state_flat[start:end].float().mul_(float(beta)).add_(
+            observed,
+            alpha=1.0 - float(beta),
+        )
+        state_flat[start:end].copy_(stochastic_round_bfloat16(updated))
+
+
 class StochasticRoundingAdamW(torch.optim.Optimizer):
     """AdamW with BF16 moments and stochastic model-update rounding.
 
@@ -125,12 +158,27 @@ class StochasticRoundingAdamW(torch.optim.Optimizer):
                 step = int(state["step"].item())
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
-                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(
-                    grad,
-                    grad,
-                    value=1.0 - beta2,
-                )
+                if param.dtype == torch.bfloat16:
+                    stochastic_ema_bfloat16_(
+                        exp_avg,
+                        grad,
+                        beta=float(beta1),
+                        update_chunk_size=self.update_chunk_size,
+                    )
+                    stochastic_ema_bfloat16_(
+                        exp_avg_sq,
+                        grad,
+                        beta=float(beta2),
+                        square_observation=True,
+                        update_chunk_size=self.update_chunk_size,
+                    )
+                else:
+                    exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(
+                        grad,
+                        grad,
+                        value=1.0 - beta2,
+                    )
                 self._apply_parameter_update(
                     param=param,
                     exp_avg=exp_avg,
@@ -198,5 +246,6 @@ class StochasticRoundingAdamW(torch.optim.Optimizer):
 __all__ = [
     "DEFAULT_UPDATE_CHUNK_SIZE",
     "StochasticRoundingAdamW",
+    "stochastic_ema_bfloat16_",
     "stochastic_round_bfloat16",
 ]

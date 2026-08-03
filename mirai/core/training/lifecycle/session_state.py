@@ -72,6 +72,15 @@ def capture_torch_rng_state() -> dict[str, Any]:
     return state
 
 
+def seed_torch_rng(seed: int) -> None:
+    """Seed process-global Torch generators for a fresh training run."""
+    if torch is None:  # pragma: no cover
+        return
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
 def restore_torch_rng_state(state: Any) -> None:
     if torch is None or not isinstance(state, dict):  # pragma: no cover
         return
@@ -136,6 +145,8 @@ def build_checkpoint_payload(
     model_snapshot_id: str = "",
     config_snapshot_id: str = "",
     model_component_id: str = "",
+    runtime_overrides: Any | None = None,
+    optimizer_result: Any | None = None,
 ) -> dict[str, object]:
     training_policies = getattr(trainer, "training_policies", None)
     policy_metadata = (
@@ -172,7 +183,7 @@ def build_checkpoint_payload(
         "config_snapshot_id": str(config_snapshot_id),
         "model_component_id": str(model_component_id),
         "metadata": {
-            "schema_version": 1,
+            "schema_version": 2,
             "manifest_sha256": str(manifest_sha256),
             "dataset_snapshot_id": str(dataset_snapshot_id),
             "cache_snapshot_id": str(cache_snapshot_id),
@@ -181,7 +192,23 @@ def build_checkpoint_payload(
             "model_component_id": str(model_component_id),
         },
     }
+    if optimizer_result is not None:
+        from mirai.core.training.lifecycle.resume_validation import (
+            optimizer_implementation_identity,
+        )
+
+        payload["optimizer_identity"] = optimizer_implementation_identity(
+            optimizer_result
+        )
     if active_policies:
         payload["training_policy_metadata"] = policy_metadata
         payload["metadata"]["training_policies"] = active_policies
+    if runtime_overrides is not None:
+        from mirai.core.training.control.live_control_actions import (
+            training_runtime_overrides_state_dict,
+        )
+
+        payload["runtime_overrides"] = training_runtime_overrides_state_dict(
+            runtime_overrides
+        )
     return payload

@@ -533,22 +533,37 @@ def run_persistent_dispatch_plan(
         if routed_adapter_gate is None
         else routed_adapter_gate.resolve_sorted(sorted_token_indices, counts)
     )
-    gate, up = streamed_linear_pair(
-        owner,
-        "w1",
-        "w3",
-        sorted_tokens,
-        expert_ids,
-        counts,
-        m_offsets,
-        chunk_size=chunk_size,
-        route_gate=route_gate,
-    )
-    hidden = F.silu(gate) * up
+    primary_role = "gate" if owner.expert_mlp_spec.uses_gated_product else "input"
+    primary_key = owner.projection_for_role(primary_role)
+    if owner.expert_mlp_spec.uses_gated_product:
+        gate, up = streamed_linear_pair(
+            owner,
+            primary_key,
+            owner.projection_for_role("up"),
+            sorted_tokens,
+            expert_ids,
+            counts,
+            m_offsets,
+            chunk_size=chunk_size,
+            route_gate=route_gate,
+        )
+    else:
+        gate = streamed_linear(
+            owner,
+            primary_key,
+            sorted_tokens,
+            expert_ids,
+            counts,
+            m_offsets,
+            chunk_size=chunk_size,
+            route_gate=route_gate,
+        )
+        up = None
+    hidden = owner._combine_expert_inputs(gate, up)
     owner._capture_routed_intermediates(hidden, plan.sort_positions)
     expert_output = streamed_linear(
         owner,
-        "w2",
+        owner.projection_for_role("down"),
         hidden,
         expert_ids,
         counts,

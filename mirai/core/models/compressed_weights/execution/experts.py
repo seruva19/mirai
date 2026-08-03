@@ -12,6 +12,8 @@ from mirai.core.moe.storage.aliases import (
     validate_logical_to_physical,
 )
 from mirai.core.moe.runtime.specs import (
+    CANONICAL_PACKED_EXPERT_MLP_SPEC,
+    ExpertMLPExecutionSpec,
     normalize_expert_weight_access_policy,
     resolve_moe_batched_dequant,
     resolve_moe_batched_gather,
@@ -71,8 +73,10 @@ from .expert_gather import BatchedExpertGatherStrategy
 from .expert_device_cache import ExpertDeviceCache
 from .routed_output_observer import RoutedOutputObserverHost
 from .linear import (
+    _FrozenDequantExpertLinear,
     _FrozenDequantBatchedLinear,
     _FrozenDequantBatchedLinearPair,
+    _FrozenDequantMegaBlocksLinear,
     _FrozenTritonGroupedLinear,
     _FrozenTritonGroupedLinearPair,
     _persistent_dispatch_available,
@@ -83,7 +87,7 @@ logger = logging.getLogger(__name__)
 
 
 class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
-    """LingBot-style grouped experts stored as int8 buffers."""
+    """Provider-described grouped experts stored in frozen packed formats."""
 
     def __init__(
         self,
@@ -94,10 +98,19 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         expert_dequant_chunk_size: int = 0,
         quant_format: str = "int8",
         nf4_blocksize: int = NF4_BLOCKSIZE,
+        execution_spec: ExpertMLPExecutionSpec | None = None,
     ):
         super().__init__()
         if torch is None:  # pragma: no cover
             raise RuntimeError("CompressedGroupedExperts requires torch.")
+        # Direct construction predates provider-owned execution specs. Keep the
+        # canonical fallback as a compatibility boundary; shipping preparation
+        # requires and passes the model-owned spec explicitly.
+        resolved_spec = (
+            execution_spec
+            or getattr(base, "mirai_expert_mlp_spec", None)
+            or CANONICAL_PACKED_EXPERT_MLP_SPEC
+        )
         self._init_empty(
             num_experts=int(getattr(base, "num_experts")),
             group_sizes=group_sizes,
@@ -105,8 +118,9 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             expert_dequant_chunk_size=expert_dequant_chunk_size,
             quant_format=quant_format,
             nf4_blocksize=nf4_blocksize,
+            execution_spec=resolved_spec,
         )
-        for key in ("w1", "w2", "w3"):
+        for key in resolved_spec.tensor_names:
             self.load_dense_weight(key, getattr(base, key))
 
     @classmethod
@@ -119,6 +133,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         expert_dequant_chunk_size: int = 0,
         quant_format: str = "int8",
         nf4_blocksize: int = NF4_BLOCKSIZE,
+        execution_spec: ExpertMLPExecutionSpec = CANONICAL_PACKED_EXPERT_MLP_SPEC,
     ) -> CompressedGroupedExperts:
         module = cls.__new__(cls)
         nn.Module.__init__(module)
@@ -129,6 +144,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             expert_dequant_chunk_size=expert_dequant_chunk_size,
             quant_format=quant_format,
             nf4_blocksize=nf4_blocksize,
+            execution_spec=execution_spec,
         )
         return module
 
@@ -141,8 +157,12 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         expert_dequant_chunk_size: int,
         quant_format: str = "int8",
         nf4_blocksize: int = NF4_BLOCKSIZE,
+        execution_spec: ExpertMLPExecutionSpec,
     ) -> None:
         self.num_experts = int(num_experts)
+        if not isinstance(execution_spec, ExpertMLPExecutionSpec):
+            raise TypeError("execution_spec must use ExpertMLPExecutionSpec.")
+        self.mirai_expert_mlp_spec = execution_spec
         self._group_sizes = group_sizes
         self._quant_format = normalize_quant_format(quant_format)
         self._nf4_blocksize = int(nf4_blocksize)
@@ -199,6 +219,8 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         if observer is None:
             self._flexmoe_taylor_observer = None
             return
+        if not self.expert_mlp_spec.uses_gated_product:
+            raise ValueError("FlexMoE Taylor ranking requires a gated-product expert MLP.")
         if self._flexmoe_channel_mask is not None:
             raise ValueError(
                 "FlexMoE Taylor ranking and action-mask learning are separate stages."
@@ -210,7 +232,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             )
         if int(getattr(observer, "num_experts", -1)) != self.num_experts:
             raise ValueError("FlexMoE Taylor observer expert topology mismatch.")
-        shape = self.expert_weight_shape("w1")
+        shape = self.expert_weight_shape(self.projection_for_role("gate"))
         if int(getattr(observer, "intermediate_size", -1)) != int(shape[1]):
             raise ValueError("FlexMoE Taylor observer channel topology mismatch.")
         if not callable(getattr(observer, "capture", None)):
@@ -223,6 +245,8 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         if mask is None:
             self._flexmoe_channel_mask = None
             return
+        if not self.expert_mlp_spec.uses_gated_product:
+            raise ValueError("FlexMoE channel masks require a gated-product expert MLP.")
         if self._flexmoe_taylor_observer is not None:
             raise ValueError(
                 "FlexMoE action-mask learning cannot run during Taylor ranking."
@@ -233,7 +257,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
                 "already pruned ragged artifact."
             )
         value = torch.as_tensor(mask)
-        shape = self.expert_weight_shape("w1")
+        shape = self.expert_weight_shape(self.projection_for_role("gate"))
         expected = (self.num_experts, int(shape[1]))
         if tuple(value.shape) != expected or not value.is_floating_point():
             raise ValueError(
@@ -253,6 +277,43 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
     @property
     def flexmoe_taylor_observer_active(self) -> bool:
         return self._flexmoe_taylor_observer is not None
+
+    @property
+    def expert_mlp_spec(self) -> ExpertMLPExecutionSpec:
+        return self.mirai_expert_mlp_spec
+
+    def projection_for_role(self, role: str) -> str:
+        return self.expert_mlp_spec.tensor_for_role(role)
+
+    def _activate_expert_hidden(self, value: torch.Tensor) -> torch.Tensor:
+        activation = self.expert_mlp_spec.activation
+        if activation == "silu":
+            return F.silu(value)
+        if activation == "gelu":
+            return F.gelu(value)
+        if activation == "relu":
+            return F.relu(value)
+        if activation == "identity":
+            return value
+        raise RuntimeError(f"Unsupported expert activation {activation!r}.")
+
+    def _combine_expert_inputs(
+        self,
+        primary: torch.Tensor,
+        secondary: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        activated = self._activate_expert_hidden(primary)
+        if self.expert_mlp_spec.combiner == "activated":
+            if secondary is not None:
+                raise RuntimeError("Activated expert MLP does not accept an up projection.")
+            return activated
+        if self.expert_mlp_spec.combiner == "gated_product":
+            if secondary is None:
+                raise RuntimeError("Gated expert MLP requires an up projection.")
+            return activated * secondary
+        raise RuntimeError(
+            f"Unsupported expert combiner {self.expert_mlp_spec.combiner!r}."
+        )
 
     def _apply_flexmoe_channel_mask(
         self,
@@ -304,7 +365,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
     ) -> None:
         """Attach an optional learned groupwise orthogonal INT8 rotation."""
 
-        if key not in {"w1", "w2", "w3"}:
+        if key not in self.expert_mlp_spec.tensor_names:
             raise ValueError(f"Unknown grouped expert rotation key {key!r}.")
         buffer_name = f"{key}_rotation"
         if rotation is None:
@@ -408,29 +469,41 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
                 "Prototype observer shared inputs must preserve a non-empty "
                 "[tokens, hidden] tensor."
             )
+        input_role = "gate" if self.expert_mlp_spec.uses_gated_product else "input"
+        input_key = self.projection_for_role(input_role)
+        down_key = self.projection_for_role("down")
+        up_key = (
+            self.projection_for_role("up")
+            if self.expert_mlp_spec.uses_gated_product
+            else None
+        )
         for expert_idx in range(self.num_experts):
-            w1 = self._dequantize_expert(
-                "w1",
+            input_weight = self._dequantize_expert(
+                input_key,
                 expert_idx,
                 dtype=calibration_tokens.dtype,
                 device=calibration_tokens.device,
             )
-            w2 = self._dequantize_expert(
-                "w2",
+            down_weight = self._dequantize_expert(
+                down_key,
                 expert_idx,
                 dtype=calibration_tokens.dtype,
                 device=calibration_tokens.device,
             )
-            w3 = self._dequantize_expert(
-                "w3",
-                expert_idx,
-                dtype=calibration_tokens.dtype,
-                device=calibration_tokens.device,
-            )
-            hidden = F.silu(F.linear(calibration_tokens, w1)) * F.linear(calibration_tokens, w3)
-            expert_output = F.linear(hidden, w2)
+            primary = F.linear(calibration_tokens, input_weight)
+            secondary = None
+            if up_key is not None:
+                up_weight = self._dequantize_expert(
+                    up_key,
+                    expert_idx,
+                    dtype=calibration_tokens.dtype,
+                    device=calibration_tokens.device,
+                )
+                secondary = F.linear(calibration_tokens, up_weight)
+            hidden = self._combine_expert_inputs(primary, secondary)
+            expert_output = F.linear(hidden, down_weight)
             record(expert_idx, expert_output)
-            del w1, w2, w3, hidden, expert_output
+            del input_weight, down_weight, primary, secondary, hidden, expert_output
 
     def set_whitening_calibration_observer(self, observer: Any) -> None:
         """Attach a streaming observer for the actual expert-linear inputs."""
@@ -478,7 +551,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         use_rslora: bool = False,
     ) -> nn.Module:
         key = str(tensor_name)
-        if key not in {"w1", "w2", "w3"}:
+        if key not in self.expert_mlp_spec.tensor_names:
             raise ValueError(f"Unknown grouped expert LoRA tensor '{key}'.")
         if key in self.expert_lora:
             raise ValueError(f"Grouped expert LoRA is already attached to '{key}'.")
@@ -525,7 +598,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         self._packed_shapes = {
             str(key): tuple(int(dim) for dim in shape) for key, shape in shapes.items()
         }
-        for key in ("w1", "w2", "w3"):
+        for key in self.expert_mlp_spec.tensor_names:
             shape = self._packed_shapes.get(key)
             if shape is None or len(shape) != 3 or int(shape[0]) != self.num_experts:
                 raise ValueError(f"Invalid disk-backed grouped expert shape for '{key}': {shape}.")
@@ -561,7 +634,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         self._nf4_meta = meta
         self._nf4_blocksize = int(meta.blocksize)
         self._nf4_pair_codebook_cache.clear()
-        for key in ("w1", "w2", "w3"):
+        for key in self.expert_mlp_spec.tensor_names:
             shape = self._packed_shapes.get(key)
             if shape is None or len(shape) != 3 or int(shape[0]) != self.num_experts:
                 raise ValueError(
@@ -603,7 +676,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         self._packed_shapes = {
             str(key): tuple(int(dim) for dim in shape) for key, shape in shapes.items()
         }
-        for key in ("w1", "w2", "w3"):
+        for key in self.expert_mlp_spec.tensor_names:
             shape = self._packed_shapes.get(key)
             meta = metadata.get(key)
             if (
@@ -623,7 +696,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             raise RuntimeError("A physical expert-weight provider is already attached.")
         if int(getattr(provider, "num_experts", -1)) != self.num_experts:
             raise ValueError("Physical weight provider expert count does not match module.")
-        for key in ("w1", "w2", "w3"):
+        for key in self.expert_mlp_spec.tensor_names:
             shape = tuple(int(value) for value in provider.expert_weight_shape(key))
             if len(shape) != 3 or shape[0] != self.num_experts:
                 raise ValueError(
@@ -737,12 +810,16 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             raise RuntimeError(
                 "Grouped compressed_weights execution requires resident full_dequant expert weights."
             )
-        if not hasattr(torch, "_grouped_mm") or x.device.type != "cuda":
+        from mirai.core.moe.runtime.gemm import grouped_mm_op
+
+        if grouped_mm_op() is None or x.device.type != "cuda":
             raise RuntimeError(
-                "Grouped compressed_weights execution requires CUDA torch._grouped_mm."
+                "Grouped compressed_weights execution requires CUDA and a "
+                "framework grouped_mm operation."
             )
-        weight = self._dequantize(str(key)).to(device=x.device, dtype=x.dtype)
-        output = torch._grouped_mm(x, weight.transpose(-2, -1), offs=offsets)
+        from .torch_grouped import _FrozenGroupedMMLinear
+
+        output = _FrozenGroupedMMLinear.apply(x, self, str(key), offsets)
         adapter = self.expert_lora[key] if key in self.expert_lora else None
         if adapter is not None:
             output = output + adapter.grouped_forward(x, offsets=offsets)
@@ -753,8 +830,12 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             raise RuntimeError(
                 "Batched compressed_weights execution requires resident full_dequant expert weights."
             )
-        weight = self._dequantize(str(key), dtype=x.dtype, device=x.device)
-        output = torch.bmm(x, weight.transpose(-2, -1))
+        output = _FrozenDequantBatchedLinear.apply(
+            x,
+            self,
+            str(key),
+            tuple(range(self.num_experts)),
+        )
         adapter = self.expert_lora[key] if key in self.expert_lora else None
         if adapter is not None:
             output = output + adapter.batched_forward(x)
@@ -772,9 +853,13 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             raise RuntimeError(
                 "MegaBlocks grouped execution requires resident full_dequant experts."
             )
-        weight = self._dequantize(str(key), dtype=x.dtype, device=x.device)
-        batch_sizes = counts.detach().to(device="cpu", dtype=torch.int64)
-        output = grouped_gemm_ops.gmm(x, weight, batch_sizes, trans_b=True)
+        output = _FrozenDequantMegaBlocksLinear.apply(
+            x,
+            self,
+            str(key),
+            counts,
+            grouped_gemm_ops,
+        )
         adapter = self.expert_lora[key] if key in self.expert_lora else None
         if adapter is not None:
             output = output + adapter.megablocks_forward(
@@ -798,13 +883,26 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             )
         if tokens.device.type != "cuda":
             raise RuntimeError("MegaBlocks grouped experts require CUDA tensors.")
-        gate = self.megablocks_linear(
-            "w1", tokens, counts=counts, grouped_gemm_ops=grouped_gemm_ops
+        primary_role = "gate" if self.expert_mlp_spec.uses_gated_product else "input"
+        primary = self.megablocks_linear(
+            self.projection_for_role(primary_role),
+            tokens,
+            counts=counts,
+            grouped_gemm_ops=grouped_gemm_ops,
         )
-        up = self.megablocks_linear("w3", tokens, counts=counts, grouped_gemm_ops=grouped_gemm_ops)
+        secondary = None
+        if self.expert_mlp_spec.uses_gated_product:
+            secondary = self.megablocks_linear(
+                self.projection_for_role("up"),
+                tokens,
+                counts=counts,
+                grouped_gemm_ops=grouped_gemm_ops,
+            )
         return self.megablocks_linear(
-            "w2",
-            self._capture_and_return_sorted_intermediate(F.silu(gate) * up),
+            self.projection_for_role("down"),
+            self._capture_and_return_sorted_intermediate(
+                self._combine_expert_inputs(primary, secondary)
+            ),
             counts=counts,
             grouped_gemm_ops=grouped_gemm_ops,
         )
@@ -828,11 +926,14 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         valid = local[None, :] < counts_i64[:, None]
         padded = tokens.new_zeros((self.num_experts, max_count, tokens.shape[-1]))
         padded[valid] = tokens[source[valid]]
-        gate = self.batched_linear("w1", padded)
-        up = self.batched_linear("w3", padded)
-        hidden = F.silu(gate) * up
+        primary_role = "gate" if self.expert_mlp_spec.uses_gated_product else "input"
+        primary = self.batched_linear(self.projection_for_role(primary_role), padded)
+        secondary = None
+        if self.expert_mlp_spec.uses_gated_product:
+            secondary = self.batched_linear(self.projection_for_role("up"), padded)
+        hidden = self._combine_expert_inputs(primary, secondary)
         self._capture_sorted_intermediate(hidden[valid])
-        output = self.batched_linear("w2", hidden)
+        output = self.batched_linear(self.projection_for_role("down"), hidden)
         return output[valid]
 
     def load_dense_weight(
@@ -842,7 +943,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         *,
         rotation: torch.Tensor | None = None,
     ) -> None:
-        if key not in {"w1", "w2", "w3"}:
+        if key not in self.expert_mlp_spec.tensor_names:
             raise ValueError(f"Unknown compressed_weights grouped expert tensor '{key}'.")
         if source.ndim != 3:
             raise ValueError(
@@ -1172,7 +1273,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         meta: _GgufMeta,
     ) -> None:
         """Restore one grouped-expert GGUF tensor from packed uint8 blocks."""
-        if key not in {"w1", "w2", "w3"}:
+        if key not in self.expert_mlp_spec.tensor_names:
             raise ValueError(f"Unknown compressed_weights grouped expert tensor '{key}'.")
         if self._quant_format not in GGUF_FORMATS:
             raise ValueError("GGUF packed state requires a gguf grouped-expert wrapper.")
@@ -1199,7 +1300,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         shape: Iterable[int],
         meta: MicroscalingMeta,
     ) -> None:
-        if key not in {"w1", "w2", "w3"}:
+        if key not in self.expert_mlp_spec.tensor_names:
             raise ValueError(f"Unknown compressed_weights grouped expert tensor '{key}'.")
         if self._quant_format not in MICROSCALING_FORMATS:
             raise ValueError(
@@ -1241,7 +1342,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         shape: Iterable[int],
         meta: BlockwiseFP8Meta,
     ) -> None:
-        if key not in {"w1", "w2", "w3"}:
+        if key not in self.expert_mlp_spec.tensor_names:
             raise ValueError(f"Unknown compressed_weights grouped expert tensor '{key}'.")
         if self._quant_format not in BLOCKWISE_FP8_FORMATS:
             raise ValueError("Blockwise FP8 state requires an FP8 expert wrapper.")
@@ -1272,7 +1373,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         return int(
             sum(
                 getattr(self, f"{key}_int8").numel()
-                for key in ("w1", "w2", "w3")
+                for key in self.expert_mlp_spec.tensor_names
                 if hasattr(self, f"{key}_int8")
             )
         )
@@ -1286,7 +1387,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         group_size: int,
         rotation: torch.Tensor | None = None,
     ) -> None:
-        if key not in {"w1", "w2", "w3"}:
+        if key not in self.expert_mlp_spec.tensor_names:
             raise ValueError(f"Unknown compressed_weights grouped expert tensor '{key}'.")
         if weight_int8.ndim != 3:
             raise ValueError(
@@ -1333,7 +1434,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         meta: _Nf4Meta,
     ) -> None:
         """Restore one grouped-expert NF4 tensor from packed buffers."""
-        if key not in {"w1", "w2", "w3"}:
+        if key not in self.expert_mlp_spec.tensor_names:
             raise ValueError(f"Unknown compressed_weights grouped expert tensor '{key}'.")
         if self._quant_format != "nf4":
             raise ValueError("NF4 packed state requires an NF4 grouped-expert wrapper.")
@@ -1374,7 +1475,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             self.register_buffer(name, value)
 
     def is_fully_loaded(self) -> bool:
-        return self._loaded_dense_keys.issuperset({"w1", "w2", "w3"})
+        return self._loaded_dense_keys.issuperset(self.expert_mlp_spec.tensor_names)
 
     @property
     def w1(self) -> torch.Tensor:
@@ -1557,28 +1658,50 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
                 "Prototype calibration requires direct routed execution with route weights."
             )
         if not self.is_fully_loaded():
-            missing = sorted({"w1", "w2", "w3"} - self._loaded_dense_keys)
+            missing = sorted(set(self.expert_mlp_spec.tensor_names) - self._loaded_dense_keys)
             raise RuntimeError(
                 f"compressed_weights grouped experts are missing weights: {missing}."
             )
         count_list = [int(v) for v in counts.detach().cpu().tolist()]
         splits = torch.split(tokens, count_list, dim=0)
         outputs: list[torch.Tensor] = []
+        primary_role = "gate" if self.expert_mlp_spec.uses_gated_product else "input"
+        primary_key = self.projection_for_role(primary_role)
+        up_key = (
+            self.projection_for_role("up")
+            if self.expert_mlp_spec.uses_gated_product
+            else None
+        )
+        down_key = self.projection_for_role("down")
+        input_keys = (primary_key, up_key) if up_key is not None else primary_key
         if self.expert_weight_access == "full_dequant":
-            w1 = self.w1.to(device=tokens.device, dtype=tokens.dtype)
-            w2 = self.w2.to(device=tokens.device, dtype=tokens.dtype)
-            w3 = self.w3.to(device=tokens.device, dtype=tokens.dtype)
+            weights = {
+                key: self._dequantize(key).to(device=tokens.device, dtype=tokens.dtype)
+                for key in self.expert_mlp_spec.tensor_names
+            }
             for expert_idx, expert_tokens in enumerate(splits):
                 if expert_tokens.numel() == 0:
                     continue
-                self._record_whitening_inputs(("w1", "w3"), expert_tokens)
-                gate = self._expert_linear("w1", expert_tokens, w1[expert_idx], expert_idx)
-                up = self._expert_linear("w3", expert_tokens, w3[expert_idx], expert_idx)
-                h = F.silu(gate) * up
+                self._record_whitening_inputs(input_keys, expert_tokens)
+                primary = self._expert_linear(
+                    primary_key, expert_tokens, weights[primary_key][expert_idx], expert_idx
+                )
+                secondary = (
+                    self._expert_linear(
+                        up_key, expert_tokens, weights[up_key][expert_idx], expert_idx
+                    )
+                    if up_key is not None
+                    else None
+                )
+                h = self._combine_expert_inputs(primary, secondary)
                 h = self._apply_flexmoe_channel_mask(h, expert_idx)
                 self._capture_sorted_intermediate(h)
-                self._record_whitening_inputs("w2", h)
-                outputs.append(self._expert_linear("w2", h, w2[expert_idx], expert_idx))
+                self._record_whitening_inputs(down_key, h)
+                outputs.append(
+                    self._expert_linear(
+                        down_key, h, weights[down_key][expert_idx], expert_idx
+                    )
+                )
             if not outputs:
                 return tokens.new_zeros(tokens.shape)
             return torch.cat(outputs, dim=0)
@@ -1596,23 +1719,28 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
                 if expert_tokens.numel() == 0:
                     continue
                 expert_idx = chunk_start + offset
-                self._record_whitening_inputs(("w1", "w3"), expert_tokens)
-                w1 = self._dequantize_expert(
-                    "w1", expert_idx, dtype=tokens.dtype, device=tokens.device
+                self._record_whitening_inputs(input_keys, expert_tokens)
+                weights = {
+                    key: self._dequantize_expert(
+                        key, expert_idx, dtype=tokens.dtype, device=tokens.device
+                    )
+                    for key in self.expert_mlp_spec.tensor_names
+                }
+                primary = self._expert_linear(
+                    primary_key, expert_tokens, weights[primary_key], expert_idx
                 )
-                w2 = self._dequantize_expert(
-                    "w2", expert_idx, dtype=tokens.dtype, device=tokens.device
+                secondary = (
+                    self._expert_linear(up_key, expert_tokens, weights[up_key], expert_idx)
+                    if up_key is not None
+                    else None
                 )
-                w3 = self._dequantize_expert(
-                    "w3", expert_idx, dtype=tokens.dtype, device=tokens.device
-                )
-                gate = self._expert_linear("w1", expert_tokens, w1, expert_idx)
-                up = self._expert_linear("w3", expert_tokens, w3, expert_idx)
-                h = F.silu(gate) * up
+                h = self._combine_expert_inputs(primary, secondary)
                 h = self._apply_flexmoe_channel_mask(h, expert_idx)
                 self._capture_sorted_intermediate(h)
-                self._record_whitening_inputs("w2", h)
-                outputs.append(self._expert_linear("w2", h, w2, expert_idx))
+                self._record_whitening_inputs(down_key, h)
+                outputs.append(
+                    self._expert_linear(down_key, h, weights[down_key], expert_idx)
+                )
         if not outputs:
             return tokens.new_zeros(tokens.shape)
         return torch.cat(outputs, dim=0)
@@ -1660,6 +1788,15 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             dtype=torch.float32,
             device=tokens.device,
         )
+        primary_role = "gate" if self.expert_mlp_spec.uses_gated_product else "input"
+        primary_key = self.projection_for_role(primary_role)
+        up_key = (
+            self.projection_for_role("up")
+            if self.expert_mlp_spec.uses_gated_product
+            else None
+        )
+        down_key = self.projection_for_role("down")
+        input_keys = (primary_key, up_key) if up_key is not None else primary_key
         chunk_size = (
             int(self.expert_dequant_chunk_size)
             if self.expert_weight_access in {"chunked_dequant", "fused_kernel"}
@@ -1704,32 +1841,48 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
                 token_indices = assignments[:, 0]
                 route_slots = assignments[:, 1]
                 expert_tokens = tokens.index_select(0, token_indices)
-                self._record_whitening_inputs(("w1", "w3"), expert_tokens)
-                w1 = self._dequantize_expert(
-                    "w1", expert_idx, dtype=tokens.dtype, device=tokens.device
+                self._record_whitening_inputs(input_keys, expert_tokens)
+                projection_weights = {
+                    key: self._dequantize_expert(
+                        key, expert_idx, dtype=tokens.dtype, device=tokens.device
+                    )
+                    for key in self.expert_mlp_spec.tensor_names
+                }
+                primary = self._expert_linear(
+                    primary_key,
+                    expert_tokens,
+                    projection_weights[primary_key],
+                    expert_idx,
                 )
-                w2 = self._dequantize_expert(
-                    "w2", expert_idx, dtype=tokens.dtype, device=tokens.device
+                secondary = (
+                    self._expert_linear(
+                        up_key,
+                        expert_tokens,
+                        projection_weights[up_key],
+                        expert_idx,
+                    )
+                    if up_key is not None
+                    else None
                 )
-                w3 = self._dequantize_expert(
-                    "w3", expert_idx, dtype=tokens.dtype, device=tokens.device
-                )
-                gate = self._expert_linear("w1", expert_tokens, w1, expert_idx)
-                up = self._expert_linear("w3", expert_tokens, w3, expert_idx)
-                hidden = F.silu(gate) * up
+                hidden = self._combine_expert_inputs(primary, secondary)
                 hidden = self._apply_flexmoe_channel_mask(hidden, expert_idx)
                 self._capture_routed_intermediates(hidden, token_indices * top_k + route_slots)
-                self._record_whitening_inputs("w2", hidden)
-                expert_output = self._expert_linear("w2", hidden, w2, expert_idx)
+                self._record_whitening_inputs(down_key, hidden)
+                expert_output = self._expert_linear(
+                    down_key,
+                    hidden,
+                    projection_weights[down_key],
+                    expert_idx,
+                )
                 if self._flexmoe_taylor_observer is not None:
                     self._flexmoe_taylor_observer.capture(
                         expert_index=expert_idx,
                         inputs=expert_tokens,
-                        w1=w1,
-                        w2=w2,
-                        w3=w3,
-                        gate=gate,
-                        up=up,
+                        w1=projection_weights[primary_key],
+                        w2=projection_weights[down_key],
+                        w3=projection_weights[up_key],
+                        gate=primary,
+                        up=secondary,
                         hidden=hidden,
                         output=expert_output,
                     )
@@ -1917,11 +2070,16 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             prefetch(
                 self._packed_tensor_names,
                 quant_format=self._quant_format,
-                keys=("w1", "w3", "w2"),
+                keys=self.expert_mlp_spec.tensor_names,
                 expert_indices=active,
                 device=device,
             )
         if rotated:
+            if self.expert_mlp_spec != CANONICAL_PACKED_EXPERT_MLP_SPEC:
+                raise RuntimeError(
+                    "rotated_int8 currently supports only the canonical "
+                    "gated-product expert layout."
+                )
             from ..quantization.rotated_int8 import rotate_activations, rotated_int8_linear
 
             # w1/w3 share one activation rotation; fp32/tf32 bmm retains parity.
@@ -1947,10 +2105,23 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             if adapter_w3 is not None:
                 up = up + adapter_w3.batched_subset_forward(padded, expert_indices=expert_ids)
         else:
-            gate, up = self._expert_linear_batched_requant_pair(
-                "w1", "w3", padded, active, expert_ids
+            primary_role = "gate" if self.expert_mlp_spec.uses_gated_product else "input"
+            primary_key = self.projection_for_role(primary_role)
+            up_key = (
+                self.projection_for_role("up")
+                if self.expert_mlp_spec.uses_gated_product
+                else None
             )
-        hidden = F.silu(gate) * up
+            if up_key is None:
+                gate = self._expert_linear_batched_requant(
+                    primary_key, padded, active, expert_ids
+                )
+                up = None
+            else:
+                gate, up = self._expert_linear_batched_requant_pair(
+                    primary_key, up_key, padded, active, expert_ids
+                )
+        hidden = self._combine_expert_inputs(gate, up)
         del gate, up
         self._capture_chunk_intermediate(hidden)
         if rotated:
@@ -1975,7 +2146,9 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
                     hidden, expert_indices=expert_ids
                 )
         else:
-            expert_output = self._expert_linear_batched_requant("w2", hidden, active, expert_ids)
+            expert_output = self._expert_linear_batched_requant(
+                self.projection_for_role("down"), hidden, active, expert_ids
+            )
         return expert_output
 
     def _run_direct_routed_device_chunks(
@@ -2187,13 +2360,28 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         (nf4 / int8-module / int8-packed). LoRA stays on its existing padded
         ``batched_subset_forward`` path.
         """
-        gate, up = self._expert_linear_batched_triton_pair(
-            "w1", "w3", padded, active, expert_ids, counts
+        primary_role = "gate" if self.expert_mlp_spec.uses_gated_product else "input"
+        primary_key = self.projection_for_role(primary_role)
+        up_key = (
+            self.projection_for_role("up")
+            if self.expert_mlp_spec.uses_gated_product
+            else None
         )
-        hidden = F.silu(gate) * up
+        if up_key is None:
+            gate = self._expert_linear_batched_triton(
+                primary_key, padded, active, expert_ids, counts
+            )
+            up = None
+        else:
+            gate, up = self._expert_linear_batched_triton_pair(
+                primary_key, up_key, padded, active, expert_ids, counts
+            )
+        hidden = self._combine_expert_inputs(gate, up)
         del gate, up
         self._capture_chunk_intermediate(hidden)
-        expert_output = self._expert_linear_batched_triton("w2", hidden, active, expert_ids, counts)
+        expert_output = self._expert_linear_batched_triton(
+            self.projection_for_role("down"), hidden, active, expert_ids, counts
+        )
         return expert_output
 
     def _run_direct_routed_batched_triton(
@@ -2542,7 +2730,13 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         output = (
             self._blockwise_fp8_linear(key, x, (int(expert_idx),))
             if self._quant_format in BLOCKWISE_FP8_FORMATS
-            else x @ weight.transpose(-2, -1)
+            else _FrozenDequantExpertLinear.apply(
+                x,
+                weight,
+                self,
+                key,
+                int(expert_idx),
+            )
         )
         adapter = self.expert_lora[key] if key in self.expert_lora else None
         if adapter is not None:

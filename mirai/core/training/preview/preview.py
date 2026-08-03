@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -201,6 +202,7 @@ def run_native_denoise_loop(
     if cfg_mode_key not in {"sequential", "batched"}:
         raise ValueError(f"Unknown CFG mode '{cfg_mode}'.")
     device = _resolve_model_compute_device(pipeline)
+    model_dtype = _resolve_model_compute_dtype(pipeline)
 
     from mirai.core.inference.conditioning import (
         VIDEO_TO_VIDEO,
@@ -318,7 +320,13 @@ def run_native_denoise_loop(
     uses_saliency_guidance = bool(
         getattr(pipeline, "uses_previous_clean_routing_guidance", lambda: False)()
     )
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+    autocast_ctx = (
+        torch.amp.autocast("cuda", dtype=model_dtype)
+        if device.type == "cuda"
+        and model_dtype in {torch.float16, torch.bfloat16}
+        else contextlib.nullcontext()
+    )
+    with torch.no_grad(), autocast_ctx:
         for idx, t_val in enumerate(solver.timesteps):
             prepared.pin_condition(latents[0])
             timestep = t_val.unsqueeze(0).to(device)

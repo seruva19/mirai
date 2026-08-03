@@ -135,7 +135,7 @@ def _pipeline(*, checkpointing: str = "off") -> tuple[
             seed=37,
         )
     )
-    pipeline.configure_training_policy("selective_sinkhorn", controller)
+    pipeline.configure_selective_sinkhorn(controller)
     controller.bind_batch(global_batch_index=11, training=True)
     pipeline.set_gradient_checkpointing(checkpointing)
     pipeline.train()

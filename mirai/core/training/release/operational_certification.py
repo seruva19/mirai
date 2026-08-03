@@ -21,22 +21,46 @@ except ModuleNotFoundError as exc:  # pragma: no cover
     raise RuntimeError(f"Torch is required for operational certification: {exc}")
 
 
-def _flatten_tensor_tree(payload: Any, *, prefix: str = "") -> dict[str, torch.Tensor]:
+def _flatten_state_tree(payload: Any, *, prefix: str = "") -> dict[str, Any]:
     if isinstance(payload, dict):
-        out: dict[str, torch.Tensor] = {}
+        out: dict[str, Any] = {}
         for key, value in payload.items():
             key_prefix = f"{prefix}.{key}" if prefix else str(key)
-            out.update(_flatten_tensor_tree(value, prefix=key_prefix))
+            out.update(_flatten_state_tree(value, prefix=key_prefix))
         return out
-    if isinstance(payload, list):
-        out: dict[str, torch.Tensor] = {}
+    if isinstance(payload, (list, tuple)):
+        out: dict[str, Any] = {f"{prefix}.__sequence_type__": type(payload).__name__}
         for idx, value in enumerate(payload):
             key_prefix = f"{prefix}[{idx}]"
-            out.update(_flatten_tensor_tree(value, prefix=key_prefix))
+            out.update(_flatten_state_tree(value, prefix=key_prefix))
         return out
     if torch.is_tensor(payload):
-        return {prefix: payload.detach().cpu().float()}
-    return {}
+        return {prefix: payload.detach().cpu()}
+    return {prefix: payload}
+
+
+_BEHAVIOR_STATE_KEYS = (
+    "global_step",
+    "trainer_state",
+    "strategy_metadata",
+    "optimizer_state",
+    "optimizer_identity",
+    "scheduler_state",
+    "rng_state",
+    "torch_rng_state",
+    "skipped_steps",
+    "consecutive_skipped_steps",
+    "early_stop_state",
+    "ema_state",
+    "ema_decay",
+    "posthoc_ema_state",
+    "runtime_overrides",
+    "training_policy_metadata",
+)
+
+
+def _behavior_state(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: payload.get(key) for key in _BEHAVIOR_STATE_KEYS}
 
 
 def build_resume_equivalence_certification(
@@ -53,8 +77,8 @@ def build_resume_equivalence_certification(
     full_payload = load_checkpoint(full_checkpoint)
     resumed_payload = load_checkpoint(resumed_checkpoint)
 
-    full_tensors = _flatten_tensor_tree(full_payload.get("trainer_state", {}).get("pipeline", {}))
-    resumed_tensors = _flatten_tensor_tree(resumed_payload.get("trainer_state", {}).get("pipeline", {}))
+    full_tensors = _flatten_state_tree(_behavior_state(full_payload))
+    resumed_tensors = _flatten_state_tree(_behavior_state(resumed_payload))
     full_keys = set(full_tensors)
     resumed_keys = set(resumed_tensors)
     shared_keys = sorted(full_keys & resumed_keys)
@@ -65,8 +89,25 @@ def build_resume_equivalence_certification(
     for key in shared_keys:
         left = full_tensors[key]
         right = resumed_tensors[key]
-        max_abs_delta = max(max_abs_delta, float(torch.max(torch.abs(left - right)).item()))
-        if not torch.allclose(left, right, atol=float(atol), rtol=float(rtol)):
+        if torch.is_tensor(left) or torch.is_tensor(right):
+            if not (torch.is_tensor(left) and torch.is_tensor(right)):
+                mismatched_keys.append(str(key))
+                continue
+            if left.shape != right.shape or left.dtype != right.dtype:
+                mismatched_keys.append(str(key))
+                continue
+            if left.is_floating_point() or left.is_complex():
+                if left.numel():
+                    max_abs_delta = max(
+                        max_abs_delta,
+                        float(torch.max(torch.abs(left - right)).item()),
+                    )
+                equal = torch.allclose(left, right, atol=float(atol), rtol=float(rtol))
+            else:
+                equal = torch.equal(left, right)
+        else:
+            equal = type(left) is type(right) and left == right
+        if not equal:
             mismatched_keys.append(str(key))
     global_step_match = int(full_payload.get("global_step", 0)) == int(resumed_payload.get("global_step", 0))
     status = (

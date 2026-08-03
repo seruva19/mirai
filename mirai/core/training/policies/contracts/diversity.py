@@ -202,7 +202,7 @@ class DiversityRoutingTrainingPolicyTests(unittest.TestCase):
         controller = DiversityAwareRoutingController(
             num_experts=8, top_k=2, warmup_steps=1
         )
-        pipeline.configure_training_policy("diversity_routing", controller)
+        pipeline.configure_diversity_routing(controller)
         pipeline.train()
         inputs = (
             torch.randn(1, 2, 4, 8, 8),

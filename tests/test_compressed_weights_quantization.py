@@ -34,7 +34,14 @@ from mirai.core.models.compressed_weights.quantization.learned_rotation import (
     learn_groupwise_expert_rotation,
     validate_learned_rotation_selection,
 )
-from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
+from mirai.core.models.compressed_weights.quantization.rotated_int8 import (
+    rotated_int8_linear,
+)
+from mirai.core.moe.runtime.specs import (
+    ExpertMLPExecutionSpec,
+    ExpertProjectionRole,
+    MoEOptimizationPolicy,
+)
 from mirai.core.moe.runtime.specs import active_moe_optimization_policy
 from mirai.core.models.compressed_weights.quantization.microscaling_quant import (
     dequantize_microscaling,
@@ -83,6 +90,320 @@ except ModuleNotFoundError:  # pragma: no cover
 
 @unittest.skipIf(torch is None, "torch not installed")
 class CompressedWeightQuantizationTests(unittest.TestCase):
+    def test_prepare_supports_provider_declared_two_projection_gelu_experts(self) -> None:
+        spec = ExpertMLPExecutionSpec(
+            projections=(
+                ExpertProjectionRole("input", "fc_in"),
+                ExpertProjectionRole("down", "fc_out"),
+            ),
+            activation="gelu",
+            combiner="activated",
+        )
+
+        class _AlternativeExperts(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.num_experts = 3
+                self.mirai_expert_mlp_spec = spec
+                self.fc_in = nn.Parameter(
+                    torch.randn(3, 24, 16), requires_grad=False
+                )
+                self.fc_out = nn.Parameter(
+                    torch.randn(3, 16, 24), requires_grad=False
+                )
+
+        class _Root(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.experts = _AlternativeExperts()
+
+        torch.manual_seed(125)
+        counts = torch.tensor([2, 1, 2])
+        for access in ("full_dequant", "active_dequant", "chunked_dequant"):
+            with self.subTest(expert_weight_access=access):
+                root = _Root()
+                reference_in = root.experts.fc_in.detach().clone()
+                reference_out = root.experts.fc_out.detach().clone()
+                report = quantize_compressed_weights_modules(
+                    root,
+                    group_sizes=16,
+                    expert_weight_access=access,
+                    expert_dequant_chunk_size=2,
+                    expert_mlp_execution_spec=spec,
+                )
+                self.assertEqual(report.grouped_expert_modules, 1)
+                self.assertEqual(report.quantized_tensors, 2)
+                self.assertIsInstance(root.experts, CompressedGroupedExperts)
+                self.assertEqual(root.experts.expert_mlp_spec, spec)
+
+                inputs = torch.randn(5, 16, requires_grad=True)
+                reference_inputs = inputs.detach().clone().requires_grad_(True)
+                actual = root.experts.run_for_loop(inputs, counts)
+                expected_parts = []
+                for expert_idx, expert_inputs in enumerate(
+                    torch.split(reference_inputs, [2, 1, 2])
+                ):
+                    hidden = torch.nn.functional.gelu(
+                        torch.nn.functional.linear(
+                            expert_inputs, reference_in[expert_idx]
+                        )
+                    )
+                    expected_parts.append(
+                        torch.nn.functional.linear(hidden, reference_out[expert_idx])
+                    )
+                expected = torch.cat(expected_parts)
+                torch.testing.assert_close(actual, expected, rtol=0.12, atol=0.35)
+                actual.square().mean().backward()
+                expected.square().mean().backward()
+                torch.testing.assert_close(
+                    inputs.grad,
+                    reference_inputs.grad,
+                    rtol=0.12,
+                    atol=0.35,
+                )
+
+        with self.assertRaisesRegex(RuntimeError, "canonical w1/w3/w2"):
+            export_compressed_weights_packed_state(root)
+        with self.assertRaisesRegex(ValueError, "canonical gated-product"):
+            StructuredSparse24GroupedExperts(_AlternativeExperts())
+        with self.assertRaisesRegex(ValueError, "canonical gated-product"):
+            quantize_compressed_weights_modules(
+                _Root(),
+                group_sizes=16,
+                learn_expert_rotations=True,
+                expert_mlp_execution_spec=spec,
+            )
+
+    def test_provider_and_module_execution_specs_must_match(self) -> None:
+        alternative_spec = ExpertMLPExecutionSpec(
+            projections=(
+                ExpertProjectionRole("input", "fc_in"),
+                ExpertProjectionRole("down", "fc_out"),
+            ),
+            activation="gelu",
+            combiner="activated",
+        )
+
+        class _CanonicalExperts(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.num_experts = 2
+                self.w1 = nn.Parameter(torch.randn(2, 16, 16), requires_grad=False)
+                self.w2 = nn.Parameter(torch.randn(2, 16, 16), requires_grad=False)
+                self.w3 = nn.Parameter(torch.randn(2, 16, 16), requires_grad=False)
+
+        class _AlternativeExperts(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.num_experts = 2
+                self.mirai_expert_mlp_spec = alternative_spec
+                self.fc_in = nn.Parameter(torch.randn(2, 16, 16), requires_grad=False)
+                self.fc_out = nn.Parameter(torch.randn(2, 16, 16), requires_grad=False)
+
+        source = nn.Module()
+        source.experts = _CanonicalExperts()
+        quantize_compressed_weights_modules(source, group_sizes=16)
+        _tensors, manifest = export_compressed_weights_packed_state(source)
+
+        target = nn.Module()
+        target.experts = _AlternativeExperts()
+        with self.assertRaisesRegex(ValueError, "provider-declared spec"):
+            prepare_compressed_weights_modules_from_manifest(target, manifest)
+
+    def test_megablocks_linear_rematerializes_frozen_weight_in_backward(self) -> None:
+        class _Experts(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.num_experts = 3
+                self.w1 = nn.Parameter(torch.randn(3, 16, 16), requires_grad=False)
+                self.w2 = nn.Parameter(torch.randn(3, 16, 16), requires_grad=False)
+                self.w3 = nn.Parameter(torch.randn(3, 16, 16), requires_grad=False)
+
+        class _GroupedGemmOps:
+            @staticmethod
+            def gmm(inputs, weights, batch_sizes, *, trans_b):
+                assert trans_b
+                return torch.cat(
+                    [
+                        part @ weights[index].transpose(-2, -1)
+                        for index, part in enumerate(
+                            torch.split(inputs, batch_sizes.tolist())
+                        )
+                    ]
+                )
+
+        torch.manual_seed(127)
+        module = CompressedGroupedExperts(_Experts(), group_sizes=16)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        counts = torch.tensor([2, 0, 3], dtype=torch.int64, device=device)
+        inputs = torch.randn(5, 16, device=device, requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_(True)
+        weight = module._dequantize("w1", dtype=inputs.dtype, device=inputs.device)
+        expected = torch.cat(
+            [
+                part @ weight[index].transpose(-2, -1)
+                for index, part in enumerate(
+                    torch.split(reference_inputs, counts.tolist())
+                )
+            ]
+        )
+        saved: list[torch.Tensor] = []
+
+        with torch.autograd.graph.saved_tensors_hooks(
+            lambda tensor: saved.append(tensor) or tensor,
+            lambda tensor: tensor,
+        ):
+            actual = module.megablocks_linear(
+                "w1",
+                inputs,
+                counts=counts,
+                grouped_gemm_ops=_GroupedGemmOps(),
+            )
+
+        self.assertEqual(saved, [])
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+        grad = torch.randn_like(actual)
+        actual.backward(grad)
+        expected.backward(grad)
+        torch.testing.assert_close(
+            inputs.grad,
+            reference_inputs.grad,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_dense_compressed_linear_does_not_save_materialized_weight(self) -> None:
+        torch.manual_seed(121)
+        for quant_format in ("int8", "mxfp8_e4m3"):
+            with self.subTest(quant_format=quant_format):
+                module = CompressedLinear(
+                    nn.Linear(32, 16, bias=True),
+                    group_sizes=16,
+                    quant_format=quant_format,
+                )
+                inputs = torch.randn(2, 3, 32, requires_grad=True)
+                saved: list[torch.Tensor] = []
+
+                def pack(
+                    tensor: torch.Tensor,
+                    saved_tensors: list[torch.Tensor] = saved,
+                ) -> torch.Tensor:
+                    saved_tensors.append(tensor)
+                    return tensor
+
+                with torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value):
+                    output = module(inputs)
+
+                self.assertEqual(saved, [])
+                output.square().mean().backward()
+                self.assertTrue(torch.isfinite(inputs.grad).all())
+
+    def test_per_expert_linear_does_not_save_dequantized_weight(self) -> None:
+        class _Experts(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.num_experts = 2
+                self.w1 = torch.randn(2, 16, 32)
+                self.w2 = torch.randn(2, 32, 16)
+                self.w3 = torch.randn(2, 16, 32)
+
+        torch.manual_seed(122)
+        module = CompressedGroupedExperts(
+            _Experts(),
+            group_sizes=16,
+            expert_weight_access="active_dequant",
+        )
+        inputs = torch.randn(5, 32, requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_(True)
+        weight = module._dequantize_expert(  # noqa: SLF001
+            "w1", 1, dtype=inputs.dtype, device=inputs.device
+        )
+        saved: list[torch.Tensor] = []
+
+        def pack(tensor: torch.Tensor) -> torch.Tensor:
+            saved.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value):
+            observed = module._expert_linear("w1", inputs, weight, 1)  # noqa: SLF001
+        expected = reference_inputs @ weight.transpose(-2, -1)
+        grad_output = torch.randn_like(observed)
+        observed.backward(grad_output)
+        expected.backward(grad_output)
+
+        self.assertEqual(saved, [])
+        torch.testing.assert_close(observed, expected, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0.0, atol=0.0)
+
+    def test_full_dequant_batched_linear_does_not_save_expert_stack(self) -> None:
+        class _Experts(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.num_experts = 3
+                self.w1 = torch.randn(3, 16, 32)
+                self.w2 = torch.randn(3, 32, 16)
+                self.w3 = torch.randn(3, 16, 32)
+
+        torch.manual_seed(124)
+        module = CompressedGroupedExperts(
+            _Experts(),
+            group_sizes=16,
+            expert_weight_access="full_dequant",
+        )
+        inputs = torch.randn(3, 5, 32, requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_(True)
+        weight = module._dequantize("w1", dtype=inputs.dtype, device=inputs.device)  # noqa: SLF001
+        saved: list[torch.Tensor] = []
+
+        def pack(tensor: torch.Tensor) -> torch.Tensor:
+            saved.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value):
+            observed = module.batched_linear("w1", inputs)
+        expected = torch.bmm(reference_inputs, weight.transpose(-2, -1))
+        grad_output = torch.randn_like(observed)
+        observed.backward(grad_output)
+        expected.backward(grad_output)
+
+        self.assertEqual(saved, [])
+        torch.testing.assert_close(observed, expected, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0.0, atol=0.0)
+
+    def test_rotated_int8_does_not_save_fp32_weight_operand(self) -> None:
+        torch.manual_seed(123)
+        inputs = torch.randn(2, 5, 16, requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_(True)
+        quantized = torch.randint(-127, 128, (2, 8, 16), dtype=torch.int8)
+        scale = torch.rand(2, 8, 1)
+        rotation, _ = torch.linalg.qr(torch.randn(16, 16))
+        saved: list[torch.Tensor] = []
+
+        def pack(tensor: torch.Tensor) -> torch.Tensor:
+            saved.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value):
+            observed = rotated_int8_linear(
+                inputs,
+                quantized,
+                scale,
+                16,
+                rotation=rotation,
+            )
+        reference_rotated = reference_inputs.float() @ rotation
+        expected = torch.bmm(
+            reference_rotated,
+            quantized.float().transpose(-2, -1),
+        ) * scale.reshape(2, 1, 8)
+        grad_output = torch.randn_like(observed)
+        observed.backward(grad_output)
+        expected.backward(grad_output)
+
+        self.assertEqual(saved, [])
+        torch.testing.assert_close(observed, expected, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0.0, atol=0.0)
+
     def test_blockwise_fp8_matches_e4m3_tile_oracle_and_high_precision_dgrad(
         self,
     ) -> None:

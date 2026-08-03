@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from mirai.core.moe.routing.contracts import RoutingStats
+from mirai.core.moe.routing.contracts import (
+    RoutingStats,
+    assignment_distribution_entropy,
+)
 from mirai.core.moe.adaptation.losses import (
     expert_combination_usage,
     router_similarity_loss,
@@ -54,8 +57,6 @@ def _routing_stats(model: nn.Module) -> list[RoutingStats]:
         selected_tokens = max(1, int(selected.numel()))
         expert_fraction = tuple((counts / float(selected_tokens)).detach().cpu().tolist())
         mean_prob = tuple(scores.float().mean(dim=0).detach().cpu().tolist())
-        token_probs = top_scores.float()
-        entropy = -(token_probs * (token_probs.clamp_min(1e-12).log())).sum(dim=-1).mean()
         stats.append(
             RoutingStats(
                 layer=name,
@@ -64,7 +65,7 @@ def _routing_stats(model: nn.Module) -> list[RoutingStats]:
                 expert_fraction=expert_fraction,
                 mean_router_probability=mean_prob,
                 dead_experts=int((counts == 0).sum().item()),
-                routing_entropy=float(entropy.detach().cpu().item()),
+                routing_entropy=assignment_distribution_entropy(expert_fraction),
             )
         )
     return stats

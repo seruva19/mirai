@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/mirai-logo-dark-transparent.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/mirai-logo.png">
-    <img src="assets/mirai-logo.png" alt="Mirai" width="420">
+    <source media="(prefers-color-scheme: light)" srcset="assets/mirai-logo-light-transparent.png">
+    <img src="assets/mirai-logo-light-transparent.png" alt="Mirai" width="420">
   </picture>
 </p>
 
@@ -69,17 +69,11 @@ python scripts/infer.py \
 Prompt structure, supported solvers, and family-specific arguments are
 documented on each model page.
 
-## Development model
-
-Mirai is an agent-first codebase. Repository structure, ownership metadata,
-configuration contracts, and executable validation are optimized for coding
-agents; maintenance rules live in [`agent/`](agent/AGENTS.md).
-
 ## Features
 
-The capabilities below are implemented and linked to executable contracts in
-`agent/features.json`. Many are optional and default-off; their configuration
-keys and compatibility rules are documented in
+The catalog below summarizes Mirai's capabilities. Many advanced features are
+opt-in; experimental routing topologies are disabled by default. Their
+configuration and compatibility rules are documented in
 [`CONFIG_REFERENCE.md`](CONFIG_REFERENCE.md).
 
 ### Generic
@@ -89,11 +83,13 @@ keys and compatibility rules are documented in
   provider-declared transformer blocks, validates configurable token-shape
   buckets, supplies soft dynamic-shape hints, and reports compiled regions and
   graph counters in dry-run diagnostics. [(repo)](https://github.com/pytorch/pytorch)
-- **Capability-gated attention backends** — One model-agnostic registry selects
+- **Capability-gated attention backends** — A shared registry selects
   automatic PyTorch SDPA, forced cuDNN or PyTorch Flash Attention, and optional
-  FlashAttention-3/4 fixed- or variable-length kernels. Explicit choices verify
-  CUDA capability and package availability and fail instead of silently
-  degrading; no backend speedup is claimed without workload-specific evidence.
+  FlashAttention-3/4 fixed- or variable-length kernels. Packed `auto` execution
+  falls back to an exact per-sequence PyTorch SDPA reference path when those
+  optional kernels are absent. Explicit choices verify CUDA capability and
+  package availability and fail instead of silently degrading; no backend
+  speedup is claimed without workload-specific evidence.
   [(FA3 repo)](https://github.com/Dao-AILab/flash-attention/tree/main/hopper)
   [(FA4 paper)](https://arxiv.org/abs/2603.05451)
   [(FA4 repo)](https://github.com/Dao-AILab/flash-attention)
@@ -108,8 +104,8 @@ keys and compatibility rules are documented in
   for fixed-task training and curriculum-selected homogeneous microbatches.
 - **Progressive video curriculum** — Step-keyed resolution and frame stages can
   change the deterministic T2I:T2V:I2V sampling ratio. Every active task pool is
-  validated before training; task selection is exact across resume, and the
-  existing dynamic flow-shift policy recomputes from each selected latent
+  validated before training; task selection derives from the restored step and
+  RNG state, and dynamic flow shifting recomputes from each selected latent
   shape. [(paper)](https://arxiv.org/abs/2412.03603)
   [(paper)](https://arxiv.org/abs/2511.18870)
   [(paper)](https://arxiv.org/abs/2502.10248)
@@ -120,7 +116,7 @@ keys and compatibility rules are documented in
   [(paper)](https://arxiv.org/abs/2506.05350)
   [(repo)](https://github.com/gstoica27/DeltaFM)
 - **Rectified-flow timestep sampling** — Deterministic uniform, logit-normal,
-  and mode-shift distributions with checkpointed sampler state.
+  and mode-shift distributions driven by checkpointed RNG state.
   [(paper)](https://arxiv.org/abs/2403.03206)
 - **Token-count-aware flow shifting** — Opt-in square-root scaling derives the
   rectified-flow shift from visual patch-token count and uses the same
@@ -131,9 +127,9 @@ keys and compatibility rules are documented in
 - **Timestep loss weighting** — Uniform, Min-SNR, and cosine-map weighting.
 - **Adaptive noise-level loss weighting** — An opt-in Fourier uncertainty head
   learns one log-variance `u(t)` over the rectified-flow noise coordinate and
-  optimizes `L / exp(u) + u`. The head is model-agnostic, checkpointed for exact
-  resume, and its effective weights and log-variance range are reported during
-  training. [(paper)](https://arxiv.org/abs/2312.02696)
+  optimizes `L / exp(u) + u`. The head is shared across providers, included in
+  checkpoint state, and its effective weights and log-variance range are
+  reported during training. [(paper)](https://arxiv.org/abs/2312.02696)
   [(repo)](https://github.com/NVlabs/edm2)
 - **Dispersive representation regularization** — Opt-in parameter-free
   InfoNCE-L2 repulsion over the physical mini-batch at a configurable
@@ -153,20 +149,25 @@ keys and compatibility rules are documented in
   eligible saved activations.
 - **Asynchronous checkpoint serialization** — Single-flight immutable
   snapshots.
-- **Optimizers** — AdamW, AdamW8bit, paged AdamW8bit, Prodigy, schedule-free
-  AdamW, Adafactor, Lion, and CAME.
+- **Optimizers** — AdamW, AdamW8bit, paged AdamW8bit, Prodigy, Adafactor, Lion,
+  and CAME.
 - **BF16 stochastic-rounding updates** — Opt-in AdamW, paired-LoRA, and
-  selected-expert optimizer updates use unbiased mantissa dithering without
-  persistent FP32 master weights.
+  selected-expert paths use unbiased mantissa dithering for BF16 parameter
+  writes without persistent FP32 master weights. Supported BF16-moment paths
+  apply the same unbiased writes to moment EMAs; FP32 and packed-low-bit
+  moments retain their documented formats.
   [(paper)](https://arxiv.org/abs/2502.20566)
 - **Learning-rate schedulers** — Constant, linear, cosine, cosine-restart,
   polynomial, and REX.
 - **Training lifecycle and observability** — EMA, validation, early stopping,
   previews, TensorBoard, and Weights & Biases.
-- **Checkpoint persistence and resume** — Adapter-only checkpoints, exact
-  resume, atomic artifacts, and migrations.
+- **Checkpoint persistence and resume** — Adapter-only checkpoints, atomic
+  artifacts, migrations, and replay-tested restoration of registered runtime
+  scenarios rather than an exactness claim for every optional-feature
+  combination.
 - **LoRA lifecycle** — Targeting, rank/alpha patterns, rsLoRA, LoRA+, dropout,
-  import, export, merge, and sparse expert export.
+  import, export, and sparse expert export. Runtime merge/unmerge is
+  capability-gated and is not supported by the currently released provider.
 - **Weight-decomposed low-rank adaptation (DoRA)** — DoRA trains independent
   output-channel magnitudes while LoRA updates each dense or grouped
   weight-space direction; native, Kohya, and Diffusers checkpoints preserve
@@ -198,20 +199,21 @@ keys and compatibility rules are documented in
   [(repo)](https://github.com/NVlabs/edm2)
 - **LoRA interchange** — Kohya, Diffusers, LyCORIS, and ComfyUI layouts.
 - **Inference solvers** — Native Euler, Flow-UniPC, and DPM++ 2M.
-- **Classifier-free guidance** — Sequential and batched execution.
+- **Classifier-free guidance** — Sequential execution and a capability-gated
+  batched path with explicit variable-length prefix masks.
 - **Batch inference sessions** — Per-request negative prompts, seeds, FPS, and
   decoding of saved latent outputs.
 - **Conditioned inference** — Provider-owned T2I, text-plus-image-to-video, and
-  video-to-video inputs share one model-agnostic contract. TI2V keeps its
+  video-to-video inputs share one conditioning contract. TI2V keeps its
   first-frame latent fixed throughout denoising; V2V truncates the solver
   schedule by an explicit denoising strength.
   [(DiffSynth PR)](https://github.com/modelscope/DiffSynth-Studio/pull/1545)
-- **Operational runtime controls** — CPU dry-run, structured metrics/events,
-  resource telemetry, and GPU leases.
+- **Operational runtime controls** — Synthetic-step dry-run diagnostics,
+  structured metrics/events, resource telemetry, and GPU leases. Dry-run still
+  constructs the configured model and therefore requires its model assets and
+  sufficient memory.
 - **Interactive training controls** — Learning-rate finder, file/SQLite live
   control, and dataset compliance gates.
-- **Release evidence and promotion gates** — Evidence bundles, an operational
-  matrix, promotion gates, and bundle verification.
 
 ### MoE
 
@@ -219,9 +221,10 @@ keys and compatibility rules are documented in
   checkpoints bounded local expert-compute chunks to reduce routed-activation
   lifetime without changing routing topology.
   [(paper)](https://arxiv.org/abs/2511.21431)
-- **Provider-based sparse-MoE integration** — Model families expose typed
-  capabilities and native pipeline hooks without family branches in core
-  orchestration.
+- **Provider-declared expert execution** — Model providers declare expert tensor
+  names, projection roles, activation, and combiner. Shared compressed execution
+  supports gated three-projection and activated two-projection MLPs; specialized
+  canonical-only transforms reject incompatible layouts explicitly.
 - **Grouped adjugate experts** — Opt-in Grove MoE capacity expansion assigns
   one smaller trainable FFN to each explicit disjoint expert group without
   changing the native router. For a token, routes that land in the same group
@@ -291,10 +294,11 @@ keys and compatibility rules are documented in
   every K=128 partial product into an FP32 accumulator; input gradients remain
   high precision rather than applying the unstable block-scaled Dgrad variant.
   [(paper)](https://arxiv.org/abs/2412.19437)
-- **Native DeepGEMM FP8 experts** — An explicit SM90 backend executes
-  routed FP8 expert projections as one M-grouped tensor-core GEMM while retaining
-  Mirai's high-precision frozen-weight input gradient and adapter-gradient path.
-  The portable block-scaled implementation remains the reference.
+- **Native DeepGEMM FP8 experts** — When the SM90 and DeepGEMM capability probes
+  succeed, routed FP8 expert projections execute as one M-grouped tensor-core
+  GEMM while retaining Mirai's high-precision frozen-weight input-gradient and
+  adapter-gradient path. The portable block-scaled implementation remains the
+  reference.
   [(repo)](https://github.com/deepseek-ai/DeepGEMM)
   [(repo)](https://github.com/deepseek-ai/DeepSeek-V3)
 - **GGUF low-bit storage** — IQ4_XS and IQ3_XXS artifacts provide compact,
@@ -313,7 +317,9 @@ keys and compatibility rules are documented in
   [(paper)](https://arxiv.org/abs/2506.08027)
   [(specification)](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
 - **Packed expert artifacts** — Quantized expert tensors, scales, shapes, and
-  lineage are serialized as versioned artifacts with lossless restore.
+  lineage are serialized as versioned artifacts whose packed payload restores
+  losslessly; quantization itself is not claimed to preserve the original BF16
+  weights losslessly.
 - **Direct packed restore** — Compatible packed weights reconstruct the
   executable graph without first materializing the complete BF16 base.
 - **Aligned expert shards** — Safetensors expert payloads can be aligned for
@@ -325,21 +331,28 @@ keys and compatibility rules are documented in
   through the same bounded residency schedule; trainable adapter state remains
   independently owned.
 - **Routing-aware block residency** — Residency planning retains blocks using
-  execution phase and observed routing heat under a fixed memory budget.
+  execution phase and observed routing heat under a configured declared-weight
+  residency budget.
 - **Bounded H2D residency ring** — Flat pinned buffers and bounded slots limit
-  in-flight expert transfers and allocator fragmentation.
+  ring-owned in-flight expert transfers and reusable staging allocations.
 - **Expert-aware activation checkpointing** — Checkpoint policies preserve
   routed-expert semantics while controlling recomputation and saved tensors.
 - **Train-state CPU offload** — Activations, gradients, optimizer state, and
   trainable parameters can be offloaded independently with explicit ownership.
 - **Re-dequantized expert backward** — Backward reconstructs frozen expert
-  weights as needed so BF16 expert stacks do not survive in autograd.
+  operands across registered dense, per-expert, batched, and grouped projection
+  paths for input-gradient computation instead of retaining their dequantized
+  forward tensors in autograd.
 - **Paired and chunked dequantization** — Routed expert projections are
-  reconstructed in bounded pairs or chunks to cap transient VRAM.
-- **Routed-expert device cache** — A byte-bounded cache retains frequently used
-  experts while preserving explicit host/device ownership.
-- **Unified residency ledger** — Components, blocks, and experts share a
-  single-device byte ledger that rejects budget overcommit.
+  reconstructed in bounded pairs or chunks per operation; this is not a bound
+  on total process VRAM.
+- **Routed-expert device cache** — A byte-bounded cache retains reconstructed
+  INT8 experts while preserving explicit host/device ownership.
+- **Unified residency ledger** — Block resident sets, transfer windows, and the
+  expert-device cache reserve bytes in one configured ledger. It rejects
+  declared overcommit but does not
+  measure or bound activations, dequantization transients, allocator overhead,
+  or total CUDA peak memory.
 - **Hardware-tier planning** — Named hardware policies resolve conservative
   memory settings without changing feature defaults.
 - **Explicit disk streaming** — Packed experts may stream from disk only when
@@ -370,7 +383,9 @@ keys and compatibility rules are documented in
   [(repo)](https://github.com/woct0rdho/transformers-qwen3-moe-fused)
 - **Activation-rotated INT8 expert execution** — Frozen expert weights are
   quantized after orthogonal rotation; routed execution rotates activations,
-  consumes the stored INT8 operands directly, and preserves adapter gradients.
+  reconstructs FP32 GEMM operands from the stored INT8 tensors at the operation
+  boundary, and preserves adapter gradients. This is compact INT8 storage, not
+  a packed INT8 GEMM throughput claim.
   [(paper)](https://arxiv.org/abs/2404.00456)
 - **Learned orthogonal expert quantization rotations** — Packed INT8 export can
   replace the fixed Hadamard basis with Cayley-parameterized group rotations
@@ -382,9 +397,10 @@ keys and compatibility rules are documented in
   packed execution.
   [(paper)](https://arxiv.org/abs/2405.16406)
   [(repo)](https://github.com/facebookresearch/SpinQuant)
-- **Packed INT8 expert operation** — Gate/up activation rotation, quantized
-  GEMM, scale epilogues, SwiGLU, and active-expert LoRA share one bounded
-  execution contract.
+- **Packed INT8 expert operation** — For the canonical `w1`/`w3`/`w2` SwiGLU
+  artifact layout, gate/up activation rotation, INT8-backed reference GEMM,
+  scale epilogues, and active-expert LoRA share one bounded execution contract.
+  Export and import reject other provider-declared layouts.
 - **Independent grouped backward selection** — Forward and input-gradient
   grouped GEMMs may select different capability-checked backends.
 - **Autograd-complete dispatch operations** — Routed permutation and
@@ -518,7 +534,7 @@ keys and compatibility rules are documented in
 - **Adam-mini selected-expert neuron partitioning** — Directly tuned grouped
   expert projections retain a full first moment only for selected rows and one
   second-moment scalar per selected expert/output neuron. The partition is
-  checkpoint-bound and supports exact resume and BF16 stochastic writes.
+  checkpoint-bound; its compact state round-trips with BF16 stochastic writes.
   [(paper)](https://arxiv.org/abs/2406.16793)
   [(repo)](https://github.com/zyushun/Adam-mini)
 - **Matrix-geometry selected-expert optimization** — Muon applies an

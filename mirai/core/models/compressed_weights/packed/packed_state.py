@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from mirai.core.lineage import sha256_file
 from mirai.core.moe.storage.aliases import logical_to_physical_from_manifest_spec
 from mirai.core.moe.runtime.specs import (
+    CANONICAL_PACKED_EXPERT_MLP_SPEC,
     normalize_expert_weight_access_policy,
     resolve_packed_shard_size_bytes,
 )
@@ -101,7 +102,10 @@ def prepare_compressed_weights_modules_from_manifest(
         if kind == "grouped_experts":
             if not (
                 isinstance(module, CompressedGroupedExperts)
-                or is_dense_grouped_expert_module(module)
+                or is_dense_grouped_expert_module(
+                    module,
+                    execution_spec=CANONICAL_PACKED_EXPERT_MLP_SPEC,
+                )
             ):
                 raise ValueError(f"Target module {module_name!r} is not a grouped expert module.")
             access = str(raw_spec.get("expert_weight_access") or "full_dequant")
@@ -298,8 +302,16 @@ def _packed_state_inventory(
             quantized_numel += int(module.weight_int8.numel())
             continue
         if isinstance(module, CompressedGroupedExperts):
+            if module.expert_mlp_spec != CANONICAL_PACKED_EXPERT_MLP_SPEC:
+                raise RuntimeError(
+                    "Packed grouped-expert artifacts currently encode only the "
+                    "canonical w1/w3/w2 gated-product layout; export of a "
+                    "provider-specific execution layout is not supported."
+                )
             if not module.is_fully_loaded():
-                missing = sorted({"w1", "w2", "w3"} - module._loaded_dense_keys)
+                missing = sorted(
+                    set(module.expert_mlp_spec.tensor_names) - module._loaded_dense_keys
+                )
                 raise RuntimeError(f"Cannot export incomplete compressed_weights grouped experts {module_name!r}: {missing}.")
             quant_format = normalize_quant_format(getattr(module, "_quant_format", "int8"))
             physical_provider = getattr(module, "_physical_weight_provider", None)

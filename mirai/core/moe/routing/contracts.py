@@ -3,7 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
+
+
+def assignment_distribution_entropy(fractions: tuple[float, ...]) -> float:
+    """Shannon entropy of detached per-expert assignment fractions."""
+
+    return float(
+        -sum(
+            value * math.log(value)
+            for raw_value in fractions
+            if (value := float(raw_value)) > 0.0
+        )
+    )
 
 
 @dataclass(frozen=True)

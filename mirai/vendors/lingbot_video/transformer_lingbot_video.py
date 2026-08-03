@@ -90,6 +90,16 @@ LINGBOT_VIDEO_FP32_MODULES = (
 )
 
 
+def _torch_grouped_mm_supported(device: torch.device) -> bool:
+    """Return whether this torch build can execute grouped MM on ``device``."""
+
+    return bool(
+        device.type == "cuda"
+        and hasattr(torch, "_grouped_mm")
+        and torch.cuda.get_device_capability(device) == (9, 0)
+    )
+
+
 def should_keep_in_fp32(name: str) -> bool:
     return any(module_name in name.split(".") for module_name in LINGBOT_VIDEO_FP32_MODULES)
 
@@ -1505,7 +1515,11 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             capability = torch.cuda.get_device_capability(tokens.device)
             if capability < (9, 0):
                 return batched_runner(tokens, counts)
-        if not hasattr(torch, "_grouped_mm") or tokens.device.type != "cuda":
+        # PyTorch currently exposes ``_grouped_mm`` on builds where the kernel
+        # itself is SM90-only. Attribute presence is therefore not a sufficient
+        # capability probe: supported SM80/SM89 Mirai hosts must retain the
+        # reference expert loop instead of failing inside the CUDA op.
+        if not _torch_grouped_mm_supported(tokens.device):
             return self._run_experts_for_loop(tokens, counts)
         input_shape, padded_tokens, permuted_indices, aligned_counts = self._pad_grouped_tokens(
             tokens, counts, training=self.training

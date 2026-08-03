@@ -158,29 +158,32 @@ def run_torch_grouped_dispatch_plan(
         if routed_adapter_gate is None
         else routed_adapter_gate.resolve_sorted(plan.sorted_token_indices, counts)
     )
-    gate = _grouped_linear(
+    primary_role = "gate" if owner.expert_mlp_spec.uses_gated_product else "input"
+    primary = _grouped_linear(
         owner,
-        "w1",
+        owner.projection_for_role(primary_role),
         sorted_tokens,
         expert_ids,
         counts,
         offsets,
         route_gate=route_gate,
     )
-    up = _grouped_linear(
-        owner,
-        "w3",
-        sorted_tokens,
-        expert_ids,
-        counts,
-        offsets,
-        route_gate=route_gate,
-    )
-    hidden = F.silu(gate) * up
+    secondary = None
+    if owner.expert_mlp_spec.uses_gated_product:
+        secondary = _grouped_linear(
+            owner,
+            owner.projection_for_role("up"),
+            sorted_tokens,
+            expert_ids,
+            counts,
+            offsets,
+            route_gate=route_gate,
+        )
+    hidden = owner._combine_expert_inputs(primary, secondary)
     owner._capture_routed_intermediates(hidden, plan.sort_positions)
     expert_output = _grouped_linear(
         owner,
-        "w2",
+        owner.projection_for_role("down"),
         hidden,
         expert_ids,
         counts,

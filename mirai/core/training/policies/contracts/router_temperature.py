@@ -181,7 +181,7 @@ class RouterTemperatureTrainingPolicyTests(unittest.TestCase):
             temperature=2.0,
             minimum_temperature=2.0,
         )
-        pipeline.configure_training_policy("router_temperature", controller)
+        pipeline.configure_router_temperature(controller)
         pipeline.train()
         controller.bind_step(step=0, training=True)
         router = pipeline._moe_router_modules[0]

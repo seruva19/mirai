@@ -9,9 +9,30 @@ from pathlib import Path
 
 from mirai.core.moe.artifacts.manifest import write_download_manifest
 from mirai.core.moe.artifacts.verification import verify_downloaded_snapshot
+from scripts.download import _snapshot_file_inventory
 
 
 class SnapshotVerificationTests(unittest.TestCase):
+    def test_download_inventory_excludes_local_cache_and_prior_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "transformer").mkdir()
+            (root / "transformer" / "config.json").write_bytes(b"abc")
+            (root / ".cache" / "huggingface").mkdir(parents=True)
+            (root / ".cache" / "huggingface" / "metadata").write_bytes(b"local")
+            (root / "download_manifest.json").write_text("{}", encoding="utf-8")
+
+            self.assertEqual(
+                _snapshot_file_inventory(root),
+                [
+                    {
+                        "path": "transformer/config.json",
+                        "size": 3,
+                        "status": "downloaded",
+                    }
+                ],
+            )
+
     def test_verifies_complete_lingbot_snapshot_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

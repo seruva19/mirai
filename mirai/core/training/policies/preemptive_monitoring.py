@@ -30,7 +30,7 @@ class PreemptiveMonitoringTrainingPolicy(TrainingPolicy):
         self.monitor = monitor or PreemptiveAttentionMonitor()
 
     def configure_pipeline(self, pipeline: Any) -> None:
-        pipeline.configure_training_policy(self.name, self.monitor)
+        pipeline.configure_preemptive_monitoring(self.monitor)
 
     def state_dict(self) -> Mapping[str, Any]:
         return self.monitor.state_dict()

@@ -12,9 +12,31 @@ from mirai.core.training.release.release_evidence_contract import (
     validate_release_evidence_bundle,
     validate_train_summary,
 )
+from mirai.core.training.release.operational_certification import (
+    _behavior_state,
+    _flatten_state_tree,
+)
 
 
 class ReleaseEvidenceContractTests(unittest.TestCase):
+    def test_resume_certification_inventory_includes_non_pipeline_state(self) -> None:
+        flattened = _flatten_state_tree(
+            _behavior_state(
+                {
+                    "global_step": 7,
+                    "trainer_state": {"pipeline": {"weight": 1}},
+                    "optimizer_state": {"state": {0: {"step": 7}}},
+                    "scheduler_state": {"last_epoch": 7},
+                    "rng_state": (3, (1, 2), None),
+                    "runtime_overrides": {"val_every_n_steps_override": 4},
+                }
+            )
+        )
+        self.assertEqual(flattened["global_step"], 7)
+        self.assertEqual(flattened["optimizer_state.state.0.step"], 7)
+        self.assertEqual(flattened["scheduler_state.last_epoch"], 7)
+        self.assertEqual(flattened["runtime_overrides.val_every_n_steps_override"], 4)
+
     @staticmethod
     def _native_report(*, model_type: str) -> dict[str, object]:
         return {
