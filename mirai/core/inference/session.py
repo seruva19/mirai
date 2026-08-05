@@ -59,7 +59,7 @@ def _sync_perf_counter() -> float:
 
 
 def decode_pipeline_video(
-    *, pipeline, pred: torch.Tensor, video_path: Path, fps: int = 8
+    *, pipeline, pred: torch.Tensor, video_path: Path, fps: float = 8.0
 ) -> None:
     from mirai.core.training.preview.preview import _write_mp4
 
@@ -68,7 +68,7 @@ def decode_pipeline_video(
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
         frames = pipeline.decode_latents_native([pred])
-        written = bool(_write_mp4(video_path, frames, fps=int(fps)))
+        written = bool(_write_mp4(video_path, frames, fps=float(fps)))
     except Exception as exc:
         raise RuntimeError(f"Native VAE decode failed: {exc}") from exc
     finally:
@@ -94,7 +94,7 @@ def decode_pipeline_media(
     pred: torch.Tensor,
     out_path: Path,
     task: str,
-    fps: int = 8,
+    fps: float = 8.0,
 ) -> Path:
     """Decode one latent and write the task's native PNG or MP4 artifact."""
     from mirai.core.inference.conditioning import TEXT_TO_IMAGE
@@ -135,7 +135,7 @@ def decode_pipeline_media(
             Image.fromarray(rgb, mode="RGB").save(media_path)
             written = media_path.is_file()
         else:
-            written = bool(_write_mp4(media_path, frames, fps=int(fps)))
+            written = bool(_write_mp4(media_path, frames, fps=float(fps)))
     except Exception as exc:
         raise RuntimeError(f"Native VAE decode failed: {exc}") from exc
     finally:
@@ -455,7 +455,7 @@ class InferenceSession:
         frames: int = 17,
         height: int = 480,
         width: int = 832,
-        fps: int = 8,
+        fps: float = 8.0,
         scheduler: str = "euler",
         decode_latent: str = "",
         allow_latent_output_only: bool = False,
@@ -637,7 +637,7 @@ class InferenceSession:
                     pred=pred,
                     out_path=out_path,
                     task=task_key,
-                    fps=int(fps),
+                    fps=float(fps),
                 )
                 media_written = True
                 video_written = task_key != TEXT_TO_IMAGE
@@ -667,7 +667,7 @@ class InferenceSession:
             "merge": bool(self.merge),
             "prompt": prompt,
             "negative_prompt": str(negative_prompt),
-            "fps": int(fps),
+            "fps": float(fps),
             "inference_mode": self.inference_mode,
             "native_inference": use_native,
             "video_written": video_written,

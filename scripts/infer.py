@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Prompt rewriter override (default: inference.prompt_rewriter from config).",
     )
-    p.add_argument("--fps", type=int, default=8, help="Output video frame rate")
+    p.add_argument("--fps", type=float, default=8.0, help="Output video frame rate")
     p.add_argument(
         "--task",
         choices=["t2v", "t2i", "ti2v", "i2v", "v2v", "text_to_video",
@@ -319,7 +319,7 @@ def main() -> int:
             height=int(args.height),
             width=int(args.width),
             out_path=args.out,
-            fps=int(args.fps),
+            fps=float(args.fps),
             scheduler=str(args.scheduler),
             decode_latent=decode_latent_path,
             allow_latent_output_only=bool(args.allow_latent_output_only),
