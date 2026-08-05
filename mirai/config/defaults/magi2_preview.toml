@@ -1,0 +1,10 @@
+[model]
+type = "magi2-preview"
+
+[model.params]
+variant = "magi2-preview-114b-a6b"
+strict_native_assets = true
+flow_shift = 7.0
+
+[model.params.family_params]
+audio_tokens = -1

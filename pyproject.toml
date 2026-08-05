@@ -26,7 +26,10 @@ dependencies = [
     "torchvision>=0.23",
     "safetensors>=0.7.0",
     "einops>=0.7.0",
-    "transformers>=4.57.0,<5",
+    "transformers==5.5.0",
+    "fla-core==0.5.2",
+    "pydantic-settings==2.14.1",
+    "unfoldNd==0.2.3",
     "ftfy>=6.0.0",
     "regex>=2024.0.0",
     "numpy>=1.26",
@@ -68,6 +71,7 @@ exclude = ["mirai.*.contracts", "mirai.*.contracts.*"]
 "mirai.config" = ["defaults/*.toml", "presets/*.toml"]
 "mirai.vendors.lingbot_video" = ["LICENSE"]
 "mirai.vendors.qwen3_moe_fused" = ["LICENSE"]
+"mirai.vendors.magi2_preview" = ["LICENSE", "configs/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "mirai"]
@@ -103,7 +107,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "**/__init__.py" = ["F401"]
 "mirai/core/models/compressed_weights/**" = ["F401"]
-"mirai/vendors/**" = ["F401", "F841"]
+"mirai/vendors/**" = ["E401", "E402", "E712", "F401", "F811", "F821", "F841", "B008", "B011"]
 "scripts/**" = ["E402", "F401", "F841"]
 "tests/**" = ["F401", "F841"]
 "**/contracts/**" = ["F401", "F841"]

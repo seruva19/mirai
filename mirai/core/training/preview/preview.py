@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -167,6 +168,7 @@ def _resolve_model_compute_dtype(pipeline: Any) -> "torch.dtype":
     return torch.float32
 
 
+@torch.inference_mode()
 def run_native_denoise_loop(
     *,
     pipeline: Any,
@@ -205,6 +207,7 @@ def run_native_denoise_loop(
     model_dtype = _resolve_model_compute_dtype(pipeline)
 
     from mirai.core.inference.conditioning import (
+        TEXT_TO_VIDEO,
         VIDEO_TO_VIDEO,
         InferenceConditioningRequest,
         PreparedInferenceConditioning,
@@ -271,6 +274,18 @@ def run_native_denoise_loop(
 
     # Generate initial noise
     noise = torch.randn(target_shape, dtype=torch.float32, device=device, generator=g)
+
+    native_sampler = getattr(pipeline, "sample_native_preview", None)
+    if callable(native_sampler) and request.task == TEXT_TO_VIDEO:
+        sampled = native_sampler(
+            noise=noise,
+            context=context,
+            context_null=context_null,
+            denoise_steps=max(1, int(denoise_steps)),
+            guidance_scale=float(scale),
+            generator=g,
+        )
+        return sampled, []
 
     # Resolve the configured solver through the preview solver registry.
     steps = max(1, int(denoise_steps))
@@ -428,7 +443,7 @@ def run_native_denoise_loop(
     return latents[0], stats
 
 
-def _write_mp4(path: Path, frames: torch.Tensor, fps: int = 8) -> bool:
+def _write_mp4(path: Path, frames: torch.Tensor, fps: float = 8.0) -> bool:
     if av is None:
         return False
     if frames.ndim != 4 or int(frames.shape[1]) != 3:
@@ -437,7 +452,7 @@ def _write_mp4(path: Path, frames: torch.Tensor, fps: int = 8) -> bool:
     frame_count, _, height, width = frames.shape
     try:
         with av.open(str(path), mode="w") as container:
-            stream = container.add_stream("libx264", rate=int(fps))
+            stream = container.add_stream("libx264", rate=Fraction(str(fps)))
             stream.width = int(width)
             stream.height = int(height)
             stream.pix_fmt = "yuv420p"

@@ -123,15 +123,28 @@ class PublicationContractTests(unittest.TestCase):
                 "agent/AGENTS.md",
                 "agent/architecture.json",
                 "configs/lingbot_video/train_bf16.toml",
+                "configs/magi2_preview/inference_offload.toml",
+                "configs/magi2_preview/train_offload.toml",
                 "model_support/lingbot_video.md",
+                "model_support/magi2_preview.md",
                 "scripts/train.py",
             }
             self.assertEqual(required_source_paths - source_names, set())
             self.assertIn("mirai/config/defaults/moe.toml", wheel_names)
             self.assertIn("mirai/config/defaults/lingbot_video.toml", wheel_names)
+            self.assertIn("mirai/config/defaults/magi2_preview.toml", wheel_names)
+            self.assertIn(
+                "mirai/config/presets/magi2_preview_offload.toml", wheel_names
+            )
             self.assertTrue(
                 any(
                     name.endswith("mirai/vendors/lingbot_video/LICENSE")
+                    for name in wheel_names
+                )
+            )
+            self.assertTrue(
+                any(
+                    name.endswith("mirai/vendors/magi2_preview/LICENSE")
                     for name in wheel_names
                 )
             )
@@ -370,16 +383,24 @@ class PublicationContractTests(unittest.TestCase):
                     f"{path}: (repo) must link to an upstream source repository",
                 )
 
-    def test_all_public_examples_load_and_only_lingbot_is_exposed(self) -> None:
+    def test_all_public_examples_load_and_supported_families_are_exposed(self) -> None:
         config_root = ROOT / "configs"
         public_configs = sorted(config_root.rglob("*.toml"))
-        expected = sorted((config_root / "lingbot_video").glob("*.toml"))
+        expected = sorted(
+            [
+                *(config_root / "lingbot_video").glob("*.toml"),
+                *(config_root / "magi2_preview").glob("*.toml"),
+            ]
+        )
         self.assertEqual(public_configs, expected)
         self.assertGreaterEqual(len(public_configs), 2)
         for path in public_configs:
             config = load_config(path)
-            self.assertEqual(config.model.type, "lingbot-video")
-            if config.memory.frozen_weight_quantization == "none":
+            self.assertIn(config.model.type, {"lingbot-video", "magi2-preview"})
+            if (
+                config.model.type == "lingbot-video"
+                and config.memory.frozen_weight_quantization == "none"
+            ):
                 self.assertEqual(
                     config.optimizer.type,
                     "adamw",

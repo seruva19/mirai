@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product": "native sparse-MoE video adapter trainer",
-  "supported_families": ["lingbot_video"],
+  "supported_families": ["lingbot_video", "magi2_preview"],
   "domains": [
     {
       "name": "feature_extensions",
@@ -43,6 +43,12 @@
         "root": "mirai/core/models/lingbot_video",
         "authority": "mirai/core/models/lingbot_video/pipeline.py",
         "search_terms": ["LingBotVideoPipeline", "LingBotVideoModelFamilyProvider"]
+      },
+      {
+        "name": "magi2_preview",
+        "root": "mirai/core/models/magi2_preview",
+        "authority": "mirai/core/models/magi2_preview/pipeline.py",
+        "search_terms": ["Magi2PreviewPipeline", "Magi2PreviewModelFamilyProvider"]
       },
       {
         "name": "model_adapters",
@@ -248,18 +254,21 @@
   ],
   "dependency_rules": [
     {
-      "name": "generic_core_must_not_import_lingbot_implementation",
+      "name": "generic_core_must_not_import_model_family_implementations",
       "source_roots": [
         "mirai/config",
         "mirai/core"
       ],
       "target_prefixes": [
         "mirai.core.models.lingbot_video",
-        "mirai.vendors.lingbot_video"
+        "mirai.vendors.lingbot_video",
+        "mirai.core.models.magi2_preview",
+        "mirai.vendors.magi2_preview"
       ],
       "exclude_globs": [
         "mirai/core/builtins.py",
         "mirai/core/models/lingbot_video/**",
+        "mirai/core/models/magi2_preview/**",
         "**/contracts/**"
       ]
     },

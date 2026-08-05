@@ -2988,9 +2988,9 @@ Optional EAQuant calibration artifact consumed while frozen router INT8 storage 
 
 - **Type:** str
 - **Default:** `"auto"`
-- **Allowed / range:** `auto`, `torch`, `rotated_int8`, `compiled_packed`, `megablocks` ([`kernels.py`](mirai/core/moe/runtime/kernels.py))
+- **Allowed / range:** `auto`, `torch`, `rotated_int8`, `compiled_packed`, `megablocks`, `grouped` ([`kernels.py`](mirai/core/moe/runtime/kernels.py))
 
-MoE execution backend. `rotated_int8` requires INT8 frozen weights with chunked access and moves the stored-weight rotation onto activations before batched multiplication. `compiled_packed` uses shape-specialized TorchInductor decode kernels for GGUF IQ4/IQ3 or microscaling storage (`mxfp8_e4m3`, MXFP4, NVFP4) before grouped GEMM and fails if compilation is unavailable. `megablocks` requires `megablocks.ops` and `grouped_gemm`.
+MoE execution backend. `rotated_int8` requires INT8 frozen weights with chunked access and moves the stored-weight rotation onto activations before batched multiplication. `compiled_packed` uses shape-specialized TorchInductor decode kernels for GGUF IQ4/IQ3 or microscaling storage (`mxfp8_e4m3`, MXFP4, NVFP4) before grouped GEMM and fails if compilation is unavailable. `megablocks` requires `megablocks.ops` and `grouped_gemm`. `grouped` selects a model-family-owned grouped-GEMM expert seam and has no generic implementation; MAGI-2 Preview implements it for training with frozen experts ([`grouped_moe.py`](mirai/core/models/magi2_preview/grouped_moe.py)) and other families reject it.
 
 ### `cuda_memory_fraction`
 

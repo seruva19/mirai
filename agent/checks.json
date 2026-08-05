@@ -81,6 +81,9 @@
     {"path": "scripts/download.py", "checks": ["publication", "static"]},
     {"path": "scripts/verify_model_snapshot.py", "checks": ["publication", "static"]},
     {"path": "mirai/core/models/lingbot_video/pipeline.py", "checks": ["model_family", "static"]},
+    {"path": "mirai/core/models/magi2_preview/", "checks": ["model_family", "static"]},
+    {"path": "mirai/vendors/magi2_preview/", "checks": ["model_family", "static"]},
+    {"path": "tests/test_magi2_preview_contract.py", "checks": ["agent_validation", "model_family", "static"]},
     {"path": "mirai/core/models/flow_shift.py", "checks": ["model_family", "static"]},
     {"path": "mirai/core/training/data/curriculum.py", "checks": ["dataset", "static", "training_lifecycle"]},
     {"path": "mirai/core/training/strategies/multi_task_video.py", "checks": ["static", "training_lifecycle"]},
@@ -384,10 +387,13 @@
         "mirai/core/models/providers.py",
         "mirai/core/models/lingbot_video/",
         "mirai/vendors/lingbot_video/",
+        "mirai/core/models/magi2_preview/",
+        "mirai/vendors/magi2_preview/",
         "inference/lingbot_video/"
       ],
       "commands": [
-        "python -m pytest tests/test_sparse_moe_contract.py tests/test_lingbot_native_inference.py tests/test_lingbot_lora_residency.py tests/test_snapshot_verification.py mirai/core/models/contracts/attention_backends.py mirai/core/models/lingbot_video/contracts/dynamic_flow_shift.py -q"
+        "python -m pytest tests/test_sparse_moe_contract.py tests/test_lingbot_native_inference.py tests/test_lingbot_lora_residency.py tests/test_magi2_preview_contract.py tests/test_snapshot_verification.py mirai/core/models/contracts/attention_backends.py mirai/core/models/lingbot_video/contracts/dynamic_flow_shift.py -q",
+        "python mirai/core/models/magi2_preview/contracts/native_train_step.py"
       ],
       "invariants": [
         "runtime is native-only",

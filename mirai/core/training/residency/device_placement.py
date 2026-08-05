@@ -85,10 +85,11 @@ def place_pipeline_on_device(
     # The quantized linears dequantize to the activation dtype on the fly, and
     # the forward runs under a bf16 autocast, so a dtype cast is unnecessary.
     quantized = bool(pipeline.has_quantized_frozen_weights())
-    if not quantized:
+    preserve_native_dtypes = bool(pipeline.preserves_native_parameter_dtypes())
+    if not quantized and not preserve_native_dtypes:
         # Cast precision first (cheap on CPU, avoids a transient fp32 copy on GPU).
         model.to(dtype=dtype)
-    else:
+    elif quantized:
         cast_trainable_tensors(model, dtype=dtype)
 
     if (

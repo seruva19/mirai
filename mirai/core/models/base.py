@@ -521,6 +521,10 @@ class BasePipeline(ABC):
         """Record the intended mixed-precision compute dtype for forward passes."""
         self._compute_autocast_dtype = dtype
 
+    def preserves_native_parameter_dtypes(self) -> bool:
+        """Return whether model-owned mixed parameter dtypes must remain intact."""
+        return False
+
     def get_training_model(self) -> Any | None:
         """Return the module-like object that owns training weights, if any."""
         return getattr(self, "model", None)

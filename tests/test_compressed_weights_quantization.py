@@ -1632,6 +1632,12 @@ class CompressedWeightRotatedInt8DispatchTests(unittest.TestCase):
             with self.subTest(removed=removed), self.assertRaises(ValueError):
                 normalize_moe_kernel_backend(removed)
 
+    def test_grouped_backend_has_no_generic_direct_routed_implementation(self) -> None:
+        self.assertEqual(normalize_moe_kernel_backend("grouped_gemm"), "grouped")
+        for direct_routed in (False, True):
+            with self.subTest(direct_routed=direct_routed), self.assertRaises(ValueError):
+                build_moe_kernel_backend("grouped", direct_routed=direct_routed)
+
     def _make_experts(self, *, chunk_size: int, num_experts: int, hidden: int, inter: int, seed: int = 0):
         torch.manual_seed(seed)
 

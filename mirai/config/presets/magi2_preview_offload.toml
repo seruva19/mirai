@@ -1,0 +1,27 @@
+model.type = "magi2-preview"
+model.dtype = "bf16"
+
+[model.params]
+variant = "magi2-preview-114b-a6b"
+strict_native_assets = true
+flow_shift = 7.0
+
+[model.params.family_params]
+audio_tokens = -1
+
+[training]
+gradient_checkpointing = "aggressive"
+blocks_to_swap = 40
+block_swap_mode = "async"
+
+[adapter]
+type = "lora"
+target_preset = "attn_router"
+rank = 8
+alpha = 8.0
+
+[memory]
+weight_residency_strategy = "block_swap"
+block_swap_prefetch_depth = 1
+minimum_system_memory_gib = 384.0
+max_pinned_host_gib = 224.0

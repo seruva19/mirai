@@ -1,0 +1,13 @@
+preset = "magi2_preview_offload"
+
+[model]
+path = "./models/MAGI-2-preview"
+
+[inference]
+task = "text_to_video"
+cfg_mode = "sequential"
+keep_text_encoder_resident = false
+keep_vae_resident = false
+
+[logging]
+output_dir = "./outputs/magi2_preview_inference"

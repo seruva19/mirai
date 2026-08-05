@@ -14,6 +14,9 @@ MOE_KERNEL_BACKENDS = {
     "rotated_int8",
     "compiled_packed",
     "megablocks",
+    # Selects a model-family-owned grouped-GEMM expert execution seam; it has no
+    # generic direct-routed implementation in this registry.
+    "grouped",
 }
 
 
@@ -26,6 +29,7 @@ def normalize_moe_kernel_backend(value: str | None) -> str:
         "batched": "torch",
         "megablocks_grouped": "megablocks",
         "dmoe": "megablocks",
+        "grouped_gemm": "grouped",
     }
     normalized = aliases.get(text, text)
     if normalized not in MOE_KERNEL_BACKENDS:
@@ -190,6 +194,12 @@ def build_moe_kernel_backend(
     | None
 ):
     backend = normalize_moe_kernel_backend(value)
+    if backend == "grouped":
+        raise ValueError(
+            "memory.moe_kernel_backend='grouped' selects a model-family-owned "
+            "grouped-GEMM expert execution seam and has no generic direct-routed "
+            "backend; the family pipeline must build it."
+        )
     if backend in {"auto", "torch"}:
         return TorchChunkedKernelBackend() if direct_routed else None
     if backend == "rotated_int8":

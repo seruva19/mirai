@@ -1436,6 +1436,34 @@
       "promotion_evidence": ""
     },
     {
+      "name": "expert_layout_provider_boundary",
+      "kind": "generic",
+      "owner": "mirai/core/models/providers.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "default_path",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "ModelFamilyProvider"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": false,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/runtime/specs.py",
+      "readme_claim": "Provider-declared expert execution",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "expert_lora_allocation",
       "kind": "adapter",
       "owner": "mirai/core/models/adapters/lora_allocation.py",
@@ -2341,34 +2369,6 @@
       "promotion_evidence": ""
     },
     {
-      "name": "expert_layout_provider_boundary",
-      "kind": "generic",
-      "owner": "mirai/core/models/providers.py",
-      "check": "compressed_weights",
-      "invariants": [
-        "owner",
-        "default_path",
-        "gradients",
-        "documentation"
-      ],
-      "symbols": [
-        "ModelFamilyProvider"
-      ],
-      "config_keys": [],
-      "disabled_config": {},
-      "contract_paths": [
-        "tests/test_compressed_weights_quantization.py"
-      ],
-      "default_off": false,
-      "stateful": false,
-      "optimized": false,
-      "reference_path": "mirai/core/moe/runtime/specs.py",
-      "readme_claim": "Provider-declared expert execution",
-      "readme_claims": [],
-      "provenance": "",
-      "promotion_evidence": ""
-    },
-    {
       "name": "lingbot_video",
       "kind": "model_family",
       "owner": "mirai/core/models/lingbot_video/pipeline.py",
@@ -2478,6 +2478,84 @@
       "readme_claim": "Low-rank activation compression",
       "readme_claims": [],
       "provenance": "https://arxiv.org/abs/2509.23472",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "magi2_grouped_moe_execution",
+      "kind": "moe_policy",
+      "owner": "mirai/core/models/magi2_preview/grouped_moe.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "Magi2GroupedMoEBackend",
+        "Magi2GroupedMoEPlan",
+        "resolve_magi2_moe_execution"
+      ],
+      "config_keys": [
+        "memory.moe_kernel_backend",
+        "memory.moe_gemm_backend"
+      ],
+      "disabled_config": {
+        "memory.moe_kernel_backend": "auto",
+        "memory.moe_gemm_backend": "auto"
+      },
+      "contract_paths": [
+        "tests/test_magi2_preview_contract.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/vendors/magi2_preview/model/magi2_preview.py",
+      "readme_claim": "Grouped MAGI-2 expert execution",
+      "readme_claims": [],
+      "provenance": "https://github.com/SandAI-org/MAGI-2-preview",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "magi2_preview",
+      "kind": "model_family",
+      "owner": "mirai/core/models/magi2_preview/pipeline.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "gradients",
+        "persistence",
+        "native_execution",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "Magi2PreviewModelFamilyProvider",
+        "Magi2PreviewPipeline"
+      ],
+      "config_keys": [
+        "model.type",
+        "model.params.family_params",
+        "training.blocks_to_swap",
+        "memory.weight_residency_strategy"
+      ],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_magi2_preview_contract.py"
+      ],
+      "default_off": false,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/vendors/magi2_preview/model/magi2_preview.py",
+      "readme_claim": "MAGI-2 Preview single-GPU adapter training",
+      "readme_claims": [
+        "Host-resident MAGI-2 block streaming",
+        "Native MAGI-2 inference"
+      ],
+      "provenance": "https://github.com/SandAI-org/MAGI-2-preview",
       "promotion_evidence": ""
     },
     {

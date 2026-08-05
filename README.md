@@ -35,6 +35,7 @@ CUDA 12.6 requirements and the Linux-only dependencies.
 ## Model support
 
 - [LingBot Video](model_support/lingbot_video.md)
+- [MAGI-2 Preview](model_support/magi2_preview.md)
 
 Each model page documents its supported training and inference paths,
 family-specific configuration, and native runtime capabilities.

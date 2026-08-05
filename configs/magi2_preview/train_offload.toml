@@ -1,0 +1,18 @@
+preset = "magi2_preview_offload"
+
+[model]
+path = "./models/MAGI-2-preview"
+
+[dataset]
+path = "./data/videos"
+auto_preprocess_cache = true
+preprocess_raw_media_to_pt = true
+enable_bucketing = true
+frame_buckets = [17]
+bucket_resolutions = ["256x448"]
+
+[logging]
+output_dir = "./outputs/magi2_preview_lora"
+save_every_n_steps = 100
+
+
