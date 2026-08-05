@@ -4,8 +4,8 @@ Native training and inference support targets SandAI's preview-stage
 [MAGI-2 Preview](https://huggingface.co/sand-ai/MAGI-2-preview) transformer. The
 provider loads the attributed native modules vendored under
 `mirai/vendors/magi2_preview` directly; the denoiser, text encoder, and VAE are
-plain `torch.nn.Module` graphs and no Diffusers pipeline participates in loading
-or in a forward pass.
+plain `torch.nn.Module` graphs. Diffusers is not a dependency of the family:
+neither loading nor a forward pass imports it.
 
 The reference release ships a multi-device configuration
 (`engine_config.cp_size = engine_config.ep_size = 8`). Mirai forces both to `1`,
@@ -56,10 +56,12 @@ pip install -e ".[magi2-preview]"
 ```
 
 The extra adds Triton (the fused multi-head MoE kernels in the vendored
-transformer), `tqdm` (shard loading and sampler progress), SciPy (audio-feature
-resampling in the vendored inference engine), and Diffusers, whose
-configuration/serialization mixins the vendored TurboVAE decoder and Flow-UniPC
-scheduler inherit. `einops`, `unfoldNd`, `pydantic-settings`, and the pinned
+transformer), `tqdm` (shard loading and sampler progress), and SciPy
+(audio-feature resampling in the vendored inference engine). Diffusers is not
+part of the extra: the vendored TurboVAE decoder and Flow-UniPC scheduler carry
+their own constructor-argument registration in
+`mirai/vendors/magi2_preview/common/native_config.py`. `einops`, `unfoldNd`,
+`pydantic-settings`, and the pinned
 `transformers` runtime that provides the Qwen3.5 text-encoder classes are
 already base dependencies. The Triton requirement carries a
 `sys_platform == "linux"` marker because the PyPI package is Linux-only; a
@@ -263,8 +265,8 @@ figures are published only after the GPU validation contract records them.
 - **Host-resident MAGI-2 block streaming** — Frozen transformer blocks move to
   the execution device only for their forward/backward window.
 - **Native MAGI-2 inference** — The provider uses the same native denoiser and
-  residency path for sampling; the denoiser is a plain `torch.nn.Module` and no
-  Diffusers pipeline participates in loading or in a forward pass.
+  residency path for sampling; the denoiser is a plain `torch.nn.Module` and
+  Diffusers is imported nowhere in loading or in a forward pass.
 - **Grouped MAGI-2 expert execution** — Optional grouped-GEMM execution of the
   multi-head routed experts during training, selected by
   `memory.moe_kernel_backend="grouped"`, with the vendored per-expert loop

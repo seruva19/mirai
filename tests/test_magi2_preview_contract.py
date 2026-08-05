@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import pathlib
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -461,3 +464,173 @@ def test_magi2_pipeline_attaches_and_detaches_the_grouped_seam() -> None:
 
     pipeline.configure_moe_optimization_policy(MoEOptimizationPolicy())
     assert module._mirai_moe_kernel_backend is None
+
+
+_NATIVE_ONLY_IMPORT_PROBE = """
+import importlib
+import sys
+
+# Any attempt to import Diffusers, at any depth, fails inside this probe.
+sys.modules["diffusers"] = None
+
+for module_name in (
+    "mirai.vendors.magi2_preview.common.native_config",
+    "mirai.vendors.magi2_preview.model.turbo_vaed",
+    "mirai.vendors.magi2_preview.pipeline.sampler",
+    "mirai.vendors.magi2_preview.pipeline.inference_engine",
+    "mirai.core.models.magi2_preview.pipeline",
+):
+    importlib.import_module(module_name)
+
+loaded = [name for name, module in sys.modules.items() if name.split(".")[0] == "diffusers" and module is not None]
+assert not loaded, loaded
+print("native-only")
+"""
+
+
+def test_magi2_load_and_forward_path_imports_without_diffusers() -> None:
+    """The vendored load/sampling path must import with Diffusers unavailable."""
+    result = subprocess.run(
+        [sys.executable, "-c", _NATIVE_ONLY_IMPORT_PROBE],
+        capture_output=True,
+        text=True,
+        cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "native-only" in result.stdout
+
+
+# Reference values below were recorded from the vendored Flow-UniPC scheduler
+# while it still derived from the Diffusers SchedulerMixin/ConfigMixin pair
+# (diffusers 0.38.0.dev0, torch 2.8.0, CPU, float32). They pin the numerical
+# behavior of the de-mixined scheduler and stay checkable without Diffusers.
+_REFERENCE_TIMESTEPS = [999, 922, 817, 666, 428]
+_REFERENCE_SIGMAS = [
+    0.9996664524078369,
+    0.9227216839790344,
+    0.8178097009658813,
+    0.666296124458313,
+    0.42826521396636963,
+    0.0,
+]
+_REFERENCE_FINAL_STATE = [
+    0.00241873, -0.0345197, -0.00316913, -0.96296185, -0.00124159, 0.22802615,
+    0.00136874, -0.02314733, 0.16864161, -0.34140122, -1.25907004, -0.07026298,
+    1.20232749, -0.04369771, 1.28708112, 0.63499749, -2.51118183, 1.28877664,
+    0.00323494, -1.22862971, -1.28806329, -0.00306869, -0.00766827, 0.01063976,
+]
+_REFERENCE_STEP_SDE = [
+    -0.43580237, -0.03616618, 0.74579, -1.38215542, 0.02491212, 0.74293435,
+    -0.35706922, -0.82400393, 0.03100988, -1.21992922, -0.85443711, 0.37083352,
+    -0.02005237, -0.35716024, 0.2563442, 0.86101246, -2.47145104, 0.73862797,
+    -1.3879627, -1.04105484, -0.5656082, 0.37187937, 0.38976991, 1.00858998,
+]
+_REFERENCE_RANDN = [
+    0.61268586, -1.17535365, -0.76464927, -0.66656566, 0.74436599, -0.64531738,
+]
+
+
+def _reference_sample() -> torch.Tensor:
+    generator = torch.Generator().manual_seed(1234)
+    return torch.randn(1, 2, 3, 4, generator=generator, dtype=torch.float32)
+
+
+def test_magi2_flow_unipc_scheduler_reproduces_recorded_reference() -> None:
+    from mirai.vendors.magi2_preview.pipeline.sampler import (
+        FlowUniPCMultistepScheduler,
+    )
+
+    scheduler = FlowUniPCMultistepScheduler()
+    assert scheduler.config.solver_type == "bh2"
+    assert scheduler.config.prediction_type == "flow_prediction"
+    assert len(scheduler) == 1000
+
+    scheduler.set_timesteps(5, device="cpu", shift=3.0)
+    assert scheduler.timesteps.tolist() == _REFERENCE_TIMESTEPS
+    assert scheduler.sigmas.tolist() == pytest.approx(_REFERENCE_SIGMAS, abs=1e-7)
+
+    state = _reference_sample()
+    for index, timestep in enumerate(scheduler.timesteps):
+        model_output = torch.sin(state * (index + 1)) * 0.5
+        state = scheduler.step(model_output, timestep, state, return_dict=False)[0]
+    assert state.flatten().tolist() == pytest.approx(_REFERENCE_FINAL_STATE, abs=1e-6)
+
+
+def test_magi2_flow_unipc_scheduler_step_returns_named_output() -> None:
+    from mirai.vendors.magi2_preview.pipeline.sampler import (
+        FlowUniPCMultistepScheduler,
+    )
+
+    sample = _reference_sample()
+    named_scheduler = FlowUniPCMultistepScheduler()
+    named_scheduler.set_timesteps(5, device="cpu", shift=3.0)
+    named = named_scheduler.step(
+        torch.zeros_like(sample), named_scheduler.timesteps[0], sample.clone()
+    )
+
+    tuple_scheduler = FlowUniPCMultistepScheduler()
+    tuple_scheduler.set_timesteps(5, device="cpu", shift=3.0)
+    plain = tuple_scheduler.step(
+        torch.zeros_like(sample),
+        tuple_scheduler.timesteps[0],
+        sample.clone(),
+        return_dict=False,
+    )
+
+    assert isinstance(named.prev_sample, torch.Tensor)
+    assert torch.equal(named.prev_sample, plain[0])
+
+
+def test_magi2_flow_unipc_stochastic_step_is_generator_reproducible() -> None:
+    from mirai.vendors.magi2_preview.pipeline.sampler import (
+        FlowUniPCMultistepScheduler,
+        randn_tensor,
+    )
+
+    scheduler = FlowUniPCMultistepScheduler()
+    scheduler.set_timesteps(5, device="cpu", shift=3.0)
+    sample = _reference_sample()
+    velocity = torch.linspace(-1, 1, sample.numel()).reshape(sample.shape)
+    generator = torch.Generator().manual_seed(7)
+    stochastic = scheduler.step_sde(
+        velocity, 1, sample.clone(), noise_theta=0.5, generator=generator
+    )
+    assert stochastic.flatten().tolist() == pytest.approx(
+        _REFERENCE_STEP_SDE, abs=1e-6
+    )
+
+    noise_generator = torch.Generator().manual_seed(99)
+    noise = randn_tensor(
+        (2, 3),
+        generator=noise_generator,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert noise.flatten().tolist() == pytest.approx(_REFERENCE_RANDN, abs=1e-6)
+    with pytest.raises(TypeError):
+        randn_tensor((2, 3), generator=[torch.Generator()])
+
+
+def test_magi2_native_config_registration_matches_upstream_filtering() -> None:
+    from mirai.vendors.magi2_preview.common.native_config import (
+        NativeConfigMixin,
+        register_to_config,
+    )
+
+    class _Probe(NativeConfigMixin):
+        @register_to_config
+        def __init__(self, a: int = 1, b: str = "x", **kwargs) -> None:
+            self.seen = dict(kwargs)
+            if a < 0:
+                self.register_to_config(a=0)
+
+    probe = _Probe.from_config({"a": 5, "unknown": 7, "_class_name": "Z"})
+    assert probe.config.a == 5
+    assert probe.config.b == "x"
+    assert probe.seen == {}
+    assert sorted(probe.config) == ["a", "b"]
+
+    overridden = _Probe(-3)
+    assert overridden.config.a == 0
+    with pytest.raises(AttributeError):
+        overridden.config.a = 1

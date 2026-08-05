@@ -15,6 +15,12 @@ from __future__ import annotations
 
 import torch
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mirai.vendors.magi2_preview.pipeline.sampler import (
+        FlowUniPCMultistepScheduler,
+    )
 @dataclass
 class ModelInput:
     x_t: torch.Tensor
@@ -62,8 +68,8 @@ class SamplerInput:
     null_txt_feat: torch.Tensor  # B, L, C
     ref_audio_feat: torch.Tensor  # B, L, C
     ref_video_feat: Optional[torch.Tensor]  # B, C, 1, H, W
-    video_scheduler: SchedulerMixin
-    audio_scheduler: SchedulerMixin
+    video_scheduler: "FlowUniPCMultistepScheduler"
+    audio_scheduler: "FlowUniPCMultistepScheduler"
     cfg_config: CFGConfig
     ref_image_feat: Optional[torch.Tensor] = None  # B, M, C, 1, H, W
     ref_image_feat_len: Optional[torch.Tensor] = None  # B, M, 2 holding (H, W)

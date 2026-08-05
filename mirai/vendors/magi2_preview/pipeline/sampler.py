@@ -16,7 +16,6 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from tqdm import tqdm
 
 from mirai.vendors.magi2_preview.infra.distributed import psm
@@ -414,8 +413,8 @@ class Magi2PreviewSampler:
         audio_latent: torch.Tensor,
         video_txt_guidance_scale: torch.Tensor,
         audio_txt_guidance_scale: torch.Tensor,
-        video_scheduler: SchedulerMixin,
-        audio_scheduler: SchedulerMixin,
+        video_scheduler: "FlowUniPCMultistepScheduler",
+        audio_scheduler: "FlowUniPCMultistepScheduler",
         t: torch.Tensor,
         cfg_config: Optional[CFGConfig] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -441,27 +440,82 @@ class Magi2PreviewSampler:
 # -----------------------------------------------------------------------------
 
 import math
+import warnings
+from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.schedulers.scheduling_utils import (
-    KarrasDiffusionSchedulers,
-    SchedulerMixin,
-    SchedulerOutput,
+
+from mirai.vendors.magi2_preview.common.native_config import (
+    NativeConfigMixin,
+    register_to_config,
 )
-from diffusers.utils import deprecate
-from diffusers.utils.torch_utils import randn_tensor
 
 
-class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+@dataclass
+class SchedulerOutput:
+    """Native stand-in for the Diffusers scheduler step output."""
+
+    prev_sample: torch.Tensor
+
+
+def randn_tensor(
+    shape: Union[tuple, list],
+    generator: Optional[torch.Generator] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+) -> torch.Tensor:
+    """Sample noise on ``device`` while honoring the generator's own device.
+
+    A CPU generator paired with an accelerator device samples on CPU and then
+    moves the result, which keeps a seeded run reproducible across devices. A
+    CUDA generator cannot feed a CPU tensor. Only a single generator is
+    accepted; upstream also allows a per-batch-element generator list, which no
+    vendored call site uses.
+    """
+    if isinstance(generator, (list, tuple)):
+        raise TypeError("randn_tensor accepts a single generator, not a sequence.")
+    if isinstance(device, str):
+        device = torch.device(device)
+    rand_device = device
+    layout = layout or torch.strided
+    device = device or torch.device("cpu")
+
+    if generator is not None:
+        generator_device_type = generator.device.type
+        if generator_device_type != device.type:
+            if generator_device_type == "cpu":
+                rand_device = "cpu"
+            elif generator_device_type == "cuda":
+                raise ValueError(
+                    f"Cannot generate a {device} tensor from a generator of type "
+                    f"{generator_device_type}."
+                )
+
+    return torch.randn(
+        shape, generator=generator, device=rand_device, dtype=dtype, layout=layout
+    ).to(device)
+
+
+def deprecate(name: str, version: str, message: str) -> None:
+    """Warn that a removed upstream argument was supplied and is ignored."""
+    warnings.warn(
+        f"`{name}` is deprecated and will be removed in version {version}. {message}",
+        FutureWarning,
+        stacklevel=3,
+    )
+
+
+class FlowUniPCMultistepScheduler(NativeConfigMixin):
     """
     `UniPCMultistepScheduler` is a training-free framework designed for the fast sampling of diffusion models.
 
-    This model inherits from [`SchedulerMixin`] and [`ConfigMixin`]. Check the superclass documentation for the generic
-    methods the library implements for all schedulers such as loading and saving.
+    Upstream derives this scheduler from the Diffusers `SchedulerMixin` and
+    `ConfigMixin`; the registered-config surface is the only part it uses, and
+    it is supplied natively by `NativeConfigMixin`.
 
     Args:
         num_train_timesteps (`int`, defaults to 1000):
@@ -509,7 +563,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             sigma is the same as the last sigma in the training schedule. If `zero`, the final sigma is set to 0.
     """
 
-    _compatibles = [e.name for e in KarrasDiffusionSchedulers]
     order = 1
 
     @register_to_config
@@ -527,7 +580,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         solver_type: str = "bh2",
         lower_order_final: bool = True,
         disable_corrector: List[int] = [],
-        solver_p: SchedulerMixin = None,
+        solver_p: Optional["FlowUniPCMultistepScheduler"] = None,
         timestep_spacing: str = "linspace",
         steps_offset: int = 0,
         final_sigmas_type: Optional[str] = "zero",  # "zero", "sigma_min"
@@ -1311,20 +1364,4 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
     def __len__(self):
         return self.config.num_train_timesteps
-
-
-# -----------------------------------------------------------------------------
-# Flow UniPC scheduler
-# -----------------------------------------------------------------------------
-
-from typing import List, Optional, Tuple, Union
-
-import torch
-import torch.nn.functional as F
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.schedulers.scheduling_utils import (
-    KarrasDiffusionSchedulers,
-    SchedulerMixin,
-    SchedulerOutput,
-)
 

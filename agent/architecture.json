@@ -274,7 +274,7 @@
     },
     {
       "name": "native_runtime_must_not_import_diffusers",
-      "source_roots": ["mirai/core"],
+      "source_roots": ["mirai/core", "mirai/vendors"],
       "target_prefixes": ["diffusers"],
       "exclude_globs": ["**/contracts/**", "**/testbed/**"]
     }

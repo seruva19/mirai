@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import os
 import re
+import urllib.request
 from dataclasses import dataclass
 from typing import Literal, Optional
 
 import numpy as np
 import torch
-from diffusers.utils import load_image
-from diffusers.video_processor import VideoProcessor
-from PIL import Image
+from PIL import Image, ImageOps
 
 from mirai.vendors.magi2_preview.common import DistBroadcaster, OffloadMode, OffloadUtils
 from mirai.vendors.magi2_preview.common.magi2_config import EvaluationConfig
@@ -80,6 +80,65 @@ class EvalInput:
 
 
 EvalTaskType = Literal["image2video", "text2video"]
+
+
+def load_image(image: "str | Image.Image") -> Image.Image:
+    """Open a reference image from a path, an http(s) URL, or a PIL object.
+
+    EXIF orientation is applied before the RGB conversion so a rotated capture
+    conditions the clip the way it is displayed.
+    """
+    if isinstance(image, Image.Image):
+        opened = image
+    elif isinstance(image, (str, os.PathLike)):
+        text = str(image)
+        if text.startswith(("http://", "https://")):
+            with urllib.request.urlopen(text) as response:  # noqa: S310
+                opened = Image.open(io.BytesIO(response.read()))
+        else:
+            opened = Image.open(text)
+    else:
+        raise ValueError(
+            "Reference image must be a path, an http(s) URL, or a PIL image, "
+            f"got {type(image).__name__}."
+        )
+    return ImageOps.exif_transpose(opened).convert("RGB")
+
+
+class VaeImagePreprocessor:
+    """Resize an image onto the VAE grid and normalize it to [-1, 1].
+
+    Upstream delegates this to the Diffusers ``VideoProcessor``; the native
+    implementation keeps the same semantics: both sides are floored to a
+    multiple of ``vae_scale_factor``, resampling is Lanczos, channels are taken
+    as they come, and the result is a ``[1, C, H, W]`` float tensor.
+    """
+
+    def __init__(self, vae_scale_factor: int) -> None:
+        self.vae_scale_factor = int(vae_scale_factor)
+
+    def preprocess(
+        self,
+        image: Image.Image,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+    ) -> torch.Tensor:
+        if not isinstance(image, Image.Image):
+            raise TypeError(
+                f"Expected a PIL image, got {type(image).__name__}."
+            )
+        height = image.height if height is None else int(height)
+        width = image.width if width is None else int(width)
+        ratio = self.vae_scale_factor
+        height -= height % ratio
+        width -= width % ratio
+
+        resized = image.resize((width, height), resample=Image.Resampling.LANCZOS)
+        array = np.array(resized).astype(np.float32) / 255.0
+        if array.ndim == 2:
+            array = array[..., None]
+        tensor = torch.from_numpy(array.transpose(2, 0, 1)).unsqueeze(0)
+        return 2.0 * tensor - 1.0
 
 
 def resizepad(image: Image.Image, th: int, tw: int) -> Image.Image:
@@ -147,7 +206,9 @@ class Magi2InferenceEngine:
         OffloadUtils.setup(self.vae, self._vae_mode, self.device)
         if config.use_turbo_vae and psm.is_group_first_rank("cp"):
             OffloadUtils.setup(self.turbo_vae, self._vae_mode, self.device)
-        self.video_processor = VideoProcessor(vae_scale_factor=2 * self.vae_stride[1])
+        self.video_processor = VaeImagePreprocessor(
+            vae_scale_factor=2 * self.vae_stride[1]
+        )
         self.txt_model_path = config.txt_model_path
 
         self.audio_latent_dim = 64

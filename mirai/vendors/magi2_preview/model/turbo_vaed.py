@@ -17,9 +17,12 @@ from typing import List, Optional, Tuple, Union
 import json
 import torch
 import torch.nn as nn
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
+
+from mirai.vendors.magi2_preview.common.native_config import (
+    NativeConfigMixin,
+    register_to_config,
+)
 
 try:
     from magi_compiler.api import magi_compile
@@ -784,7 +787,11 @@ class TurboVAEDDecoder3d(nn.Module):
         return hidden_states
 
 
-class TurboVAED(ModelMixin, ConfigMixin):
+class TurboVAED(nn.Module, NativeConfigMixin):
+    # Upstream derives this decoder from the Diffusers ``ModelMixin``/
+    # ``ConfigMixin`` pair. Only the plain ``nn.Module`` base and the
+    # constructor-argument registration are used here, so the native
+    # ``NativeConfigMixin`` supplies ``from_config`` and ``self.config``.
 
     @register_to_config
     def __init__(
