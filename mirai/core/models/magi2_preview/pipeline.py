@@ -44,6 +44,25 @@ MAGI2_GRADIENT_CHECKPOINTING_ON = frozenset({"standard", "true", "1"})
 MAGI2_NATIVE_SOLVER = "unipc"
 MAGI2_NATIVE_CFG_MODE = "batched"
 
+# The audio placeholder is drawn from a family-owned stream rather than from the
+# latent-noise stream the training loop seeds, so the two draws stay independent
+# of each other's shapes and call counts.
+MAGI2_AUDIO_NOISE_SEED_OFFSET = 20_011
+
+# Empirical envelope of the single-GPU sampling path, in latent frames. Probes
+# on one device sample correctly at T=32 (125 pixel frames); T=63 (249 frames,
+# the release's native horizon) and T=5 (17 frames) both collapse to flat
+# output. These are limits of the sampling path Mirai ships, not of the model
+# contract, and they bound generation only: training forwards are unaffected.
+MAGI2_MIN_SAMPLING_LATENT_FRAMES = 8
+MAGI2_MAX_SAMPLING_LATENT_FRAMES = 32
+
+
+def _magi2_pixel_frames(latent_frames: int) -> int:
+    """Pixel frames carried by ``latent_frames`` under the 4n+1 VAE mapping."""
+    return 4 * (int(latent_frames) - 1) + 1
+
+
 MAGI2_TARGET_PRESETS: dict[str, tuple[str, ...]] = {
     "attn_only": (".attention.linear_qkv", ".attention.linear_proj"),
     "attn_router": (
@@ -85,7 +104,13 @@ class Magi2RuntimeOptions:
 class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     """Native MAGI-2 denoiser with host-resident block streaming."""
 
-    def __init__(self, model_config: Any, memory_config: Any | None = None) -> None:
+    def __init__(
+        self,
+        model_config: Any,
+        memory_config: Any | None = None,
+        *,
+        seed: int | None = None,
+    ) -> None:
         super().__init__()
         self.model_config = model_config
         family = dict(getattr(model_config.params, "family_params", {}) or {})
@@ -111,10 +136,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._text_encoder: Any | None = None
         self._vae: nn.Module | None = None
         self._inference_device = "cpu"
+        self._audio_noise_generator = self._build_audio_noise_generator(seed)
+
+    @staticmethod
+    def _build_audio_noise_generator(seed: int | None) -> torch.Generator:
+        """CPU generator owning the audio placeholder stream of one run."""
+        generator = torch.Generator()
+        generator.manual_seed(
+            int(0 if seed is None else seed) + MAGI2_AUDIO_NOISE_SEED_OFFSET
+        )
+        return generator
 
     @classmethod
     def from_training_config(cls, config: Any) -> "Magi2PreviewPipeline":
-        return cls(config.model, config.memory)
+        return cls(config.model, config.memory, seed=int(config.training.seed))
 
     def _build_model(self) -> tuple[Any, nn.Module, Any]:
         try:
@@ -163,6 +198,43 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             frame_count_rule="1 modulo 4 (4n+1)",
             request_spatial_multiple=16,
         )
+
+    def preview_latent_geometry(
+        self, *, frame_count: int, height: int, width: int
+    ) -> tuple[int, int, int, int]:
+        """Apply the 4n+1 layout rule and the sampling-path length envelope.
+
+        The layout rule states what the VAE pair can represent; the envelope
+        states what the shipped single-GPU sampling path is validated to
+        produce. A request outside it is rejected here rather than returning a
+        clip the caller cannot use.
+        """
+        geometry = super().preview_latent_geometry(
+            frame_count=frame_count, height=height, width=width
+        )
+        latent_frames = int(geometry[1])
+        if latent_frames > MAGI2_MAX_SAMPLING_LATENT_FRAMES:
+            raise ValueError(
+                f"frame_count={int(frame_count)} maps to {latent_frames} latent "
+                "frames, beyond the validated MAGI-2 Preview generation "
+                f"envelope of {MAGI2_MAX_SAMPLING_LATENT_FRAMES} latent frames "
+                f"({_magi2_pixel_frames(MAGI2_MAX_SAMPLING_LATENT_FRAMES)} "
+                "frames). Sampling the model's full native horizon (~10 s) on "
+                "this single-GPU path is not supported: it degenerates to flat "
+                "output. The maximum supported request is "
+                f"{_magi2_pixel_frames(MAGI2_MAX_SAMPLING_LATENT_FRAMES)} frames."
+            )
+        if latent_frames < MAGI2_MIN_SAMPLING_LATENT_FRAMES:
+            raise ValueError(
+                f"frame_count={int(frame_count)} maps to {latent_frames} latent "
+                "frames, below the validated MAGI-2 Preview generation "
+                f"envelope of {MAGI2_MIN_SAMPLING_LATENT_FRAMES} latent frames "
+                f"({_magi2_pixel_frames(MAGI2_MIN_SAMPLING_LATENT_FRAMES)} "
+                "frames, about 1.2 s). Short-horizon sampling below that "
+                "degrades on this path and is unsupported; the bound is "
+                "empirical."
+            )
+        return geometry
 
     def has_native_inference(self) -> bool:
         return True
@@ -529,14 +601,21 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             else configured_audio_tokens
         )
         # MAGI-2 ships without an audio encoder, so the audio track carries no
-        # user signal; the reference engine feeds it fresh Gaussian noise for
-        # every generation (`pipeline/inference_engine.py`). Those tokens still
-        # take part in attention and MoE routing, so the draw is reproduced here
-        # per call rather than cached: it consumes the process RNG stream that
-        # the training seed owns instead of freezing one hidden sample.
+        # user signal; the reference engine feeds it Gaussian noise
+        # (`pipeline/inference_engine.py`), once per generation. Those tokens
+        # take part in attention and MoE routing, so this training forward draws
+        # them fresh on every call rather than freezing one hidden sample - the
+        # deliberate difference from the per-generation inference draw in
+        # ``sample_native_preview``. The draw comes from the run-seeded family
+        # generator, so a training step is reproducible under its seed and the
+        # audio track length never perturbs the process RNG stream.
         audio = torch.randn(
-            batch, audio_tokens, 64, device=latents.device, dtype=latents.dtype
-        )
+            batch,
+            audio_tokens,
+            64,
+            generator=self._audio_noise_generator,
+            dtype=latents.dtype,
+        ).to(device=latents.device)
         timestep = torch.as_tensor(timesteps, device=latents.device).reshape(batch)
         model_input = ModelInput(
             x_t=latents,

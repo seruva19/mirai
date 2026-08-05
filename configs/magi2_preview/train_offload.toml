@@ -15,6 +15,6 @@ bucket_resolutions = ["256x448"]
 output_dir = "./outputs/magi2_preview_lora"
 save_every_n_steps = 100
 sample_solver = "unipc"
-sample_frame_count = 17
+sample_frame_count = 125
 
 

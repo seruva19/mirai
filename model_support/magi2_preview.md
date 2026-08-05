@@ -254,6 +254,29 @@ The example keeps `inference.keep_text_encoder_resident` and
 decoding occupy the execution device sequentially. Set either to `true` to
 trade VRAM for reload time across repeated session generations.
 
+### Generation length
+
+The validated generation envelope of this single-GPU sampling path is **29 to
+125 frames** (latent `T` 8 to 32) at the `4n+1` frame rule. A request outside
+it is rejected before sampling starts, by the same family seam that enforces
+`4n+1`, rather than returning a clip that does not carry usable content:
+
+- Above 125 frames, including the release's full native horizon of roughly ten
+  seconds (249 frames, latent `T` 63), output degenerates to a flat clip on
+  this path. Native-horizon generation is a known limitation under
+  investigation; no timeline is claimed.
+- Below 29 frames output degenerates as well. The floor is empirical: 17 frames
+  (latent `T` 5) is observed bad and 125 frames is observed good, and the
+  intermediate lengths have not been probed, so the bound is set at the
+  conservative side of the measured range rather than inferred.
+
+Both bounds describe the shipped sampling path, not the model contract, and
+they apply to generation only — training forwards accept any representable
+latent length, and `dataset.frame_buckets` is unaffected. `scripts/infer.py`
+defaults `--frames` to 17, which this family rejects; pass a length inside the
+envelope. `logging.sample_frame_count` must also fall inside it for a training
+run that emits previews; the shipped example sets 125.
+
 The native sampler owns its own CFG execution and its own schedule, so both
 requested policies are checked rather than applied. Every denoise step packs
 the conditional and unconditional branches into one single-device `B=2`
@@ -296,7 +319,7 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.strict_native_assets` | Requires the complete released native assets; the shipped preset sets this to `true`. |
 | `model.params.flow_shift` | Preset value `7.0`, matching the release's `evaluation_config.shift`. |
 | `model.params.family_params.config_path` | Override for the vendored architecture JSON; empty resolves to the shipped `magi2_preview.json`. |
-| `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, redrawn on every forward from the process RNG stream the run seed owns, and it takes part in attention and MoE routing. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
+| `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, and it takes part in attention and MoE routing. The training forward redraws it on every call from a family-owned generator seeded from `training.seed`, so a step is reproducible under its seed and the track length never perturbs the process RNG stream; native sampling draws it once per generation from the generation generator. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
 | `adapter.type` | `lora` only. |
 | `adapter.target_preset` | `attn_only` or `attn_router`. |
 | `dataset.caption_format` | `raw`; captions are encoded by the native Qwen3.5 path at cache time. |

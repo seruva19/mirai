@@ -688,6 +688,87 @@ def test_magi2_qwen_width_text_embedding_is_accepted() -> None:
     assert lengths.tolist() == [3, 3]
 
 
+# --- The audio placeholder is seeded, not stolen from the global stream ------
+
+
+class _AudioProbeProxy:
+    """Data proxy that hands the assembled model input straight through."""
+
+    def process_input(self, model_input):
+        return (model_input,)
+
+    def process_output(self, prediction):
+        return prediction, None
+
+
+def _audio_probe_transformer(model_input):
+    """Fold the audio placeholder into the returned video tensor."""
+    return model_input.x_t + model_input.audio_x_t.mean()
+
+
+def _audio_probe_pipeline(seed: int):
+    from mirai.core.models.magi2_preview.pipeline import (
+        Magi2PreviewPipeline,
+        Magi2RuntimeOptions,
+    )
+
+    pipeline = _bare_pipeline()
+    pipeline.options = Magi2RuntimeOptions(config_path="", audio_tokens=-1)
+    pipeline.data_proxy = _AudioProbeProxy()
+    pipeline.transformer = _audio_probe_transformer
+    pipeline._audio_noise_generator = (
+        Magi2PreviewPipeline._build_audio_noise_generator(seed)
+    )
+    return pipeline
+
+
+def _audio_probe_loss(pipeline, *, latent_frames: int) -> torch.Tensor:
+    latents = torch.zeros(1, 48, latent_frames, 2, 2)
+    text = {"magi2": torch.zeros(1, 3, 5120)}
+    prediction = pipeline.forward(latents, torch.full((1,), 0.5), text)
+    return prediction.square().mean()
+
+
+def test_magi2_training_audio_placeholder_is_reproducible_under_the_run_seed() -> None:
+    """Same seed, same batch, same loss - the audio draw is not global RNG."""
+    pytest.importorskip("mirai.vendors.magi2_preview.pipeline.preview_data_proxy")
+
+    first = [
+        _audio_probe_loss(_audio_probe_pipeline(7), latent_frames=4).item()
+        for _ in range(1)
+    ]
+    second = [
+        _audio_probe_loss(_audio_probe_pipeline(7), latent_frames=4).item()
+        for _ in range(1)
+    ]
+    assert first == second
+
+    other = _audio_probe_loss(_audio_probe_pipeline(11), latent_frames=4).item()
+    assert other != first[0]
+
+    # Fresh noise per training forward is deliberate: the second call of one run
+    # advances the family stream instead of repeating the first draw.
+    pipeline = _audio_probe_pipeline(7)
+    step_one = _audio_probe_loss(pipeline, latent_frames=4).item()
+    step_two = _audio_probe_loss(pipeline, latent_frames=4).item()
+    assert step_one != step_two
+    assert step_one == first[0]
+
+
+def test_magi2_training_audio_placeholder_never_touches_the_global_stream() -> None:
+    """Changing the audio track length must not perturb global torch RNG."""
+    pytest.importorskip("mirai.vendors.magi2_preview.pipeline.preview_data_proxy")
+
+    torch.manual_seed(1234)
+    baseline = torch.random.get_rng_state()
+    for latent_frames in (2, 4, 9):
+        _audio_probe_loss(_audio_probe_pipeline(7), latent_frames=latent_frames)
+        assert torch.equal(torch.random.get_rng_state(), baseline)
+    assert torch.randn(1).item() == pytest.approx(
+        torch.randn(1, generator=torch.Generator().manual_seed(1234)).item()
+    )
+
+
 # --- Sampling policies are answered, not discarded --------------------------
 
 
@@ -787,7 +868,7 @@ def test_magi2_frame_count_maps_to_the_decoder_temporal_ratio() -> None:
     pipeline = _bare_pipeline()
     layout = pipeline.get_video_latent_layout()
     assert layout.temporal_downsample == 4
-    for frames in (1, 5, 17, 81):
+    for frames in (29, 33, 81, 125):
         channels, t_lat, h_lat, w_lat = pipeline.preview_latent_geometry(
             frame_count=frames, height=256, width=448
         )
@@ -804,6 +885,52 @@ def test_magi2_unrepresentable_frame_count_is_rejected() -> None:
             )
     with pytest.raises(ValueError, match="multiples of 16"):
         pipeline.preview_latent_geometry(frame_count=17, height=250, width=448)
+
+
+def test_magi2_generation_envelope_bounds_are_enforced() -> None:
+    """Lengths the shipped sampling path is not validated for are rejected.
+
+    The bounds are empirical properties of this single-GPU sampling path: the
+    native ~10 s horizon and very short clips both degenerate, so a request for
+    either fails instead of returning unusable frames.
+    """
+    from mirai.core.models.magi2_preview.pipeline import (
+        MAGI2_MAX_SAMPLING_LATENT_FRAMES,
+        MAGI2_MIN_SAMPLING_LATENT_FRAMES,
+    )
+
+    pipeline = _bare_pipeline()
+    assert (MAGI2_MIN_SAMPLING_LATENT_FRAMES, MAGI2_MAX_SAMPLING_LATENT_FRAMES) == (
+        8,
+        32,
+    )
+
+    with pytest.raises(ValueError, match="native horizon"):
+        pipeline.preview_latent_geometry(frame_count=249, height=256, width=448)
+    with pytest.raises(ValueError, match="125 frames"):
+        pipeline.preview_latent_geometry(frame_count=129, height=256, width=448)
+    for frames in (17, 5, 1):
+        with pytest.raises(ValueError, match="Short-horizon"):
+            pipeline.preview_latent_geometry(
+                frame_count=frames, height=256, width=448
+            )
+
+    assert pipeline.preview_latent_geometry(
+        frame_count=125, height=256, width=448
+    ) == (48, 32, 16, 28)
+    assert pipeline.preview_latent_geometry(
+        frame_count=29, height=256, width=448
+    ) == (48, 8, 16, 28)
+
+
+def test_magi2_shipped_preview_sample_length_is_inside_the_envelope() -> None:
+    config = load_config("configs/magi2_preview/train_offload.toml")
+    pipeline = _bare_pipeline()
+    channels, t_lat, _h, _w = pipeline.preview_latent_geometry(
+        frame_count=config.logging.sample_frame_count, height=256, width=448
+    )
+    assert channels == 48
+    assert t_lat == 32
 
 
 # --- Environment escape hatches ---------------------------------------------
