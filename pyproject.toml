@@ -27,9 +27,6 @@ dependencies = [
     "safetensors>=0.7.0",
     "einops>=0.7.0",
     "transformers==5.5.0",
-    "fla-core==0.5.2",
-    "pydantic-settings==2.14.1",
-    "unfoldNd==0.2.3",
     "ftfy>=6.0.0",
     "regex>=2024.0.0",
     "numpy>=1.26",
@@ -53,6 +50,10 @@ tools = [
 magi2-preview = [
     # Fused multi-head MoE kernels in the vendored native transformer.
     "triton>=3.0.0; sys_platform == 'linux'",
+    # Typed architecture/engine config models in the vendored MAGI-2 config.
+    "pydantic-settings==2.14.1",
+    # N-dimensional unfold in the vendored MAGI-2 data proxies.
+    "unfoldNd==0.2.3",
     # Shard-loading and sampler progress reporting.
     "tqdm>=4.66.0",
     # Audio-feature resampling in the vendored inference engine.
@@ -115,7 +116,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "**/__init__.py" = ["F401"]
 "mirai/core/models/compressed_weights/**" = ["F401"]
-"mirai/vendors/**" = ["E401", "E402", "E712", "F401", "F811", "F821", "F841", "B008", "B011"]
+"mirai/vendors/**" = ["E401", "E402", "E712", "F401", "F841", "B008", "B011"]
 "scripts/**" = ["E402", "F401", "F841"]
 "tests/**" = ["F401", "F841"]
 "**/contracts/**" = ["F401", "F841"]

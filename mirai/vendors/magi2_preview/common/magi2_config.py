@@ -31,15 +31,11 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from mirai.vendors.magi2_preview.utils import env_is_true
 
-
-def _env_float(name: str, default: float | str) -> float:
-    return float(os.environ.get(name, default))
-
-
-def _cfg_rescale_default() -> float:
-    return float(os.environ.get("CFG_RESCALE", 0.0))
+# Mirai edit: upstream sources the CFG fields of EvaluationConfig below from the
+# environment (VG, AG, USE_SKIMMED_CFG_LINEAR, SKIMMED_CFG_SCALE, CFG_RESCALE).
+# Sampling behavior is config-driven in Mirai, so those fields are frozen to the
+# upstream defaults and the environment is not read.
 
 
 CKPT_ROOT_ENV = "MAGI2_CKPT_ROOT"
@@ -251,12 +247,8 @@ class EvaluationConfig(BaseModel):
     patch_size: Tuple[int, int, int] = (1, 1, 1)
     z_dim: int = 48
     txt_encoder_type: Literal["qwen35"] = "qwen35"
-    video_txt_guidance_scale: float = Field(
-        default_factory=lambda: float(os.environ.get("VG", 5.0))
-    )
-    audio_txt_guidance_scale: float = Field(
-        default_factory=lambda: float(os.environ.get("AG", 5.0))
-    )
+    video_txt_guidance_scale: float = 5.0
+    audio_txt_guidance_scale: float = 5.0
     use_cfg_trick: bool = True
     cfg_trick_start_frame: int = 13
     cfg_trick_value: float = 2.0
@@ -265,13 +257,9 @@ class EvaluationConfig(BaseModel):
     dynamic_cfg_cutoff_value: float = 2.0
     use_negative_prompt: bool = False
     use_ref_for_uncond: bool = False
-    use_skimmed_cfg_linear: bool = Field(
-        default_factory=lambda: env_is_true("USE_SKIMMED_CFG_LINEAR")
-    )
-    skimmed_cfg_scale: float = Field(
-        default_factory=lambda: _env_float("SKIMMED_CFG_SCALE", 5.0)
-    )
-    cfg_rescale: float = Field(default_factory=_cfg_rescale_default)
+    use_skimmed_cfg_linear: bool = False
+    skimmed_cfg_scale: float = 5.0
+    cfg_rescale: float = 0.0
     ref_image_type: Literal["square", "original"] = "original"
 
     @field_validator("skimmed_cfg_scale", "cfg_rescale")

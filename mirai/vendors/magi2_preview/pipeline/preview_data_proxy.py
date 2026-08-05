@@ -81,7 +81,7 @@ from dataclasses import dataclass
 from itertools import chain
 from typing import Any, Literal, Optional
 
-import torch
+import torch  # noqa: F811 - upstream module boundary keeps its own imports
 import torch.distributed as dist
 from einops import rearrange
 from torch.nn import functional as F

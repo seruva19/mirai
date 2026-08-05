@@ -10,7 +10,7 @@ flow_shift = 7.0
 audio_tokens = -1
 
 [training]
-gradient_checkpointing = "aggressive"
+gradient_checkpointing = "standard"
 blocks_to_swap = 40
 block_swap_mode = "async"
 

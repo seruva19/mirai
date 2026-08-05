@@ -183,7 +183,7 @@ def run_native_denoise_loop(
     height: int = 480,
     width: int = 832,
     solver_name: str = "euler",
-    cfg_mode: str = "sequential",
+    cfg_mode: str | None = None,
     forward_fn: Any = None,
     conditioning: Any | None = None,
 ) -> tuple[torch.Tensor, list[dict[str, float]]]:
@@ -200,7 +200,11 @@ def run_native_denoise_loop(
     )
 
     scale = float(cfg_scale)
-    cfg_mode_key = str(cfg_mode).strip().lower()
+    # ``None`` means the caller states no CFG policy, so a family that owns its
+    # own CFG execution keeps its native one. The generic loop below is
+    # unaffected: it still defaults to sequential.
+    requested_cfg_mode = None if cfg_mode is None else str(cfg_mode).strip().lower()
+    cfg_mode_key = requested_cfg_mode or "sequential"
     if cfg_mode_key not in {"sequential", "batched"}:
         raise ValueError(f"Unknown CFG mode '{cfg_mode}'.")
     device = _resolve_model_compute_device(pipeline)
@@ -284,6 +288,8 @@ def run_native_denoise_loop(
             denoise_steps=max(1, int(denoise_steps)),
             guidance_scale=float(scale),
             generator=g,
+            solver_name=str(solver_name),
+            **({} if requested_cfg_mode is None else {"cfg_mode": requested_cfg_mode}),
         )
         return sampled, []
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import pathlib
 import subprocess
 import sys
@@ -634,3 +635,332 @@ def test_magi2_native_config_registration_matches_upstream_filtering() -> None:
     assert overridden.config.a == 0
     with pytest.raises(AttributeError):
         overridden.config.a = 1
+
+
+def _bare_pipeline():
+    """A pipeline object without the released weights behind it.
+
+    ``__new__`` skips ``_build_model``, which is the only part of construction
+    that needs the checkpoint; every seam probed below is pure policy.
+    """
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    return pipeline
+
+
+# --- Text conditioning is never fabricated ---------------------------------
+
+
+def test_magi2_missing_text_embedding_is_rejected() -> None:
+    pipeline = _bare_pipeline()
+    like = torch.zeros(2, 1, 1, 1, 1)
+    with pytest.raises(ValueError, match="carried none"):
+        pipeline._text_features({"text_mask": None}, batch=2, like=like)
+    with pytest.raises(ValueError, match="carried none"):
+        pipeline._text_features(None, batch=2, like=like)
+
+
+def test_magi2_wrong_width_text_embedding_is_rejected_as_lineage_mismatch() -> None:
+    """A foreign encoder width is a cache-lineage error, not something to broadcast."""
+    pipeline = _bare_pipeline()
+    like = torch.zeros(2, 1, 1, 1, 1)
+    with pytest.raises(ValueError, match="lineage"):
+        pipeline._text_features({"t5": torch.zeros(2, 3, 4096)}, batch=2, like=like)
+    # A scalar-per-sample payload is the shape the removed fabrication accepted.
+    with pytest.raises(ValueError, match="lineage"):
+        pipeline._text_features({"t5": torch.ones(2)}, batch=2, like=like)
+    with pytest.raises(ValueError, match="latent batch"):
+        pipeline._text_features({"t5": torch.zeros(1, 3, 5120)}, batch=2, like=like)
+
+
+def test_magi2_qwen_width_text_embedding_is_accepted() -> None:
+    from mirai.core.models.magi2_preview.pipeline import MAGI2_TEXT_EMBED_WIDTH
+
+    assert MAGI2_TEXT_EMBED_WIDTH == 5120
+    pipeline = _bare_pipeline()
+    like = torch.zeros(2, 1, 1, 1, 1)
+    value, lengths = pipeline._text_features(
+        {"t5": torch.zeros(2, 3, MAGI2_TEXT_EMBED_WIDTH)}, batch=2, like=like
+    )
+    assert tuple(value.shape) == (2, 3, MAGI2_TEXT_EMBED_WIDTH)
+    assert lengths.tolist() == [3, 3]
+
+
+# --- Sampling policies are answered, not discarded --------------------------
+
+
+def test_magi2_native_sampler_rejects_policies_it_does_not_implement() -> None:
+    """cfg_mode and the solver name reach the sampler and are answered."""
+    pipeline = _bare_pipeline()
+    call = dict(
+        noise=torch.zeros(48, 1, 1, 1),
+        context=torch.zeros(1, 1, 5120),
+        context_null=torch.zeros(1, 1, 5120),
+        denoise_steps=1,
+        guidance_scale=1.0,
+        generator=torch.Generator(),
+    )
+    with pytest.raises(ValueError, match="unipc"):
+        pipeline.sample_native_preview(**call, solver_name="euler")
+    with pytest.raises(ValueError, match="B=2"):
+        pipeline.sample_native_preview(**call, cfg_mode="sequential")
+
+
+def test_magi2_shipped_examples_ask_for_implemented_sampling_policies() -> None:
+    config = load_config("configs/magi2_preview/inference_offload.toml")
+    assert config.inference.cfg_mode == "batched"
+    training = load_config("configs/magi2_preview/train_offload.toml")
+    assert training.logging.sample_solver == "unipc"
+
+
+def test_native_denoise_loop_leaves_cfg_policy_to_the_family_when_unset() -> None:
+    """An unset cfg_mode must not be forced onto a family that owns its CFG."""
+    import inspect
+
+    from mirai.core.training.preview.preview import run_native_denoise_loop
+
+    signature = inspect.signature(run_native_denoise_loop)
+    assert signature.parameters["cfg_mode"].default is None
+
+
+# --- Gradient checkpointing modes -------------------------------------------
+
+
+def test_magi2_gradient_checkpointing_accepts_only_implemented_modes() -> None:
+    pipeline = _bare_pipeline()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.block = torch.nn.Module()
+
+    pipeline.set_gradient_checkpointing("standard")
+    assert pipeline.transformer.block.gradient_checkpointing is True
+    pipeline.set_gradient_checkpointing("off")
+    assert pipeline.transformer.block.gradient_checkpointing is False
+    pipeline.set_gradient_checkpointing(True)
+    assert pipeline.transformer.block.gradient_checkpointing is True
+
+    for mode in ("selective", "aggressive"):
+        with pytest.raises(ValueError, match=mode):
+            pipeline.set_gradient_checkpointing(mode)
+
+
+def test_magi2_preset_requests_an_implemented_checkpointing_mode() -> None:
+    config = load_config("configs/magi2_preview/train_offload.toml")
+    assert config.training.gradient_checkpointing == "standard"
+
+
+# --- Adapter state loading honours strict -----------------------------------
+
+
+def test_magi2_load_state_dict_honours_strict() -> None:
+    module, _adapter = _build_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32
+    )
+    container = torch.nn.Module()
+    container.moe_mlp = module
+    pipeline = _bare_pipeline()
+    pipeline.transformer = container
+
+    full = pipeline.state_dict()
+    assert full, "the reduced MoE layer must expose a LoRA surface"
+    pipeline.load_state_dict(full)
+
+    partial = {key: value for key, value in list(full.items())[1:]}
+    with pytest.raises(ValueError, match="missing"):
+        pipeline.load_state_dict(partial)
+    with pytest.raises(ValueError, match="missing"):
+        pipeline.load_state_dict({})
+    pipeline.load_state_dict(partial, strict=False)
+
+    stray = dict(full)
+    stray["not.a.lora.tensor"] = torch.zeros(1)
+    with pytest.raises(ValueError, match="unexpected"):
+        pipeline.load_state_dict(stray)
+
+
+# --- Latent geometry --------------------------------------------------------
+
+
+def test_magi2_frame_count_maps_to_the_decoder_temporal_ratio() -> None:
+    """4n+1 frames round-trip: the VAE pair carries 4*(T-1)+1 pixel frames."""
+    pipeline = _bare_pipeline()
+    layout = pipeline.get_video_latent_layout()
+    assert layout.temporal_downsample == 4
+    for frames in (1, 5, 17, 81):
+        channels, t_lat, h_lat, w_lat = pipeline.preview_latent_geometry(
+            frame_count=frames, height=256, width=448
+        )
+        assert (channels, h_lat, w_lat) == (48, 16, 28)
+        assert 4 * (t_lat - 1) + 1 == frames
+
+
+def test_magi2_unrepresentable_frame_count_is_rejected() -> None:
+    pipeline = _bare_pipeline()
+    for frames in (16, 18, 11):
+        with pytest.raises(ValueError, match="4n"):
+            pipeline.preview_latent_geometry(
+                frame_count=frames, height=256, width=448
+            )
+    with pytest.raises(ValueError, match="multiples of 16"):
+        pipeline.preview_latent_geometry(frame_count=17, height=250, width=448)
+
+
+# --- Environment escape hatches ---------------------------------------------
+
+
+_ENV_MUTATION_PROBE = """
+import os
+
+sentinel = dict(os.environ)
+import mirai.vendors.magi2_preview.model.magi2_preview  # noqa: F401
+
+changed = {
+    key: (sentinel.get(key), value)
+    for key, value in os.environ.items()
+    if sentinel.get(key) != value
+}
+removed = sorted(set(sentinel) - set(os.environ))
+assert not changed, changed
+assert not removed, removed
+print("env-unchanged")
+"""
+
+
+def test_importing_the_vendored_model_does_not_mutate_the_environment() -> None:
+    """Import-time env writes leak into every child process; there must be none."""
+    result = subprocess.run(
+        [sys.executable, "-c", _ENV_MUTATION_PROBE],
+        capture_output=True,
+        text=True,
+        cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+    )
+    if result.returncode != 0 and "ModuleNotFoundError" in result.stderr:
+        pytest.skip(
+            "vendored MAGI-2 runtime unavailable: "
+            + result.stderr.strip().splitlines()[-1]
+        )
+    assert result.returncode == 0, result.stderr
+    assert "env-unchanged" in result.stdout
+
+
+def test_magi2_load_path_has_no_environment_escape_hatch() -> None:
+    """No environment variable may skip the checkpoint read."""
+    import mirai.vendors.magi2_preview.infra.checkpoint.load_checkpoint as load_checkpoint
+    from mirai.core.models.magi2_preview import pipeline as mirai_pipeline
+
+    for module in (load_checkpoint, mirai_pipeline):
+        source = pathlib.Path(module.__file__).read_text(encoding="utf-8")
+        for name in ("SKIP_LOAD_MODEL", "MIRAI_MAGI2_SKIP_LOAD"):
+            for line in source.splitlines():
+                if name in line:
+                    assert line.lstrip().startswith("#"), (module.__name__, line)
+
+
+def test_magi2_evaluation_cfg_defaults_ignore_the_environment() -> None:
+    from mirai.vendors.magi2_preview.common.magi2_config import EvaluationConfig
+
+    baseline = EvaluationConfig()
+    assert baseline.video_txt_guidance_scale == 5.0
+    assert baseline.audio_txt_guidance_scale == 5.0
+    assert baseline.use_skimmed_cfg_linear is False
+    assert baseline.skimmed_cfg_scale == 5.0
+    assert baseline.cfg_rescale == 0.0
+
+    keys = ("VG", "AG", "USE_SKIMMED_CFG_LINEAR", "SKIMMED_CFG_SCALE", "CFG_RESCALE")
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        os.environ.update(
+            {
+                "VG": "1.5",
+                "AG": "2.5",
+                "USE_SKIMMED_CFG_LINEAR": "1",
+                "SKIMMED_CFG_SCALE": "3.5",
+                "CFG_RESCALE": "0.7",
+            }
+        )
+        assert EvaluationConfig() == baseline
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_magi2_router_bias_source_env_is_rejected() -> None:
+    """Which bias pairs with the released EMA weights is not a runtime choice."""
+    from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import (
+        _apply_router_bias_ema,
+    )
+
+    key = "block.layers.0.mlp.moe_mlp.router.expert_bias"
+    state = {key: torch.zeros(2), key + "_ema": torch.ones(2)}
+    assert torch.equal(_apply_router_bias_ema(dict(state))[key], torch.ones(2))
+
+    previous = os.environ.get("MAGI2_ROUTER_BIAS_SOURCE")
+    try:
+        os.environ["MAGI2_ROUTER_BIAS_SOURCE"] = "main"
+        with pytest.raises(RuntimeError, match="expert_bias_ema"):
+            _apply_router_bias_ema(dict(state))
+    finally:
+        if previous is None:
+            os.environ.pop("MAGI2_ROUTER_BIAS_SOURCE", None)
+        else:
+            os.environ["MAGI2_ROUTER_BIAS_SOURCE"] = previous
+
+
+# --- Expert-execution backend precedence ------------------------------------
+
+
+def test_magi2_configured_backend_wins_over_the_default_triton_path() -> None:
+    """An attached backend is the selected path with and without autograd."""
+    module, _adapter = _build_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32
+    )
+    calls: list[str] = []
+
+    class _RecordingBackend:
+        def execute(self, owner, x_heads, topk_probs, topk_indices):
+            calls.append("backend")
+            return owner._torch_forward(x_heads, topk_probs, topk_indices)
+
+    module._mirai_moe_kernel_backend = _RecordingBackend()
+    hidden = torch.randn(5, 16)
+    with torch.no_grad():
+        module._forward_impl(hidden)
+    module._forward_impl(hidden)
+    assert calls == ["backend", "backend"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_magi2_triton_flash_forward_matches_the_reference_loop() -> None:
+    """The fused Triton default must reproduce the vendored per-expert loop.
+
+    ``d_head`` and the expert intermediate follow the kernel's own tiling
+    preconditions (multiples of 64 and 32). Both paths run BF16 experts with
+    fp32 accumulation but sum the selected experts in a different order, so the
+    band is stated against the output scale rather than per element: a few
+    near-zero rows carry a large relative error at BF16 while the whole tensor
+    stays within one part in fifty of its own magnitude.
+    """
+    pytest.importorskip("triton", reason="the fused MoE kernel is Triton-only")
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device)[0] < 8:
+        pytest.skip("the vendored MoE kernel targets SM80+ tensor cores")
+
+    module, _adapter = _build_reduced_moe(
+        device=device,
+        dtype=torch.bfloat16,
+        hidden_size=128,
+        expert_intermediate_size=32,
+    )
+    hidden = torch.randn(64, 128, device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        x_heads = hidden.view(-1, module.num_heads, module.d_head)
+        topk_probs, topk_indices = module._route(x_heads)
+        reference = module._torch_forward(x_heads, topk_probs, topk_indices).float()
+        fused = module._flash_forward(x_heads, topk_probs, topk_indices).float()
+    scale = reference.abs().max()
+    assert scale > 0.0
+    assert (reference - fused).abs().max() <= 2e-2 * scale

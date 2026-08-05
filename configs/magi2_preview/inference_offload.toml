@@ -5,7 +5,7 @@ path = "./models/MAGI-2-preview"
 
 [inference]
 task = "text_to_video"
-cfg_mode = "sequential"
+cfg_mode = "batched"
 keep_text_encoder_resident = false
 keep_vae_resident = false
 

@@ -56,12 +56,15 @@ pip install -e ".[magi2-preview]"
 ```
 
 The extra adds Triton (the fused multi-head MoE kernels in the vendored
-transformer), `tqdm` (shard loading and sampler progress), and SciPy
-(audio-feature resampling in the vendored inference engine). Diffusers is not
+transformer), `tqdm` (shard loading and sampler progress), SciPy (audio-feature
+resampling in the vendored inference engine), `pydantic-settings` (the typed
+architecture and engine config models), and `unfoldNd` (the n-dimensional
+unfold in the vendored data proxies). The last two are imported by this family
+alone, so they install with the extra rather than with the base package.
+Diffusers is not
 part of the extra: the vendored TurboVAE decoder and Flow-UniPC scheduler carry
 their own constructor-argument registration in
-`mirai/vendors/magi2_preview/common/native_config.py`. `einops`, `unfoldNd`,
-`pydantic-settings`, and the pinned
+`mirai/vendors/magi2_preview/common/native_config.py`. `einops` and the pinned
 `transformers` runtime that provides the Qwen3.5 text-encoder classes are
 already base dependencies. The Triton requirement carries a
 `sys_platform == "linux"` marker because the PyPI package is Linux-only; a
@@ -72,7 +75,10 @@ FlashAttention packages described by the upstream release — is deliberately no
 part of the extra. Every one of those imports is guarded, and Mirai retains a
 differentiable Torch reference path for training and for environments where
 those kernels are unavailable. Install them manually only if you want the
-accelerated attention and compile paths.
+accelerated attention and compile paths. MagiAttention reads
+`MAGI_ATTENTION_WORKSPACE_BASE` when it is imported; Mirai never writes it for
+you, so set it in the environment that starts the process if you install that
+package.
 
 ## Download
 
@@ -123,7 +129,7 @@ The values that matter for planning a host:
 | `memory.block_swap_prefetch_depth` | `1` | One block of transfer lookahead; one extra resident swap block is reserved. |
 | `memory.minimum_system_memory_gib` | `384.0` | Host-RAM guard: the run refuses to start below it. |
 | `memory.max_pinned_host_gib` | `224.0` | Ceiling on page-locked host memory. |
-| `training.gradient_checkpointing` | `aggressive` | Trades recompute for activation memory across the swap window. |
+| `training.gradient_checkpointing` | `standard` | Trades recompute for activation memory across the swap window. The vendored block carries one whole-block recompute switch, so `selective` and `aggressive` are rejected for this family. |
 
 Page-locked staging is bounded by
 `min(free_ram - minimum_system_memory_gib, max_pinned_host_gib)`; tensors over
@@ -238,6 +244,7 @@ with `scripts/infer.py`:
 ```bash
 python scripts/infer.py \
   --config configs/magi2_preview/inference_offload.toml \
+  --scheduler unipc \
   --prompt "..." \
   --out outputs/clip.mp4
 ```
@@ -247,10 +254,13 @@ The example keeps `inference.keep_text_encoder_resident` and
 decoding occupy the execution device sequentially. Set either to `true` to
 trade VRAM for reload time across repeated session generations.
 
-The provider declares batch/mask parity, so `inference.cfg_mode = "batched"`
-is permitted and runs the conditional and unconditional branches in one
-single-device `B=2` forward. The shipped example uses `sequential`, which is
-the lower-VRAM choice on a host already streaming blocks.
+The native sampler owns its own CFG execution and its own schedule, so both
+requested policies are checked rather than applied. Every denoise step packs
+the conditional and unconditional branches into one single-device `B=2`
+forward, which is why the shipped example sets `inference.cfg_mode = "batched"`
+and passes `--scheduler unipc`: `sequential` and any other solver name are
+rejected instead of being silently ignored. A training run that emits previews
+sets `logging.sample_solver = "unipc"` for the same reason.
 
 Prompt-to-video output requires the official Qwen3.5 text encoder and the
 TurboVAE decoder from the same snapshot; both are validated before use and a
@@ -286,8 +296,11 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.strict_native_assets` | Requires the complete released native assets; the shipped preset sets this to `true`. |
 | `model.params.flow_shift` | Preset value `7.0`, matching the release's `evaluation_config.shift`. |
 | `model.params.family_params.config_path` | Override for the vendored architecture JSON; empty resolves to the shipped `magi2_preview.json`. |
-| `model.params.family_params.audio_tokens` | Length of the inert audio track the multimodal forward requires. `-1` derives it from the latent frame count; a non-negative value fixes it. |
+| `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, redrawn on every forward from the process RNG stream the run seed owns, and it takes part in attention and MoE routing. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
 | `adapter.type` | `lora` only. |
 | `adapter.target_preset` | `attn_only` or `attn_router`. |
 | `dataset.caption_format` | `raw`; captions are encoded by the native Qwen3.5 path at cache time. |
 | `inference.task` | `text_to_video`. |
+| `inference.cfg_mode` | `batched` only. The native sampler evaluates the conditional and unconditional branches together in one `B=2` forward; `sequential` is rejected. |
+| `training.gradient_checkpointing` | `off` or `standard`. The vendored transformer block exposes one whole-block recompute switch, so `selective` and `aggressive` are rejected rather than collapsed onto `standard`. |
+| `logging.sample_solver` / `--scheduler` | `unipc` only. The native sampler is the vendored Flow-UniPC multistep scheduler and implements no other schedule. |

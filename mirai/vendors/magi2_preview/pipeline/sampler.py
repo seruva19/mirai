@@ -446,7 +446,7 @@ from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: F811 - upstream module boundary keeps its own imports
 
 from mirai.vendors.magi2_preview.common.native_config import (
     NativeConfigMixin,

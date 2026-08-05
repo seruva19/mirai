@@ -71,7 +71,6 @@ from mirai.vendors.magi2_preview.infra.parallelism.all_to_all_primitive import (
     scatter_seqlen_gather_head,
 )
 from mirai.vendors.magi2_preview.infra.parallelism.context_parallel import ulysses_scheduler
-from mirai.vendors.magi2_preview.utils import env_is_true
 
 
 logger = logging.getLogger(__name__)
@@ -2085,7 +2084,12 @@ class MHCHandler:
 # modeling
 # ============================================================
 
-os.environ.setdefault("MAGI_ATTENTION_WORKSPACE_BASE", "/tmp")
+# Mirai edit: upstream sets MAGI_ATTENTION_WORKSPACE_BASE=/tmp here. Importing a
+# module never mutates the process environment in Mirai: the write leaks into
+# every child process, hardcodes a world-writable path, and lands after the
+# optional magi_attn_extensions import above that would have consumed it.
+# Operators of the optional accelerated attention path set the variable
+# themselves before starting the process.
 
 
 @dataclass
@@ -2763,13 +2767,15 @@ class CoreMultiHeadMoE(nn.Module):
 
         if self.has_real_moe_heads:
             topk_probs, topk_indices = self._route(x_heads)
-            if torch.is_grad_enabled() or x_heads.device.type != "cuda":
-                kernel_backend = self._mirai_moe_kernel_backend
-                out = (
-                    kernel_backend.execute(self, x_heads, topk_probs, topk_indices)
-                    if kernel_backend is not None
-                    else self._torch_forward(x_heads, topk_probs, topk_indices)
-                )
+            # Mirai edit: a configured expert-execution backend is the selected
+            # path in every mode. The fused Triton kernel is the default only
+            # when no backend is attached, and it needs CUDA and no autograd
+            # graph; otherwise the vendored per-expert loop is the reference.
+            kernel_backend = self._mirai_moe_kernel_backend
+            if kernel_backend is not None:
+                out = kernel_backend.execute(self, x_heads, topk_probs, topk_indices)
+            elif torch.is_grad_enabled() or x_heads.device.type != "cuda":
+                out = self._torch_forward(x_heads, topk_probs, topk_indices)
             else:
                 out = self._flash_forward(x_heads, topk_probs, topk_indices)
         else:
@@ -3349,8 +3355,10 @@ class Transformer(nn.Module):
         self.pre_adapter = PreAdapter(adapter_config)
         self.post_adapter = PostAdapter(adapter_config)
         self.block = TransformerBlock(model_config)
-        if env_is_true("SKIP_LOAD_MODEL"):
-            self.initialize_for_skip_load()
+        # Mirai edit: upstream also fills synthetic weights here when the
+        # environment sets SKIP_LOAD_MODEL. Skipping the checkpoint read is a
+        # behavior change and must be requested in code, so callers that want
+        # synthetic weights call initialize_for_skip_load() explicitly.
 
     def initialize_for_skip_load(self) -> None:
         _initialize_magi2_skip_load_weights(self)
@@ -3410,7 +3418,7 @@ Multi-head MoE routing with pure-torch implementations.
 Sufficient for inference; training may benefit from fused CUDA/Triton variants.
 """
 
-from typing import Literal
+from typing import Literal  # noqa: F811 - upstream module boundary keeps its own imports
 
 import torch
 

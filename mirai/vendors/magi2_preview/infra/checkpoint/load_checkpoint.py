@@ -23,7 +23,7 @@ from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import (
     load_magi2_model_state_dict,
     load_safetensors_dir,
 )
-from mirai.vendors.magi2_preview.utils import env_is_true, print_rank_0
+from mirai.vendors.magi2_preview.utils import print_rank_0
 
 
 def load_magi2_model(config: Magi2Config) -> torch.nn.Module:
@@ -39,17 +39,15 @@ def load_magi2_model(config: Magi2Config) -> torch.nn.Module:
     model = Transformer(arch, ep_size=config.engine_config.ep_size)
     print_rank_0(f"[magi2] Model built, params_dtype={arch.params_dtype}")
 
-    if env_is_true("SKIP_LOAD_MODEL"):
-        # Transformer.__init__ already filled in synthetic weights. Shapes,
-        # compilation and memory footprint stay real; only the read is skipped.
-        print_rank_0("[magi2] SKIP_LOAD_MODEL=1: synthetic weights, no checkpoint read")
-    else:
-        state_dict = load_magi2_model_state_dict(model, config.engine_config)
-        model.load_state_dict(state_dict, strict=True)
-        print_rank_0("[magi2] Checkpoint loaded successfully")
+    # Mirai edit: upstream skips the checkpoint read when the environment sets
+    # SKIP_LOAD_MODEL. Weight loading is not environment-switchable here;
+    # synthetic weights come from an explicit initialize_for_skip_load() call.
+    state_dict = load_magi2_model_state_dict(model, config.engine_config)
+    model.load_state_dict(state_dict, strict=True)
+    print_rank_0("[magi2] Checkpoint loaded successfully")
 
-        del state_dict
-        gc.collect()
+    del state_dict
+    gc.collect()
 
     model = model.to(f"cuda:{torch.cuda.current_device()}")
     model.eval()
@@ -69,11 +67,8 @@ def load_magi2_refiner(config: Magi2Config) -> torch.nn.Module:
     )
 
     model = Magi2RefinerModel(refiner_config)
-    if env_is_true("SKIP_LOAD_MODEL"):
-        print_rank_0("[magi2] SKIP_LOAD_MODEL=1: synthetic refiner weights, no checkpoint read")
-        model.eval()
-        return model
-
+    # Mirai edit: the upstream SKIP_LOAD_MODEL environment bypass is removed
+    # here as well; the refiner always reads its released weights.
     model_path = config.evaluation_config.magi2_refiner_model_path
     print_rank_0(f"[magi2] Loading magi2_refiner checkpoint from {model_path}")
 

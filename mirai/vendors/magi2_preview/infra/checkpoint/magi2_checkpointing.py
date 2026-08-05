@@ -129,18 +129,29 @@ def _load_by_shard(
     return state_dict
 
 
+_ROUTER_BIAS_SOURCE_ENV = "MAGI2_ROUTER_BIAS_SOURCE"
+
+
 def _apply_router_bias_ema(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Pair the router bias buffer with the EMA-smoothed model weights.
 
-    The checkpoint stores both ``expert_bias`` (latest training value) and
-    ``expert_bias_ema`` (EMA-smoothed value). Inference uses the EMA model
-    weights, so the router must use the paired EMA bias; otherwise routing
-    biases mismatch the weights and quality degrades. Set the env var
-    ``MAGI2_ROUTER_BIAS_SOURCE=main`` to keep the raw ``expert_bias`` instead.
+    The released checkpoint stores both ``expert_bias`` (the latest training
+    value) and ``expert_bias_ema`` (the EMA-smoothed value) for every routed
+    MoE layer, while the shipped expert weights are the EMA weights. The router
+    bias must therefore be the paired EMA tensor; the raw ``expert_bias``
+    belongs to weights that are not in the checkpoint.
+
+    Mirai edit: upstream lets ``MAGI2_ROUTER_BIAS_SOURCE=main`` swap in the
+    unpaired tensor. Which bias a checkpoint's weights were trained with is not
+    a runtime choice, so the pairing is fixed and the environment variable is
+    rejected rather than honored.
     """
-    if (os.environ.get("MAGI2_ROUTER_BIAS_SOURCE") or "ema").strip().lower() == "main":
-        print_rank_0("[magi2] Router bias source: expert_bias (raw, MAGI2_ROUTER_BIAS_SOURCE=main)")
-        return state_dict
+    if os.environ.get(_ROUTER_BIAS_SOURCE_ENV) is not None:
+        raise RuntimeError(
+            f"{_ROUTER_BIAS_SOURCE_ENV} is not supported: the MAGI-2 router bias is "
+            "fixed to 'expert_bias_ema', the tensor paired with the released "
+            "EMA expert weights. Unset the variable."
+        )
 
     copied = 0
     for key, value in list(state_dict.items()):

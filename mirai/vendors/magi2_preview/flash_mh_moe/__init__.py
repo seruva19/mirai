@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SandAI. All Rights Reserved.
+# Apache-2.0.
 # Vendored flash_mh_moe inference subset.
 # Routing/sorting: pure PyTorch.
 # Forward GEMM: fused Triton kernel with deterministic scatter support.

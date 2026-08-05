@@ -8,7 +8,6 @@ imports remain lazy so the rest of Mirai is usable without them.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +29,20 @@ from mirai.core.training.residency.tensor_residency import (
     move_trainable_tensors,
 )
 
+
+# Hidden width of the Qwen3.5 text encoder shipped with the MAGI-2 snapshot;
+# ``ModelConfig.text_in_channels`` in the released architecture JSON.
+MAGI2_TEXT_EMBED_WIDTH = 5120
+
+# The vendored ``TransformerBlock`` carries a single whole-block recompute flag,
+# so the family implements only the "off" family and "standard".
+MAGI2_GRADIENT_CHECKPOINTING_OFF = frozenset({"off", "false", "none", "0", ""})
+MAGI2_GRADIENT_CHECKPOINTING_ON = frozenset({"standard", "true", "1"})
+
+# The vendored sampler is Flow-UniPC and always evaluates the conditional and
+# unconditional branches in one B=2 forward.
+MAGI2_NATIVE_SOLVER = "unipc"
+MAGI2_NATIVE_CFG_MODE = "batched"
 
 MAGI2_TARGET_PRESETS: dict[str, tuple[str, ...]] = {
     "attn_only": (".attention.linear_qkv", ".attention.linear_proj"),
@@ -93,7 +106,6 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._gradient_checkpointing = "off"
         self._adapter_configured = False
         self._last_audio_prediction: torch.Tensor | None = None
-        self._inference_audio_noise: torch.Tensor | None = None
         self._compute_autocast_dtype = torch.bfloat16
         self._lora_scale = 1.0
         self._text_encoder: Any | None = None
@@ -125,40 +137,35 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         checkpoint_dir = model_path / "preview" if (model_path / "preview").is_dir() else model_path
         config.engine_config.load = str(checkpoint_dir)
         transformer = Transformer(config.arch_config, ep_size=1)
-        if os.environ.get("MIRAI_MAGI2_SKIP_LOAD", "").strip().lower() not in {
-            "1", "true", "yes", "on"
-        }:
-            state = load_magi2_model_state_dict(transformer, config.engine_config)
-            transformer.load_state_dict(state, strict=True)
-            del state
-        else:
-            transformer.initialize_for_skip_load()
+        state = load_magi2_model_state_dict(transformer, config.engine_config)
+        transformer.load_state_dict(state, strict=True)
+        del state
         transformer.train()
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
 
     def get_video_latent_layout(self) -> VideoLatentLayout:
+        """Latent geometry of the released MAGI-2 preview VAE pair.
+
+        Both the Wan2.2 encoder used at cache time and the TurboVAE decoder used
+        at inference compress time by four with a leading key frame, so ``T``
+        latent frames carry ``4 * (T - 1) + 1`` pixel frames and only frame
+        counts congruent to 1 modulo 4 are representable. Requests are rejected
+        rather than rounded: a rounded request decodes to a clip that is not the
+        length the caller asked for.
+        """
         return VideoLatentLayout(
             latent_channels=48,
-            temporal_downsample=8,
+            temporal_downsample=4,
             spatial_downsample=16,
             layout="BCTHW",
+            frame_count_modulus=4,
+            frame_count_remainder=1,
+            frame_count_rule="1 modulo 4 (4n+1)",
             request_spatial_multiple=16,
         )
 
     def has_native_inference(self) -> bool:
         return True
-
-    def preview_latent_geometry(
-        self, *, frame_count: int, height: int, width: int
-    ) -> tuple[int, int, int, int]:
-        if int(frame_count) < 1 or int(height) < 16 or int(width) < 16:
-            raise ValueError("MAGI-2 inference dimensions must be positive and spatially >= 16.")
-        return (
-            48,
-            (int(frame_count) - 1) // 8 + 1,
-            int(height) // 16,
-            int(width) // 16,
-        )
 
     def resolve_flow_shift_for_latent_shape(self, latent_shape: tuple[int, ...]) -> float:
         _ = latent_shape
@@ -376,8 +383,19 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self.transformer.load_state_dict(state, strict=False)
 
     def set_gradient_checkpointing(self, enabled: bool | str) -> None:
-        self._gradient_checkpointing = str(enabled).strip().lower()
-        active = self._gradient_checkpointing not in {"off", "false", "none", "0", ""}
+        mode = str(enabled).strip().lower()
+        if mode in MAGI2_GRADIENT_CHECKPOINTING_OFF:
+            active = False
+        elif mode in MAGI2_GRADIENT_CHECKPOINTING_ON:
+            active = True
+        else:
+            raise ValueError(
+                f"MAGI-2 Preview does not implement gradient_checkpointing='{mode}'. "
+                "The vendored transformer block exposes one whole-block recompute "
+                "switch, so only 'off' and 'standard' are accepted; 'selective' and "
+                "'aggressive' would silently resolve to 'standard'."
+            )
+        self._gradient_checkpointing = mode
         self.transformer.block.gradient_checkpointing = active
 
     def get_block_swap_units(self) -> list[tuple[int, Any]]:
@@ -467,13 +485,28 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             value = text_embeds.get("magi2", text_embeds.get("qwen", text_embeds.get("t5")))
             mask = text_embeds.get("text_mask", text_embeds.get("attention_mask"))
         if value is None:
-            value = torch.zeros(batch, 1, 5120, device=like.device)
+            raise ValueError(
+                "MAGI-2 requires Qwen3.5 text embeddings of width "
+                f"{MAGI2_TEXT_EMBED_WIDTH}; the batch carried none under "
+                "'magi2', 'qwen', or 't5'. Unconditional conditioning is a "
+                "real encode of the empty prompt, not an absent embedding."
+            )
         value = torch.as_tensor(value, device=like.device, dtype=torch.float32)
         if value.ndim == 2:
             value = value.unsqueeze(1)
-        if value.shape[-1] != 5120:
-            scalar = value.reshape(batch, -1).mean(dim=1, keepdim=True).unsqueeze(-1)
-            value = scalar.expand(batch, 1, 5120).contiguous()
+        if value.ndim != 3 or int(value.shape[-1]) != MAGI2_TEXT_EMBED_WIDTH:
+            raise ValueError(
+                "MAGI-2 text embeddings must be [B, S, "
+                f"{MAGI2_TEXT_EMBED_WIDTH}] Qwen3.5 hidden states; got "
+                f"{tuple(value.shape)}. A different width means the latent cache "
+                "was written by another text encoder, so its lineage does not "
+                "match this model."
+            )
+        if int(value.shape[0]) != batch:
+            raise ValueError(
+                "MAGI-2 text embeddings must cover the latent batch: got "
+                f"{int(value.shape[0])} rows for {batch} latents."
+            )
         lengths = (
             torch.as_tensor(mask, device=like.device).long().sum(dim=1)
             if mask is not None
@@ -495,16 +528,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             if configured_audio_tokens < 0
             else configured_audio_tokens
         )
-        expected_audio_shape = (1, audio_tokens, 64)
-        if (
-            self._inference_audio_noise is None
-            or tuple(self._inference_audio_noise.shape) != expected_audio_shape
-            or self._inference_audio_noise.device != latents.device
-        ):
-            self._inference_audio_noise = torch.randn(
-                expected_audio_shape, device=latents.device, dtype=latents.dtype
-            )
-        audio = self._inference_audio_noise.expand(batch, -1, -1)
+        # MAGI-2 ships without an audio encoder, so the audio track carries no
+        # user signal; the reference engine feeds it fresh Gaussian noise for
+        # every generation (`pipeline/inference_engine.py`). Those tokens still
+        # take part in attention and MoE routing, so the draw is reproduced here
+        # per call rather than cached: it consumes the process RNG stream that
+        # the training seed owns instead of freezing one hidden sample.
+        audio = torch.randn(
+            batch, audio_tokens, 64, device=latents.device, dtype=latents.dtype
+        )
         timestep = torch.as_tensor(timesteps, device=latents.device).reshape(batch)
         model_input = ModelInput(
             x_t=latents,
@@ -536,8 +568,30 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         denoise_steps: int,
         guidance_scale: float,
         generator: torch.Generator,
+        solver_name: str = MAGI2_NATIVE_SOLVER,
+        cfg_mode: str = MAGI2_NATIVE_CFG_MODE,
     ) -> torch.Tensor:
-        """Run the shipping joint video/audio Flow-UniPC sampler."""
+        """Run the shipping joint video/audio Flow-UniPC sampler.
+
+        The vendored sampler owns its schedule and its CFG execution, so the two
+        requested policies are checked rather than applied: it implements
+        Flow-UniPC only, and every step evaluates the conditional and
+        unconditional branches together in one ``B=2`` forward.
+        """
+        requested_solver = str(solver_name).strip().lower()
+        if requested_solver != MAGI2_NATIVE_SOLVER:
+            raise ValueError(
+                f"MAGI-2 Preview implements the '{MAGI2_NATIVE_SOLVER}' solver only; "
+                f"got '{requested_solver}'. The native sampler is the vendored "
+                "Flow-UniPC multistep scheduler and has no other schedule."
+            )
+        requested_cfg_mode = str(cfg_mode).strip().lower()
+        if requested_cfg_mode != MAGI2_NATIVE_CFG_MODE:
+            raise ValueError(
+                f"MAGI-2 Preview runs '{MAGI2_NATIVE_CFG_MODE}' CFG only; got "
+                f"'{requested_cfg_mode}'. The native sampler packs the conditional "
+                "and unconditional branches into one B=2 forward per step."
+            )
         from mirai.vendors.magi2_preview.pipeline.preview_data_proxy import (
             CFGConfig,
             SamplerInput,
@@ -645,6 +699,24 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return {key: value for key, value in full.items() if "parametrizations." in key and (key.endswith("lora_a") or key.endswith("lora_b"))}
 
     def load_state_dict(self, state: dict[str, Any], strict: bool = True):
+        """Load the adapter surface reported by :meth:`state_dict`.
+
+        The payload is applied to the wrapped transformer non-strictly because it
+        never carries the frozen base tensors. ``strict`` is enforced against the
+        adapter surface itself: a payload that does not cover exactly the
+        configured LoRA parameters is a lineage mismatch and fails.
+        """
+        if strict:
+            expected = set(self.state_dict())
+            supplied = {str(key) for key in state}
+            missing = sorted(expected - supplied)
+            unexpected = sorted(supplied - expected)
+            if missing or unexpected:
+                raise ValueError(
+                    "MAGI-2 adapter state does not match the configured LoRA "
+                    f"targets (missing={missing[:4]}, unexpected={unexpected[:4]}). "
+                    "Pass strict=False to load a partial adapter surface."
+                )
         return self.transformer.load_state_dict(state, strict=False)
 
 
