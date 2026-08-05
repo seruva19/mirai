@@ -9,6 +9,13 @@ expert weights are indexed by a single flattened ``head * num_experts + expert``
 axis, so one sorted token-slice layout covers every head at once. Routing,
 activation, and combine stay in plain autograd; only the per-group expert matmul
 is a custom Function, because its weights are frozen and carry no gradient.
+
+The ``torch_grouped`` primitive additionally requires every operand stride to be
+a multiple of 16 bytes, which for BF16 experts means ``d_head`` and
+``expert_intermediate_size`` must both be multiples of 8. The expert layout
+decides this before any forward runs: an ``auto`` selection resolves to ``bmm``
+when the layout does not satisfy it, and an explicit ``torch_grouped`` selection
+raises. There is no per-call downgrade.
 """
 
 from __future__ import annotations
@@ -19,7 +26,12 @@ from typing import Any, Callable
 import torch
 
 from mirai.core.moe.runtime.gemm import (
+    GROUPED_MM_ALIGNMENT_BYTES,
+    BackendProbe,
     grouped_mm_op,
+    grouped_mm_operand,
+    grouped_mm_row_operand,
+    grouped_mm_stride_violations,
     normalize_moe_gemm_backend,
     normalize_moe_gemm_role_backend,
     probe_backend,
@@ -69,6 +81,107 @@ class Magi2GroupedMoEPlan:
                     + f"; got '{normalized}' for the {field.split('_')[0]} role."
                 )
             object.__setattr__(self, field, normalized)
+
+
+def magi2_grouped_mm_alignment_violations(
+    *,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    w_down: torch.Tensor,
+) -> tuple[str, ...]:
+    """Stride-precondition failures for every operand ``torch_grouped`` receives.
+
+    Packed experts are ``W_gate``/``W_up`` ``[groups, d_head, d_expert]`` and
+    ``W_down`` ``[groups, d_expert, d_head]``. The forward role passes the stored
+    weight together with a contiguous ``[tokens, K]`` activation; the dX role
+    passes a transposed weight VIEW, whose unit stride moves to the inner
+    dimension and leaves the larger dimension carrying the checked stride. Both
+    roles are enumerated here from the real tensors, so the verdict is derived
+    from layout rather than from a shape heuristic.
+    """
+    operands = [
+        grouped_mm_row_operand(
+            label="x_sorted forward activation rows",
+            columns=int(w_gate.shape[-2]),
+            element_size=int(w_gate.element_size()),
+        ),
+        grouped_mm_operand(w_gate, label="W_gate forward expert weight"),
+        grouped_mm_operand(w_up, label="W_up forward expert weight"),
+        grouped_mm_row_operand(
+            label="hidden forward activation rows",
+            columns=int(w_down.shape[-2]),
+            element_size=int(w_down.element_size()),
+        ),
+        grouped_mm_operand(w_down, label="W_down forward expert weight"),
+        grouped_mm_row_operand(
+            label="grad_output dX rows for W_gate/W_up",
+            columns=int(w_gate.shape[-1]),
+            element_size=int(w_gate.element_size()),
+        ),
+        grouped_mm_operand(
+            w_gate.transpose(-2, -1), label="W_gate dX transposed weight view"
+        ),
+        grouped_mm_operand(
+            w_up.transpose(-2, -1), label="W_up dX transposed weight view"
+        ),
+        grouped_mm_row_operand(
+            label="grad_output dX rows for W_down",
+            columns=int(w_down.shape[-1]),
+            element_size=int(w_down.element_size()),
+        ),
+        grouped_mm_operand(
+            w_down.transpose(-2, -1), label="W_down dX transposed weight view"
+        ),
+    ]
+    return grouped_mm_stride_violations(operands)
+
+
+def _alignment_rejection(role: str, violations: tuple[str, ...]) -> str:
+    return (
+        f"memory.moe_gemm_backend (or its '{role}' role override) selected "
+        "'torch_grouped', which requires every operand stride to be a multiple "
+        f"of {GROUPED_MM_ALIGNMENT_BYTES} bytes. This model's MAGI-2 expert "
+        "layout does not satisfy it: "
+        + " ".join(violations)
+        + " Select 'bmm', or 'auto' to fall back to 'bmm' automatically."
+    )
+
+
+def select_grouped_backends(
+    plan: Magi2GroupedMoEPlan,
+    *,
+    probe: Callable[[str], BackendProbe],
+    alignment_violations: tuple[str, ...],
+    device_label: str,
+) -> tuple[str, str]:
+    """Decide the forward/dX primitives once, from probes and the expert layout.
+
+    ``auto`` falls back to ``bmm`` when ``torch_grouped`` is unavailable OR when
+    the expert layout violates its stride precondition. An explicit
+    ``torch_grouped`` raises instead of downgrading.
+    """
+    resolved: list[str] = []
+    for role, requested in (
+        ("forward", plan.forward_backend),
+        ("dx", plan.dx_backend),
+    ):
+        if requested == "auto":
+            usable = not alignment_violations and probe("torch_grouped").available
+            resolved.append("torch_grouped" if usable else "bmm")
+            continue
+        if requested == "torch_grouped" and alignment_violations:
+            raise Magi2GroupedMoEPolicyError(
+                _alignment_rejection(role, alignment_violations)
+            )
+        result = probe(requested)
+        if not result.available:
+            raise RuntimeError(
+                f"memory.moe_gemm_backend (or its '{role}' role override) "
+                f"selected '{requested}', which is unavailable for MAGI-2 "
+                f"grouped MoE execution on {device_label}: {result.reason}."
+            )
+        resolved.append(requested)
+    return resolved[0], resolved[1]
 
 
 def _grouped_boundaries(offsets: torch.Tensor) -> list[int]:
@@ -163,30 +276,65 @@ class Magi2GroupedMoEBackend:
     def __init__(self, plan: Magi2GroupedMoEPlan) -> None:
         self.plan = plan
         self._resolved: dict[str, tuple[str, str]] = {}
+        self._alignment: tuple[str, ...] | None = None
 
-    def _resolve(self, device: torch.device) -> tuple[str, str]:
-        key = f"{device.type}:{device.index if device.index is not None else -1}"
-        cached = self._resolved.get(key)
-        if cached is not None:
-            return cached
-        resolved: list[str] = []
+    @property
+    def alignment_violations(self) -> tuple[str, ...]:
+        """Operand layouts that fail the ``torch_grouped`` stride precondition.
+
+        Empty until an expert layout has been inspected, and frozen once the
+        first primitive selection has been resolved.
+        """
+        return self._alignment if self._alignment is not None else ()
+
+    def inspect_expert_layout(self, module: Any) -> tuple[str, ...]:
+        """Record ``module``'s expert-layout verdict; attach time calls this.
+
+        Layers share one plan, so verdicts accumulate until the first resolution
+        fixes the selection. This keeps the decision observable and stable rather
+        than re-derived per call.
+        """
+        if self._resolved:
+            return self.alignment_violations
+        violations = magi2_grouped_mm_alignment_violations(
+            w_gate=module.W_gate, w_up=module.W_up, w_down=module.W_down
+        )
+        merged = list(self._alignment or ())
+        for reason in violations:
+            if reason not in merged:
+                merged.append(reason)
+        self._alignment = tuple(merged)
+        return self._alignment
+
+    def validate_explicit_alignment(self) -> None:
+        """Raise when an explicitly requested ``torch_grouped`` cannot be honored."""
+        violations = self.alignment_violations
+        if not violations:
+            return
         for role, requested in (
             ("forward", self.plan.forward_backend),
             ("dx", self.plan.dx_backend),
         ):
-            if requested == "auto":
-                probe = probe_backend("torch_grouped", device=device)
-                resolved.append("torch_grouped" if probe.available else "bmm")
-                continue
-            probe = probe_backend(requested, device=device)
-            if not probe.available:
-                raise RuntimeError(
-                    f"memory.moe_gemm_backend (or its '{role}' role override) "
-                    f"selected '{requested}', which is unavailable for MAGI-2 "
-                    f"grouped MoE execution on {device}: {probe.reason}."
+            if requested == "torch_grouped":
+                raise Magi2GroupedMoEPolicyError(
+                    _alignment_rejection(role, violations)
                 )
-            resolved.append(requested)
-        selection = (resolved[0], resolved[1])
+
+    def _resolve(self, device: torch.device, module: Any = None) -> tuple[str, str]:
+        if module is not None and self._alignment is None:
+            # Backstop for a path that never reached attach-time inspection; the
+            # policy is identical, only its trigger point differs.
+            self.inspect_expert_layout(module)
+        key = f"{device.type}:{device.index if device.index is not None else -1}"
+        cached = self._resolved.get(key)
+        if cached is not None:
+            return cached
+        selection = select_grouped_backends(
+            self.plan,
+            probe=lambda name: probe_backend(name, device=device),
+            alignment_violations=self.alignment_violations,
+            device_label=str(device),
+        )
         self._resolved[key] = selection
         return selection
 
@@ -197,7 +345,7 @@ class Magi2GroupedMoEBackend:
         topk_probs: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
-        forward_backend, dx_backend = self._resolve(x_heads.device)
+        forward_backend, dx_backend = self._resolve(x_heads.device, module)
         device = x_heads.device
         tokens = int(x_heads.shape[0])
         num_heads = int(x_heads.shape[1])
@@ -339,7 +487,9 @@ def validate_grouped_moe_backend_support(
     Weight residency places the transformer after the MoE policy is configured,
     so a non-CUDA ``device`` means the execution device is not yet knowable: only
     the torch build capability is decided here and the per-device architecture
-    gate stays with :meth:`Magi2GroupedMoEBackend._resolve`.
+    gate stays with :meth:`Magi2GroupedMoEBackend._resolve`. The operand stride
+    precondition needs the expert tensors and is decided by
+    :meth:`Magi2GroupedMoEBackend.inspect_expert_layout` at attach time.
     """
     probe_device = device if device is not None and device.type == "cuda" else None
     for role, requested in (
@@ -374,6 +524,8 @@ def attach_grouped_moe_backend(
     attached = 0
     for module in transformer.modules():
         if isinstance(module, CoreMultiHeadMoE):
+            if backend is not None:
+                backend.inspect_expert_layout(module)
             module._mirai_moe_kernel_backend = backend
             attached += 1
     if backend is not None and attached == 0:
@@ -381,4 +533,6 @@ def attach_grouped_moe_backend(
             "memory.moe_kernel_backend='grouped' matched no MAGI-2 multi-head MoE "
             "layer in this model."
         )
+    if backend is not None:
+        backend.validate_explicit_alignment()
     return attached

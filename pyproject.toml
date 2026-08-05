@@ -50,6 +50,17 @@ preview = [
 tools = [
     "requests>=2.32.0",
 ]
+magi2-preview = [
+    # Fused multi-head MoE kernels in the vendored native transformer.
+    "triton>=3.0.0; sys_platform == 'linux'",
+    # Shard-loading and sampler progress reporting.
+    "tqdm>=4.66.0",
+    # Audio-feature resampling in the vendored inference engine.
+    "scipy>=1.11.0",
+    # Configuration/serialization mixins the vendored TurboVAE and Flow-UniPC
+    # scheduler inherit from; no Diffusers pipeline participates in execution.
+    "diffusers>=0.31.0",
+]
 dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.3.0",

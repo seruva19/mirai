@@ -18,7 +18,8 @@ Backends (``MOE_GEMM_BACKENDS``):
 * ``torch_grouped`` -- the public ``torch.nn.functional.grouped_mm`` op (probed;
                        falls back to the private ``torch._grouped_mm`` when the
                        public name is absent). BF16 CUDA SM80+ jagged-offset
-                       contract.
+                       contract, plus a 16-byte operand stride precondition
+                       checked by :func:`grouped_mm_stride_violation`.
 * ``deepgemm_fp8``  -- native M-grouped DeepGEMM forward for block-scaled FP8
                        experts (CUDA SM90; optional external dependency).
 
@@ -246,6 +247,106 @@ def probe_backend(name: str, *, device=None) -> BackendProbe:
         else "torch._grouped_mm (private fallback, SM90+)"
     )
     return BackendProbe(name, True, surface)
+
+
+# ---------------------------------------------------------------------------
+# Operand layout precondition (pure; never executes the op)
+# ---------------------------------------------------------------------------
+
+
+# ``torch._grouped_mm`` requires one of each operand's two innermost dimensions
+# to be contiguous and the other one's stride to be a multiple of 16 BYTES, so
+# the element count that satisfies it depends on the dtype (8 for BF16, 4 for
+# FP32). The op raises ``RuntimeError: strides should be multiple of 16 bytes``
+# when the precondition does not hold; this predicate decides it in advance.
+GROUPED_MM_ALIGNMENT_BYTES = 16
+
+
+@dataclass(frozen=True)
+class GroupedMMOperand:
+    """One operand's layout exactly as ``torch grouped_mm`` will receive it."""
+
+    label: str
+    sizes: tuple[int, ...]
+    strides: tuple[int, ...]
+    element_size: int
+
+
+def grouped_mm_operand(tensor, *, label: str) -> GroupedMMOperand:
+    """Capture ``tensor``'s layout, including a non-contiguous transposed view."""
+    return GroupedMMOperand(
+        label=label,
+        sizes=tuple(int(value) for value in tensor.shape),
+        strides=tuple(int(value) for value in tensor.stride()),
+        element_size=int(tensor.element_size()),
+    )
+
+
+def grouped_mm_row_operand(
+    *, label: str, columns: int, element_size: int
+) -> GroupedMMOperand:
+    """Layout of a contiguous ``[tokens, columns]`` activation operand.
+
+    The token count never reaches the stride check: a contiguous 2-D activation
+    has strides ``(columns, 1)`` for any row count, so ``columns`` alone decides
+    alignment.
+    """
+    columns = int(columns)
+    return GroupedMMOperand(
+        label=label,
+        sizes=(1, columns),
+        strides=(columns, 1),
+        element_size=int(element_size),
+    )
+
+
+def grouped_mm_stride_violation(operand: GroupedMMOperand) -> Optional[str]:
+    """Return ``None`` when ``operand`` satisfies the stride precondition.
+
+    Otherwise return a message naming the operand, its strides in elements and
+    in bytes, and the 16-byte requirement. This mirrors the ATen check that one
+    of the two innermost dimensions is unit-strided while the other carries a
+    stride that is a whole number of 16-byte blocks.
+    """
+    sizes = operand.sizes
+    strides = operand.strides
+    if len(sizes) < 2 or len(strides) != len(sizes):
+        return (
+            f"{operand.label} must be at least 2-D for torch grouped_mm; got "
+            f"sizes {sizes} and strides {strides}."
+        )
+    element_size = max(1, int(operand.element_size))
+    alignment = max(1, GROUPED_MM_ALIGNMENT_BYTES // element_size)
+    if strides[-2] == 1 and strides[-1] >= max(1, sizes[-2]):
+        checked, dim = strides[-1], len(sizes) - 1
+    elif strides[-1] == 1 and strides[-2] >= max(1, sizes[-1]):
+        checked, dim = strides[-2], len(sizes) - 2
+    else:
+        return (
+            f"{operand.label} with sizes {sizes} and strides {strides} has no "
+            "unit-strided innermost dimension, which torch grouped_mm rejects."
+        )
+    if checked % alignment == 0:
+        return None
+    return (
+        f"{operand.label} with sizes {sizes} and strides {strides} carries "
+        f"stride {checked} on dim {dim}, i.e. {checked * element_size} bytes for "
+        f"{element_size}-byte elements; torch grouped_mm requires every operand "
+        f"stride to be a multiple of {GROUPED_MM_ALIGNMENT_BYTES} bytes "
+        f"({alignment} elements for this dtype)."
+    )
+
+
+def grouped_mm_stride_violations(
+    operands: "tuple[GroupedMMOperand, ...] | list[GroupedMMOperand]",
+) -> tuple[str, ...]:
+    """Every distinct precondition failure across ``operands``, in order."""
+    violations: list[str] = []
+    for operand in operands:
+        reason = grouped_mm_stride_violation(operand)
+        if reason is not None and reason not in violations:
+            violations.append(reason)
+    return tuple(violations)
 
 
 # ---------------------------------------------------------------------------
