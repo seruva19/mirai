@@ -857,9 +857,13 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     ) -> Any | None:
         if not bool(config.enabled):
             return None
+        from mirai.core.dataset.native_encode import validate_native_cache_encoder
         from mirai.core.models.magi2_preview.cache import Magi2PreviewNativeCacheEncoder
 
-        return Magi2PreviewNativeCacheEncoder(config)
+        return validate_native_cache_encoder(
+            Magi2PreviewNativeCacheEncoder(config),
+            source="the magi2-preview model-family provider",
+        )
 
 
 _provider = Magi2PreviewModelFamilyProvider()

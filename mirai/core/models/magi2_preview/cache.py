@@ -97,3 +97,8 @@ class Magi2PreviewNativeCacheEncoder:
         )
         return latent[0].detach().cpu().float().contiguous(), bucket
 
+    def encode_clip(self, media_path: Path) -> None:
+        # MAGI-2 conditions on Qwen text hidden states only; there is no CLIP tower.
+        _ = media_path
+        return None
+

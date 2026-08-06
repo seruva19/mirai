@@ -909,7 +909,14 @@ class LingBotVideoModelFamilyProvider(ModelFamilyProvider):
     ) -> LingBotVideoNativeCacheEncoder | None:
         if not bool(config.enabled):
             return None
-        return LingBotVideoNativeCacheEncoder(config)
+        from mirai.core.dataset.native_encode import validate_native_cache_encoder
+
+        encoder = LingBotVideoNativeCacheEncoder(config)
+        validate_native_cache_encoder(
+            encoder,
+            source="the lingbot-video model-family provider",
+        )
+        return encoder
 
     def build_prototype_calibration_targets(
         self,

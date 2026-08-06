@@ -1121,6 +1121,77 @@ def test_magi2_provider_declares_native_cache_encoding() -> None:
     assert int(encoder.latent_channels) == 48
 
 
+def test_magi2_cache_encoder_satisfies_the_native_cache_encoder_contract(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The cache loop duck-types the encoder; conformance must be provable here.
+
+    A member missing from the encoder empties the cache one silent skip at a
+    time, so the contract is validated when the encoder is constructed.
+    """
+    from mirai.core.dataset.native_encode import validate_native_cache_encoder
+    from mirai.core.models.magi2_preview.cache import Magi2PreviewNativeCacheEncoder
+
+    provider = get_model_family_provider("magi2-preview")
+    assert provider is not None
+    encoder = provider.build_native_cache_encoder(
+        NativeCacheEncoderConfig(
+            enabled=True,
+            model_type="magi2-preview",
+            variant="preview",
+            model_path="./models/MAGI-2-preview",
+            dtype_name="bf16",
+            max_frames=17,
+        )
+    )
+    assert isinstance(encoder, Magi2PreviewNativeCacheEncoder)
+    assert validate_native_cache_encoder(encoder, source="test") is encoder
+    # MAGI-2 has no CLIP conditioning: the contract member exists and is a no-op.
+    assert encoder.encode_clip(tmp_path / "clip.mp4") is None
+
+
+def test_magi2_cache_loop_produces_records_without_clip_conditioning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A MAGI-2 raw-media cache build must yield records, not 20 silent skips."""
+    from mirai.core.dataset import cache as cache_module
+    from mirai.core.dataset.native_encode import BucketInfo
+    from mirai.core.models.magi2_preview.cache import Magi2PreviewNativeCacheEncoder
+
+    def _fake_latent(
+        self: Magi2PreviewNativeCacheEncoder, media_path: pathlib.Path
+    ) -> tuple[torch.Tensor, BucketInfo]:
+        _ = media_path
+        return (
+            torch.zeros(self.latent_channels, 1, 2, 2, dtype=torch.float32),
+            BucketInfo(bucket_id="32x32x1", bucket_h=32, bucket_w=32, bucket_frames=1),
+        )
+
+    monkeypatch.setattr(Magi2PreviewNativeCacheEncoder, "encode_latent", _fake_latent)
+    monkeypatch.setattr(
+        Magi2PreviewNativeCacheEncoder,
+        "encode_text",
+        lambda self, caption: torch.zeros(4, 8, dtype=torch.float32),
+    )
+
+    dataset_dir = tmp_path / "videos"
+    dataset_dir.mkdir()
+    (dataset_dir / "clip0.mp4").write_bytes(b"")
+    (dataset_dir / "clip0.txt").write_text("a caption", encoding="utf-8")
+
+    payload = cache_module.build_cache(
+        dataset_dir,
+        tmp_path / "cache.pt",
+        native_encode=True,
+        model_type="magi2-preview",
+        model_variant="preview",
+        model_path=str(tmp_path / "model"),
+    )
+    assert int(payload["num_records"]) == 1
+    assert int(payload["num_skipped"]) == 0
+    assert payload["records"][0]["clip_embed"] is None
+
+
 def test_magi2_auto_preprocess_defers_to_the_native_cache_encoder(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:

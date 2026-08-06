@@ -24,7 +24,11 @@ from mirai.core.dataset.fingerprint import (
     selective_rebuild_plan,
     text_cache_fingerprint,
 )
-from mirai.core.dataset.native_encode import ValidationCacheEncoder
+from mirai.core.dataset.native_encode import (
+    ValidationCacheEncoder,
+    native_cache_encoder_contract_error,
+    validate_native_cache_encoder,
+)
 from mirai.core.models.providers import (
     NativeCacheEncoderConfig,
     build_native_cache_encoder,
@@ -130,6 +134,41 @@ def _is_finite_payload_value(value: Any) -> bool:
         return bool(torch.isfinite(torch.tensor(float(value), dtype=torch.float32)).item())
     except Exception:
         return False
+
+
+def _record_skipped_sample(
+    skipped: list[dict[str, str]],
+    skip_reasons: dict[str, str],
+    *,
+    sample_id: str,
+    status: str,
+    reason: str,
+) -> None:
+    """Skips are per-sample data failures and must never be silent."""
+
+    print(
+        f"[cache] warning: skipping sample '{sample_id}': {status} ({reason})",
+        file=sys.stderr,
+    )
+    skipped.append({"sample_id": sample_id, "status": status})
+    skip_reasons.setdefault(status, str(reason))
+
+
+def _format_skip_breakdown(
+    skipped: list[dict[str, str]],
+    skip_reasons: dict[str, str],
+) -> str:
+    counts: dict[str, int] = {}
+    for entry in skipped:
+        status = str(entry.get("status", "skipped_unknown"))
+        counts[status] = counts.get(status, 0) + 1
+    parts: list[str] = []
+    for status in sorted(counts):
+        reason = skip_reasons.get(status, "")
+        parts.append(
+            f"{counts[status]} {status}({reason})" if reason else f"{counts[status]} {status}"
+        )
+    return ", ".join(parts)
 
 
 def _normalize_split(value: Any, *, source_label: str) -> str:
@@ -653,6 +692,7 @@ def build_cache(
     with cache_write_lock(cache_file):
         records: list[CachedRecord] = []
         skipped: list[dict[str, str]] = []
+        skip_reasons: dict[str, str] = {}
         clips_per_video = max(1, int(clips_per_video))
         tag_shuffle_variants = max(1, int(tag_shuffle_variants))
         recovered_count = 0
@@ -717,6 +757,13 @@ def build_cache(
                 f"Model family '{str(model_type).strip().lower()}' must provide "
                 "build_native_cache_encoder() for raw-media cache construction."
             )
+        # Conformance is checked before any sample is touched: a missing method
+        # discovered inside the loop is indistinguishable from per-sample data
+        # failure and would silently empty the cache.
+        validate_native_cache_encoder(
+            native,
+            source=f"model family '{str(model_type).strip().lower()}'",
+        )
         native_status = native.status()
         component_id = str(model_denoiser_subfolder or "transformer").strip() or "transformer"
         model_component_id = snapshot_component_id(
@@ -832,6 +879,11 @@ def build_cache(
             try:
                 latent_value, _bucket_info = native.encode_latent(media_file)
             except Exception as exc:
+                if native_cache_encoder_contract_error(exc, native):
+                    raise ValueError(
+                        f"Native cache encoder {type(native).__name__} violates the "
+                        f"NativeCacheEncoder contract during encode_latent(): {exc}"
+                    ) from exc
                 if supports_native_cache:
                     raise ValueError(
                         f"Native cache encoder failed for '{media_file}': {exc}"
@@ -841,23 +893,48 @@ def build_cache(
                     latent_value = float(tensor.reshape(-1).mean().item())
                     _bucket_info = None
                 else:
-                    skipped.append({"sample_id": media_file.stem, "status": "skipped_decode_error"})
+                    _record_skipped_sample(
+                        skipped,
+                        skip_reasons,
+                        sample_id=media_file.stem,
+                        status="skipped_decode_error",
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
                     continue
             if not _is_finite_payload_value(latent_value):
-                print(
-                    f"[cache] warning: skipping sample '{media_file.stem}' due to non-finite latent.",
-                    file=sys.stderr,
+                _record_skipped_sample(
+                    skipped,
+                    skip_reasons,
+                    sample_id=media_file.stem,
+                    status="skipped_nan",
+                    reason="non-finite latent",
                 )
-                skipped.append({"sample_id": media_file.stem, "status": "skipped_nan"})
                 continue
             clip_embed_value = None
             try:
                 clip_embed_value = native.encode_clip(media_file)
-            except Exception:
-                skipped.append({"sample_id": media_file.stem, "status": "skipped_clip_error"})
+            except Exception as exc:
+                if native_cache_encoder_contract_error(exc, native):
+                    raise ValueError(
+                        f"Native cache encoder {type(native).__name__} violates the "
+                        f"NativeCacheEncoder contract during encode_clip(): {exc}"
+                    ) from exc
+                _record_skipped_sample(
+                    skipped,
+                    skip_reasons,
+                    sample_id=media_file.stem,
+                    status="skipped_clip_error",
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
                 continue
             if clip_embed_value is not None and not _is_finite_payload_value(clip_embed_value):
-                skipped.append({"sample_id": media_file.stem, "status": "skipped_clip_nan"})
+                _record_skipped_sample(
+                    skipped,
+                    skip_reasons,
+                    sample_id=media_file.stem,
+                    status="skipped_clip_nan",
+                    reason="non-finite clip embedding",
+                )
                 continue
             loss_mask_value: float | None = None
             if mask_extension:
@@ -865,8 +942,12 @@ def build_cache(
                     mask_tensor = torch.load(mask_file, map_location="cpu").float()
                     mask_mean = float(mask_tensor.reshape(-1).mean().item())
                     if not torch.isfinite(torch.tensor(mask_mean, dtype=torch.float32)):
-                        skipped.append(
-                            {"sample_id": media_file.stem, "status": "skipped_mask_nan"}
+                        _record_skipped_sample(
+                            skipped,
+                            skip_reasons,
+                            sample_id=media_file.stem,
+                            status="skipped_mask_nan",
+                            reason="non-finite loss mask",
                         )
                         continue
                     loss_mask_value = mask_mean
@@ -1034,6 +1115,12 @@ def build_cache(
                     )
 
         if not records:
+            if skipped:
+                raise ValueError(
+                    "Cache encoding produced no valid records. "
+                    f"{len(skipped)}/{len(media_files)} samples skipped: "
+                    f"{_format_skip_breakdown(skipped, skip_reasons)}"
+                )
             raise ValueError("Cache encoding produced no valid records.")
 
         total_seen = len(media_files)
@@ -1042,7 +1129,8 @@ def build_cache(
             if skip_ratio > max_cache_skip_ratio:
                 raise ValueError(
                     "Cache skip ratio exceeded max_cache_skip_ratio: "
-                    f"{skip_ratio:.3f} > {max_cache_skip_ratio:.3f}"
+                    f"{skip_ratio:.3f} > {max_cache_skip_ratio:.3f}; skipped: "
+                    f"{_format_skip_breakdown(skipped, skip_reasons)}"
                 )
 
         native_status = native.status()

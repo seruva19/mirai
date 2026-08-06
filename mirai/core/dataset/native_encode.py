@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 try:
     import torch
@@ -147,6 +147,81 @@ class BucketInfo:
     bucket_h: int
     bucket_w: int
     bucket_frames: int
+
+
+@runtime_checkable
+class NativeCacheEncoder(Protocol):
+    """Object contract every provider-owned cache encoder must satisfy.
+
+    The cache builder calls exactly these members on the encoder it receives
+    from ``build_native_cache_encoder``. ``encode_clip`` is part of the contract
+    even for families without CLIP-style conditioning; such families return
+    ``None``. ``encode_text_for_media`` is the one optional extension and is
+    probed explicitly at its call site.
+    """
+
+    latent_channels: int
+
+    def status(self) -> NativeCacheStatus: ...
+
+    def encode_text(self, caption: str) -> Any: ...
+
+    def encode_latent(self, media_path: Path) -> tuple[torch.Tensor, "BucketInfo | None"]: ...
+
+    def encode_clip(self, media_path: Path) -> Any | None: ...
+
+
+NATIVE_CACHE_ENCODER_REQUIRED_METHODS: tuple[str, ...] = (
+    "status",
+    "encode_text",
+    "encode_latent",
+    "encode_clip",
+)
+NATIVE_CACHE_ENCODER_REQUIRED_ATTRIBUTES: tuple[str, ...] = ("latent_channels",)
+
+
+def validate_native_cache_encoder(encoder: Any, *, source: str) -> NativeCacheEncoder:
+    """Fail before encoding starts when an encoder breaks the object contract.
+
+    Duck typing here is unsafe: a missing method surfaces only inside the
+    per-sample loop, where it is indistinguishable from a per-sample data error.
+    """
+
+    missing: list[str] = []
+    for name in NATIVE_CACHE_ENCODER_REQUIRED_METHODS:
+        if not callable(getattr(encoder, name, None)):
+            missing.append(f"{name}()")
+    for name in NATIVE_CACHE_ENCODER_REQUIRED_ATTRIBUTES:
+        if getattr(encoder, name, None) is None:
+            missing.append(name)
+    if missing:
+        raise ValueError(
+            f"Native cache encoder {type(encoder).__name__} from {source} does not "
+            "satisfy the NativeCacheEncoder contract; missing: "
+            f"{', '.join(missing)}."
+        )
+    return encoder
+
+
+def native_cache_encoder_contract_error(exc: BaseException, encoder: Any) -> bool:
+    """True when ``exc`` is a missing member on the encoder itself.
+
+    A contract violation is a code defect and must abort the build; an error
+    raised while processing one media file is a data problem and may be skipped.
+    """
+
+    if not isinstance(exc, AttributeError):
+        return False
+    if getattr(exc, "obj", None) is encoder:
+        return True
+    name = str(getattr(exc, "name", "") or "")
+    return bool(
+        name
+        and name
+        in set(NATIVE_CACHE_ENCODER_REQUIRED_METHODS)
+        | set(NATIVE_CACHE_ENCODER_REQUIRED_ATTRIBUTES)
+        and not hasattr(encoder, name)
+    )
 
 
 class ValidationCacheEncoder:
