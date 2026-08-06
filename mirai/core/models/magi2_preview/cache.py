@@ -17,6 +17,16 @@ from mirai.core.dataset.native_encode import (
 from mirai.core.models.providers import NativeCacheEncoderConfig
 
 
+def magi2_cache_frame_trim(frame_count: int) -> int:
+    """Largest ``8n + 1`` frame count that fits ``frame_count``.
+
+    The Wan2.2 encoder compresses time by eight with a leading key frame, which
+    is the same grid the generation path declares in its latent layout, so a
+    cached clip and a generated clip express lengths identically.
+    """
+    return max(1, 1 + 8 * max(0, (int(frame_count) - 1) // 8))
+
+
 class Magi2PreviewNativeCacheEncoder:
     """Sequential native encoder; large components never share device residency."""
 
@@ -81,7 +91,7 @@ class Magi2PreviewNativeCacheEncoder:
         if media_path.suffix.lower() not in VIDEO_MEDIA_SUFFIXES:
             raise ValueError("MAGI-2 training cache accepts videos or native .pt latents.")
         video = _load_video_media(media_path, max_frames=self.max_frames)
-        valid_frames = max(1, 1 + 8 * max(0, (int(video.shape[1]) - 1) // 8))
+        valid_frames = magi2_cache_frame_trim(int(video.shape[1]))
         video = video[:, :valid_frames]
         height = max(16, int(video.shape[-2]) // 16 * 16)
         width = max(16, int(video.shape[-1]) // 16 * 16)

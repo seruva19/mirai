@@ -356,14 +356,15 @@ def grouped_mm_stride_violations(
 # ---------------------------------------------------------------------------
 
 
-# ``torch grouped_mm`` processes at most this many groups in a single call: the
-# ATen implementation raises ``RuntimeError: Can't process more than 1024
-# groups`` when ``offs`` carries more entries. A packed MoE layer that flattens
-# a second axis onto the group axis (e.g. head * num_experts) exceeds it, so
+# ``torch grouped_mm`` processes strictly fewer than 1024 groups in a single
+# call: despite the ATen message ``RuntimeError: Can't process more than 1024
+# groups``, the check rejects 1024 itself (probed on H100/torch 2.9.1: 1023
+# groups succeed, 1024 and above fail). A packed MoE layer that flattens a
+# second axis onto the group axis (e.g. head * num_experts) exceeds it, so
 # every call site routes through :func:`run_grouped_mm`, which splits the work
 # into contiguous group segments. The limit is a property of the primitive, not
 # of any one consumer, so it lives beside the primitive.
-GROUPED_MM_MAX_GROUPS = 1024
+GROUPED_MM_MAX_GROUPS = 1023
 
 
 @dataclass(frozen=True)

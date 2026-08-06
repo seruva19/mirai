@@ -2553,7 +2553,8 @@
       "readme_claim": "MAGI-2 Preview single-GPU adapter training",
       "readme_claims": [
         "Host-resident MAGI-2 block streaming",
-        "Native MAGI-2 inference"
+        "Native MAGI-2 inference",
+        "Native MAGI-2 refiner staging"
       ],
       "provenance": "https://github.com/SandAI-org/MAGI-2-preview",
       "promotion_evidence": ""

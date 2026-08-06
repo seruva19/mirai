@@ -24,6 +24,7 @@ from mirai.core.models.magi2_preview.grouped_moe import (
 )
 from mirai.core.moe.runtime.gemm import BackendProbe, grouped_mm_op
 from mirai.core.models.magi2_preview.pipeline import LowRankWeight
+from mirai.core.models.native_video import resolve_output_fps
 from mirai.core.models.providers import (
     NativeCacheEncoderConfig,
     get_model_family_provider,
@@ -866,36 +867,44 @@ def test_magi2_load_state_dict_honours_strict() -> None:
 # --- Latent geometry --------------------------------------------------------
 
 
-def test_magi2_frame_count_maps_to_the_decoder_temporal_ratio() -> None:
-    """4n+1 frames round-trip: the VAE pair carries 4*(T-1)+1 pixel frames."""
+def test_magi2_frame_count_maps_to_the_transformer_temporal_stride() -> None:
+    """8n+1 frames round-trip: a request spans 8*(T-1)+1 of the 25 fps timeline.
+
+    The transformer is positioned at temporal stride 8 (``vae_stride[0] = 8``,
+    ``time_pos_fps = 3.125``), so a request denotes 25 fps-equivalent frames.
+    Declaring stride 4 here would halve every horizon: the native ten-second
+    length would come out as a five-second request.
+    """
     pipeline = _bare_pipeline()
     layout = pipeline.get_video_latent_layout()
-    assert layout.temporal_downsample == 4
-    for frames in (29, 33, 81, 125):
+    assert layout.temporal_downsample == 8
+    assert (layout.frame_count_modulus, layout.frame_count_remainder) == (8, 1)
+    for frames in (57, 65, 161, 249):
         channels, t_lat, h_lat, w_lat = pipeline.preview_latent_geometry(
             frame_count=frames, height=256, width=448
         )
         assert (channels, h_lat, w_lat) == (48, 16, 28)
-        assert 4 * (t_lat - 1) + 1 == frames
+        assert 8 * (t_lat - 1) + 1 == frames
 
 
 def test_magi2_unrepresentable_frame_count_is_rejected() -> None:
+    """Counts off the 8n+1 grid fail, including 4n+1 counts that are not 8n+1."""
     pipeline = _bare_pipeline()
-    for frames in (16, 18, 11):
-        with pytest.raises(ValueError, match="4n"):
+    for frames in (16, 18, 11, 125, 250):
+        with pytest.raises(ValueError, match="8n"):
             pipeline.preview_latent_geometry(
                 frame_count=frames, height=256, width=448
             )
     with pytest.raises(ValueError, match="multiples of 16"):
-        pipeline.preview_latent_geometry(frame_count=17, height=250, width=448)
+        pipeline.preview_latent_geometry(frame_count=57, height=250, width=448)
 
 
 def test_magi2_generation_envelope_bounds_are_enforced() -> None:
-    """Lengths the shipped sampling path is not validated for are rejected.
+    """The native horizon is accepted and refiner-space lengths are rejected.
 
-    The bounds are empirical properties of this single-GPU sampling path: the
-    native ~10 s horizon and very short clips both degenerate, so a request for
-    either fails instead of returning unusable frames.
+    Latent ``T`` 32 is the full length the preview model is trained for, so the
+    249-frame request that resolves to it must succeed. ``T`` above 32 belongs
+    to the refiner's temporal upsample rather than to a longer preview.
     """
     from mirai.core.models.magi2_preview.pipeline import (
         MAGI2_MAX_SAMPLING_LATENT_FRAMES,
@@ -908,22 +917,53 @@ def test_magi2_generation_envelope_bounds_are_enforced() -> None:
         32,
     )
 
+    assert pipeline.preview_latent_geometry(
+        frame_count=249, height=256, width=448
+    ) == (48, 32, 16, 28)
+    assert pipeline.preview_latent_geometry(
+        frame_count=57, height=256, width=448
+    ) == (48, 8, 16, 28)
+
     with pytest.raises(ValueError, match="native horizon"):
-        pipeline.preview_latent_geometry(frame_count=249, height=256, width=448)
-    with pytest.raises(ValueError, match="125 frames"):
-        pipeline.preview_latent_geometry(frame_count=129, height=256, width=448)
-    for frames in (17, 5, 1):
+        pipeline.preview_latent_geometry(frame_count=257, height=256, width=448)
+    with pytest.raises(ValueError, match="refiner"):
+        pipeline.preview_latent_geometry(frame_count=497, height=256, width=448)
+    for frames in (49, 17, 9, 1):
         with pytest.raises(ValueError, match="Short-horizon"):
             pipeline.preview_latent_geometry(
                 frame_count=frames, height=256, width=448
             )
 
-    assert pipeline.preview_latent_geometry(
-        frame_count=125, height=256, width=448
-    ) == (48, 32, 16, 28)
-    assert pipeline.preview_latent_geometry(
-        frame_count=29, height=256, width=448
-    ) == (48, 8, 16, 28)
+
+def test_magi2_preview_only_decode_is_half_rate() -> None:
+    """The declared output rate matches the frames the Turbo VAE emits.
+
+    The decoder expands T latents into 4*(T-1)+1 physical frames while the
+    request spans 8*(T-1)+1 frames of the 25 fps timeline, so the clip covers
+    the requested duration only at 12.5 fps. 25 fps needs the refiner, which
+    this path does not run.
+    """
+    from mirai.core.models.magi2_preview.pipeline import (
+        MAGI2_NATIVE_OUTPUT_FPS,
+        MAGI2_REQUEST_FPS,
+        _magi2_decoded_frames,
+        _magi2_request_frames,
+    )
+
+    pipeline = _bare_pipeline()
+    layout = pipeline.get_video_latent_layout()
+    assert layout.native_output_fps == MAGI2_NATIVE_OUTPUT_FPS == 12.5
+    assert resolve_output_fps(pipeline=pipeline, requested=None) == 12.5
+    # An explicit request still wins over the declared native rate.
+    assert resolve_output_fps(pipeline=pipeline, requested=24.0) == 24.0
+
+    for latent_frames in (8, 16, 32):
+        requested = _magi2_request_frames(latent_frames)
+        decoded = _magi2_decoded_frames(latent_frames)
+        assert requested == 2 * decoded - 1
+        assert (requested - 1) / MAGI2_REQUEST_FPS == pytest.approx(
+            (decoded - 1) / MAGI2_NATIVE_OUTPUT_FPS
+        )
 
 
 def test_magi2_shipped_preview_sample_length_is_inside_the_envelope() -> None:
@@ -933,7 +973,416 @@ def test_magi2_shipped_preview_sample_length_is_inside_the_envelope() -> None:
         frame_count=config.logging.sample_frame_count, height=256, width=448
     )
     assert channels == 48
-    assert t_lat == 32
+    assert t_lat == 16
+
+
+def test_magi2_cache_frame_trimming_matches_the_layout_rule() -> None:
+    """Cache-time trimming lands on the same 8n+1 grid the layout declares.
+
+    A cache trimmed on a different stride writes latents whose length the
+    generation path cannot express, so the two rules are checked together.
+    """
+    from mirai.core.models.magi2_preview.cache import magi2_cache_frame_trim
+
+    layout = _bare_pipeline().get_video_latent_layout()
+    modulus = int(layout.frame_count_modulus)
+    remainder = int(layout.frame_count_remainder) % modulus
+    for raw_frames, expected in ((17, 17), (24, 17), (25, 25), (120, 113), (7, 1)):
+        trimmed = magi2_cache_frame_trim(raw_frames)
+        assert trimmed == expected
+        assert trimmed <= raw_frames
+        assert trimmed % modulus == remainder
+
+
+# --- Refiner stage ----------------------------------------------------------
+
+
+_REFINER_CONFIG = str(
+    pathlib.Path(__file__).resolve().parents[1]
+    / "mirai"
+    / "vendors"
+    / "magi2_preview"
+    / "configs"
+    / "magi2_refiner.json"
+)
+
+
+def _refiner_pipeline(model_path: str = "./models/MAGI-2-preview"):
+    """A pipeline whose only configured surface is the refiner stage."""
+    from mirai.core.models.magi2_preview.pipeline import Magi2RuntimeOptions
+
+    pipeline = _bare_pipeline()
+    pipeline.model_config = type("_ModelConfig", (), {"path": model_path})()
+    pipeline.options = Magi2RuntimeOptions(
+        config_path="", refiner_config_path=_REFINER_CONFIG
+    )
+    return pipeline
+
+
+def test_magi2_refiner_resamples_the_preview_latent_onto_the_decoder_grid() -> None:
+    """T -> 2T-1 is what makes a refined clip decode at the requested length.
+
+    The preview transformer sits at temporal stride 8 while the shared decoder
+    expands stride 4, which is the half-rate preview. The refiner's ``2T - 1``
+    resample lands the latent on the decoder's own grid, so the decoded count
+    equals the frames the request denotes on its 25 fps timeline.
+    """
+    from mirai.core.models.magi2_preview.pipeline import (
+        _magi2_decoded_frames,
+        _magi2_request_frames,
+    )
+    from mirai.core.models.magi2_preview.refiner import (
+        magi2_refiner_decoded_frames,
+        magi2_refiner_latent_frames,
+    )
+
+    assert magi2_refiner_latent_frames(32) == 63
+    for latent_frames in (8, 16, 32):
+        refined = magi2_refiner_latent_frames(latent_frames)
+        decoded = magi2_refiner_decoded_frames(latent_frames)
+        # The refined clip carries 2*(preview decode) - 1 frames ...
+        assert decoded == 2 * _magi2_decoded_frames(latent_frames) - 1
+        # ... which is exactly the request itself.
+        assert decoded == _magi2_request_frames(latent_frames)
+        assert refined == 2 * latent_frames - 1
+    with pytest.raises(ValueError, match=">= 1"):
+        magi2_refiner_latent_frames(0)
+
+
+def test_magi2_refiner_upsample_pins_the_preview_endpoints() -> None:
+    """``align_corners=True`` is load-bearing, not incidental.
+
+    With it, preview frame ``k`` reappears at refined frame ``2k`` and the
+    inserted frames are true midpoints. Without it the whole trajectory shifts
+    by half a preview frame, which is a different clip.
+    """
+    import torch.nn.functional as F
+
+    from mirai.core.models.magi2_preview.refiner import magi2_refiner_upsample
+
+    torch.manual_seed(0)
+    latent = torch.randn(1, 3, 5, 4, 6)
+    upsampled = magi2_refiner_upsample(latent, latent_height=4, latent_width=6)
+    assert tuple(upsampled.shape) == (1, 3, 9, 4, 6)
+    assert torch.equal(
+        upsampled,
+        F.interpolate(latent, size=(9, 4, 6), mode="trilinear", align_corners=True),
+    )
+    for index in range(5):
+        assert torch.allclose(upsampled[:, :, 2 * index], latent[:, :, index], atol=1e-6)
+    for index in range(4):
+        midpoint = 0.5 * (latent[:, :, index] + latent[:, :, index + 1])
+        assert torch.allclose(upsampled[:, :, 2 * index + 1], midpoint, atol=1e-5)
+    misaligned = F.interpolate(
+        latent, size=(9, 4, 6), mode="trilinear", align_corners=False
+    )
+    assert not torch.allclose(upsampled, misaligned, atol=1e-4)
+
+    # Spatial resampling shares the same call, so a wider target is expressible.
+    wider = magi2_refiner_upsample(latent, latent_height=8, latent_width=12)
+    assert tuple(wider.shape) == (1, 3, 9, 8, 12)
+    with pytest.raises(ValueError, match=r"\[B,C,T,H,W\]"):
+        magi2_refiner_upsample(latent[0], latent_height=4, latent_width=6)
+
+
+def test_magi2_refiner_renoise_is_the_variance_preserving_mix() -> None:
+    """``sigma`` is the SIGNAL coefficient, so the noise weight is its complement.
+
+    Reading it as a noise level would invert the corruption: index 220 keeps
+    most of the preview rather than almost none of it.
+    """
+    from mirai.core.models.magi2_preview.refiner import magi2_refiner_renoise
+
+    torch.manual_seed(1)
+    latent = torch.randn(2, 3, 4)
+    noise = torch.randn(2, 3, 4)
+    sigma = 0.8389104008674622
+    assert torch.allclose(
+        magi2_refiner_renoise(latent, noise, sigma),
+        latent * sigma + noise * (1.0 - sigma**2) ** 0.5,
+    )
+    assert torch.equal(magi2_refiner_renoise(latent, noise, 1.0), latent)
+    assert torch.allclose(magi2_refiner_renoise(latent, noise, 0.0), noise)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        magi2_refiner_renoise(latent, noise, 1.5)
+    with pytest.raises(ValueError, match="matching shapes"):
+        magi2_refiner_renoise(latent, noise[:1], sigma)
+
+
+def test_magi2_refiner_noise_index_addresses_the_released_sigma_table() -> None:
+    """The re-noise level comes from the vendored zero-terminal-SNR table."""
+    from mirai.core.models.magi2_preview.refiner import (
+        MAGI2_REFINER_SIGMA_TABLE_SIZE,
+        magi2_refiner_renoise_sigma,
+        magi2_refiner_sigma_table,
+    )
+    from mirai.vendors.magi2_preview.pipeline.inference_engine import (
+        ZeroSNRDDPMDiscretization,
+    )
+
+    table = magi2_refiner_sigma_table()
+    assert torch.equal(
+        table, ZeroSNRDDPMDiscretization()(1000, do_append_zero=False, flip=True)
+    )
+    assert int(table.numel()) == MAGI2_REFINER_SIGMA_TABLE_SIZE
+    # Zero terminal SNR: the last entry keeps no signal at all.
+    assert float(table[-1]) == 0.0
+    assert float(table[0]) > 0.999
+    assert bool((table[1:] - table[:-1] <= 0.0).all())
+    assert magi2_refiner_renoise_sigma(220) == pytest.approx(0.8389104, abs=1e-6)
+    for index in (-1, MAGI2_REFINER_SIGMA_TABLE_SIZE):
+        with pytest.raises(ValueError, match="noise index"):
+            magi2_refiner_renoise_sigma(index)
+
+
+def test_magi2_refiner_resolves_the_released_refinement_profile() -> None:
+    """``--refine`` alone must run the shipped profile, not the generic CLI values.
+
+    Steps, guidance and shift are stated by the released refiner config; an
+    unset request resolves to them, and a stated value overrides them.
+    """
+    from mirai.core.models.magi2_preview.refiner import Magi2Refiner
+
+    refiner = Magi2Refiner(
+        type("_ModelConfig", (), {"path": "./models/MAGI-2-preview"})(),
+        config_path=_REFINER_CONFIG,
+    )
+    geometry = dict(preview_height=256, preview_width=448, scheduler="unipc")
+    resolved = refiner.settings(
+        steps=None, cfg_scale=None, shift=None, height=None, width=None, **geometry
+    )
+    assert (resolved.steps, resolved.cfg_scale, resolved.shift) == (5, 2.0, 5.0)
+    assert resolved.noise_index == 220
+    # An unset target resolution keeps the preview geometry, so the default
+    # refinement is purely temporal.
+    assert (resolved.height, resolved.width) == (256, 448)
+    assert refiner.latent_size(resolved) == (16, 28)
+    assert resolved.as_request()["scheduler"] == "unipc"
+
+    overridden = refiner.settings(
+        steps=7, cfg_scale=1.5, shift=3.0, height=512, width=896, **geometry
+    )
+    assert (overridden.steps, overridden.cfg_scale, overridden.shift) == (7, 1.5, 3.0)
+    assert refiner.latent_size(overridden) == (32, 56)
+
+    with pytest.raises(RuntimeError, match="unipc"):
+        refiner.settings(
+            steps=None,
+            cfg_scale=None,
+            shift=None,
+            height=None,
+            width=None,
+            preview_height=256,
+            preview_width=448,
+            scheduler="euler",
+        )
+    for bad in ({"steps": 0}, {"cfg_scale": -1.0}, {"shift": 0.0}):
+        call = dict(
+            steps=None, cfg_scale=None, shift=None, height=None, width=None, **geometry
+        )
+        call.update(bad)
+        with pytest.raises(RuntimeError):
+            refiner.settings(**call)
+    with pytest.raises(RuntimeError, match="spatial stride"):
+        refiner.settings(
+            steps=None, cfg_scale=None, shift=None, height=250, width=448, **geometry
+        )
+
+
+def test_magi2_refinement_without_weights_names_the_missing_snapshot_dir() -> None:
+    """A refine request with no refiner checkpoint fails before the base denoise."""
+    pipeline = _refiner_pipeline()
+    assert pipeline.supports_refiner()
+    assert not pipeline.has_refiner_weights()
+    with pytest.raises(RuntimeError) as excinfo:
+        pipeline.validate_refinement_request(
+            {"scheduler": "unipc"}, frames=249, height=256, width=448
+        )
+    message = str(excinfo.value)
+    assert "refiner" in message
+    assert "model.safetensors.index.json" in message
+
+
+def test_magi2_refinement_rejects_another_familys_re_noise_mechanism() -> None:
+    """``t_thresh`` describes a different refiner; it is refused, not ignored."""
+    pipeline = _refiner_pipeline()
+    for key in ("t_thresh", "sigma_tail_steps"):
+        with pytest.raises(RuntimeError, match="does not implement"):
+            pipeline.validate_refinement_request(
+                {"scheduler": "unipc", key: 0.85}, frames=249, height=256, width=448
+            )
+    # Unset values are the normal case and must not trip the same guard.
+    with pytest.raises(RuntimeError, match="requires a separate checkpoint"):
+        pipeline.validate_refinement_request(
+            {"scheduler": "unipc", "t_thresh": None, "sigma_tail_steps": None},
+            frames=249,
+            height=256,
+            width=448,
+        )
+
+
+def test_magi2_refinement_is_validated_against_the_generation_envelope() -> None:
+    """A refine request outside the preview envelope fails at pre-flight."""
+    pipeline = _refiner_pipeline()
+    with pytest.raises(ValueError, match="Short-horizon"):
+        pipeline.validate_refinement_request(
+            {"scheduler": "unipc"}, frames=17, height=256, width=448
+        )
+    with pytest.raises(ValueError, match="native horizon"):
+        pipeline.validate_refinement_request(
+            {"scheduler": "unipc"}, frames=257, height=256, width=448
+        )
+
+
+def test_magi2_refinement_arms_the_full_rate_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A refined clip is written at 25 fps; an unrefined one stays at 12.5.
+
+    The rate follows the configured stage rather than the request, so the
+    layout answers it once the refinement has been resolved.
+    """
+    from mirai.core.models.magi2_preview.refiner import MAGI2_REFINER_OUTPUT_FPS
+
+    root = tmp_path / "MAGI-2-preview"
+    (root / "refiner").mkdir(parents=True)
+    (root / "refiner" / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
+
+    pipeline = _refiner_pipeline(str(root))
+    assert resolve_output_fps(pipeline=pipeline, requested=None) == 12.5
+    resolved = pipeline.validate_refinement_request(
+        {"scheduler": "unipc"}, frames=249, height=256, width=448
+    )
+    assert resolved == {
+        "steps": 5,
+        "cfg_scale": 2.0,
+        "shift": 5.0,
+        "height": 256,
+        "width": 448,
+        "noise_index": 220,
+        "scheduler": "unipc",
+    }
+    assert (
+        resolve_output_fps(pipeline=pipeline, requested=None)
+        == MAGI2_REFINER_OUTPUT_FPS
+        == 25.0
+    )
+    # An explicit request still wins over the armed rate.
+    assert resolve_output_fps(pipeline=pipeline, requested=30.0) == 30.0
+
+
+def test_magi2_refiner_hooks_match_the_seam_the_session_consults() -> None:
+    """The session drives refinement through two hooks; both must conform."""
+    import inspect
+
+    from mirai.core.inference.session import InferenceSession
+    from mirai.core.models.base import BasePipeline
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+
+    for name in ("validate_refinement_request", "refine_inference_latent"):
+        family = inspect.signature(getattr(Magi2PreviewPipeline, name))
+        assert family == inspect.signature(getattr(BasePipeline, name)), name
+    # The policy loop's own hooks live on the family, not on generic core.
+    for name in (
+        "supports_refiner",
+        "has_refiner_weights",
+        "load_refiner",
+        "release_refiner",
+        "release_base_transformer",
+        "refiner_forward",
+        "refiner_residency_request",
+    ):
+        assert callable(getattr(Magi2PreviewPipeline, name)), name
+        assert not hasattr(BasePipeline, name), name
+    session = inspect.signature(InferenceSession._validate_refine_request)
+    assert set(session.parameters) == {"self", "refine", "frames", "height", "width"}
+
+
+def test_magi2_refiner_streams_under_the_configured_residency_policy() -> None:
+    """The refiner reuses the family's block-residency policy, not its own.
+
+    A run configured for block swapping must stream the refiner's layers too;
+    the refiner is a different architecture but the same ``block.layers`` stack.
+    """
+    from mirai.core.models.magi2_preview.pipeline import (
+        Magi2PreviewPipeline,
+        Magi2ResidencyRequest,
+    )
+
+    pipeline = _bare_pipeline()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.block = torch.nn.Module()
+    pipeline.transformer.block.layers = torch.nn.ModuleList(
+        [torch.nn.Linear(2, 2) for _ in range(4)]
+    )
+    pipeline._adapter_configured = True
+    assert pipeline.refiner_residency_request() is None
+
+    Magi2PreviewPipeline.set_weight_residency_strategy(
+        pipeline, strategy="block_swap", blocks_to_swap=3, mode="async"
+    )
+    request = pipeline.refiner_residency_request()
+    assert isinstance(request, Magi2ResidencyRequest)
+    assert (request.enabled, request.blocks_to_swap, request.mode) == (True, 3, "async")
+    assert request.offload_dir is None
+
+    Magi2PreviewPipeline.set_weight_residency_strategy(
+        pipeline, strategy="disabled", blocks_to_swap=0, mode="async"
+    )
+    assert pipeline.refiner_residency_request().enabled is False
+
+
+def test_magi2_provider_accepts_and_validates_refiner_family_params() -> None:
+    provider = get_model_family_provider("magi2-preview")
+    assert provider is not None
+    assert provider.validate_family_params(
+        {"refiner_config_path": _REFINER_CONFIG, "refiner_subfolder": "refiner"}
+    ) == []
+    assert provider.validate_family_params({"refiner_subfolder": "/etc"})
+    assert provider.validate_family_params({"refiner_subfolder": "../elsewhere"})
+    assert provider.validate_family_params({"refiner_config_path": 3})
+
+
+_REFINER_DEFAULT_OFF_PROBE = """
+import importlib
+import sys
+
+importlib.import_module("mirai.core.models.magi2_preview.pipeline")
+importlib.import_module("mirai.core.models.magi2_preview.refiner")
+
+vendored = [
+    name
+    for name in sys.modules
+    if name in {
+        "mirai.vendors.magi2_preview.model.magi2_refiner",
+        "mirai.vendors.magi2_preview.pipeline.refiner_data_proxy",
+    }
+]
+assert not vendored, vendored
+
+from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+
+assert Magi2PreviewPipeline._refiner is None
+assert Magi2PreviewPipeline._refine_settings is None
+print("refiner-absent")
+"""
+
+
+def test_magi2_refiner_is_absent_until_a_refinement_is_requested() -> None:
+    """Default-off means no refiner state and no vendored refiner import.
+
+    The refiner transformer and its data proxy are the two heaviest vendored
+    modules of the family; importing them for a run that never refines is a
+    cost the default path must not pay.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _REFINER_DEFAULT_OFF_PROBE],
+        capture_output=True,
+        text=True,
+        cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "refiner-absent" in result.stdout
 
 
 # --- Environment escape hatches ---------------------------------------------

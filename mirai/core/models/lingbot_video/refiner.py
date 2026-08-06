@@ -42,6 +42,19 @@ except ModuleNotFoundError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
 
+# Released refinement profile of this family. A request that leaves a value
+# unset takes the entry below, which is what ``--refine`` alone runs.
+LINGBOT_REFINER_DEFAULTS: dict[str, Any] = {
+    "steps": 8,
+    "cfg_scale": 3.0,
+    "shift": 3.0,
+    "t_thresh": 0.85,
+    "sigma_tail_steps": 2,
+    "height": 1088,
+    "width": 1920,
+}
+
+
 _HF_REFINER_HINT = (
     "The LingBot-Video refiner is a separate DiT checkpoint in the 'refiner/' "
     "subfolder of the model root. Fetch it, e.g. "
@@ -421,8 +434,26 @@ def run_refine(
     return refined.detach().float()
 
 
+def resolve_refiner_request(
+    request: dict[str, Any], *, scheduler: str
+) -> dict[str, Any]:
+    """Fill an incoming request from :data:`LINGBOT_REFINER_DEFAULTS`.
+
+    ``None`` means "the family decides", so the resolved dict states every
+    parameter the stage will actually run with.
+    """
+    resolved: dict[str, Any] = {}
+    for key, default in LINGBOT_REFINER_DEFAULTS.items():
+        value = request.get(key)
+        resolved[key] = type(default)(default if value is None else value)
+    resolved["scheduler"] = str(request.get("scheduler") or scheduler)
+    return resolved
+
+
 __all__ = [
+    "LINGBOT_REFINER_DEFAULTS",
     "LingBotRefiner",
+    "resolve_refiner_request",
     "build_refiner_solver",
     "compute_refiner_sigmas",
     "prepare_refiner_latent",

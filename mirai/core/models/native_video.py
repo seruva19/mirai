@@ -13,6 +13,10 @@ if TYPE_CHECKING:
         PreparedInferenceConditioning,
     )
 
+# Frame rate written when neither the caller nor the model family states one.
+DEFAULT_OUTPUT_FPS = 8.0
+
+
 def _ceil_div(value: int, divisor: int) -> int:
     return max(1, (max(1, int(value)) + max(1, int(divisor)) - 1) // max(1, int(divisor)))
 
@@ -29,6 +33,11 @@ class VideoLatentLayout:
     frame_count_remainder: int = 0
     frame_count_rule: str = ""
     request_spatial_multiple: int | None = None
+    # Playback rate of the frames the model's decoder physically emits. It is
+    # not derivable from the request: a decoder that emits fewer frames than the
+    # requested timeline spans covers the same duration only at a lower rate.
+    # ``None`` means the family declares no rate and the caller's default stands.
+    native_output_fps: float | None = None
 
     def validate_request(self, *, frame_count: int, height: int, width: int) -> None:
         frame_count = int(frame_count)
@@ -179,3 +188,20 @@ class NativeVideoPipeline(BasePipeline):
         raise NotImplementedError(
             f"{type(self).__name__} does not implement native VAE offload."
         )
+
+
+def resolve_output_fps(*, pipeline: Any, requested: float | None) -> float:
+    """Resolve the rate a decoded clip is written at.
+
+    An explicit request always wins. Otherwise a native family that declares
+    ``native_output_fps`` on its latent layout supplies it, so a decoder that
+    emits fewer physical frames than the requested timeline covers still plays
+    back over the requested duration instead of at a generic default.
+    """
+    if requested is not None:
+        return float(requested)
+    if isinstance(pipeline, NativeVideoPipeline):
+        declared = pipeline.get_video_latent_layout().native_output_fps
+        if declared is not None:
+            return float(declared)
+    return DEFAULT_OUTPUT_FPS

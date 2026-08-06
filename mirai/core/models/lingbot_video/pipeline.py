@@ -1908,8 +1908,12 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         request: dict[str, Any],
         *,
         frames: int,
-    ) -> None:
-        _ = request
+        height: int,
+        width: int,
+    ) -> dict[str, Any]:
+        # The refiner states its own target resolution, so the base geometry is
+        # not consulted beyond the video-only frame check.
+        _ = height, width
         if int(frames) <= 1:
             raise RuntimeError(
                 "LingBot-Video refinement is video-only and requires frames>1; "
@@ -1928,6 +1932,11 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 "LingBot-Video refinement requires a separate checkpoint under "
                 f"'{Path(str(self.model_config.path)) / subfolder}'."
             )
+        from mirai.core.models.lingbot_video.refiner import resolve_refiner_request
+
+        return resolve_refiner_request(
+            request, scheduler=str(request.get("scheduler") or "euler")
+        )
 
     def refine_inference_latent(
         self,

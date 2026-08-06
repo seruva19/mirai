@@ -93,6 +93,10 @@ which must contain:
 - `vae/Wan2.2_VAE.pth` — the native encoder used by the training cache.
 - `turbo_vae/TurboV3-Wan22-TinyShallow_7_7.json` and
   `turbo_vae/checkpoint.ckpt` — the TurboVAE decoder used at inference.
+- `refiner/` with `model.safetensors.index.json` and its shards — required only
+  by the optional [refiner stage](#refiner-stage), and validated when that stage
+  is requested. The refiner ships no `config.json`; its architecture comes from
+  the vendored refiner profile.
 
 ## Presets
 
@@ -251,6 +255,7 @@ with `scripts/infer.py`:
 python scripts/infer.py \
   --config configs/magi2_preview/inference_offload.toml \
   --scheduler unipc \
+  --frames 121 \
   --prompt "..." \
   --out outputs/clip.mp4
 ```
@@ -260,28 +265,50 @@ The example keeps `inference.keep_text_encoder_resident` and
 decoding occupy the execution device sequentially. Set either to `true` to
 trade VRAM for reload time across repeated session generations.
 
-### Generation length
+### Generation length and output frame rate
 
-The validated generation envelope of this single-GPU sampling path is **29 to
-125 frames** (latent `T` 8 to 32) at the `4n+1` frame rule. A request outside
-it is rejected before sampling starts, by the same family seam that enforces
-`4n+1`, rather than returning a clip that does not carry usable content:
+The preview transformer is positioned on a **25 fps timeline sampled at
+temporal stride 8** (`vae_stride = [8, 16, 16]`, `time_pos_fps = 25 / 8 =
+3.125`). A `--frames` request is therefore expressed on that 25 fps timeline:
+`T` latent frames span `8 * (T - 1) + 1` requested frames, and only counts
+congruent to 1 modulo 8 are representable. A count outside the rule is rejected
+rather than rounded.
 
-- Above 125 frames, including the release's full native horizon of roughly ten
-  seconds (249 frames, latent `T` 63), output degenerates to a flat clip on
-  this path. Native-horizon generation is a known limitation under
-  investigation; no timeline is claimed.
-- Below 29 frames output degenerates as well. The floor is empirical: 17 frames
-  (latent `T` 5) is observed bad and 125 frames is observed good, and the
-  intermediate lengths have not been probed, so the bound is set at the
-  conservative side of the measured range rather than inferred.
+**Latent `T` 32 — 249 frames, about 10 s — is the model's native horizon**: it
+is the full length the preview model is trained for, and the length upstream
+resolves for a ten-second request. Longer latents are not a longer preview.
+`T` 63 is reached only inside the [refiner](#refiner-stage), which resamples the
+preview latent to `2T - 1` frames in time, re-noises it, and runs its own short
+denoise. `T` above 32 is therefore refiner space and is rejected on the preview
+path, where sampling it degenerates to flat output.
 
-Both bounds describe the shipped sampling path, not the model contract, and
-they apply to generation only — training forwards accept any representable
-latent length, and `dataset.frame_buckets` is unaffected. `scripts/infer.py`
-defaults `--frames` to 17, which this family rejects; pass a length inside the
-envelope. `logging.sample_frame_count` must also fall inside it for a training
-run that emits previews; the shipped example sets 125.
+The generation envelope is therefore **57 to 249 frames** (latent `T` 8 to 32).
+The floor is empirical: latent `T` 5 is observed to degenerate and the
+intermediate lengths were not probed, so the bound sits on the conservative
+side of the measured range rather than being inferred.
+
+Preview-only decoding is **half-rate**. The Turbo VAE expands `T` latent frames
+into `4 * (T - 1) + 1` physical frames, so a 249-frame request writes 125
+frames — the requested ten seconds only when played at **12.5 fps**. A file of
+249 physical frames at 25 fps needs the refiner's temporal resample; see
+[Refiner stage](#refiner-stage). The family declares its native output rate
+through its latent layout — 12.5 fps preview-only, 25 fps once `--refine` is
+resolved — so `scripts/infer.py` writes at that rate when `--fps` is not passed;
+an explicit `--fps` still wins. No frames are padded or trimmed to the requested
+count: the file carries exactly what the VAE decoded.
+
+| request (`--frames`) | latent `T` | decoded frames | duration at 12.5 fps |
+|---|---|---|---|
+| 57 | 8 | 29 | 2.3 s |
+| 121 | 16 | 61 | 4.9 s |
+| 249 | 32 | 125 | 10.0 s |
+
+The bounds apply to generation only — training forwards accept any
+representable latent length, and `dataset.frame_buckets` is unaffected.
+`scripts/infer.py` defaults `--frames` to 17, which this family rejects as
+below the floor; pass a length inside the envelope. `logging.sample_frame_count`
+must also fall inside it for a training run that emits previews; the shipped
+example sets 121 for a cheap mid-length preview.
 
 The native sampler owns its own CFG execution and its own schedule, so both
 requested policies are checked rather than applied. Every denoise step packs
@@ -296,6 +323,87 @@ TurboVAE decoder from the same snapshot; both are validated before use and a
 missing asset fails with the expected path named. Throughput and peak-memory
 figures are published only after the GPU validation contract records them.
 
+### Refiner stage
+
+The refiner is an optional, default-off second stage that turns a finished
+preview latent into a full-rate clip. It is a **separate checkpoint of a
+different architecture**: a dense 30-layer transformer with no routed experts,
+shipped in the `refiner/` subfolder of the snapshot. It does not re-generate the
+clip — it consumes the preview latent.
+
+What it does, in order:
+
+1. **Resample.** The preview latent `[48, T, H, W]` is trilinearly interpolated
+   to `[48, 2T - 1, H', W']` with `align_corners=True`. `align_corners` is
+   load-bearing: it pins preview frame `k` to refined frame `2k`, so the
+   inserted frames are true midpoints rather than a half-frame shift of the
+   whole trajectory. `H'`/`W'` come from the refiner target resolution, which
+   defaults to the preview resolution — the default refinement is purely
+   temporal.
+2. **Re-noise.** The resampled latent is corrupted once, variance-preserving, at
+   a fixed index into a zero-terminal-SNR `sqrt(alphas_cumprod)` table:
+   `x * sigma + n * sqrt(1 - sigma^2)`. `sigma` is the *signal* coefficient, so
+   the released index keeps most of the preview and asks the refiner to restore
+   detail rather than to invent content. This is not the rectified-flow blend
+   the preview path uses.
+3. **Denoise.** A short Flow-UniPC run over the released step count, with the
+   conditional and unconditional branches evaluated as **two separate forwards**
+   — unlike the preview sampler, which packs them into one `B=2` forward. The
+   refiner's window attention admits batch size 1 only.
+4. **Decode.** The refined latent sits on the shared Turbo VAE's own temporal
+   grid (`magi2_refiner_vae_stride = [4, 16, 16]`), so `2T - 1` latent frames
+   decode to `8 * (T - 1) + 1` physical frames — exactly the frames the request
+   denotes, at **25 fps**.
+
+The refiner runs with **zero audio tokens**. The released profile sets
+`magi2_refiner_audio_noise_scale = -1`, which is a sentinel for "no audio track
+at all" rather than a scale; the stage fails explicitly if a configured profile
+makes the refiner return audio velocity.
+
+**Cost.** The refiner is a second model load and a second denoise, so a refined
+run pays a full extra stage on top of the preview. The refined latent carries
+roughly twice the tokens of the preview latent at the same resolution, and more
+again if the target resolution is raised, so its per-step cost is not comparable
+to a preview step. The preview transformer is released off the compute device
+before any refiner state is allocated, so the two never co-reside; refinement
+ends the current sampling session and the next generation re-places the preview
+transformer. When the run is configured for block swapping, the refiner streams
+its own layers under the same policy. No latency or peak-memory figures are
+claimed here; they are published only after the GPU validation contract records
+them.
+
+Enable it with `--refine`:
+
+```bash
+python scripts/infer.py \
+  --config configs/magi2_preview/inference_offload.toml \
+  --scheduler unipc \
+  --frames 249 \
+  --refine \
+  --prompt "..." \
+  --out outputs/clip.mp4
+```
+
+`--refine` alone runs the released refinement profile. Every refiner flag
+defaults to unset, which means "the family decides"; a stated value overrides
+the profile, and the run's payload reports the values that were actually
+applied.
+
+| flag | MAGI-2 behavior when unset |
+|---|---|
+| `--refiner-steps` | The released refiner step count. |
+| `--refiner-cfg` | The released refiner guidance scale. |
+| `--refiner-shift` | The released refiner flow shift, falling back to the preview `shift`. |
+| `--refiner-height` / `--refiner-width` | The preview `--height` / `--width`, making the refinement purely temporal. Both must be multiples of 16, the refiner VAE spatial stride. |
+| `--refiner-scheduler` | `unipc`; any other solver is rejected, as on the preview path. |
+| `--refiner-t-thresh`, `--refiner-sigma-tail-steps` | Not implemented by this family and **rejected** if stated. They describe a rectified-flow tail re-entry; MAGI-2 re-noises once at a table index instead. Change it through the refiner profile. |
+
+A refine request is validated before the base denoise starts, so an unusable
+one never costs a generation. It is rejected when the `refiner/` subfolder holds
+no `model.safetensors.index.json` — the error names the directory — when the
+frame request falls outside the preview generation envelope, when the solver is
+not `unipc`, or when a key belonging to another family's refiner is stated.
+
 ## Model-specific features
 
 - **MAGI-2 Preview single-GPU adapter training** — Adapter-only optimization
@@ -306,6 +414,9 @@ figures are published only after the GPU validation contract records them.
 - **Native MAGI-2 inference** — The provider uses the same native denoiser and
   residency path for sampling; the denoiser is a plain `torch.nn.Module` and
   Diffusers is imported nowhere in loading or in a forward pass.
+- **Native MAGI-2 refiner staging** — Optional default-off second stage that
+  resamples the preview latent in time, re-noises it once, and short-denoises it
+  through the released refiner checkpoint, producing a full-rate clip.
 - **Grouped MAGI-2 expert execution** — Optional grouped-GEMM execution of the
   multi-head routed experts during training, selected by
   `memory.moe_kernel_backend="grouped"`, with the vendored per-expert loop
@@ -325,6 +436,8 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.strict_native_assets` | Requires the complete released native assets; the shipped preset sets this to `true`. |
 | `model.params.flow_shift` | Preset value `7.0`, matching the release's `evaluation_config.shift`. |
 | `model.params.family_params.config_path` | Override for the vendored architecture JSON; empty resolves to the shipped `magi2_preview.json`. |
+| `model.params.family_params.refiner_config_path` | Override for the vendored refiner profile JSON; empty resolves to the shipped `magi2_refiner.json`. The profile states the refiner architecture, its step count, guidance scale, flow shift, VAE stride and the zero-terminal-SNR index the stage re-noises at, so changing the refinement means pointing this at a different profile. Only read when `--refine` is requested. |
+| `model.params.family_params.refiner_subfolder` | Snapshot subdirectory holding the refiner shards; defaults to `refiner`. Must be relative to the snapshot root and must not traverse upwards. |
 | `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, and it takes part in attention and MoE routing. The training forward redraws it on every call from a family-owned generator seeded from `training.seed`, so a step is reproducible under its seed and the track length never perturbs the process RNG stream; native sampling draws it once per generation from the generation generator. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
 | `adapter.type` | `lora` only. |
 | `adapter.target_preset` | `attn_only` or `attn_router`. |

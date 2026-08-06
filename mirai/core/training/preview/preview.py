@@ -8,6 +8,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from mirai.core.models.native_video import resolve_output_fps
 from mirai.core.training.preview.preview_runtime import (
     activate_preview_runtime_assets,
     begin_preview_runtime,
@@ -651,7 +652,11 @@ def generate_preview(
             )
 
         video_path = out_dir / f"{name}.mp4"
-        wrote_mp4 = _write_mp4(video_path, frames)
+        wrote_mp4 = _write_mp4(
+            video_path,
+            frames,
+            fps=resolve_output_fps(pipeline=pipeline, requested=None),
+        )
         png_dir = ""
         if not wrote_mp4:
             video_path = Path()

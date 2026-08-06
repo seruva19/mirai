@@ -30,6 +30,7 @@ from mirai.core.inference.prompt_rewriter import (
 from mirai.core.inference.component_residency import (
     resolve_inference_component_residency,
 )
+from mirai.core.models.native_video import resolve_output_fps
 from mirai.core.models.providers import get_model_family_provider
 from mirai.core.training.adapters import load_adapter_payload, normalize_adapter_state
 from mirai.core.persistence.checkpoints import load_checkpoint
@@ -59,10 +60,11 @@ def _sync_perf_counter() -> float:
 
 
 def decode_pipeline_video(
-    *, pipeline, pred: torch.Tensor, video_path: Path, fps: float = 8.0
+    *, pipeline, pred: torch.Tensor, video_path: Path, fps: float | None = None
 ) -> None:
     from mirai.core.training.preview.preview import _write_mp4
 
+    fps = resolve_output_fps(pipeline=pipeline, requested=fps)
     try:
         pipeline.load_vae(
             device="cuda" if torch.cuda.is_available() else "cpu",
@@ -94,12 +96,13 @@ def decode_pipeline_media(
     pred: torch.Tensor,
     out_path: Path,
     task: str,
-    fps: float = 8.0,
+    fps: float | None = None,
 ) -> Path:
     """Decode one latent and write the task's native PNG or MP4 artifact."""
     from mirai.core.inference.conditioning import TEXT_TO_IMAGE
     from mirai.core.training.preview.preview import _write_mp4
 
+    fps = resolve_output_fps(pipeline=pipeline, requested=fps)
     task_key = str(task)
     media_path = (
         Path(out_path).with_suffix(".png")
@@ -429,12 +432,24 @@ class InferenceSession:
         self._base_placement_dirty = False
 
     # -- refiner pre-flight ------------------------------------------------
-    def _validate_refine_request(self, refine: dict, *, frames: int) -> None:
+    def _validate_refine_request(
+        self, refine: dict, *, frames: int, height: int, width: int
+    ) -> dict:
         """Fail fast on an unusable --refine request before the base denoise.
 
-        Rejects invalid requests before a base denoise run is started.
+        Rejects invalid requests before a base denoise run is started, and
+        returns the request the family resolved, so the run reports the values
+        that drove it rather than the values that were typed.
         """
-        self.pipeline.validate_refinement_request(refine, frames=int(frames))
+        resolved = self.pipeline.validate_refinement_request(
+            refine, frames=int(frames), height=int(height), width=int(width)
+        )
+        if not isinstance(resolved, dict):
+            raise RuntimeError(
+                f"{type(self.pipeline).__name__}.validate_refinement_request must "
+                "return the resolved refinement request."
+            )
+        return resolved
 
     def __enter__(self) -> "InferenceSession":
         return self
@@ -455,7 +470,7 @@ class InferenceSession:
         frames: int = 17,
         height: int = 480,
         width: int = 832,
-        fps: float = 8.0,
+        fps: float | None = None,
         scheduler: str = "euler",
         decode_latent: str = "",
         allow_latent_output_only: bool = False,
@@ -476,13 +491,15 @@ class InferenceSession:
         :meth:`from_config`.
 
         ``refine=None`` leaves the base payload and behavior unchanged. When a
-        dict of refiner parameters is supplied
-        (``height``/``width``/``steps``/``cfg_scale``/``shift``/``t_thresh``/
-        ``sigma_tail_steps``/``scheduler``), the base final latent is upscaled,
-        re-noised to ``t_thresh``, and tail-denoised by the on-demand refiner DiT
-        before the standard VAE decode. The base DiT is released off the compute
-        device before the refiner is loaded (VRAM realism).
+        dict of refiner parameters is supplied, the model family resolves it
+        against its own released refinement profile — an entry left ``None``
+        means "the family decides" — and then hands the base final latent to its
+        on-demand refiner before the standard VAE decode. Which parameters are
+        meaningful, and what the stage does with them, is family-owned; the base
+        transformer is released off the compute device before the refiner is
+        loaded (VRAM realism).
         """
+        output_fps = resolve_output_fps(pipeline=self.pipeline, requested=fps)
         decode_latent_path = str(decode_latent or "").strip()
         if not decode_latent_path:
             self._ensure_base_placement()
@@ -541,7 +558,15 @@ class InferenceSession:
         # Refine pre-flight (fail fast BEFORE the expensive base denoise). Only
         # runs when --refine is set; the default path is untouched.
         if refine and not decode_latent_path:
-            self._validate_refine_request(refine, frames=effective_frames)
+            refine = self._validate_refine_request(
+                refine,
+                frames=effective_frames,
+                height=int(height),
+                width=int(width),
+            )
+            # Arming the stage can change the rate the family decodes at, so the
+            # output rate is resolved again against the now-configured pipeline.
+            output_fps = resolve_output_fps(pipeline=self.pipeline, requested=fps)
 
         # Provider hooks drive text encoding, denoising, VAE decode, and media output.
         from mirai.core.training.preview.preview import (
@@ -637,7 +662,7 @@ class InferenceSession:
                     pred=pred,
                     out_path=out_path,
                     task=task_key,
-                    fps=float(fps),
+                    fps=output_fps,
                 )
                 media_written = True
                 video_written = task_key != TEXT_TO_IMAGE
@@ -667,7 +692,7 @@ class InferenceSession:
             "merge": bool(self.merge),
             "prompt": prompt,
             "negative_prompt": str(negative_prompt),
-            "fps": float(fps),
+            "fps": output_fps,
             "inference_mode": self.inference_mode,
             "native_inference": use_native,
             "video_written": video_written,
@@ -685,16 +710,9 @@ class InferenceSession:
         if refined:
             # Only present when --refine ran; default payload stays byte-identical.
             payload["refined"] = True
-            payload["refiner"] = {
-                "height": int(refine["height"]),
-                "width": int(refine["width"]),
-                "steps": int(refine["steps"]),
-                "cfg_scale": float(refine["cfg_scale"]),
-                "shift": float(refine["shift"]),
-                "t_thresh": float(refine["t_thresh"]),
-                "sigma_tail_steps": int(refine["sigma_tail_steps"]),
-                "scheduler": str(refine["scheduler"]),
-            }
+            # ``refine`` is the family-resolved request, so the payload names the
+            # parameters the stage ran with and nothing the family does not own.
+            payload["refiner"] = dict(refine)
         if rewriter_name != "none":
             payload["prompt_rewriter"] = rewriter_name
             payload["original_prompt"] = original_prompt
@@ -709,4 +727,5 @@ __all__ = [
     "decode_pipeline_media",
     "decode_pipeline_video",
     "resolve_inference_mode",
+    "resolve_output_fps",
 ]

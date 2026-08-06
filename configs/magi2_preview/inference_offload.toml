@@ -3,6 +3,12 @@ preset = "magi2_preview_offload"
 [model]
 path = "./models/MAGI-2-preview"
 
+# The optional refiner stage reads these only when `--refine` is passed; an
+# unrefined run never touches the refiner profile or the refiner/ subfolder.
+[model.params.family_params]
+refiner_config_path = ""
+refiner_subfolder = "refiner"
+
 [inference]
 task = "text_to_video"
 cfg_mode = "batched"

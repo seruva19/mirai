@@ -321,9 +321,18 @@ class BasePipeline(ABC):
         request: dict[str, Any],
         *,
         frames: int,
-    ) -> None:
-        """Validate an optional family-owned post-denoise refinement stage."""
-        _ = request, frames
+        height: int,
+        width: int,
+    ) -> dict[str, Any]:
+        """Validate an optional family-owned post-denoise refinement stage.
+
+        Returns the request the family will actually apply. A value the caller
+        left unset is resolved here to the family's own default, so the run
+        reports the parameters that drove it rather than the ones that were
+        typed. The base geometry is supplied because a refinement is validated
+        against the clip it refines, not in isolation.
+        """
+        _ = request, frames, height, width
         raise RuntimeError(
             f"{type(self).__name__} does not support an inference refinement stage."
         )

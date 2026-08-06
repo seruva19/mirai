@@ -71,7 +71,10 @@ def _problem(groups: int, *, k: int = 8, n: int = 8, seed: int = 0):
 
 
 def test_group_limit_matches_the_documented_primitive_cap() -> None:
-    assert GROUPED_MM_MAX_GROUPS == 1024
+    # The ATen check rejects 1024 groups despite its "more than 1024" message
+    # (probed on H100/torch 2.9.1: 1023 succeeds, 1024 fails), so the usable
+    # cap is 1023.
+    assert GROUPED_MM_MAX_GROUPS == 1023
 
 
 def test_production_group_count_splits_into_whole_segments() -> None:
@@ -79,16 +82,18 @@ def test_production_group_count_splits_into_whole_segments() -> None:
     groups = 12 * 256
     boundaries = list(range(1, groups + 1))
     segments = grouped_mm_segments(boundaries)
-    assert [segment.group_count for segment in segments] == [1024, 1024, 1024]
+    assert [segment.group_count for segment in segments] == [1023, 1023, 1023, 3]
     assert [(segment.group_start, segment.group_stop) for segment in segments] == [
-        (0, 1024),
-        (1024, 2048),
-        (2048, 3072),
+        (0, 1023),
+        (1023, 2046),
+        (2046, 3069),
+        (3069, 3072),
     ]
     assert [(segment.row_start, segment.row_stop) for segment in segments] == [
-        (0, 1024),
-        (1024, 2048),
-        (2048, 3072),
+        (0, 1023),
+        (1023, 2046),
+        (2046, 3069),
+        (3069, 3072),
     ]
 
 
@@ -148,7 +153,7 @@ def test_production_group_count_matches_the_unchunked_reference_exactly() -> Non
     lhs, weight, offsets = _problem(12 * 256, seed=2)
     op = _RecordingOp()
     chunked = run_grouped_mm(op, lhs, weight, offsets)
-    assert op.group_counts == [1024, 1024, 1024]
+    assert op.group_counts == [1023, 1023, 1023, 3]
     assert all(count <= GROUPED_MM_MAX_GROUPS for count in op.group_counts)
     reference = _reference_grouped_mm(lhs, weight, offs=offsets)
     assert chunked.shape == reference.shape
@@ -180,7 +185,7 @@ def test_transposed_weight_view_dx_role_chunks_and_matches_reference() -> None:
     assert not weight_t.is_contiguous()
     op = _RecordingOp()
     chunked = run_grouped_mm(op, grad_output, weight_t, offsets)
-    assert op.group_counts == [1024, 1024, 1024]
+    assert op.group_counts == [1023, 1023, 1023, 3]
     assert torch.equal(chunked, _reference_grouped_mm(grad_output, weight_t, offs=offsets))
 
 
@@ -231,7 +236,7 @@ def test_magi2_forward_and_dx_route_torch_grouped_through_the_chunker(monkeypatc
     monkeypatch.setattr(grouped_moe, "grouped_mm_op", lambda: op)
 
     forward = grouped_moe._grouped_linear(lhs, weight, offsets, "torch_grouped")
-    assert op.group_counts == [1024, 1024, 1024]
+    assert op.group_counts == [1023, 1023, 1023, 3]
     assert torch.equal(
         forward, grouped_moe._grouped_linear(lhs, weight, offsets, "bmm")
     )
@@ -239,7 +244,7 @@ def test_magi2_forward_and_dx_route_torch_grouped_through_the_chunker(monkeypatc
     op.group_counts.clear()
     grad_output = torch.randn(int(lhs.shape[0]), int(weight.shape[-1]))
     grad_x = grouped_moe._grouped_linear_dx(grad_output, weight, offsets, "torch_grouped")
-    assert op.group_counts == [1024, 1024, 1024]
+    assert op.group_counts == [1023, 1023, 1023, 3]
     assert torch.equal(
         grad_x, grouped_moe._grouped_linear_dx(grad_output, weight, offsets, "bmm")
     )

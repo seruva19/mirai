@@ -28,6 +28,14 @@ try:
 except ModuleNotFoundError as exc:  # pragma: no cover
     raise SystemExit(f"Torch is required: {exc}")
 
+def _optional_int(value: object) -> int | None:
+    return None if value is None else int(value)  # type: ignore[arg-type]
+
+
+def _optional_float(value: object) -> float | None:
+    return None if value is None else float(value)  # type: ignore[arg-type]
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True, help="Path to TOML config")
@@ -45,7 +53,13 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Prompt rewriter override (default: inference.prompt_rewriter from config).",
     )
-    p.add_argument("--fps", type=float, default=8.0, help="Output video frame rate")
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Output video frame rate. Unset uses the rate the model family "
+        "declares for its decoder, or 8.0 when it declares none.",
+    )
     p.add_argument(
         "--task",
         choices=["t2v", "t2i", "ti2v", "i2v", "v2v", "text_to_video",
@@ -77,7 +91,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="./outputs/infer_output.pt", help="Output path (.pt or .mp4)")
     p.add_argument("--width", type=int, default=832, help="Output width")
     p.add_argument("--height", type=int, default=480, help="Output height")
-    p.add_argument("--frames", type=int, default=17, help="Number of frames (4n+1)")
+    p.add_argument(
+        "--frames",
+        type=int,
+        default=17,
+        help="Number of frames; the model family's latent layout states the "
+        "rule the count must satisfy.",
+    )
     p.add_argument("--steps", type=int, default=20, help="Number of denoise steps")
     p.add_argument("--cfg-scale", type=float, default=5.0, help="Classifier-free guidance scale")
     p.add_argument(
@@ -115,31 +135,59 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow native inference to succeed without decoded video output.",
     )
-    # The refiner is disabled by default. When enabled, the base
-    # final latent is upscaled, re-noised to t_thresh, and tail-denoised by the
-    # on-demand refiner DiT (loaded from model_root/refiner) before VAE decode.
+    # The refiner is disabled by default. When enabled, the model family hands
+    # its final latent to its own second-stage refiner before the VAE decode.
+    # Every parameter below defaults to unset, which selects the family's
+    # released refinement profile; the run reports the values it resolved.
     p.add_argument(
         "--refine",
         action="store_true",
-        help="Run the LingBot-Video refiner stage after the base denoise "
-        "(480p -> 1088p). Video-only; requires refiner/ weights in the model root.",
+        help="Run the model family's refiner stage after the base denoise. "
+        "Video-only; requires the family's refiner weights in the model root.",
     )
-    p.add_argument("--refiner-steps", type=int, default=8, help="Refiner tail steps")
-    p.add_argument("--refiner-cfg", type=float, default=3.0, help="Refiner CFG scale")
-    p.add_argument("--refiner-shift", type=float, default=3.0, help="Refiner flow shift")
+    p.add_argument(
+        "--refiner-steps",
+        type=int,
+        default=None,
+        help="Refiner denoise steps (unset: the family's released value).",
+    )
+    p.add_argument(
+        "--refiner-cfg",
+        type=float,
+        default=None,
+        help="Refiner CFG scale (unset: the family's released value).",
+    )
+    p.add_argument(
+        "--refiner-shift",
+        type=float,
+        default=None,
+        help="Refiner flow shift (unset: the family's released value).",
+    )
     p.add_argument(
         "--refiner-t-thresh",
         type=float,
-        default=0.85,
-        help="Re-noise sigma / tail start in (0,1]",
+        default=None,
+        help="Re-noise sigma / tail start in (0,1], for families whose refiner "
+        "re-enters the flow at a threshold.",
     )
-    p.add_argument("--refiner-height", type=int, default=1088, help="Refiner output height")
-    p.add_argument("--refiner-width", type=int, default=1920, help="Refiner output width")
+    p.add_argument(
+        "--refiner-height",
+        type=int,
+        default=None,
+        help="Refiner output height (unset: the family's released target).",
+    )
+    p.add_argument(
+        "--refiner-width",
+        type=int,
+        default=None,
+        help="Refiner output width (unset: the family's released target).",
+    )
     p.add_argument(
         "--refiner-sigma-tail-steps",
         type=int,
-        default=2,
-        help="Extra low-noise sigmas appended to the tail",
+        default=None,
+        help="Extra low-noise sigmas appended to the tail, for families whose "
+        "refiner extends its sigma grid.",
     )
     p.add_argument(
         "--refiner-scheduler",
@@ -257,14 +305,16 @@ def main() -> int:
     peak_vram_mb: float | None = None
     refine_request = None
     if bool(args.refine):
+        # ``None`` is preserved rather than filled in: the model family owns the
+        # default for every value the caller did not state.
         refine_request = {
-            "height": int(args.refiner_height),
-            "width": int(args.refiner_width),
-            "steps": int(args.refiner_steps),
-            "cfg_scale": float(args.refiner_cfg),
-            "shift": float(args.refiner_shift),
-            "t_thresh": float(args.refiner_t_thresh),
-            "sigma_tail_steps": int(args.refiner_sigma_tail_steps),
+            "height": _optional_int(args.refiner_height),
+            "width": _optional_int(args.refiner_width),
+            "steps": _optional_int(args.refiner_steps),
+            "cfg_scale": _optional_float(args.refiner_cfg),
+            "shift": _optional_float(args.refiner_shift),
+            "t_thresh": _optional_float(args.refiner_t_thresh),
+            "sigma_tail_steps": _optional_int(args.refiner_sigma_tail_steps),
             "scheduler": str(args.refiner_scheduler or args.scheduler),
         }
     if collect_timings and torch.cuda.is_available():
@@ -319,7 +369,7 @@ def main() -> int:
             height=int(args.height),
             width=int(args.width),
             out_path=args.out,
-            fps=float(args.fps),
+            fps=None if args.fps is None else float(args.fps),
             scheduler=str(args.scheduler),
             decode_latent=decode_latent_path,
             allow_latent_output_only=bool(args.allow_latent_output_only),

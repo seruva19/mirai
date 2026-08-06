@@ -8,7 +8,7 @@ imports remain lazy so the rest of Mirai is usable without them.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import torch
@@ -19,6 +19,11 @@ from mirai.core.models.base import (
     MemoryFeatureCapabilities,
     ModelExtensionCapabilities,
     SyntheticBatchSpec,
+)
+from mirai.core.models.magi2_preview.refiner import (
+    MAGI2_REFINER_OUTPUT_FPS,
+    MAGI2_REFINER_SUBFOLDER,
+    Magi2RefineSettings,
 )
 from mirai.core.models.native_video import NativeVideoPipeline, VideoLatentLayout
 from mirai.core.models.providers import (
@@ -53,17 +58,36 @@ MAGI2_NATIVE_CFG_MODE = "batched"
 # of each other's shapes and call counts.
 MAGI2_AUDIO_NOISE_SEED_OFFSET = 20_011
 
-# Empirical envelope of the single-GPU sampling path, in latent frames. Probes
-# on one device sample correctly at T=32 (125 pixel frames); T=63 (249 frames,
-# the release's native horizon) and T=5 (17 frames) both collapse to flat
-# output. These are limits of the sampling path Mirai ships, not of the model
-# contract, and they bound generation only: training forwards are unaffected.
+# The preview transformer is positioned on a 25 fps timeline sampled at
+# temporal stride 8 (``vae_stride[0] = 8``, ``time_pos_fps = 25 / 8 = 3.125``),
+# so a frame request is expressed on that 25 fps timeline. The preview-only
+# decode is half-rate: the Turbo VAE expands T latent frames into 4 * (T - 1) +
+# 1 physical frames, which play back as the requested duration at 12.5 fps.
+# Upstream reaches 25 fps by running the refiner, which interpolates the latent
+# to 2T - 1 frames before its own denoise; that stage is not part of this
+# preview-only path.
+MAGI2_REQUEST_FPS = 25.0
+MAGI2_NATIVE_OUTPUT_FPS = 12.5
+
+# Generation envelope of the single-GPU sampling path, in latent frames. T=32
+# is the horizon the preview model is trained for: it is exactly the ten
+# seconds upstream resolves for its own default request. Larger T is refiner
+# space rather than a longer preview - the refiner, not a longer preview,
+# produces T=63 - and sampling the preview there collapses to flat output. The
+# floor is empirical: T=5 is observed to degenerate and the intermediate
+# lengths were not probed. Both bounds constrain generation only; training
+# forwards accept any representable latent length.
 MAGI2_MIN_SAMPLING_LATENT_FRAMES = 8
 MAGI2_MAX_SAMPLING_LATENT_FRAMES = 32
 
 
-def _magi2_pixel_frames(latent_frames: int) -> int:
-    """Pixel frames carried by ``latent_frames`` under the 4n+1 VAE mapping."""
+def _magi2_request_frames(latent_frames: int) -> int:
+    """Requested frames on the 25 fps timeline for ``latent_frames`` latents."""
+    return 8 * (int(latent_frames) - 1) + 1
+
+
+def _magi2_decoded_frames(latent_frames: int) -> int:
+    """Physical frames the Turbo VAE decodes from ``latent_frames`` latents."""
     return 4 * (int(latent_frames) - 1) + 1
 
 
@@ -103,10 +127,37 @@ class LowRankWeight(nn.Module):
 class Magi2RuntimeOptions:
     config_path: str
     audio_tokens: int = -1
+    refiner_config_path: str = ""
+    refiner_subfolder: str = MAGI2_REFINER_SUBFOLDER
+
+
+@dataclass(frozen=True)
+class Magi2ResidencyRequest:
+    """The block-residency policy the family was configured with.
+
+    Captured at configuration time so the refiner stage can stream its own
+    layers under exactly the policy the preview transformer runs under, rather
+    than re-deriving one from config it does not own.
+    """
+
+    enabled: bool
+    blocks_to_swap: int
+    mode: str
+    block_residency_planner: str
+    block_swap_prefetch_depth: int
+    block_residency_priority: str
+    block_swap_transfer_strategy: str
+    offload_dir: str | None
 
 
 class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     """Native MAGI-2 denoiser with host-resident block streaming."""
+
+    # Class-level defaults so every policy seam answers identically before
+    # __init__ has run, which is how the weightless contract probes reach them.
+    _refiner: Any | None = None
+    _refine_settings: "Magi2RefineSettings | None" = None
+    _residency_request: "Magi2ResidencyRequest | None" = None
 
     def __init__(
         self,
@@ -125,9 +176,16 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             / "configs"
             / "magi2_preview.json"
         )
+        default_refiner_config = default_config.with_name("magi2_refiner.json")
         self.options = Magi2RuntimeOptions(
             config_path=str(family.get("config_path") or default_config),
             audio_tokens=int(family.get("audio_tokens", -1)),
+            refiner_config_path=str(
+                family.get("refiner_config_path") or default_refiner_config
+            ),
+            refiner_subfolder=str(
+                family.get("refiner_subfolder") or MAGI2_REFINER_SUBFOLDER
+            ),
         )
         self.runtime_config, self.transformer, self.data_proxy = self._build_model()
         self._block_swap_manager: BlockSwapManager | None = None
@@ -141,6 +199,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._vae: nn.Module | None = None
         self._inference_device = "cpu"
         self._audio_noise_generator = self._build_audio_noise_generator(seed)
+        # Refiner state stays absent until a refinement request is validated.
+        self._refiner: Any | None = None
+        self._refine_settings: Magi2RefineSettings | None = None
+        self._residency_request: Magi2ResidencyRequest | None = None
 
     @staticmethod
     def _build_audio_noise_generator(seed: int | None) -> torch.Generator:
@@ -185,22 +247,36 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     def get_video_latent_layout(self) -> VideoLatentLayout:
         """Latent geometry of the released MAGI-2 preview VAE pair.
 
-        Both the Wan2.2 encoder used at cache time and the TurboVAE decoder used
-        at inference compress time by four with a leading key frame, so ``T``
-        latent frames carry ``4 * (T - 1) + 1`` pixel frames and only frame
-        counts congruent to 1 modulo 4 are representable. Requests are rejected
-        rather than rounded: a rounded request decodes to a clip that is not the
-        length the caller asked for.
+        The transformer is positioned at temporal stride 8 on a 25 fps timeline,
+        and the Wan2.2 encoder used at cache time compresses time by eight with
+        a leading key frame, so ``T`` latent frames span ``8 * (T - 1) + 1``
+        frames of that timeline and only counts congruent to 1 modulo 8 are
+        representable. Requests are rejected rather than rounded: a rounded
+        request produces a clip that is not the length the caller asked for.
+
+        ``native_output_fps`` is 12.5 rather than 25 because the preview-only
+        decode is half-rate: the Turbo VAE emits ``4 * (T - 1) + 1`` physical
+        frames, which cover the requested duration only when played at 12.5 fps.
+        Once a refinement request has been validated the layout reports 25
+        instead: the refiner resamples the latent to ``2T - 1`` frames, which
+        the same decoder expands to the full ``8 * (T - 1) + 1`` frames the
+        request denotes. The rate is a property of the configured stage rather
+        than of the request, so it is answered here rather than by the caller.
         """
         return VideoLatentLayout(
             latent_channels=48,
-            temporal_downsample=4,
+            temporal_downsample=8,
             spatial_downsample=16,
             layout="BCTHW",
-            frame_count_modulus=4,
+            frame_count_modulus=8,
             frame_count_remainder=1,
-            frame_count_rule="1 modulo 4 (4n+1)",
+            frame_count_rule="1 modulo 8 (8n+1)",
             request_spatial_multiple=16,
+            native_output_fps=(
+                MAGI2_REFINER_OUTPUT_FPS
+                if self._refine_settings is not None
+                else MAGI2_NATIVE_OUTPUT_FPS
+            ),
         )
 
     def get_synthetic_batch_spec(self) -> SyntheticBatchSpec:
@@ -218,12 +294,12 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     def preview_latent_geometry(
         self, *, frame_count: int, height: int, width: int
     ) -> tuple[int, int, int, int]:
-        """Apply the 4n+1 layout rule and the sampling-path length envelope.
+        """Apply the 8n+1 layout rule and the sampling-path length envelope.
 
         The layout rule states what the VAE pair can represent; the envelope
-        states what the shipped single-GPU sampling path is validated to
-        produce. A request outside it is rejected here rather than returning a
-        clip the caller cannot use.
+        states what the preview-only sampling path can produce. A request
+        outside it is rejected here rather than returning a clip the caller
+        cannot use.
         """
         geometry = super().preview_latent_geometry(
             frame_count=frame_count, height=height, width=width
@@ -232,21 +308,24 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         if latent_frames > MAGI2_MAX_SAMPLING_LATENT_FRAMES:
             raise ValueError(
                 f"frame_count={int(frame_count)} maps to {latent_frames} latent "
-                "frames, beyond the validated MAGI-2 Preview generation "
-                f"envelope of {MAGI2_MAX_SAMPLING_LATENT_FRAMES} latent frames "
-                f"({_magi2_pixel_frames(MAGI2_MAX_SAMPLING_LATENT_FRAMES)} "
-                "frames). Sampling the model's full native horizon (~10 s) on "
-                "this single-GPU path is not supported: it degenerates to flat "
-                "output. The maximum supported request is "
-                f"{_magi2_pixel_frames(MAGI2_MAX_SAMPLING_LATENT_FRAMES)} frames."
+                "frames, beyond the MAGI-2 Preview native horizon of "
+                f"{MAGI2_MAX_SAMPLING_LATENT_FRAMES} latent frames "
+                f"({_magi2_request_frames(MAGI2_MAX_SAMPLING_LATENT_FRAMES)} "
+                f"frames at {MAGI2_REQUEST_FPS:g} fps, about 10 s), which is "
+                "the full length the preview model is trained for. Latent "
+                "lengths above it belong to the refiner stage, which resamples "
+                "the preview latent in time; they are not a longer preview and "
+                "sampling them on this path degenerates to flat output. The "
+                "maximum supported request is "
+                f"{_magi2_request_frames(MAGI2_MAX_SAMPLING_LATENT_FRAMES)} frames."
             )
         if latent_frames < MAGI2_MIN_SAMPLING_LATENT_FRAMES:
             raise ValueError(
                 f"frame_count={int(frame_count)} maps to {latent_frames} latent "
                 "frames, below the validated MAGI-2 Preview generation "
                 f"envelope of {MAGI2_MIN_SAMPLING_LATENT_FRAMES} latent frames "
-                f"({_magi2_pixel_frames(MAGI2_MIN_SAMPLING_LATENT_FRAMES)} "
-                "frames, about 1.2 s). Short-horizon sampling below that "
+                f"({_magi2_request_frames(MAGI2_MIN_SAMPLING_LATENT_FRAMES)} "
+                "frames, about 2.3 s). Short-horizon sampling below that "
                 "degrades on this path and is unsupported; the bound is "
                 "empirical."
             )
@@ -506,6 +585,16 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         enabled = resolved != "disabled" and int(blocks_to_swap) > 0
         if enabled and not self._adapter_configured:
             raise ValueError("MAGI-2 block residency requires a configured adapter.")
+        self._residency_request = Magi2ResidencyRequest(
+            enabled=enabled,
+            blocks_to_swap=int(blocks_to_swap),
+            mode=str(mode),
+            block_residency_planner=str(block_residency_planner),
+            block_swap_prefetch_depth=int(block_swap_prefetch_depth),
+            block_residency_priority=str(block_residency_priority),
+            block_swap_transfer_strategy=str(block_swap_transfer_strategy),
+            offload_dir=offload_dir if resolved == "stream_disk" else None,
+        )
         count = len(self.transformer.block.layers)
         self._block_swap_manager = BlockSwapManager(
             total_blocks=count,
@@ -767,6 +856,187 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         )
         return sampled_video[0]
 
+    # -- refiner stage -----------------------------------------------------
+    def _refiner_assets(self) -> Any:
+        if self._refiner is None:
+            from mirai.core.models.magi2_preview.refiner import Magi2Refiner
+
+            self._refiner = Magi2Refiner(
+                self.model_config,
+                config_path=self.options.refiner_config_path,
+                subfolder=self.options.refiner_subfolder,
+            )
+        return self._refiner
+
+    def supports_refiner(self) -> bool:
+        """MAGI-2 implements the refiner stage; assets are checked separately."""
+        return True
+
+    def has_refiner_weights(self) -> bool:
+        return bool(self._refiner_assets().has_weights())
+
+    def refiner_residency_request(self) -> Any:
+        """The block-residency policy the refiner stage should stream under."""
+        return self._residency_request
+
+    def load_refiner(self, *, device: str) -> None:
+        self._refiner_assets().load(
+            device=device, residency=self.refiner_residency_request()
+        )
+
+    def release_refiner(self) -> None:
+        if self._refiner is not None:
+            self._refiner.release()
+
+    def release_base_transformer(self) -> None:
+        """Move the preview transformer off the compute device for the refiner.
+
+        The preview transformer stays on CPU, so refinement terminates the
+        current sampling session; the owning session restores its placement
+        before the next generation.
+        """
+        if self._block_swap_manager is not None:
+            self._block_swap_manager.finish_backward()
+        self.transformer.to(device=torch.device("cpu"))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def validate_refinement_request(
+        self,
+        request: dict[str, Any],
+        *,
+        frames: int,
+        height: int,
+        width: int,
+    ) -> dict[str, Any]:
+        """Resolve a refinement request against the released refiner profile.
+
+        Absent values take the release profile, so ``--refine`` alone runs the
+        shipped refinement. Keys that describe another family's mechanism are
+        rejected rather than ignored: MAGI-2 enters the refiner at a fixed index
+        into a zero-terminal-SNR table, not at a rectified-flow ``t_thresh``.
+
+        Resolving here also arms the stage, which is what makes the latent
+        layout report the refined output rate.
+        """
+        latent_frames = int(self.preview_latent_geometry(
+            frame_count=int(frames), height=int(height), width=int(width)
+        )[1])
+        if latent_frames < 2:
+            raise RuntimeError(
+                "MAGI-2 refinement resamples the preview latent in time and "
+                f"needs at least two latent frames; frames={int(frames)} maps to "
+                f"{latent_frames}."
+            )
+        unsupported = sorted(
+            key
+            for key in ("t_thresh", "sigma_tail_steps")
+            if request.get(key) is not None
+        )
+        if unsupported:
+            raise RuntimeError(
+                "The MAGI-2 refiner does not implement "
+                + ", ".join(f"--refiner-{key.replace('_', '-')}" for key in unsupported)
+                + ". It re-noises once at magi2_refiner_noise_value of the "
+                "zero-terminal-SNR table declared by the refiner profile; change "
+                "the profile through "
+                "model.params.family_params.refiner_config_path instead."
+            )
+        refiner = self._refiner_assets()
+        if not refiner.has_weights():
+            raise RuntimeError(
+                "MAGI-2 refinement requires a separate checkpoint under "
+                f"'{refiner.checkpoint_dir()}' holding "
+                "model.safetensors.index.json and its shards."
+            )
+        settings = refiner.settings(
+            steps=request.get("steps"),
+            cfg_scale=request.get("cfg_scale"),
+            shift=request.get("shift"),
+            height=request.get("height"),
+            width=request.get("width"),
+            preview_height=int(height),
+            preview_width=int(width),
+            scheduler=str(request.get("scheduler") or MAGI2_NATIVE_SOLVER),
+        )
+        self._refine_settings = settings
+        return settings.as_request()
+
+    def refine_inference_latent(
+        self,
+        *,
+        base_latent: Any,
+        request: dict[str, Any],
+        prompt: str,
+        negative_prompt: str,
+        seed: int,
+        device: str,
+        dtype: Any | None,
+    ) -> Any:
+        from mirai.core.models.magi2_preview.refiner import run_refine
+
+        if self._refine_settings is None:
+            raise RuntimeError(
+                "MAGI-2 refinement must be validated before it runs; "
+                "validate_refinement_request() resolves the release profile."
+            )
+        _ = request
+        return run_refine(
+            pipeline=self,
+            refiner=self._refiner_assets(),
+            base_latent=torch.as_tensor(base_latent),
+            settings=self._refine_settings,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=int(seed),
+            device=str(device),
+            dtype=dtype,
+        )
+
+    def refiner_forward(self, latents: Any, context: Any) -> Any:
+        """One velocity forward through the loaded refiner transformer.
+
+        The refiner takes no timestep: it is entered at one fixed corruption
+        level, and the solver alone advances the state. Its audio track is empty
+        by design — the released profile sets
+        ``magi2_refiner_audio_noise_scale = -1``, the sentinel for "no audio
+        tokens at all" — so the audio velocity comes back empty and is dropped.
+        """
+        from mirai.vendors.magi2_preview.pipeline.inference_engine import EvalInput
+
+        refiner = self._refiner_assets()
+        if not refiner.loaded:
+            raise RuntimeError("MAGI-2 refiner is not loaded; call load_refiner() first.")
+        video = torch.as_tensor(latents)
+        device = video.device
+        audio_channels = int(
+            refiner.runtime_config().magi2_refiner_arch_config.audio_in_channels
+        )
+        empty_audio = torch.zeros(1, 0, audio_channels, dtype=torch.float32, device=device)
+        text = torch.as_tensor(context).to(device=device, dtype=torch.float32)
+        packed = refiner.data_proxy.process_input(
+            EvalInput(
+                x_t=video,
+                audio_x_t=empty_audio,
+                audio_feat_len=torch.tensor([0], device=device),
+                txt_feat=text,
+                txt_feat_len=torch.tensor([int(text.shape[1])], device=device),
+                ref_audio_feat=empty_audio,
+                ref_audio_feat_len=torch.tensor([0], device=device),
+                ref_video_feat=torch.empty_like(video),
+                ref_video_feat_len=torch.tensor([0], device=device),
+            )
+        )
+        prediction = refiner.transformer(*packed)
+        video_velocity, audio_velocity = refiner.data_proxy.process_output(prediction)
+        if audio_velocity is not None and audio_velocity.numel() > 0:
+            raise RuntimeError(
+                "The MAGI-2 refiner returned audio velocity for an empty audio "
+                "track, so the configured refiner profile does not match the "
+                "released audio-free refinement."
+            )
+        return video_velocity
+
     def validate_config(self, config: Any) -> list[str]:
         errors: list[str] = []
         if str(config.model.type).strip().lower() not in {"magi2-preview", "magi-2-preview"}:
@@ -816,7 +1086,12 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
 
 class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
-    _ALLOWED_FAMILY_PARAMS = {"config_path", "audio_tokens"}
+    _ALLOWED_FAMILY_PARAMS = {
+        "config_path",
+        "audio_tokens",
+        "refiner_config_path",
+        "refiner_subfolder",
+    }
 
     def __init__(self, model_type: str = "magi2-preview") -> None:
         super().__init__(
@@ -840,6 +1115,23 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
         if "audio_tokens" in params and int(params["audio_tokens"]) < -1:
             errors.append("MAGI-2 family_params.audio_tokens must be -1 (auto) or >= 0.")
+        for name in ("refiner_config_path", "refiner_subfolder"):
+            value = params.get(name)
+            if value is not None and not isinstance(value, str):
+                errors.append(f"MAGI-2 family_params.{name} must be a string.")
+        subfolder = params.get("refiner_subfolder")
+        # Both flavours are tested because the rule is about the value, not
+        # about the host the config happens to be validated on.
+        if isinstance(subfolder, str) and (
+            PurePosixPath(subfolder).is_absolute()
+            or PureWindowsPath(subfolder).is_absolute()
+            or ".." in PurePosixPath(subfolder.replace("\\", "/")).parts
+        ):
+            errors.append(
+                "MAGI-2 family_params.refiner_subfolder names a directory inside "
+                "the snapshot root; it must be relative and must not traverse "
+                "upwards."
+            )
         return errors
 
     def validate_native_backend_availability(self, cfg: Any) -> list[str]:
