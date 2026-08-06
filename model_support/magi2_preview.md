@@ -424,6 +424,15 @@ Inference uses the same native denoiser and the same block-residency path as
 training, so the preview transformer runs on one GPU with host-resident block
 streaming. The declared inference task is `text_to_video`.
 
+MAGI-2 declares no `ModelFamilyProvider.generation_defaults()`, so
+`scripts/infer.py` keeps its family-agnostic fallbacks (20 steps, CFG 5.0,
+Euler) and never substitutes a negative prompt on the family's behalf. The
+family's own unconditional stays where it already was: the native pipeline
+substitutes the vendored `NEGATIVE_PROMPT` inside `encode_prompt` when the
+negative prompt is empty and `evaluation_config.use_negative_prompt` is set.
+That condition is family runtime state a provider capability cannot observe, so
+the substitution has exactly one owner and the CLI does not duplicate it.
+
 Use [`configs/magi2_preview/inference_offload.toml`](../configs/magi2_preview/inference_offload.toml)
 with `scripts/infer.py`:
 

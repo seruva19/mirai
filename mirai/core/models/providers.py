@@ -42,6 +42,66 @@ class NativeCacheEncoderConfig:
     bucket_resize_mode: str = "resize_crop"
 
 
+@dataclass(frozen=True)
+class FamilyGenerationDefaults:
+    """Sampling values a model family was released with.
+
+    Every field is ``None`` when the family declares nothing for it. That is a
+    different state from a family that intends an empty unconditional: a
+    generic caller applies a declared value only when the corresponding request
+    field was omitted, so "omitted" and "explicitly empty" never collapse into
+    the same request. A family that declares nothing leaves the caller's own
+    fallback in place and never acquires an empty-string default.
+    """
+
+    negative_prompt: str | None = None
+    steps: int | None = None
+    cfg_scale: float | None = None
+    scheduler: str | None = None
+
+    def declares_negative_prompt(self) -> bool:
+        return self.negative_prompt is not None
+
+    def resolve_negative_prompt(self, requested: str | None) -> str:
+        """Return the effective negative prompt for an omitted-or-explicit request."""
+        if requested is not None:
+            return str(requested)
+        return str(self.negative_prompt or "")
+
+    def resolve_steps(self, requested: int | None, *, fallback: int) -> int:
+        if requested is not None:
+            return int(requested)
+        return int(self.steps if self.steps is not None else fallback)
+
+    def resolve_cfg_scale(self, requested: float | None, *, fallback: float) -> float:
+        if requested is not None:
+            return float(requested)
+        return float(self.cfg_scale if self.cfg_scale is not None else fallback)
+
+    def resolve_scheduler(self, requested: str | None, *, fallback: str) -> str:
+        if requested is not None and str(requested).strip():
+            return str(requested)
+        return str(self.scheduler or fallback)
+
+    def empty_negative_prompt_warning(self, resolved: str, *, model_type: str) -> str | None:
+        """Message for a run that discards a declared family negative prompt.
+
+        Returns ``None`` for every run that is not degraded, so an ordinary
+        correct run -- one that omitted the negative prompt and received the
+        family default -- never produces it.
+        """
+        if not self.declares_negative_prompt() or str(resolved).strip():
+            return None
+        return (
+            f"model family '{model_type}' declares a default negative prompt, but "
+            "this run uses an empty one. Classifier-free guidance then steers away "
+            "from an unconditional that carries none of the family's quality and "
+            "artifact terms, which degrades predicted structure at high sigma and "
+            "inflates latent magnitude. Omit the negative prompt to use the "
+            "family default."
+        )
+
+
 @dataclass
 class ModelFamilyProvider:
     """Provider-owned model-family contracts outside trainer core."""
@@ -130,6 +190,14 @@ class ModelFamilyProvider:
 
     def supports_batched_cfg_inference(self) -> bool:
         return bool(self.batched_cfg_inference)
+
+    def generation_defaults(self) -> FamilyGenerationDefaults:
+        """Declare the sampling values this family was released with.
+
+        The base contract declares nothing, so a family that never overrides
+        this keeps every generic caller default untouched.
+        """
+        return FamilyGenerationDefaults()
 
     def supports_inference_task(self, task: str) -> bool:
         from mirai.core.inference.conditioning import normalize_inference_task
@@ -617,6 +685,14 @@ def model_allows_asset_free_cache_encoding(
     if provider is None:
         return False
     return bool(provider.allows_asset_free_cache_encoding(cfg))
+
+
+def resolve_family_generation_defaults(model_type: str) -> FamilyGenerationDefaults:
+    """Family sampling defaults for a model type, empty when none are declared."""
+    provider = get_model_family_provider(model_type)
+    if provider is None:
+        return FamilyGenerationDefaults()
+    return provider.generation_defaults()
 
 
 def build_native_cache_encoder(config: NativeCacheEncoderConfig) -> Any | None:

@@ -78,6 +78,7 @@ exclude = ["mirai.*.contracts", "mirai.*.contracts.*"]
 
 [tool.setuptools.package-data]
 "mirai.config" = ["defaults/*.toml", "presets/*.toml"]
+"mirai.core.models.lingbot_video" = ["default_negative_prompt.json"]
 "mirai.vendors.lingbot_video" = ["LICENSE"]
 "mirai.vendors.qwen3_moe_fused" = ["LICENSE"]
 "mirai.vendors.magi2_preview" = ["LICENSE", "configs/*.json"]

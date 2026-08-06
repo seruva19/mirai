@@ -983,7 +983,7 @@ Strategy-owned options; must be a table and unknown keys fail. `text_to_video` a
 - **Type:** str
 - **Default:** `"none"`
 
-`none`, or a rewriter explicitly supported by the selected model-family provider. `lingbot_json` wraps plain LingBot prompts in its structured JSON conditioning schema; already-JSON and empty prompts pass through unchanged ([`prompt_rewriter.py`](mirai/core/inference/prompt_rewriter.py), provider-owned prompt-rewriter hook).
+`none`, or a rewriter explicitly supported by the selected model-family provider. `lingbot_json` resolves the LingBot prompt to the caption body the encoder consumes: a structured JSON object is unwrapped from its `caption` envelope and stripped of runtime-only keys (`duration`, `fps`, `height`, `width`, `num_frames`, `resolution`, `ratio`), plain language is wrapped into the minimal `comprehensive_description` body, and an empty prompt stays empty. The negative prompt is conditioning text, not a caption, and is forwarded byte-for-byte ([`prompt_rewriter.py`](mirai/core/inference/prompt_rewriter.py), provider-owned prompt-rewriter hook).
 
 ### `cfg_mode`
 
@@ -2623,7 +2623,7 @@ Mask-file suffix ([`cache.py`](mirai/core/dataset/cache.py), preprocessing).
 - **Default:** `"raw"`
 - **Allowed / range:** `raw`, `lingbot_json` ([`schema.py`](mirai/config/schema.py))
 
-Training caption wrapping at cache-encode time. `raw` = byte-identical passthrough; `lingbot_json` wraps each NL caption into the minimal Rewriter-schema JSON caption (already-JSON captions pass through) so LingBot-Video training conditioning matches the inference prompt contract ([`cache.py`](mirai/core/dataset/cache.py), [`prompt_rewriter.py`](mirai/core/inference/prompt_rewriter.py), provider-owned prompt-rewriter hook).
+Training caption resolution at cache-encode time. `raw` = byte-identical passthrough; `lingbot_json` applies the same resolution the inference prompt rewriter applies — structured JSON captions are unwrapped and stripped of runtime-only keys, plain captions are wrapped into the minimal `comprehensive_description` body — so LingBot-Video training conditioning matches the inference prompt contract ([`cache.py`](mirai/core/dataset/cache.py), [`prompt_rewriter.py`](mirai/core/inference/prompt_rewriter.py), provider-owned prompt-rewriter hook).
 
 ### `enable_bucketing`
 

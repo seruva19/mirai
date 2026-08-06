@@ -138,6 +138,7 @@ from mirai.core.models.adapters.tc_lora import gate_summary
 from mirai.core.models.moe_dit_common import as_latent_tensor
 from mirai.core.models.native_video import NativeVideoPipeline, VideoLatentLayout
 from mirai.core.models.providers import (
+    FamilyGenerationDefaults,
     ModelFamilyProvider,
     get_model_family_provider,
     register_model_family_provider,
@@ -770,6 +771,31 @@ def _build_router_quantization_targets(
     return dict(sorted(targets.items()))
 
 
+# The released LingBot negative prompt is a family-owned data asset, kept beside
+# the family runtime so the provider is the single place it is read from.
+LINGBOT_DEFAULT_NEGATIVE_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "default_negative_prompt.json"
+)
+_LINGBOT_DEFAULT_NEGATIVE_PROMPT: str | None = None
+
+
+def lingbot_default_negative_prompt() -> str:
+    """Read the released LingBot negative prompt once and cache the text."""
+    global _LINGBOT_DEFAULT_NEGATIVE_PROMPT
+    if _LINGBOT_DEFAULT_NEGATIVE_PROMPT is None:
+        _LINGBOT_DEFAULT_NEGATIVE_PROMPT = LINGBOT_DEFAULT_NEGATIVE_PROMPT_PATH.read_text(
+            encoding="utf-8"
+        ).strip()
+    return _LINGBOT_DEFAULT_NEGATIVE_PROMPT
+
+
+# Released LingBot generation profile. The Euler reference trajectory is
+# --scheduler euler --steps 40 at the same guidance scale.
+LINGBOT_GENERATION_DEFAULT_STEPS = 25
+LINGBOT_GENERATION_DEFAULT_CFG_SCALE = 3.0
+LINGBOT_GENERATION_DEFAULT_SCHEDULER = "unipc"
+
+
 class LingBotVideoModelFamilyProvider(ModelFamilyProvider):
     def __init__(self, model_type: str) -> None:
         super().__init__(
@@ -822,6 +848,14 @@ class LingBotVideoModelFamilyProvider(ModelFamilyProvider):
             ),
             dataset_caption_formats=("raw", "lingbot_json"),
             expert_mlp_execution_spec=LINGBOT_EXPERT_MLP_EXECUTION_SPEC,
+        )
+
+    def generation_defaults(self) -> FamilyGenerationDefaults:
+        return FamilyGenerationDefaults(
+            negative_prompt=lingbot_default_negative_prompt(),
+            steps=LINGBOT_GENERATION_DEFAULT_STEPS,
+            cfg_scale=LINGBOT_GENERATION_DEFAULT_CFG_SCALE,
+            scheduler=LINGBOT_GENERATION_DEFAULT_SCHEDULER,
         )
 
     def resolve_dataset_caption(self, caption: str, *, caption_format: str) -> str:

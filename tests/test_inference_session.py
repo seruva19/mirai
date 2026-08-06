@@ -14,7 +14,9 @@ cost is paid, never the numerics. These tests pin that equivalence on the tiny
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -454,6 +456,189 @@ class BatchPromptsTests(unittest.TestCase):
             # One latent dump per prompt line.
             for out in outs:
                 self.assertTrue(out.with_suffix(".pt").exists(), msg=str(out))
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class FamilyGenerationDefaultsTests(unittest.TestCase):
+    """A family's released sampling values reach the generic CLI through the
+    provider capability, and an empty negative prompt never arrives silently."""
+
+    def _defaults(self, model_type: str):
+        from mirai.core.models.providers import resolve_family_generation_defaults
+
+        return resolve_family_generation_defaults(model_type)
+
+    def test_declaring_family_supplies_defaults_when_request_is_omitted(self) -> None:
+        declared = self._defaults("lingbot-video")
+        self.assertIsNotNone(declared.negative_prompt)
+        # The declared text is the family's released asset, not a placeholder.
+        parsed = json.loads(declared.resolve_negative_prompt(None))
+        self.assertIn("universal_negative", parsed)
+        self.assertEqual(declared.resolve_steps(None, fallback=20), declared.steps)
+        self.assertEqual(
+            declared.resolve_cfg_scale(None, fallback=5.0), declared.cfg_scale
+        )
+        self.assertEqual(
+            declared.resolve_scheduler(None, fallback="euler"), declared.scheduler
+        )
+        # An ordinary correct run -- omitted flag, family default applied --
+        # produces no degradation warning.
+        self.assertIsNone(
+            declared.empty_negative_prompt_warning(
+                declared.resolve_negative_prompt(None), model_type="lingbot-video"
+            )
+        )
+
+    def test_explicit_request_always_wins_and_empty_is_reported(self) -> None:
+        declared = self._defaults("lingbot-video")
+        self.assertEqual(declared.resolve_negative_prompt("blurry"), "blurry")
+        self.assertEqual(declared.resolve_steps(3, fallback=20), 3)
+        self.assertEqual(declared.resolve_cfg_scale(1.0, fallback=5.0), 1.0)
+        self.assertEqual(declared.resolve_scheduler("euler", fallback="euler"), "euler")
+        # Explicitly empty is honored, not overridden -- and made visible.
+        self.assertEqual(declared.resolve_negative_prompt(""), "")
+        warning = declared.empty_negative_prompt_warning(
+            "", model_type="lingbot-video"
+        )
+        self.assertIsNotNone(warning)
+        self.assertIn("empty", warning)
+
+    def test_family_declaring_none_acquires_no_empty_string_default(self) -> None:
+        none_declared = self._defaults("sparse_moe_test")
+        self.assertIsNone(none_declared.negative_prompt)
+        self.assertIsNone(none_declared.steps)
+        self.assertIsNone(none_declared.cfg_scale)
+        self.assertIsNone(none_declared.scheduler)
+        self.assertFalse(none_declared.declares_negative_prompt())
+        # Caller fallbacks survive untouched.
+        self.assertEqual(none_declared.resolve_steps(None, fallback=20), 20)
+        self.assertEqual(none_declared.resolve_cfg_scale(None, fallback=5.0), 5.0)
+        self.assertEqual(
+            none_declared.resolve_scheduler(None, fallback="euler"), "euler"
+        )
+        self.assertEqual(none_declared.resolve_negative_prompt(None), "")
+        # A family that declares nothing cannot be degraded by an empty one.
+        self.assertIsNone(
+            none_declared.empty_negative_prompt_warning("", model_type="sparse_moe_test")
+        )
+
+    def test_cli_applies_declared_defaults_and_honors_explicit_request(self) -> None:
+        """The generic CLI reads the capability, never a family name."""
+        from mirai.core.models.providers import FamilyGenerationDefaults
+
+        infer = _load_module("mirai_infer_defaults", "scripts/infer.py")
+        source = (REPO_ROOT / "scripts" / "infer.py").read_text(encoding="utf-8")
+        self.assertNotIn("lingbot", source.lower())
+        self.assertNotIn("magi", source.lower())
+
+        declared = FamilyGenerationDefaults(
+            negative_prompt="declared negative",
+            steps=3,
+            cfg_scale=2.0,
+            scheduler="euler",
+        )
+        infer.resolve_family_generation_defaults = lambda _model_type: declared
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg_path = tmpdir / "config.toml"
+            _write_config(cfg_path)
+
+            def _run(extra: list[str], out_name: str) -> dict:
+                argv = [
+                    "infer.py",
+                    "--config", str(cfg_path),
+                    "--prompt", "a red cube spinning",
+                    "--seed", "7",
+                    "--frames", "5",
+                    "--height", "64",
+                    "--width", "64",
+                    "--out", str(tmpdir / out_name),
+                ] + extra
+                old_argv = sys.argv
+                buffer = io.StringIO()
+                try:
+                    sys.argv = argv
+                    with contextlib.redirect_stdout(buffer):
+                        self.assertEqual(infer.main(), 0)
+                finally:
+                    sys.argv = old_argv
+                return json.loads(buffer.getvalue())
+
+            omitted = _run([], "omitted.mp4")
+            self.assertEqual(omitted["negative_prompt"], "declared negative")
+
+            explicit = _run(["--negative-prompt", "hazy"], "explicit.mp4")
+            self.assertEqual(explicit["negative_prompt"], "hazy")
+
+            emptied = _run(["--negative-prompt", ""], "empty.mp4")
+            self.assertEqual(emptied["negative_prompt"], "")
+
+    def test_session_warns_when_a_declared_negative_prompt_is_discarded(self) -> None:
+        """The session is the backstop: every caller that reaches an empty
+        negative prompt for a declaring family sees it."""
+        from mirai.core.inference.session import InferenceSession
+        from mirai.core.models.providers import (
+            FamilyGenerationDefaults,
+            get_model_family_provider,
+        )
+
+        provider = get_model_family_provider("sparse_moe_test")
+        assert provider is not None
+        original = type(provider).generation_defaults
+        type(provider).generation_defaults = lambda _self: FamilyGenerationDefaults(
+            negative_prompt="declared negative"
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmpdir = Path(tmp)
+                cfg_path = tmpdir / "config.toml"
+                _write_config(cfg_path)
+                session = InferenceSession.from_config(str(cfg_path))
+                try:
+                    errors = io.StringIO()
+                    with contextlib.redirect_stderr(errors):
+                        session.generate(
+                            prompt="a red cube spinning",
+                            out_path=tmpdir / "empty.mp4",
+                            negative_prompt="",
+                            **_RUN_KW,
+                        )
+                    self.assertIn("declares a default negative prompt", errors.getvalue())
+
+                    quiet = io.StringIO()
+                    with contextlib.redirect_stderr(quiet):
+                        session.generate(
+                            prompt="a red cube spinning",
+                            out_path=tmpdir / "declared.mp4",
+                            negative_prompt="declared negative",
+                            **_RUN_KW,
+                        )
+                    self.assertNotIn("declares a default negative prompt", quiet.getvalue())
+                finally:
+                    session.close()
+        finally:
+            type(provider).generation_defaults = original
+
+    def test_family_entrypoint_consumes_the_same_capability(self) -> None:
+        """inference/lingbot_video/generate.py keeps no private copy."""
+        from mirai.core.models.providers import resolve_family_generation_defaults
+
+        generate = _load_module(
+            "lingbot_generate_defaults", "inference/lingbot_video/generate.py"
+        )
+        declared = resolve_family_generation_defaults("lingbot-video")
+        self.assertEqual(generate.default_negative_prompt(), declared.negative_prompt)
+        profile = generate.DEFAULT_INFERENCE_PROFILE
+        self.assertEqual(profile.steps, declared.steps)
+        self.assertEqual(profile.cfg_scale, declared.cfg_scale)
+        self.assertEqual(profile.scheduler, declared.scheduler)
+        # Omitting the flag omits it downstream, so the generic CLI resolves it
+        # through the same capability instead of receiving a second copy.
+        args = generate.parse_args(["--prompt", '{"scene":"test"}'])
+        self.assertNotIn(
+            "--negative-prompt", generate.build_infer_argv(args, config_path="c.toml")
+        )
 
 
 if __name__ == "__main__":

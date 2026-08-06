@@ -578,6 +578,17 @@ class InferenceSession:
             raise ValueError(
                 f"Model family '{provider.model_type}' does not support batched CFG inference."
             )
+        # Invariant 4: a family that ships a default negative prompt degrades
+        # measurably under an empty one, so no path may reach the denoise loop
+        # with that combination silently. This is a warning, not a failure: an
+        # empty unconditional is a legitimate deliberate request (ablation,
+        # cfg_scale=1). It is unreachable from a correct run, which omits the
+        # negative prompt and receives the family default.
+        empty_negative_warning = provider.generation_defaults().empty_negative_prompt_warning(
+            str(negative_prompt), model_type=str(provider.model_type)
+        )
+        if empty_negative_warning is not None:
+            print(f"[warning] {empty_negative_warning}", file=sys.stderr)
         rewritten = rewrite_inference_prompts(
             rewriter_name,
             PromptRewriteRequest(prompt=prompt, negative_prompt=str(negative_prompt)),

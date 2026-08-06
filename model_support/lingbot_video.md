@@ -217,9 +217,49 @@ source-latent and denoising-strength mechanism introduced by
 behind Mirai’s provider contract.
 
 The default generation profile is BF16, 832×480, 33 frames at 24 FPS,
-Flow-UniPC with 25 steps, CFG 3, and flow shift 3. The family entrypoint also
-uses the vendored upstream negative prompt unless `--negative-prompt` overrides
-it. Use `--scheduler euler --steps 40` for the Euler reference trajectory.
+Flow-UniPC with 25 steps, CFG 3, and flow shift 3. Use `--scheduler euler
+--steps 40` for the Euler reference trajectory.
+
+### Prompt and negative-prompt contract
+
+The DiT reads its caption as text serialized into the VLM chat template, so the
+exact byte string is the conditioning. Mirai resolves any accepted prompt form
+to the caption body the encoder consumes
+(`mirai/core/models/lingbot_video/prompting.py`):
+
+- A structured prompt file — `--prompt @prompt.json`, or a JSON object passed
+  to `--prompt` — is unwrapped from its `caption` envelope and stripped of the
+  runtime-only keys `duration`, `fps`, `height`, `width`, `num_frames`,
+  `resolution`, `ratio`. It is never re-wrapped, so the encoder receives no
+  `caption` or `duration` tokens.
+- Plain language is wrapped into the minimal `comprehensive_description` body
+  with an empty `camera_movement_description`. `prominent_elements` and
+  `camera_info` come from the released LLM rewriter, which Mirai does not ship,
+  and are not synthesized from a sentence — supply real rewriter output to use
+  them.
+- The negative prompt is conditioning text rather than a caption and is
+  forwarded byte-for-byte. The vendored default is the released serialization,
+  spacing included; re-serializing it would change its tokenization.
+
+`dataset.caption_format = "lingbot_json"` runs the same resolution at
+cache-encode time, so a LoRA trains on the conditioning it is later prompted
+with. Captions cached before this contract resolve to different text and their
+cache fingerprints will not match.
+
+The family declares its negative prompt, denoise steps, CFG scale, and solver
+through the provider capability `ModelFamilyProvider.generation_defaults()`, so
+the generic `scripts/infer.py` applies them too — driving it directly no longer
+runs classifier-free guidance against an empty unconditional. The negative
+prompt text lives at `mirai/core/models/lingbot_video/default_negative_prompt.json`,
+read only by the provider.
+
+`--negative-prompt`, `--steps`, `--cfg-scale`, and `--scheduler` distinguish
+*omitted* from *explicitly set* in both entrypoints. Omitted takes the declared
+family value; anything passed explicitly wins. An explicit
+`--negative-prompt ""` is honored and prints a warning naming what degrades:
+guidance then steers away from an unconditional carrying none of the family's
+quality and artifact terms, which weakens predicted structure at high sigma and
+inflates latent magnitude.
 
 Use `--quant nf4` for the compressed frozen-base path. Native Euler, Flow-UniPC,
 and DPM++ 2M solvers are available; refiner execution is controlled by the
@@ -296,5 +336,5 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.moe_restore_chunk_size` | Route rows per bounded `chunked_scatter` restore operation. |
 | `model.params.moe_fused_qkv_linear` | Enables the native fused QKV projection when compatible with the loaded tensor layout. |
 | `model.params.inference_bf16_fastmath` | Enables the family-owned optional BF16 inference fast-math path. |
-| `dataset.caption_format` | `lingbot_json` converts raw training captions into the model’s structured prompt schema at cache time; already structured JSON passes through. |
-| `inference.prompt_rewriter` | `lingbot_json` applies the same family-owned schema normalization to inference prompts. |
+| `dataset.caption_format` | `lingbot_json` resolves each training caption to the caption body the encoder consumes at cache time; structured captions are normalized rather than re-wrapped. |
+| `inference.prompt_rewriter` | `lingbot_json` applies the same family-owned caption resolution to inference prompts. |

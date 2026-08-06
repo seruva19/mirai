@@ -9,6 +9,7 @@ remediation, and infer.py native-mode resolution.
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -437,6 +438,102 @@ class LingBotInferModeResolutionTests(unittest.TestCase):
             pipeline = LingBotVideoPipeline(_model_config(tmp))
         self.assertTrue(pipeline.has_native_inference())
         self.assertEqual(resolve_inference_mode(pipeline), "native")
+
+
+class LingBotCaptionContractTests(unittest.TestCase):
+    """The caption text handed to the encoder must match the reference token
+    stream: no runner-only keys, no envelope, and a vendored unconditional that
+    is byte-exact."""
+
+    def test_plain_text_emits_no_envelope_or_runtime_keys(self) -> None:
+        from mirai.core.models.lingbot_video.prompting import resolve_lingbot_prompt
+
+        resolved = resolve_lingbot_prompt("a red cube spinning on a table")
+        self.assertNotIn('"caption"', resolved)
+        self.assertNotIn("duration", resolved)
+        body = json.loads(resolved)
+        # Exactly the block the schema defines for a sentence; nothing about
+        # prominent elements or camera info is synthesized from one.
+        self.assertEqual(list(body), ["comprehensive_description"])
+        self.assertEqual(
+            body["comprehensive_description"],
+            {
+                "scene_content_description": "a red cube spinning on a table",
+                "camera_movement_description": "",
+            },
+        )
+
+    def test_structured_prompt_is_normalized_not_rewrapped(self) -> None:
+        from mirai.core.models.lingbot_video.prompting import resolve_lingbot_prompt
+
+        caption_body = {
+            "comprehensive_description": {
+                "scene_content_description": "a harbour at dawn",
+                "camera_movement_description": "slow dolly in",
+            },
+            "prominent_elements": [],
+        }
+        prompt_file = {"caption": caption_body, "duration": 3}
+        expected = json.dumps(
+            caption_body, ensure_ascii=False, separators=(",", ":")
+        )
+
+        # A mapping, and the same object supplied as a JSON string, resolve
+        # identically -- the envelope and the runtime key are gone in both.
+        self.assertEqual(resolve_lingbot_prompt(prompt_file), expected)
+        self.assertEqual(resolve_lingbot_prompt(json.dumps(prompt_file)), expected)
+        # A body given without the envelope keeps its content and loses only
+        # the runtime keys.
+        bare = dict(caption_body, fps=24, height=480, width=832)
+        self.assertEqual(resolve_lingbot_prompt(bare), expected)
+        # Not double-wrapped: the result is not a caption of a caption.
+        self.assertNotIn('"caption"', resolve_lingbot_prompt(prompt_file))
+
+    def test_vendored_negative_prompt_is_byte_exact_and_passes_through(self) -> None:
+        from mirai.core.inference.prompt_rewriter import PromptRewriteRequest
+        from mirai.core.models.lingbot_video.prompting import (
+            rewrite_lingbot_inference_prompts,
+        )
+        from mirai.core.models.providers import resolve_family_generation_defaults
+
+        negative = resolve_family_generation_defaults("lingbot-video").negative_prompt
+        assert negative is not None
+        # The released unconditional is the spaced serialization, not a
+        # re-compacted one: whitespace changes its tokenization.
+        self.assertEqual(len(negative), 896)
+        self.assertEqual(
+            negative,
+            json.dumps(json.loads(negative), ensure_ascii=False),
+        )
+        # The rewriter treats it as conditioning, not as a caption to
+        # normalize, so it reaches the encoder unchanged.
+        result = rewrite_lingbot_inference_prompts(
+            PromptRewriteRequest(prompt="a cat", negative_prompt=negative)
+        )
+        self.assertEqual(result.negative_prompt, negative)
+
+    def test_training_and_inference_paths_resolve_identically(self) -> None:
+        from mirai.core.models.lingbot_video.prompting import (
+            resolve_lingbot_prompt,
+            resolve_training_caption,
+        )
+
+        for caption in (
+            "a red cube spinning",
+            '{"caption":{"comprehensive_description":{"scene_content_description":"x"}},"duration":2}',
+        ):
+            self.assertEqual(
+                resolve_training_caption(caption, caption_format="lingbot_json"),
+                resolve_lingbot_prompt(caption),
+            )
+            # raw is still a byte-identical passthrough.
+            self.assertEqual(
+                resolve_training_caption(caption, caption_format="raw"), caption
+            )
+        # An empty caption acquires no fabricated structure.
+        self.assertEqual(
+            resolve_training_caption("", caption_format="lingbot_json"), ""
+        )
 
 
 if __name__ == "__main__":

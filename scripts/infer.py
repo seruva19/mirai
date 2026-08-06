@@ -13,6 +13,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mirai.core.inference.session import InferenceSession
+from mirai.core.models.providers import resolve_family_generation_defaults
+
+# Family-agnostic fallbacks. They apply only to a model family that declares no
+# generation defaults of its own; a family that declares them wins whenever the
+# corresponding flag was omitted.
+GENERIC_STEPS = 20
+GENERIC_CFG_SCALE = 5.0
+GENERIC_SCHEDULER = "euler"
 
 # These module-level seams let callers supply placement behavior to the
 # load-once InferenceSession without coupling the session to this CLI.
@@ -44,9 +52,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt", required=True, help="Prompt text")
     p.add_argument(
         "--negative-prompt",
-        default="",
-        help="Negative prompt text (families trained with a default negative "
-        "prompt degrade under an empty one).",
+        default=None,
+        help="Negative prompt text. Unset applies the negative prompt the model "
+        "family declares, if any; an explicit empty string is honored but "
+        "warns, because families trained with a default negative prompt "
+        "degrade under an empty one.",
     )
     p.add_argument(
         "--prompt-rewriter",
@@ -98,8 +108,20 @@ def parse_args() -> argparse.Namespace:
         help="Number of frames; the model family's latent layout states the "
         "rule the count must satisfy.",
     )
-    p.add_argument("--steps", type=int, default=20, help="Number of denoise steps")
-    p.add_argument("--cfg-scale", type=float, default=5.0, help="Classifier-free guidance scale")
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help=f"Number of denoise steps (unset: the model family's declared "
+        f"value, or {GENERIC_STEPS} when it declares none).",
+    )
+    p.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=None,
+        help=f"Classifier-free guidance scale (unset: the model family's "
+        f"declared value, or {GENERIC_CFG_SCALE} when it declares none).",
+    )
     p.add_argument(
         "--cfg-mode",
         choices=["sequential", "batched"],
@@ -118,7 +140,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Keep the VAE resident between session generations.",
     )
-    p.add_argument("--scheduler", default="euler", help="Denoise scheduler")
+    p.add_argument(
+        "--scheduler",
+        default="",
+        help=f"Denoise scheduler (unset: the model family's declared solver, or "
+        f"'{GENERIC_SCHEDULER}' when it declares none).",
+    )
     p.add_argument(
         "--compile",
         choices=["default", "reduce-overhead", "max-autotune"],
@@ -315,7 +342,9 @@ def main() -> int:
             "shift": _optional_float(args.refiner_shift),
             "t_thresh": _optional_float(args.refiner_t_thresh),
             "sigma_tail_steps": _optional_int(args.refiner_sigma_tail_steps),
-            "scheduler": str(args.refiner_scheduler or args.scheduler),
+            # Filled in once the base scheduler has been resolved against the
+            # model family's declared solver.
+            "scheduler": "",
         }
     if collect_timings and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -343,6 +372,25 @@ def main() -> int:
             device_fn=resolve_compute_device,
             dtype_fn=resolve_compute_dtype,
         )
+        # The model family declares what it was released with; the generic CLI
+        # never names a family. A flag left unset takes the family value, an
+        # explicitly passed flag always wins -- including an empty negative
+        # prompt, which the session then reports as a degraded run.
+        family_defaults = resolve_family_generation_defaults(
+            str(session.cfg.model.type)
+        )
+        negative_prompt = family_defaults.resolve_negative_prompt(
+            args.negative_prompt
+        )
+        steps = family_defaults.resolve_steps(args.steps, fallback=GENERIC_STEPS)
+        cfg_scale = family_defaults.resolve_cfg_scale(
+            args.cfg_scale, fallback=GENERIC_CFG_SCALE
+        )
+        scheduler = family_defaults.resolve_scheduler(
+            args.scheduler, fallback=GENERIC_SCHEDULER
+        )
+        if refine_request is not None:
+            refine_request["scheduler"] = str(args.refiner_scheduler or scheduler)
         routing_params = session.cfg.model.params
         routing_trace_stride = int(
             routing_params.inference_routing_telemetry_layer_stride
@@ -361,16 +409,16 @@ def main() -> int:
         timings_box: dict | None = {} if collect_timings else None
         payload = session.generate(
             prompt=args.prompt,
-            negative_prompt=str(args.negative_prompt),
+            negative_prompt=negative_prompt,
             seed=int(args.seed),
-            steps=int(args.steps),
-            cfg_scale=float(args.cfg_scale),
+            steps=steps,
+            cfg_scale=cfg_scale,
             frames=int(args.frames),
             height=int(args.height),
             width=int(args.width),
             out_path=args.out,
             fps=None if args.fps is None else float(args.fps),
-            scheduler=str(args.scheduler),
+            scheduler=scheduler,
             decode_latent=decode_latent_path,
             allow_latent_output_only=bool(args.allow_latent_output_only),
             timings=timings_box,
@@ -394,9 +442,9 @@ def main() -> int:
                 session.pipeline,
                 Path(routing_trace_out),
                 metadata={
-                    "steps": int(args.steps),
-                    "cfg_scale": float(args.cfg_scale),
-                    "scheduler": str(args.scheduler),
+                    "steps": steps,
+                    "cfg_scale": cfg_scale,
+                    "scheduler": scheduler,
                     "layer_stride": routing_trace_stride,
                     "seed": int(args.seed),
                     "prompt": str(payload["prompt"]),

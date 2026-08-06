@@ -20,23 +20,33 @@ if str(ROOT) not in sys.path:
 
 from mirai.core.models.lingbot_video.prompting import (  # noqa: E402
     is_valid_json_caption,
-    wrap_caption_as_lingbot_json,
+    resolve_lingbot_prompt,
+)
+from mirai.core.models.providers import (  # noqa: E402
+    resolve_family_generation_defaults,
 )
 
-DEFAULT_NEGATIVE_PATH = Path(__file__).resolve().parent / "default_negative_prompt.json"
+MODEL_TYPE = "lingbot-video"
+# Negative prompt and denoise profile come from the family provider capability
+# the generic CLI reads, so this entry point holds no private copy of them.
+FAMILY_GENERATION_DEFAULTS = resolve_family_generation_defaults(MODEL_TYPE)
 
 
 class LingBotInferenceProfile(NamedTuple):
-    scheduler: str = "unipc"
-    steps: int = 25
-    cfg_scale: float = 3.0
+    scheduler: str
+    steps: int
+    cfg_scale: float
     frames: int = 33
     height: int = 480
     width: int = 832
     fps: int = 24
 
 
-DEFAULT_INFERENCE_PROFILE = LingBotInferenceProfile()
+DEFAULT_INFERENCE_PROFILE = LingBotInferenceProfile(
+    scheduler=FAMILY_GENERATION_DEFAULTS.resolve_scheduler(None, fallback="euler"),
+    steps=FAMILY_GENERATION_DEFAULTS.resolve_steps(None, fallback=20),
+    cfg_scale=FAMILY_GENERATION_DEFAULTS.resolve_cfg_scale(None, fallback=5.0),
+)
 DISTILLED_4STEP_PROFILE = LingBotInferenceProfile(
     scheduler="euler",
     steps=4,
@@ -74,24 +84,29 @@ alpha = {alpha}
 
 
 def resolve_prompt_text(prompt: str, *, raw: bool) -> tuple[str, bool]:
-    """Resolve ``@file`` references and wrap plain NL prompts into the minimal
-    JSON caption the DiT was trained on. Returns (text, was_wrapped).
+    """Resolve ``@file`` references to the caption text the encoder receives.
 
-    The wrapping logic is owned by ``mirai.core.models.lingbot_video.prompting`` and
-    shared verbatim with the training cache-encode path so the two never drift.
+    A structured prompt file (or any JSON object) is normalized -- unwrapped
+    from its ``caption`` envelope and stripped of runtime-only keys -- rather
+    than re-wrapped. Plain language is wrapped into the minimal caption body.
+    Returns (text, was_wrapped).
+
+    The caption contract is owned by ``mirai.core.models.lingbot_video.prompting``
+    and shared verbatim with the training cache-encode path so the two never
+    drift.
     """
     text = prompt.strip()
     if text.startswith("@"):
         text = Path(text[1:]).read_text(encoding="utf-8").strip()
     if raw:
         return text, False
-    if is_valid_json_caption(text):
-        return text, False  # already structured
-    return wrap_caption_as_lingbot_json(text), True
+    wrapped = bool(text) and not is_valid_json_caption(text)
+    return resolve_lingbot_prompt(text), wrapped
 
 
 def default_negative_prompt() -> str:
-    return DEFAULT_NEGATIVE_PATH.read_text(encoding="utf-8").strip()
+    """The family-declared negative prompt, read through the provider seam."""
+    return FAMILY_GENERATION_DEFAULTS.resolve_negative_prompt(None)
 
 
 def build_infer_argv(args: argparse.Namespace, *, config_path: str) -> list[str]:
@@ -103,17 +118,12 @@ def build_infer_argv(args: argparse.Namespace, *, config_path: str) -> list[str]
             "--raw to bypass.",
             file=sys.stderr,
         )
-    negative = args.negative_prompt
-    if negative is None:
-        negative = default_negative_prompt()
     argv = [
         "infer.py",
         "--config",
         config_path,
         "--prompt",
         prompt_text,
-        "--negative-prompt",
-        negative,
         "--seed",
         str(args.seed),
         "--steps",
@@ -133,6 +143,10 @@ def build_infer_argv(args: argparse.Namespace, *, config_path: str) -> list[str]
         "--out",
         args.out,
     ]
+    # Omitted here means omitted downstream: scripts/infer.py resolves the
+    # family default through the same provider capability.
+    if args.negative_prompt is not None:
+        argv += ["--negative-prompt", str(args.negative_prompt)]
     if str(args.task) != "t2v":
         argv += ["--task", str(args.task)]
     if str(args.input_image).strip():
@@ -369,7 +383,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--negative-prompt",
         default=None,
-        help="Override the vendored upstream JSON negative (default: vendored)",
+        help="Override the family-declared JSON negative prompt. Unset applies "
+        "it; an explicit empty string is honored but warns.",
     )
     p.add_argument("--raw", action="store_true", help="Do not auto-wrap NL prompts")
     p.add_argument(
