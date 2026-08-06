@@ -21,6 +21,14 @@ The flattened ``head * num_experts`` axis makes the group count of a full-size
 variant exceed the primitive's 1024-group per-call cap, so every
 ``torch_grouped`` call goes through ``run_grouped_mm``, which splits it into
 contiguous group segments. The ``bmm`` path loops per group and has no cap.
+
+When the routed experts are stored in NF4 (see ``quantized_experts.py``) the
+same routing, activation, and combine run against segments dequantized on
+demand: a contiguous group range owns a contiguous sorted-token range, so a
+segment can be materialized, multiplied, and released before the next one
+exists. The vendored reference loop has no dense tensor to read in that mode, so
+grouped execution is the only path and an explicit ``torch`` kernel backend is
+rejected rather than reinterpreted.
 """
 
 from __future__ import annotations
@@ -36,12 +44,18 @@ from mirai.core.moe.runtime.gemm import (
     grouped_mm_op,
     grouped_mm_operand,
     grouped_mm_row_operand,
+    grouped_mm_segments,
     grouped_mm_stride_violations,
     normalize_moe_gemm_backend,
     normalize_moe_gemm_role_backend,
     probe_backend,
     run_grouped_dx,
     run_grouped_mm,
+)
+from mirai.core.models.magi2_preview.quantized_experts import (
+    MAGI2_ROUTED_EXPERT_TENSOR_NAMES,
+    Magi2Nf4ExpertStore,
+    magi2_expert_store,
 )
 from mirai.core.moe.runtime.specs import (
     MoEOptimizationPolicy,
@@ -344,6 +358,24 @@ class Magi2GroupedMoEBackend:
         self._resolved[key] = selection
         return selection
 
+    def expert_weight_dtype(self, module: Any, key: str) -> torch.dtype:
+        """Storage dtype of one routed expert tensor of ``module``."""
+        return getattr(module, key).dtype
+
+    def project(
+        self,
+        module: Any,
+        key: str,
+        x_sorted: torch.Tensor,
+        offsets: torch.Tensor,
+        forward_backend: str,
+        dx_backend: str,
+    ) -> torch.Tensor:
+        """One grouped expert matmul against the frozen packed tensor ``key``."""
+        return _GroupedExpertLinear.apply(
+            x_sorted, getattr(module, key), offsets, forward_backend, dx_backend
+        )
+
     def execute(
         self,
         module: Any,
@@ -374,18 +406,19 @@ class Magi2GroupedMoEBackend:
 
         x_rows = x_heads.reshape(tokens * num_heads, d_head)
         x_sorted = x_rows.index_select(0, sorted_rows)
-        gate = _GroupedExpertLinear.apply(
-            x_sorted, module.W_gate, offsets, forward_backend, dx_backend
+        gate = self.project(
+            module, "W_gate", x_sorted, offsets, forward_backend, dx_backend
         )
-        up = _GroupedExpertLinear.apply(
-            x_sorted, module.W_up, offsets, forward_backend, dx_backend
+        up = self.project(
+            module, "W_up", x_sorted, offsets, forward_backend, dx_backend
         )
         gate = gate.float().clamp(max=7.0)
         up = up.float().clamp(min=-7.0, max=7.0)
         hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
-        expert_output = _GroupedExpertLinear.apply(
-            hidden.to(module.W_down.dtype),
-            module.W_down,
+        expert_output = self.project(
+            module,
+            "W_down",
+            hidden.to(self.expert_weight_dtype(module, "W_down")),
             offsets,
             forward_backend,
             dx_backend,
@@ -397,6 +430,181 @@ class Magi2GroupedMoEBackend:
         return output.view(tokens, num_heads, d_head)
 
 
+def run_segmented_grouped_linear(
+    x_sorted: torch.Tensor,
+    offsets: torch.Tensor,
+    *,
+    boundaries: list[int],
+    materialize: Callable[[int, int], torch.Tensor],
+    backend: str,
+    max_groups: int,
+    columns: int,
+    transposed: bool = False,
+) -> torch.Tensor:
+    """Run the sorted-layout grouped matmul one contiguous group range at a time.
+
+    ``materialize(group_start, group_stop)`` returns the dense ``[groups, K, N]``
+    weight for that range. The jagged-offset contract sorts rows by group, so a
+    group range owns exactly one row range and the segment outputs concatenate
+    back into the original row order without a scatter. Each materialized
+    segment is dropped before the next one is produced, which is what bounds the
+    dense working set to ``max_groups`` weight slices instead of the whole
+    packed axis.
+
+    ``transposed`` selects the input-gradient role, which multiplies by the
+    transposed weight view; ``columns`` is the output width of the selected role
+    and only decides the shape of an all-empty result.
+    """
+    outputs: list[torch.Tensor] = []
+    for segment in grouped_mm_segments(boundaries, max_groups=max(1, int(max_groups))):
+        if segment.row_count == 0:
+            continue
+        weight = materialize(segment.group_start, segment.group_stop)
+        local_offsets = (
+            offsets[segment.group_start : segment.group_stop] - segment.row_start
+        ).contiguous()
+        rows = x_sorted[segment.row_start : segment.row_stop]
+        outputs.append(
+            _grouped_linear_dx(rows, weight, local_offsets, backend)
+            if transposed
+            else _grouped_linear(rows, weight, local_offsets, backend)
+        )
+        del weight
+    if not outputs:
+        return x_sorted.new_empty((0, int(columns)))
+    if len(outputs) == 1:
+        return outputs[0]
+    return torch.cat(outputs, dim=0)
+
+
+class _QuantizedGroupedExpertLinear(torch.autograd.Function):
+    """Grouped expert matmul against a frozen NF4 payload.
+
+    The dequantized segment buffers are produced under ``no_grad`` inside the
+    store and are never saved on the context: backward re-materializes the same
+    segments from the same packed payload, so the dense expert weights exist
+    only for the duration of one segment matmul and never survive in autograd.
+    Re-materialization is exact rather than approximate -- NF4 dequantization is
+    a deterministic function of the stored payload -- so the input gradient is
+    computed against the same values the forward used.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        x_sorted: torch.Tensor,
+        offsets: torch.Tensor,
+        store: Magi2Nf4ExpertStore,
+        key: str,
+        forward_backend: str,
+        dx_backend: str,
+    ) -> torch.Tensor:
+        boundaries = _grouped_boundaries(offsets)
+        _groups, rows, cols = store.expert_weight_shape(key)
+        span = store.segment_group_span()
+        output = run_segmented_grouped_linear(
+            x_sorted,
+            offsets,
+            boundaries=boundaries,
+            materialize=lambda start, stop: store.materialize_segment(
+                key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
+            ),
+            backend=forward_backend,
+            max_groups=span,
+            columns=int(cols),
+        )
+        ctx.save_for_backward(offsets)
+        ctx.store = store
+        ctx.key = str(key)
+        ctx.dx_backend = dx_backend
+        ctx.boundaries = boundaries
+        ctx.segment_span = int(span)
+        ctx.weight_rows = int(rows)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+        (offsets,) = ctx.saved_tensors
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            store = ctx.store
+            key = ctx.key
+            grad_x = run_segmented_grouped_linear(
+                grad_output,
+                offsets,
+                boundaries=ctx.boundaries,
+                materialize=lambda start, stop: store.materialize_segment(
+                    key, start, stop, dtype=grad_output.dtype, device=grad_output.device
+                ),
+                backend=ctx.dx_backend,
+                max_groups=ctx.segment_span,
+                columns=ctx.weight_rows,
+                transposed=True,
+            )
+        return grad_x, None, None, None, None, None
+
+
+class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
+    """Grouped execution over NF4-packed MAGI-2 routed experts.
+
+    The dense expert parameters no longer exist on the vendored layer, so both
+    the expert-layout verdict and the matmul operands come from the layer's
+    :class:`~mirai.core.models.magi2_preview.quantized_experts.Magi2Nf4ExpertStore`.
+    Routing, activation, and the probability-weighted combine stay in the
+    inherited native-autograd path.
+    """
+
+    name = "grouped_nf4"
+
+    @staticmethod
+    def _store(module: Any) -> Magi2Nf4ExpertStore:
+        store = magi2_expert_store(module)
+        if store is None:
+            raise Magi2GroupedMoEPolicyError(
+                "MAGI-2 quantized grouped execution requires packed NF4 experts "
+                "on every multi-head MoE layer; this layer carries none."
+            )
+        if not store.is_fully_loaded():
+            raise Magi2GroupedMoEPolicyError(
+                "MAGI-2 packed experts are incomplete: "
+                + ", ".join(MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
+                + " must all be quantized before a forward pass."
+            )
+        return store
+
+    def inspect_expert_layout(self, module: Any) -> tuple[str, ...]:
+        if self._resolved:
+            return self.alignment_violations
+        store = self._store(module)
+        violations = magi2_grouped_mm_alignment_violations(
+            w_gate=store.layout_probe("W_gate"),
+            w_up=store.layout_probe("W_up"),
+            w_down=store.layout_probe("W_down"),
+        )
+        merged = list(self._alignment or ())
+        for reason in violations:
+            if reason not in merged:
+                merged.append(reason)
+        self._alignment = tuple(merged)
+        return self._alignment
+
+    def expert_weight_dtype(self, module: Any, key: str) -> torch.dtype:
+        return self._store(module).expert_weight_dtype(key)
+
+    def project(
+        self,
+        module: Any,
+        key: str,
+        x_sorted: torch.Tensor,
+        offsets: torch.Tensor,
+        forward_backend: str,
+        dx_backend: str,
+    ) -> torch.Tensor:
+        return _QuantizedGroupedExpertLinear.apply(
+            x_sorted, offsets, self._store(module), key, forward_backend, dx_backend
+        )
+
+
 # The only MoEOptimizationPolicy fields MAGI-2 grouped execution reads. Every
 # other field must still hold its dataclass default, so a field added to the
 # generic policy fails closed here instead of being silently ignored.
@@ -406,6 +614,18 @@ _CONSUMED_POLICY_FIELDS = frozenset(
         "moe_gemm_backend",
         "moe_gemm_backend_forward",
         "moe_gemm_backend_dx",
+    }
+)
+
+# Fields that additionally acquire a consumer once the routed experts are stored
+# in a packed format: the access policy and its chunk size select the
+# dequantization granularity, and the on-load flag selects the streaming
+# quantized checkpoint path.
+_QUANTIZED_CONSUMED_POLICY_FIELDS = _CONSUMED_POLICY_FIELDS | frozenset(
+    {
+        "expert_weight_access",
+        "expert_dequant_chunk_size",
+        "quantize_experts_on_load",
     }
 )
 
@@ -428,7 +648,29 @@ _POLICY_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
 }
 
 _POLICY_FIELD_NOTES: dict[str, str] = {
-    "expert_weight_access": "This family keeps native BF16 experts.",
+    "expert_weight_access": (
+        "This family keeps native BF16 experts unless "
+        "memory.frozen_weight_quantization='nf4' packs them."
+    ),
+    "expert_dequant_chunk_size": (
+        "Chunked expert access exists only for packed experts; set "
+        "memory.frozen_weight_quantization='nf4'."
+    ),
+    "quantize_experts_on_load": (
+        "On-load expert quantization requires "
+        "memory.frozen_weight_quantization='nf4'."
+    ),
+    "expert_device_cache_gib": (
+        "Packed MAGI-2 experts are layer-resident state moved by the block "
+        "residency subsystem, not per-expert operands streamed on demand, so "
+        "they have no second byte-bounded device cache. Use "
+        "training.blocks_to_swap to choose how much of the packed model stays "
+        "device-resident."
+    ),
+    "device_residency_budget_gib": (
+        "This family has no independent expert-residency owner to account "
+        "against a shared ceiling."
+    ),
     "moe_dispatch": "This family owns its routed dispatch.",
     "moe_dispatch_preprocess": "This family owns its routed dispatch.",
     "moe_gemm_backend_dw": (
@@ -438,11 +680,23 @@ _POLICY_FIELD_NOTES: dict[str, str] = {
 }
 
 
-def _reject_unconsumed_policy_fields(policy: Any) -> None:
-    """Raise for any policy field MAGI-2 neither consumes nor leaves at default."""
+def _reject_unconsumed_policy_fields(
+    policy: Any, *, quantized_experts: bool = False
+) -> None:
+    """Raise for any policy field MAGI-2 neither consumes nor leaves at default.
+
+    The consumed set is a function of the storage format: three fields acquire a
+    consumer only once the routed experts are packed, and stay rejected while
+    the family runs native BF16 experts.
+    """
+    consumed = (
+        _QUANTIZED_CONSUMED_POLICY_FIELDS
+        if quantized_experts
+        else _CONSUMED_POLICY_FIELDS
+    )
     defaults = MoEOptimizationPolicy()
     for field in fields(MoEOptimizationPolicy):
-        if field.name in _CONSUMED_POLICY_FIELDS:
+        if field.name in consumed:
             continue
         default = getattr(defaults, field.name)
         value = getattr(policy, field.name, default)
@@ -459,11 +713,18 @@ def _reject_unconsumed_policy_fields(policy: Any) -> None:
         )
 
 
-def resolve_magi2_moe_execution(policy: Any) -> Magi2GroupedMoEPlan | None:
+def resolve_magi2_moe_execution(
+    policy: Any, *, quantized_experts: bool = False
+) -> Magi2GroupedMoEPlan | None:
     """Validate a MoE optimization policy and return the grouped plan, if any.
 
     Returns ``None`` for the default kernel backends, which keep the vendored
     reference execution. Every policy field MAGI-2 cannot honor raises.
+
+    Packed experts have no dense ``W_gate``/``W_up``/``W_down`` for the vendored
+    reference loop to read, so ``auto`` resolves to grouped execution instead of
+    leaving the reference path in place, and an explicit ``torch`` is rejected
+    rather than silently reinterpreted.
     """
     kernel_backend = str(getattr(policy, "kernel_backend", "auto"))
     if kernel_backend not in _GROUPED_KERNEL_BACKENDS + _DEFAULT_KERNEL_BACKENDS:
@@ -471,8 +732,15 @@ def resolve_magi2_moe_execution(policy: Any) -> Magi2GroupedMoEPlan | None:
             "MAGI-2 Preview supports memory.moe_kernel_backend='auto', 'torch', "
             f"or 'grouped'; got '{kernel_backend}'."
         )
-    _reject_unconsumed_policy_fields(policy)
-    if kernel_backend in _DEFAULT_KERNEL_BACKENDS:
+    _reject_unconsumed_policy_fields(policy, quantized_experts=quantized_experts)
+    if quantized_experts and kernel_backend == "torch":
+        raise Magi2GroupedMoEPolicyError(
+            "memory.moe_kernel_backend='torch' selects the vendored per-expert "
+            "reference loop, which reads the dense W_gate/W_up/W_down tensors "
+            "that memory.frozen_weight_quantization='nf4' replaces with packed "
+            "storage. Use 'auto' or 'grouped'."
+        )
+    if kernel_backend in _DEFAULT_KERNEL_BACKENDS and not quantized_experts:
         return None
     main = normalize_moe_gemm_backend(getattr(policy, "moe_gemm_backend", "auto"))
     forward = normalize_moe_gemm_role_backend(

@@ -11,8 +11,10 @@ The reference release ships a multi-device configuration
 (`engine_config.cp_size = engine_config.ep_size = 8`). Mirai forces both to `1`,
 keeps the frozen checkpoint in host RAM, and transfers transformer blocks to one
 GPU on demand. This requires substantial host memory and fast host-to-device
-bandwidth; it does not reduce the preview-stage checkpoint's storage footprint,
-which is roughly 228 GB of BF16 weights.
+bandwidth; on its own it does not reduce the preview-stage checkpoint's storage
+footprint, which is roughly 228 GB of BF16 weights. Optional NF4 storage for the
+routed expert stack does reduce it — see
+[NF4 routed experts](#nf4-routed-experts).
 
 ## Architecture
 
@@ -180,12 +182,104 @@ offending operand named. There is no per-call downgrade.
 
 `memory.moe_kernel_backend`, `memory.moe_gemm_backend`,
 `memory.moe_gemm_backend_forward`, and `memory.moe_gemm_backend_dx` are the
-only MoE memory-policy keys this family consumes. Every other field of the
-shared policy must hold its default: a non-default value fails closed with the
-key named, rather than being silently ignored. `memory.expert_weight_access`
-(the family keeps native BF16 experts) and `memory.moe_gemm_backend_dw`
-(frozen experts give the weight-gradient GEMM no consumer) are accepted only at
-values that request no behavior.
+only MoE memory-policy keys this family consumes while its experts are native
+BF16. Every other field of the shared policy must hold its default: a
+non-default value fails closed with the key named, rather than being silently
+ignored. `memory.expert_weight_access` (nothing consumes an access policy for
+unpacked experts) and `memory.moe_gemm_backend_dw` (frozen experts give the
+weight-gradient GEMM no consumer) are accepted only at values that request no
+behavior. Packing the experts adds three consumed keys, listed under
+[NF4 routed experts](#nf4-routed-experts).
+
+## NF4 routed experts
+
+`memory.frozen_weight_quantization = "nf4"` stores the routed expert stack in
+NF4 instead of BF16. Exactly three tensors per MoE layer are packed —
+`moe_mlp.W_gate`, `moe_mlp.W_up`, and `moe_mlp.W_down` — because they are the
+only tensors addressed on the flattened `head * num_experts + expert` axis. The
+router projection (`moe_mlp.gate`, FP32), the router bias buffers, both shared
+experts, the hyper-connection state, the attention projections, and every norm
+keep their released dtype and are not quantized by this family.
+
+Storage is one NF4 quantization per group, stacked along the group axis, which
+is what makes a contiguous group range independently dequantizable. NF4 requires
+bitsandbytes with its CUDA 4-bit operators.
+
+### What this changes, and what it does not
+
+The size relation is derived from the layout, not measured: NF4 stores four bits
+per weight plus double-quantized block statistics, against BF16's sixteen bits,
+so a packed layer holds roughly a quarter of the bytes its BF16 expert
+parameters held. Applied to a `114B-A6B` release whose roughly 228 GB is
+overwhelmingly routed experts, that is the difference between a host that must
+hold the whole BF16 stack and one that does not, and between a swapped block
+carrying its full BF16 expert triple and one carrying the packed payload. No
+throughput claim is attached: dequantization is additional work per forward and
+per backward, and this repository has published no latency measurement for it.
+
+### Load path
+
+`memory.quantize_experts_on_load = true` is the reason the host requirement
+drops rather than merely the resident footprint. The dense expert parameters are
+removed from the vendored layers before any shard is opened, the remaining
+checkpoint keys load normally, and each routed tensor is then read from its
+safetensors shard, packed, and released before the next one is read. Peak host
+cost is one dense expert tensor rather than the expert stack.
+
+Without that key the family still packs the experts, but only after the released
+BF16 checkpoint has been fully loaded, so the host must have been able to hold it
+in the first place. That path exists for completeness; the profile that removes
+the host requirement is
+[`configs/magi2_preview/train_nf4.toml`](../configs/magi2_preview/train_nf4.toml).
+
+### Execution
+
+Packed experts leave no dense `W_gate`/`W_up`/`W_down` for the vendored
+per-expert reference loop to read, so `memory.moe_kernel_backend` at `auto` or
+`grouped` resolves to the grouped seam and an explicit `torch` is rejected rather
+than silently reinterpreted. The grouped primitive selection
+(`memory.moe_gemm_backend` and its role overrides) and the 16-byte operand
+stride precondition behave exactly as in the BF16 grouped path; the layout
+verdict is read from the packed store's declared shape and dtype instead of from
+a dense tensor.
+
+`memory.expert_weight_access` selects the dequantization granularity:
+
+| value | behavior |
+|---|---|
+| `auto`, `disabled`, `full_dequant` | One dequantization per projection per call, covering the whole group axis. |
+| `chunked_dequant` | `memory.expert_dequant_chunk_size` groups per dequantization. Contiguous group ranges own contiguous sorted-token ranges, so each segment runs its own grouped GEMM and its dense buffer is released before the next segment is produced. |
+| `active_dequant`, `fused_kernel` | Rejected. They address one routed expert's operand, and the flattened head-major axis carries one weight slice per `(head, expert)` pair. |
+
+Frozen weights never enter autograd. Every dequantization runs under
+`torch.no_grad`, the dense segment is never saved on the autograd context, and
+backward re-materializes the same segments from the same packed payload. NF4
+dequantization is a deterministic function of the stored payload, so the input
+gradient is computed against exactly the values the forward used. Expert weights
+carry no gradient; routing, the swiglu7 ladder, and the probability-weighted
+combine stay in native autograd, and router LoRA gradients are unaffected.
+
+### Residency
+
+The packed payload is registered on the MoE layer, so block residency moves it
+exactly as it moved the BF16 parameters it replaced: a swapped block streams the
+packed payload, and a resident block keeps it on the device. Choosing how much of
+the packed model stays device-resident is therefore still
+`training.blocks_to_swap`, and a device large enough for the packed model can set
+it to `0`. `memory.expert_device_cache_gib` remains rejected for this family:
+packed MAGI-2 experts are layer-resident state owned by the block-residency
+subsystem, not per-expert operands streamed on demand, and a second byte-bounded
+device cache over the same bytes would be a competing residency mechanism rather
+than an additional one.
+
+### Policy keys
+
+With packed experts the family consumes three more shared MoE policy keys than
+it does with native BF16 experts — `memory.expert_weight_access`,
+`memory.expert_dequant_chunk_size`, and `memory.quantize_experts_on_load`. All
+three are rejected while the experts are BF16, because nothing consumes them
+there. The exhaustive rejection of every remaining policy field is unchanged: a
+non-default value fails closed with the key named.
 
 ## Training
 
@@ -453,6 +547,14 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   multi-head routed experts during training, selected by
   `memory.moe_kernel_backend="grouped"`, with the vendored per-expert loop
   retained as the reference path.
+- **NF4-packed MAGI-2 routed experts** — Optional NF4 storage for the three
+  routed expert tensors of each MoE layer, selected by
+  `memory.frozen_weight_quantization="nf4"`. With
+  `memory.quantize_experts_on_load` the expert stack is packed while the
+  checkpoint is read, so it never exists in host memory as one dense copy.
+  Grouped execution dequantizes contiguous group segments on demand and
+  re-materializes them in backward, so no dense expert weight survives in
+  autograd. [(QLoRA)](https://arxiv.org/abs/2305.14314)
 
 ## Model-specific configuration
 
@@ -471,6 +573,11 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.family_params.refiner_config_path` | Override for the vendored refiner profile JSON; empty resolves to the shipped `magi2_refiner.json`. The profile states the refiner architecture, its step count, guidance scale, flow shift, VAE stride and the zero-terminal-SNR index the stage re-noises at, so changing the refinement means pointing this at a different profile. Only read when `--refine` is requested. |
 | `model.params.family_params.refiner_subfolder` | Snapshot subdirectory holding the refiner shards; defaults to `refiner`. Must be relative to the snapshot root and must not traverse upwards. |
 | `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, and it takes part in attention and MoE routing. The training forward redraws it on every call from a family-owned generator seeded from `training.seed`, so a step is reproducible under its seed and the track length never perturbs the process RNG stream; native sampling draws it once per generation from the generation generator. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
+| `memory.frozen_weight_quantization` | `none` or `nf4`. `nf4` packs only the three routed expert tensors of each MoE layer and requires bitsandbytes; every other format is rejected. |
+| `memory.expert_weight_access` | `auto`, `disabled`, and `full_dequant` dequantize the whole group axis per call; `chunked_dequant` dequantizes `memory.expert_dequant_chunk_size` groups at a time. `active_dequant` and `fused_kernel` are rejected — the flattened head-major axis carries one weight slice per `(head, expert)` pair, not a per-routed-expert operand. Any non-default value requires `frozen_weight_quantization = "nf4"`. |
+| `memory.expert_dequant_chunk_size` | Groups per dequantization on the flattened `head * num_experts + expert` axis, not experts of one head. Required to be positive with `chunked_dequant`. |
+| `memory.quantize_experts_on_load` | Packs each routed expert tensor as its shard is read, so the released BF16 expert stack is never held whole. Requires `frozen_weight_quantization = "nf4"`. |
+| `memory.moe_kernel_backend` | `auto`, `torch`, or `grouped`. With NF4 experts `torch` is rejected: the vendored per-expert reference loop reads dense expert tensors that packed storage replaces. |
 | `adapter.type` | `lora` only. |
 | `adapter.target_preset` | `attn_only` or `attn_router`. |
 | `dataset.caption_format` | `raw`; captions are encoded by the native Qwen3.5 path at cache time. |

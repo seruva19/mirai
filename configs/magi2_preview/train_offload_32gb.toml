@@ -3,8 +3,9 @@
 # The 114B-A6B BF16 checkpoint is larger than the host budget minus the
 # operating system, so every value below is a requirement of that host, not a
 # tuning preference. The profile has no room for a second host copy of the
-# transformer: quantized frozen experts, which would remove that constraint,
-# are not implemented for this family.
+# transformer. This is the BF16 profile; a host that cannot hold the released
+# expert stack should use configs/magi2_preview/train_nf4.toml, which packs the
+# routed experts while the checkpoint is read.
 preset = "magi2_preview_offload"
 
 [model]

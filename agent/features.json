@@ -2555,6 +2555,49 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_nf4_routed_experts",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/magi2_preview/quantized_experts.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "Magi2Nf4ExpertStore",
+        "install_magi2_nf4_expert_stores",
+        "stream_quantize_magi2_experts"
+      ],
+      "config_keys": [
+        "memory.frozen_weight_quantization",
+        "memory.quantize_experts_on_load",
+        "memory.expert_weight_access",
+        "memory.expert_dequant_chunk_size"
+      ],
+      "disabled_config": {
+        "memory.frozen_weight_quantization": "none",
+        "memory.quantize_experts_on_load": false,
+        "memory.expert_weight_access": "auto",
+        "memory.expert_dequant_chunk_size": 0
+      },
+      "contract_paths": [
+        "tests/test_magi2_nf4_experts.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/vendors/magi2_preview/model/magi2_preview.py",
+      "readme_claim": "NF4-packed MAGI-2 routed experts",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2305.14314; https://github.com/SandAI-org/MAGI-2-preview",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_preview",
       "kind": "model_family",
       "owner": "mirai/core/models/magi2_preview/pipeline.py",
@@ -4657,7 +4700,7 @@
       "stateful": true,
       "optimized": false,
       "reference_path": "",
-      "readme_claim": "Train–inference routing agreement evidence",
+      "readme_claim": "Train\u2013inference routing agreement evidence",
       "readme_claims": [],
       "provenance": "https://arxiv.org/abs/2510.11370",
       "promotion_evidence": ""

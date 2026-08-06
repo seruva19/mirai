@@ -38,12 +38,13 @@ from ..quantization.quant import (
     NF4_BLOCKSIZE,
     _Nf4Meta,
     _dequantize_weight,
-    _import_bnb_functional,
     _nf4_dequantize,
     _nf4_quantize_2d,
     _quantize_weight,
     _validate_rotation,
     best_group_size,
+    nf4_dequantize_stack,
+    nf4_stack_dequant_supported,
     normalize_quant_format,
 )
 from ..quantization.gguf_quant import (
@@ -2829,13 +2830,9 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         if key not in self._nf4_shapes:
             return False
         _, out_features, in_features = self._nf4_shapes[key]
-        elements = int(out_features) * int(in_features)
-        absmax_len = elements // int(meta.blocksize)
-        if absmax_len * int(meta.blocksize) != elements:
-            return False
-        if absmax_len % int(meta.nested_blocksize) != 0:
-            return False
-        return True
+        return nf4_stack_dequant_supported(
+            elements=int(out_features) * int(in_features), meta=meta
+        )
 
     def _nf4_gather_buffers(
         self, key: str, expert_indices: tuple[int, ...], target: torch.device
@@ -2905,43 +2902,20 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         dtype: torch.dtype,
         meta: "_Nf4Meta",
     ) -> torch.Tensor | None:
-        """Replicate bnb's nested-absmax + dequantize_4bit for a concatenated
-        stack of ``num_selected`` equally-shaped experts in a single pair of
-        kernel launches. Any bnb API mismatch falls back (returns None)."""
-        try:
-            bnb = _import_bnb_functional()
-            from bitsandbytes.functional import QuantState
-        except RuntimeError:
-            return None
-        try:
-            nested_state = QuantState(
-                absmax=nested_absmax.reshape(-1),
-                code=nested_code,
-                blocksize=int(meta.nested_blocksize),
-                dtype=meta.nested_dtype,
-            )
-            absmax = bnb.dequantize_blockwise(absmax_q.reshape(-1), quant_state=nested_state)
-            absmax = (
-                absmax.reshape(num_selected, -1).to(torch.float32)
-                + offsets.reshape(num_selected, 1).to(torch.float32)
-            ).reshape(-1)
-            quant_state = QuantState(
-                absmax=absmax,
-                shape=torch.Size((num_selected * int(out_features), int(in_features))),
-                code=code,
-                blocksize=int(meta.blocksize),
-                quant_type="nf4",
-                dtype=meta.weight_dtype,
-            )
-            weight = bnb.dequantize_4bit(
-                packed.reshape(-1, 1),
-                quant_state,
-                blocksize=int(meta.blocksize),
-                quant_type="nf4",
-            )
-        except (TypeError, RuntimeError, AttributeError):
-            return None
-        return weight.reshape(num_selected, int(out_features), int(in_features)).to(dtype=dtype)
+        """Concatenated per-expert NF4 dequant, owned by the quantization seam."""
+        return nf4_dequantize_stack(
+            packed=packed,
+            absmax_q=absmax_q,
+            nested_absmax=nested_absmax,
+            offsets=offsets,
+            code=code,
+            nested_code=nested_code,
+            num_selected=int(num_selected),
+            out_features=int(out_features),
+            in_features=int(in_features),
+            dtype=dtype,
+            meta=meta,
+        )
 
     def _nf4_dequantize_expert_stack_batched(
         self,

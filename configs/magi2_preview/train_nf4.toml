@@ -1,0 +1,66 @@
+# MAGI-2 Preview LoRA training with NF4-packed routed experts.
+#
+# The released BF16 checkpoint is roughly 228 GB, and the routed expert stack is
+# almost all of it: 36 MoE layers each holding W_gate/W_up/W_down over a
+# flattened 3072-group axis. Packing only those three tensors per layer as NF4
+# is what this profile is for; the router projection, expert bias, shared
+# experts, hyper-connections, and norms keep their released dtype.
+#
+# `quantize_experts_on_load` is the load path, not an optimization: with it the
+# expert tensors are read shard by shard and packed one at a time, so the dense
+# stack never has to exist in host memory. Without it the family still packs the
+# experts, but only after the full BF16 checkpoint has been loaded, which is the
+# host requirement this profile removes.
+preset = "magi2_preview_offload"
+
+[model]
+path = "./models/MAGI-2-preview"
+
+[training]
+# The vendored block exposes one whole-block recompute switch.
+gradient_checkpointing = "standard"
+# Packed experts shrink what a swapped block carries, so fewer layers have to
+# stream. Raise this on a smaller device and lower it on a larger one; the
+# packed payload rides with the block exactly as the BF16 parameters did.
+blocks_to_swap = 24
+
+[adapter]
+type = "lora"
+target_preset = "attn_router"
+rank = 16
+alpha = 16.0
+
+[dataset]
+path = "./data/videos"
+auto_preprocess_cache = true
+preprocess_raw_media_to_pt = true
+enable_bucketing = true
+# The native cache path trims video to 8n + 1 frames.
+frame_buckets = [25]
+bucket_resolutions = ["256x448"]
+
+[memory]
+frozen_weight_quantization = "nf4"
+frozen_weight_quantization_strategy = "compressed_weights"
+quantize_experts_on_load = true
+# Packed experts have no dense tensor for the vendored per-expert reference loop
+# to read, so expert execution is the grouped seam.
+moe_kernel_backend = "grouped"
+# Dequantize the packed group axis in chunks rather than whole. 256 of the 3072
+# groups per call bounds the transient dense buffer to a twelfth of the layer;
+# select the value from deployment measurements.
+expert_weight_access = "chunked_dequant"
+expert_dequant_chunk_size = 256
+weight_residency_strategy = "block_swap"
+block_swap_prefetch_depth = 1
+# Free-RAM guard, not a total-RAM requirement. Packed experts remove the
+# large-host requirement of the BF16 profile, so this reserve is an operating
+# system margin rather than a checkpoint-sized one.
+minimum_system_memory_gib = 12.0
+max_pinned_host_gib = 16.0
+
+[logging]
+output_dir = "./outputs/magi2_preview_lora_nf4"
+save_every_n_steps = 100
+sample_solver = "unipc"
+sample_frame_count = 57

@@ -20,6 +20,12 @@ from mirai.core.models.base import (
     ModelExtensionCapabilities,
     SyntheticBatchSpec,
 )
+from mirai.core.models.magi2_preview.quantized_experts import (
+    MAGI2_ROUTED_EXPERT_TENSORS,
+    Magi2Nf4ExpertStore,
+    iter_magi2_moe_layers,
+    magi2_expert_store,
+)
 from mirai.core.models.magi2_preview.refiner import (
     MAGI2_REFINER_OUTPUT_FPS,
     MAGI2_REFINER_SUBFOLDER,
@@ -32,6 +38,11 @@ from mirai.core.models.providers import (
     register_model_family_provider,
 )
 from mirai.core.moe.routing.contracts import SparseMoECapabilities
+from mirai.core.moe.runtime.specs import (
+    ExpertTensorSpec,
+    MoEOptimizationPolicy,
+    validate_expert_tensor_specs,
+)
 from mirai.core.training.residency.block_swap import BlockSwapManager
 from mirai.core.training.residency.tensor_residency import (
     move_tensors_outside_modules,
@@ -79,6 +90,12 @@ MAGI2_NATIVE_OUTPUT_FPS = 12.5
 # forwards accept any representable latent length.
 MAGI2_MIN_SAMPLING_LATENT_FRAMES = 8
 MAGI2_MAX_SAMPLING_LATENT_FRAMES = 32
+
+# Frozen-weight quantization formats this family implements. Only the routed
+# expert stack is packed; the router, expert bias, shared experts, hyper
+# connections, and norms keep their released dtype.
+MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS = ("nf4",)
+MAGI2_NF4_BLOCKSIZE = 64
 
 
 def _magi2_request_frames(latent_frames: int) -> int:
@@ -158,6 +175,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     _refiner: Any | None = None
     _refine_settings: "Magi2RefineSettings | None" = None
     _residency_request: "Magi2ResidencyRequest | None" = None
+    _expert_stores: "dict[str, Magi2Nf4ExpertStore]" = {}
 
     def __init__(
         self,
@@ -168,6 +186,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     ) -> None:
         super().__init__()
         self.model_config = model_config
+        # The frozen-weight storage decision is read before the checkpoint is
+        # touched: packing the routed experts is only a host-memory saving if the
+        # released BF16 stack is never materialized in the first place.
+        self._frozen_weight_quantization = str(
+            getattr(memory_config, "frozen_weight_quantization", "none") or "none"
+        ).strip().lower()
+        self._quantize_experts_on_load = bool(
+            getattr(memory_config, "quantize_experts_on_load", False)
+        )
+        self._nf4_blocksize = int(
+            getattr(memory_config, "quantization_block_size", MAGI2_NF4_BLOCKSIZE)
+        )
+        self._expert_stores: dict[str, Magi2Nf4ExpertStore] = {}
+        self._moe_optimization_policy = MoEOptimizationPolicy()
         family = dict(getattr(model_config.params, "family_params", {}) or {})
         default_config = (
             Path(__file__).resolve().parents[3]
@@ -238,9 +270,31 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         checkpoint_dir = model_path / "preview" if (model_path / "preview").is_dir() else model_path
         config.engine_config.load = str(checkpoint_dir)
         transformer = Transformer(config.arch_config, ep_size=1)
-        state = load_magi2_model_state_dict(transformer, config.engine_config)
-        transformer.load_state_dict(state, strict=True)
-        del state
+        if self._quantizes_experts_on_load():
+            # Drop the dense routed-expert parameters before any shard is read.
+            # ``load_magi2_model_state_dict`` reads exactly the keys the model
+            # still declares, so the released expert stack never enters host
+            # memory as one dense copy; it is streamed and packed below.
+            from mirai.core.models.magi2_preview.quantized_experts import (
+                install_magi2_nf4_expert_stores,
+                stream_quantize_magi2_experts,
+            )
+
+            install_magi2_nf4_expert_stores(
+                transformer, blocksize=self._nf4_blocksize
+            )
+            state = load_magi2_model_state_dict(transformer, config.engine_config)
+            transformer.load_state_dict(state, strict=True)
+            del state
+            self._expert_stores = stream_quantize_magi2_experts(
+                transformer,
+                checkpoint_dir=str(checkpoint_dir),
+                blocksize=self._nf4_blocksize,
+            )
+        else:
+            state = load_magi2_model_state_dict(transformer, config.engine_config)
+            transformer.load_state_dict(state, strict=True)
+            del state
         transformer.train()
         self._configure_attention_backend(transformer)
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
@@ -439,9 +493,21 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     def get_memory_feature_capabilities(self) -> MemoryFeatureCapabilities:
         return MemoryFeatureCapabilities(
             block_swap=True,
+            quantized_frozen_weights=True,
             weight_residency_strategy=True,
             runtime_offload_flush=True,
+            expert_tensor_specs=True,
+            expert_weight_access_policy=True,
+            quantize_experts_on_load=True,
             moe_kernel_backend=True,
+        )
+
+    def _quantizes_experts_on_load(self) -> bool:
+        """Whether the checkpoint load itself packs the routed expert stack."""
+        return bool(
+            self._quantize_experts_on_load
+            and self._frozen_weight_quantization
+            in MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS
         )
 
     def _transformer_device(self) -> torch.device | None:
@@ -449,23 +515,167 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             return parameter.device
         return None
 
+    def get_expert_tensor_specs(self) -> list[ExpertTensorSpec]:
+        """Declare the router projection and the three routed tensors per layer.
+
+        Everything else in a MAGI-2 MoE layer -- the expert bias buffer, the two
+        shared experts, the hyper-connection state, and the norms -- is outside
+        the routed expert stack and is not described here, because none of it is
+        addressable on the packed ``head * num_experts + expert`` axis.
+        """
+        specs: list[ExpertTensorSpec] = []
+        for module_name, module in iter_magi2_moe_layers(self.transformer):
+            store = magi2_expert_store(module)
+            gate = module.gate
+            specs.append(
+                ExpertTensorSpec(
+                    name=f"{module_name}.gate",
+                    owner_module=module_name,
+                    tensor_name="gate",
+                    role="router",
+                    layout=("out", "in"),
+                    shape=tuple(int(dim) for dim in gate.shape),
+                    dtype=str(gate.dtype),
+                    quantizable=False,
+                    adapter_targetable=True,
+                    routed=False,
+                    router=True,
+                )
+            )
+            for tensor_name, role in MAGI2_ROUTED_EXPERT_TENSORS:
+                if store is not None:
+                    shape = store.expert_weight_shape(tensor_name)
+                    dtype = "nf4"
+                else:
+                    tensor = getattr(module, tensor_name)
+                    shape = tuple(int(dim) for dim in tensor.shape)
+                    dtype = str(tensor.dtype)
+                specs.append(
+                    ExpertTensorSpec(
+                        name=f"{module_name}.{tensor_name}",
+                        owner_module=module_name,
+                        tensor_name=tensor_name,
+                        role=role,
+                        layout=("expert", "out", "in"),
+                        shape=tuple(int(dim) for dim in shape),
+                        dtype=dtype,
+                        quantizable=True,
+                        # The shipped LoRA presets target attention and the
+                        # router only; the packed expert axis carries no adapter.
+                        adapter_targetable=False,
+                        routed=True,
+                    )
+                )
+        return list(validate_expert_tensor_specs(specs))
+
     def configure_moe_optimization_policy(self, policy: Any) -> None:
+        self._moe_optimization_policy = policy
+        self._attach_moe_execution()
+
+    def _attach_moe_execution(self) -> None:
+        """Resolve and bind the expert-execution seam for the current storage.
+
+        Called both when the policy arrives and after quantization replaces the
+        dense expert parameters, because the storage format decides which
+        execution paths the policy can resolve to.
+        """
         from mirai.core.models.magi2_preview.grouped_moe import (
             Magi2GroupedMoEBackend,
+            Magi2QuantizedGroupedMoEBackend,
             attach_grouped_moe_backend,
             resolve_magi2_moe_execution,
             validate_grouped_moe_backend_support,
         )
 
-        plan = resolve_magi2_moe_execution(policy)
+        quantized = self.has_quantized_frozen_weights()
+        policy = self._moe_optimization_policy
+        plan = resolve_magi2_moe_execution(policy, quantized_experts=quantized)
         if plan is not None:
             validate_grouped_moe_backend_support(
                 plan, device=self._transformer_device()
             )
-        attach_grouped_moe_backend(
-            self.transformer,
-            Magi2GroupedMoEBackend(plan) if plan is not None else None,
-        )
+        if plan is None:
+            backend = None
+        elif quantized:
+            self._bind_quantized_expert_runtime_policy()
+            backend = Magi2QuantizedGroupedMoEBackend(plan)
+        else:
+            backend = Magi2GroupedMoEBackend(plan)
+        attach_grouped_moe_backend(self.transformer, backend)
+
+    def _bind_quantized_expert_runtime_policy(self) -> None:
+        """Push the configured dequantization granularity onto every store."""
+        policy = self._moe_optimization_policy
+        for store in self._expert_stores.values():
+            store.set_expert_weight_access_policy(
+                expert_weight_access=getattr(policy, "expert_weight_access", "auto"),
+                expert_dequant_chunk_size=int(
+                    getattr(policy, "expert_dequant_chunk_size", 0)
+                ),
+            )
+
+    def enable_quantized_frozen_weights(self, quant_type: str, **kwargs: Any) -> None:
+        """Store the routed expert stack in a packed frozen format.
+
+        With ``memory.quantize_experts_on_load`` the packing already happened
+        while the checkpoint was read and this call only rebinds the runtime
+        policy; without it the dense stack is converted layer by layer here,
+        which requires the released BF16 experts to have been loaded first.
+        """
+        scheme = str(quant_type).strip().lower()
+        if scheme not in MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS:
+            raise ValueError(
+                "MAGI-2 Preview implements memory.frozen_weight_quantization="
+                + " or ".join(
+                    f"'{value}'" for value in MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS
+                )
+                + f"; got '{scheme}'."
+            )
+        strategy = str(kwargs.pop("strategy", "auto")).strip().lower()
+        if strategy not in {"", "auto", "disabled", "none", "compressed_weights"}:
+            raise ValueError(
+                "MAGI-2 frozen-weight quantization strategy must be 'auto' or "
+                "'compressed_weights'."
+            )
+        block_size = int(kwargs.pop("block_size", self._nf4_blocksize))
+        if kwargs:
+            raise ValueError(
+                "Unsupported MAGI-2 frozen-weight quantization options: "
+                + ", ".join(sorted(kwargs))
+                + "."
+            )
+        self._frozen_weight_quantization = scheme
+        self._nf4_blocksize = block_size
+        if not self.has_quantized_frozen_weights():
+            from mirai.core.models.magi2_preview.quantized_experts import (
+                quantize_magi2_experts_in_place,
+            )
+
+            self._expert_stores = quantize_magi2_experts_in_place(
+                self.transformer, blocksize=block_size
+            )
+        self._attach_moe_execution()
+
+    def has_quantized_frozen_weights(self) -> bool:
+        return bool(self._expert_stores)
+
+    def get_quantized_frozen_weight_report(self) -> dict[str, Any] | None:
+        if not self._expert_stores:
+            return None
+        stores = list(self._expert_stores.values())
+        return {
+            "strategy": "compressed_weights",
+            "quant_format": "nf4",
+            "linear_modules": 0,
+            "grouped_expert_modules": len(stores),
+            "quantized_tensors": sum(
+                len(MAGI2_ROUTED_EXPERT_TENSORS) for _store in stores
+            ),
+            "quantized_numel": sum(store.quantized_numel() for store in stores),
+            "packed_bytes": sum(store.payload_bytes() for store in stores),
+            "expert_weight_access": stores[0].expert_weight_access,
+            "expert_dequant_chunk_size": stores[0].expert_dequant_chunk_size,
+        }
 
     def preserves_native_parameter_dtypes(self) -> bool:
         return True

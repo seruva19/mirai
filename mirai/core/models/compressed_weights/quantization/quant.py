@@ -355,6 +355,82 @@ def _nf4_quantize_2d(
         return fields, codes, meta
 
 
+def nf4_stack_dequant_supported(
+    *, elements: int, meta: _Nf4Meta
+) -> bool:
+    """Whether ``elements``-sized NF4 slices concatenate into one dequant call.
+
+    bitsandbytes computes ``absmax = dequantize_blockwise(absmax_q, state2) +
+    offset`` and then ``weight = dequantize_4bit(packed, absmax)``. Both stages
+    are blockwise, so concatenating equally-shaped per-slice buffers along dim 0
+    is bit-identical to dequantizing each slice separately -- but only when both
+    block sizes divide one slice, which is what this predicate decides.
+    """
+    span = int(elements)
+    blocksize = int(meta.blocksize)
+    absmax_len = span // blocksize
+    if absmax_len * blocksize != span:
+        return False
+    return absmax_len % int(meta.nested_blocksize) == 0
+
+
+def nf4_dequantize_stack(
+    *,
+    packed: torch.Tensor,
+    absmax_q: torch.Tensor,
+    nested_absmax: torch.Tensor,
+    offsets: torch.Tensor,
+    code: torch.Tensor,
+    nested_code: torch.Tensor,
+    num_selected: int,
+    out_features: int,
+    in_features: int,
+    dtype: torch.dtype,
+    meta: _Nf4Meta,
+) -> torch.Tensor | None:
+    """Dequantize ``num_selected`` equally-shaped NF4 slices in one call pair.
+
+    Replicates bitsandbytes' nested-absmax + ``dequantize_4bit`` stages for a
+    concatenated stack, returning ``[num_selected, out_features, in_features]``.
+    Returns ``None`` when the installed bitsandbytes surface does not match, so
+    callers keep a per-slice reference path.
+    """
+    try:
+        bnb = _import_bnb_functional()
+        from bitsandbytes.functional import QuantState
+    except RuntimeError:
+        return None
+    try:
+        nested_state = QuantState(
+            absmax=nested_absmax.reshape(-1),
+            code=nested_code,
+            blocksize=int(meta.nested_blocksize),
+            dtype=meta.nested_dtype,
+        )
+        absmax = bnb.dequantize_blockwise(absmax_q.reshape(-1), quant_state=nested_state)
+        absmax = (
+            absmax.reshape(num_selected, -1).to(torch.float32)
+            + offsets.reshape(num_selected, 1).to(torch.float32)
+        ).reshape(-1)
+        quant_state = QuantState(
+            absmax=absmax,
+            shape=torch.Size((num_selected * int(out_features), int(in_features))),
+            code=code,
+            blocksize=int(meta.blocksize),
+            quant_type="nf4",
+            dtype=meta.weight_dtype,
+        )
+        weight = bnb.dequantize_4bit(
+            packed.reshape(-1, 1),
+            quant_state,
+            blocksize=int(meta.blocksize),
+            quant_type="nf4",
+        )
+    except (TypeError, RuntimeError, AttributeError):
+        return None
+    return weight.reshape(num_selected, int(out_features), int(in_features)).to(dtype=dtype)
+
+
 def _nf4_dequantize(
     fields: Mapping[str, torch.Tensor],
     codes: Mapping[str, torch.Tensor],

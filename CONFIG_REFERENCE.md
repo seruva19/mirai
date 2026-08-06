@@ -2888,7 +2888,7 @@ Opt-in resolution from `config/defaults/hardware_tiers.toml`. `tiered` matches c
 - **Default:** `"none"`
 - **Allowed / range:** `none`, `fp8`, `int8`, `nf4`, `gguf_iq4`, `gguf_iq3`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
 
-Frozen-weight quant scheme ([`quantization.py`](mirai/core/models/quantization.py), compressed_weights). `fp8` is DeepSeek-style E4M3 W8A8 reference execution: 128×128 FP32 weight scales, online per-token-per-128-channel activation scales, FP32 K=128 accumulation, and high-precision input gradients; packed dense and routed-expert artifacts use separate `*_fp8`/`*_fp8_scale` roles. `nf4` requires bitsandbytes. `gguf_iq4`/`gguf_iq3` provide GGUF sub-4-bit expert storage. `mxfp8_e4m3` is the distinct OCP microscaling format with 32-value E4M3 blocks and round-up UE8M0 scales (`ceil(log2(amax / 448))`). `mxfp4` implements OCP E2M1 with 32-value E8M0-scaled blocks; `nvfp4` implements E2M1 with 16-value E4M3 block scales and a tensor FP32 scale. The portable paths are default-off and make no native-kernel speed claim.
+Frozen-weight quant scheme ([`quantization.py`](mirai/core/models/quantization.py), compressed_weights). `fp8` is DeepSeek-style E4M3 W8A8 reference execution: 128×128 FP32 weight scales, online per-token-per-128-channel activation scales, FP32 K=128 accumulation, and high-precision input gradients; packed dense and routed-expert artifacts use separate `*_fp8`/`*_fp8_scale` roles. `nf4` requires bitsandbytes; MAGI-2 Preview implements `nf4` only, and packs exactly the three routed expert tensors of each multi-head MoE layer ([`quantized_experts.py`](mirai/core/models/magi2_preview/quantized_experts.py)). `gguf_iq4`/`gguf_iq3` provide GGUF sub-4-bit expert storage. `mxfp8_e4m3` is the distinct OCP microscaling format with 32-value E4M3 blocks and round-up UE8M0 scales (`ceil(log2(amax / 448))`). `mxfp4` implements OCP E2M1 with 32-value E8M0-scaled blocks; `nvfp4` implements E2M1 with 16-value E4M3 block scales and a tensor FP32 scale. The portable paths are default-off and make no native-kernel speed claim.
 
 ### `frozen_weight_quantization_strategy`
 
@@ -2944,7 +2944,7 @@ Frozen transformer-block residency policy ([`device_placement.py`](mirai/core/tr
 - **Default:** `"auto"`
 - **Allowed / range:** `auto`, `disabled`, `full_dequant`, `active_dequant`, `chunked_dequant`, `fused_kernel` ([`specs.py`](mirai/core/moe/runtime/specs.py))
 
-Expert weight access pattern. With `fused_kernel`, activation rotation is shared by gate/up and the stored INT8 tensors are converted to FP32 GEMM operands at the operation boundary; SwiGLU and activation-space LoRA remain in the same chunk operation. This is compact INT8 storage with reference execution, not a packed-INT8 throughput claim. It requires INT8, chunk size > 1, and kernel backend `auto` or `rotated_int8` ([`experts.py`](mirai/core/models/compressed_weights/execution/experts.py), [`rotated_int8.py`](mirai/core/models/compressed_weights/quantization/rotated_int8.py)).
+Expert weight access pattern. With `fused_kernel`, activation rotation is shared by gate/up and the stored INT8 tensors are converted to FP32 GEMM operands at the operation boundary; SwiGLU and activation-space LoRA remain in the same chunk operation. This is compact INT8 storage with reference execution, not a packed-INT8 throughput claim. It requires INT8, chunk size > 1, and kernel backend `auto` or `rotated_int8` ([`experts.py`](mirai/core/models/compressed_weights/execution/experts.py), [`rotated_int8.py`](mirai/core/models/compressed_weights/quantization/rotated_int8.py)). MAGI-2 Preview implements `full_dequant` and `chunked_dequant` over its packed group axis and rejects `active_dequant` and `fused_kernel`, which address a per-routed-expert operand its flattened head-major layout does not expose.
 
 ### `expert_dequant_chunk_size`
 
@@ -2952,7 +2952,7 @@ Expert weight access pattern. With `fused_kernel`, activation rotation is shared
 - **Default:** `0`
 - **Allowed / range:** —
 
-Experts dequantized per chunk; `0` resolves from device capabilities when `expert_weight_access="chunked_dequant"` (`compressed_weights`, [`expert_specs.py`](mirai/core/moe/runtime/specs.py)). In explicit disk mode, chunking converts singleton reads into bounded multi-expert range requests. Larger chunks reduce read operations but increase H2D traffic and transient dequantization storage; select the value from deployment measurements.
+Experts dequantized per chunk (for MAGI-2 Preview, groups of the flattened `head * num_experts + expert` axis); `0` resolves from device capabilities when `expert_weight_access="chunked_dequant"` (`compressed_weights`, [`expert_specs.py`](mirai/core/moe/runtime/specs.py)). In explicit disk mode, chunking converts singleton reads into bounded multi-expert range requests. Larger chunks reduce read operations but increase H2D traffic and transient dequantization storage; select the value from deployment measurements.
 
 ### `expert_device_cache_gib`
 
@@ -2960,7 +2960,7 @@ Experts dequantized per chunk; `0` resolves from device capabilities when `exper
 - **Default:** `0.0`
 - **Allowed / range:** >=0
 
-Global byte-bounded LRU of immutable INT8 expert operands on the compute device. Zero creates no resident entries and preserves demand transfer. Positive values are shared across every compressed MoE layer, cache only routed physical experts and their scales, evict before crossing the exact ceiling, and never retain BF16 weights. Other quantization formats fail explicitly.
+Global byte-bounded LRU of immutable INT8 expert operands on the compute device. Zero creates no resident entries and preserves demand transfer. Positive values are shared across every compressed MoE layer, cache only routed physical experts and their scales, evict before crossing the exact ceiling, and never retain BF16 weights. Other quantization formats fail explicitly. MAGI-2 Preview rejects any positive value: its packed experts are layer-resident state moved by the block-residency subsystem, so device residency for them is chosen with `training.blocks_to_swap`.
 
 ### `device_residency_budget_gib`
 
@@ -2976,7 +2976,7 @@ Optional shared VRAM-residency ceiling across the routed-expert device cache, al
 - **Default:** `False`
 - **Allowed / range:** requires a supported frozen-weight quantization format
 
-Quantize routed experts while checkpoint tensors are loaded, avoiding a persistent dense copy (compressed_weights, runtime provider).
+Quantize routed experts while checkpoint tensors are loaded, avoiding a persistent dense copy (compressed_weights, runtime provider). For MAGI-2 Preview this removes the dense expert parameters before any shard is opened and packs each routed tensor as it is read, so the released BF16 expert stack never exists in host memory as one copy; without it the same packing runs only after the full checkpoint has loaded.
 
 ### `router_quantization`
 
@@ -3000,7 +3000,7 @@ Optional EAQuant calibration artifact consumed while frozen router INT8 storage 
 - **Default:** `"auto"`
 - **Allowed / range:** `auto`, `torch`, `rotated_int8`, `compiled_packed`, `megablocks`, `grouped` ([`kernels.py`](mirai/core/moe/runtime/kernels.py))
 
-MoE execution backend. `rotated_int8` requires INT8 frozen weights with chunked access and moves the stored-weight rotation onto activations before batched multiplication. `compiled_packed` uses shape-specialized TorchInductor decode kernels for GGUF IQ4/IQ3 or microscaling storage (`mxfp8_e4m3`, MXFP4, NVFP4) before grouped GEMM and fails if compilation is unavailable. `megablocks` requires `megablocks.ops` and `grouped_gemm`. `grouped` selects a model-family-owned grouped-GEMM expert seam and has no generic implementation; MAGI-2 Preview implements it for training with frozen experts ([`grouped_moe.py`](mirai/core/models/magi2_preview/grouped_moe.py)) and other families reject it.
+MoE execution backend. `rotated_int8` requires INT8 frozen weights with chunked access and moves the stored-weight rotation onto activations before batched multiplication. `compiled_packed` uses shape-specialized TorchInductor decode kernels for GGUF IQ4/IQ3 or microscaling storage (`mxfp8_e4m3`, MXFP4, NVFP4) before grouped GEMM and fails if compilation is unavailable. `megablocks` requires `megablocks.ops` and `grouped_gemm`. `grouped` selects a model-family-owned grouped-GEMM expert seam and has no generic implementation; MAGI-2 Preview implements it for training with frozen experts ([`grouped_moe.py`](mirai/core/models/magi2_preview/grouped_moe.py)) and other families reject it. With MAGI-2 NF4 experts, `auto` resolves to that seam and `torch` is rejected, because the vendored per-expert reference loop reads the dense expert tensors packed storage replaces.
 
 ### `cuda_memory_fraction`
 

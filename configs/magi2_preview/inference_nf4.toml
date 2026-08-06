@@ -1,0 +1,36 @@
+# MAGI-2 Preview native inference with NF4-packed routed experts.
+#
+# Same storage decision as configs/magi2_preview/train_nf4.toml: only the three
+# routed expert tensors of each MoE layer are packed, and the load path packs
+# them shard by shard so the released BF16 expert stack is never held whole.
+preset = "magi2_preview_offload"
+
+[model]
+path = "./models/MAGI-2-preview"
+
+# The optional refiner stage reads these only when `--refine` is passed. The
+# refiner runs its own transformer, which this profile does not pack.
+[model.params.family_params]
+refiner_config_path = ""
+refiner_subfolder = "refiner"
+
+[inference]
+task = "text_to_video"
+cfg_mode = "batched"
+keep_text_encoder_resident = false
+keep_vae_resident = false
+
+[memory]
+frozen_weight_quantization = "nf4"
+frozen_weight_quantization_strategy = "compressed_weights"
+quantize_experts_on_load = true
+moe_kernel_backend = "grouped"
+expert_weight_access = "chunked_dequant"
+expert_dequant_chunk_size = 256
+weight_residency_strategy = "block_swap"
+block_swap_prefetch_depth = 1
+minimum_system_memory_gib = 12.0
+max_pinned_host_gib = 16.0
+
+[logging]
+output_dir = "./outputs/magi2_preview_inference_nf4"
