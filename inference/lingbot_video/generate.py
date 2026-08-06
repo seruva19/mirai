@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mirai.core.models.lingbot_video.prompting import (  # noqa: E402
-    is_valid_json_caption,
+    LingBotCaptionError,
     resolve_lingbot_prompt,
 )
 from mirai.core.models.providers import (  # noqa: E402
@@ -83,25 +83,30 @@ alpha = {alpha}
 """
 
 
-def resolve_prompt_text(prompt: str, *, raw: bool) -> tuple[str, bool]:
+def resolve_prompt_text(prompt: str, *, raw: bool) -> str:
     """Resolve ``@file`` references to the caption text the encoder receives.
 
     A structured prompt file (or any JSON object) is normalized -- unwrapped
     from its ``caption`` envelope and stripped of runtime-only keys -- rather
     than re-wrapped. Plain language is wrapped into the minimal caption body.
-    Returns (text, was_wrapped).
 
-    The caption contract is owned by ``mirai.core.models.lingbot_video.prompting``
-    and shared verbatim with the training cache-encode path so the two never
-    drift.
+    The caption contract, including the schema check that rejects a malformed
+    caption and reports an underspecified one, is owned by
+    ``mirai.core.models.lingbot_video.prompting`` and shared verbatim with the
+    training cache-encode path so the two never drift. Resolving here means the
+    diagnostic reaches the caller before the model is loaded.
     """
     text = prompt.strip()
     if text.startswith("@"):
         text = Path(text[1:]).read_text(encoding="utf-8").strip()
     if raw:
-        return text, False
-    wrapped = bool(text) and not is_valid_json_caption(text)
-    return resolve_lingbot_prompt(text), wrapped
+        return text
+    try:
+        return resolve_lingbot_prompt(text)
+    except LingBotCaptionError as exc:
+        # The caption contract is a user-input error at this boundary, so the
+        # CLI reports it as one instead of a traceback.
+        raise SystemExit(str(exc)) from exc
 
 
 def default_negative_prompt() -> str:
@@ -110,14 +115,7 @@ def default_negative_prompt() -> str:
 
 
 def build_infer_argv(args: argparse.Namespace, *, config_path: str) -> list[str]:
-    prompt_text, wrapped = resolve_prompt_text(args.prompt, raw=bool(args.raw))
-    if wrapped:
-        print(
-            "[lingbot] plain-text prompt auto-wrapped into a minimal JSON caption; "
-            "pass a full Rewriter-schema JSON (or @file) to preserve every structured field, "
-            "--raw to bypass.",
-            file=sys.stderr,
-        )
+    prompt_text = resolve_prompt_text(args.prompt, raw=bool(args.raw))
     argv = [
         "infer.py",
         "--config",
@@ -254,15 +252,7 @@ def _generate_kwargs(
 
 
 def _resolve_prompt_for_run(args: argparse.Namespace, prompt: str) -> str:
-    prompt_text, wrapped = resolve_prompt_text(prompt, raw=bool(args.raw))
-    if wrapped:
-        print(
-            "[lingbot] plain-text prompt auto-wrapped into a minimal JSON caption; "
-            "pass a full Rewriter-schema JSON (or @file) to preserve every structured field, "
-            "--raw to bypass.",
-            file=sys.stderr,
-        )
-    return prompt_text
+    return resolve_prompt_text(prompt, raw=bool(args.raw))
 
 
 def _load_batch_entries(path: str) -> list[dict]:

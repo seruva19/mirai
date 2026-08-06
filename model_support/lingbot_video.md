@@ -166,8 +166,10 @@ block swapping, and the text encoder and VAE released between phases instead of
 kept resident. Set either `keep_*_resident` back to `true` only when the
 measured peak leaves room for it.
 
-Prompts use the release’s structured JSON format. Plain text passed through the
-family entrypoint is converted to the required structure.
+Prompts use the release’s structured JSON caption format, described under
+[Prompt and negative-prompt contract](#prompt-and-negative-prompt-contract).
+The family entrypoint accepts `@<path>` to read the caption from a file; the
+model-agnostic `scripts/infer.py` takes the caption text on `--prompt` itself.
 
 ```bash
 python inference/lingbot_video/generate.py \
@@ -227,11 +229,14 @@ exact byte string is the conditioning. Mirai resolves any accepted prompt form
 to the caption body the encoder consumes
 (`mirai/core/models/lingbot_video/prompting.py`):
 
-- A structured prompt file — `--prompt @prompt.json`, or a JSON object passed
-  to `--prompt` — is unwrapped from its `caption` envelope and stripped of the
-  runtime-only keys `duration`, `fps`, `height`, `width`, `num_frames`,
-  `resolution`, `ratio`. It is never re-wrapped, so the encoder receives no
-  `caption` or `duration` tokens.
+- A structured prompt file — `--prompt @prompt.json` on the family entrypoint,
+  or a JSON object passed to `--prompt` on either entrypoint — is unwrapped
+  from its `caption` envelope and stripped of the runtime-only keys `duration`,
+  `fps`, `height`, `width`, `num_frames`, `resolution`, `ratio`. It is never
+  re-wrapped, so the encoder receives no `caption` or `duration` tokens. The
+  `@<path>` form is argument handling owned by
+  `inference/lingbot_video/generate.py`; `scripts/infer.py` stays
+  model-agnostic and reads no files from `--prompt`.
 - Plain language is wrapped into the minimal `comprehensive_description` body
   with an empty `camera_movement_description`. `prominent_elements` and
   `camera_info` come from the released LLM rewriter, which Mirai does not ship,
@@ -245,6 +250,71 @@ to the caption body the encoder consumes
 cache-encode time, so a LoRA trains on the conditioning it is later prompted
 with. Captions cached before this contract resolve to different text and their
 cache fingerprints will not match.
+
+#### Caption schema
+
+A prompt file is `{"caption": {...}, "duration": <int>}`. The caption body
+carries three blocks, which the release’s rewriter fills
+(`rewriter/system_prompts.py`, `VIDEO_STEP2_MAP`, and the `assets/cases/`
+examples in the [repo](https://github.com/Robbyant/lingbot-video)):
+
+| Field | Type | Contents |
+|---|---|---|
+| `comprehensive_description` | object | `scene_content_description` and `camera_movement_description`, both strings; the camera string may be empty. |
+| `prominent_elements` | list of objects | One entry per subject: `name`, `description`, `actions` (list of `{timestamp, action}`), `location`, `relative_size`, `shape_and_color`, `texture`, `pose`, `expression`, `clothing`, `is_cluster`, `number_of_objects`. Human-only descriptors stay present and blank for non-human subjects. |
+| `camera_info` | object | `color`, `frame_size`, `shot_type_angle`, `lens_size`, `composition`, `lighting`, `lighting_type`, drawn from the rewriter’s closed vocabularies. |
+
+`mirai/core/models/lingbot_video/prompting.py` declares this schema as typed
+field specs and checks the parsed caption against it whenever the caption is
+resolved — that is, under `inference.prompt_rewriter = "lingbot_json"`,
+`dataset.caption_format = "lingbot_json"`, and the family entrypoint without
+`--raw`. Two outcomes:
+
+- **A declared field carrying the wrong type is rejected.** Resolution raises
+  and names the field, the type the schema declares, and the type found — for
+  example `camera_info: expected object, found str`, or
+  `prominent_elements[0].actions: expected list of objects, found str`. Right
+  field names with wrong types is the common way a hand-written caption goes
+  off-distribution, and it is not something a caller intends.
+- **A caption missing declared fields is reported and used.** Resolution emits
+  a `LingBotCaptionWarning` naming the absent fields. A bare sentence is the
+  main case: it is a legitimate deliberate request, so it proceeds.
+
+Both diagnostics are raised at prompt resolution. On the family entrypoint that
+is before the model is loaded, so a malformed caption costs no load or render
+time. `--raw` (family entrypoint) and `inference.prompt_rewriter = "none"` /
+`--prompt-rewriter none` (`scripts/infer.py`) bypass caption resolution
+entirely and send the text as conditioning unchanged.
+
+Under `dataset.caption_format = "lingbot_json"` the same rule applies per
+caption at cache-encode time, so a malformed dataset caption stops the cache
+build instead of silently entering the cache.
+
+#### Why the caption schema matters
+
+An off-schema caption is off-distribution conditioning, not a formatting
+detail. On one fixed scene and seed, holding everything but the caption
+constant, decoder activations overshoot the VAE output range by:
+
+| Caption | Decoder overshoot | Result |
+|---|---|---|
+| Bare sentence, wrapped into the minimal body | 9.09% | Posterized, over-saturated, flat silhouettes, banding, rainbow fringing |
+| Malformed caption — schema field names, wrong types | 1.94% | Still posterized |
+| Schema-valid rich caption | ~0.9% | Photorealistic |
+
+For reference, a real encoded video sits at 0.85% under the same measurement.
+Scene content stays correct in every case; what degrades is appearance. This is
+the model’s response to the caption, not a Mirai defect: the release’s own
+runner reproduces the same degradation on the same malformed caption (1.72%
+overshoot upstream against 1.94% here), and on a schema-valid caption the two
+runners are indistinguishable (mean saturation 0.3106 upstream against 0.3139
+here).
+
+The supported way to obtain a caption is the release’s two-stage LLM rewriter,
+which Mirai does not ship. Mirai does not substitute for it: it will not invent
+`prominent_elements`, `camera_info`, or action timestamps from a sentence,
+because a fabricated caption is off-distribution content carrying Mirai’s
+signature rather than the release’s.
 
 The family declares its negative prompt, denoise steps, CFG scale, and solver
 through the provider capability `ModelFamilyProvider.generation_defaults()`, so
@@ -291,7 +361,9 @@ defaults.
   roles, and released dimensions are checked before execution.
   [(repo)](https://github.com/Robbyant/lingbot-video)
 - **Structured prompt alignment** — Prompt normalization preserves the
-  model-specific system/user schema expected by the text encoder.
+  model-specific system/user schema expected by the text encoder, and the
+  resolved caption is checked against that schema before the model is loaded:
+  a wrong field type is rejected by name, a missing field is reported.
   [(repo)](https://github.com/Robbyant/lingbot-video)
 - **Native text encoder and VAE** — Training caches and inference use native
   family components without a Diffusers load or forward dependency.
@@ -336,5 +408,5 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.moe_restore_chunk_size` | Route rows per bounded `chunked_scatter` restore operation. |
 | `model.params.moe_fused_qkv_linear` | Enables the native fused QKV projection when compatible with the loaded tensor layout. |
 | `model.params.inference_bf16_fastmath` | Enables the family-owned optional BF16 inference fast-math path. |
-| `dataset.caption_format` | `lingbot_json` resolves each training caption to the caption body the encoder consumes at cache time; structured captions are normalized rather than re-wrapped. |
-| `inference.prompt_rewriter` | `lingbot_json` applies the same family-owned caption resolution to inference prompts. |
+| `dataset.caption_format` | `lingbot_json` resolves each training caption to the caption body the encoder consumes at cache time; structured captions are normalized rather than re-wrapped, and the caption schema is checked per caption. |
+| `inference.prompt_rewriter` | `lingbot_json` applies the same family-owned caption resolution and schema check to inference prompts. |

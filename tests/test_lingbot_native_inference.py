@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -445,6 +446,141 @@ class LingBotCaptionContractTests(unittest.TestCase):
     stream: no runner-only keys, no envelope, and a vendored unconditional that
     is byte-exact."""
 
+    @staticmethod
+    def _schema_valid_caption() -> dict:
+        """A caption carrying every block the release schema declares.
+
+        Shaped after ``rewriter/system_prompts.py`` (``VIDEO_STEP2_MAP``) and
+        the shipped ``assets/cases/`` examples: human-only descriptors stay
+        present and blank for a non-human element.
+        """
+        return {
+            "comprehensive_description": {
+                "scene_content_description": "a wooden boat drifts across a harbour at dawn",
+                "camera_movement_description": "slow dolly in",
+            },
+            "prominent_elements": [
+                {
+                    "name": "wooden boat",
+                    "description": "a small weathered fishing boat",
+                    "actions": [{"timestamp": "0-2s", "action": "drifts to the left"}],
+                    "location": "left third of the frame",
+                    "relative_size": "medium",
+                    "shape_and_color": "brown hull with a white stripe",
+                    "texture": "weathered painted wood",
+                    "pose": "",
+                    "expression": "",
+                    "clothing": "",
+                    "is_cluster": False,
+                    "number_of_objects": 1,
+                }
+            ],
+            "camera_info": {
+                "color": "natural color",
+                "frame_size": "wide shot",
+                "shot_type_angle": "eye level",
+                "lens_size": "35mm",
+                "composition": "centered",
+                "lighting": "soft",
+                "lighting_type": "natural light",
+            },
+        }
+
+    def test_schema_valid_caption_passes_and_is_emitted_byte_exact(self) -> None:
+        from mirai.core.models.lingbot_video.prompting import (
+            LingBotCaptionWarning,
+            resolve_lingbot_prompt,
+            validate_lingbot_caption,
+        )
+
+        body = self._schema_valid_caption()
+        verdict = validate_lingbot_caption(body)
+        self.assertEqual(verdict.defects, ())
+        self.assertEqual(verdict.missing, ())
+        self.assertFalse(verdict.is_malformed)
+        self.assertFalse(verdict.is_underspecified)
+
+        expected = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resolved = resolve_lingbot_prompt({"caption": body, "duration": 3})
+        # A complete caption is conditioning the model was trained on: it is
+        # emitted unchanged and says nothing on the way through.
+        self.assertEqual(resolved, expected)
+        self.assertEqual(
+            [w for w in caught if issubclass(w.category, LingBotCaptionWarning)], []
+        )
+        # The envelope contract still holds for a full caption.
+        self.assertNotIn('"caption"', resolved)
+        self.assertNotIn("duration", resolved)
+
+    def test_wrong_field_types_are_rejected_naming_the_field(self) -> None:
+        from mirai.core.models.lingbot_video.prompting import (
+            LingBotCaptionError,
+            resolve_lingbot_prompt,
+        )
+
+        # Right field names, wrong types -- the failure mode that renders
+        # posterized video. Each case must be rejected before a model is built,
+        # and must name the field that is wrong.
+        cases = {
+            "comprehensive_description": "a wooden boat drifts across a harbour",
+            "prominent_elements": ["a wooden boat", "a gull"],
+            "camera_info": "wide shot, natural light, 35mm",
+        }
+        for field, wrong_value in cases.items():
+            body = self._schema_valid_caption()
+            body[field] = wrong_value
+            for prompt in (body, json.dumps({"caption": body, "duration": 3})):
+                with self.subTest(field=field, form=type(prompt).__name__):
+                    with self.assertRaises(LingBotCaptionError) as ctx:
+                        resolve_lingbot_prompt(prompt)
+                    message = str(ctx.exception)
+                    self.assertIn(field, message)
+                    # The message states the schema type and the type found,
+                    # and points at the only supported caption producer.
+                    self.assertIn("expected", message)
+                    self.assertIn("found", message)
+                    self.assertIn("rewriter", message)
+        # A nested wrong type is caught with its full path, not just the block.
+        body = self._schema_valid_caption()
+        body["prominent_elements"][0]["actions"] = "drifts to the left"
+        with self.assertRaises(LingBotCaptionError) as ctx:
+            resolve_lingbot_prompt(body)
+        self.assertIn("prominent_elements[0].actions", str(ctx.exception))
+
+    def test_bare_sentence_warns_and_still_produces_the_minimal_body(self) -> None:
+        from mirai.core.models.lingbot_video.prompting import (
+            LingBotCaptionWarning,
+            resolve_lingbot_prompt,
+        )
+
+        sentence = "a red cube spinning on a table"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resolved = resolve_lingbot_prompt(sentence)
+        messages = [
+            str(w.message)
+            for w in caught
+            if issubclass(w.category, LingBotCaptionWarning)
+        ]
+        # A sentence is an underspecified caption, not a malformed one: the
+        # caller may want it, so the run proceeds and is told what is absent.
+        self.assertEqual(len(messages), 1)
+        self.assertIn("prominent_elements", messages[0])
+        self.assertIn("camera_info", messages[0])
+        self.assertIn("rewriter", messages[0])
+        # ... and the emitted body is exactly what it was before the check.
+        self.assertEqual(
+            json.loads(resolved),
+            {
+                "comprehensive_description": {
+                    "scene_content_description": sentence,
+                    "camera_movement_description": "",
+                }
+            },
+        )
+
     def test_plain_text_emits_no_envelope_or_runtime_keys(self) -> None:
         from mirai.core.models.lingbot_video.prompting import resolve_lingbot_prompt
 
@@ -533,6 +669,30 @@ class LingBotCaptionContractTests(unittest.TestCase):
         # An empty caption acquires no fabricated structure.
         self.assertEqual(
             resolve_training_caption("", caption_format="lingbot_json"), ""
+        )
+
+    def test_training_and_inference_apply_the_same_caption_contract(self) -> None:
+        from mirai.core.models.lingbot_video.prompting import (
+            LingBotCaptionError,
+            resolve_lingbot_prompt,
+            resolve_training_caption,
+        )
+
+        body = self._schema_valid_caption()
+        body["camera_info"] = "wide shot, natural light"
+        malformed = json.dumps(body, ensure_ascii=False)
+
+        # A caption that is off-distribution for inference is off-distribution
+        # for the cache too: one owner, so neither path can accept what the
+        # other rejects.
+        with self.assertRaises(LingBotCaptionError):
+            resolve_lingbot_prompt(malformed)
+        with self.assertRaises(LingBotCaptionError):
+            resolve_training_caption(malformed, caption_format="lingbot_json")
+        # ``raw`` is an explicit byte-for-byte passthrough and stays outside
+        # the caption contract.
+        self.assertEqual(
+            resolve_training_caption(malformed, caption_format="raw"), malformed
         )
 
 
