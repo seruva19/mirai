@@ -47,16 +47,10 @@ except (ImportError, ModuleNotFoundError):
     fa3_varlen_func_with_sink = None
     _HAS_MAGI2_FAST_ATTENTION = False
 
-try:
-    from magi_compiler import magi_compile, magi_register_custom_op
-except (ImportError, ModuleNotFoundError):
-    def _identity_decorator(*args, **kwargs):
-        if args and len(args) == 1 and callable(args[0]) and not kwargs:
-            return args[0]
-        return lambda value: value
-
-    magi_compile = _identity_decorator
-    magi_register_custom_op = _identity_decorator
+from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
+    magi_compile,
+    magi_register_custom_op,
+)
 from mirai.vendors.magi2_preview.flash_mh_moe import (
     compute_topk_probs_and_indices as _mh_moe_compute_topk,
     flash_mh_moe_fwd as _mh_moe_fwd,

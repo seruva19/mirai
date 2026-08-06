@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from mirai.config.schema import AdapterConfig, ModelConfig, ModelParams, TrainingConfig
 from mirai.core.builtins import register_builtin_components
-from mirai.core.models.attention_backends import attention_backend_status
+from mirai.core.models.attention_backends import varlen_attention_backward_status
 from mirai.core.models.lingbot_video.pipeline import LingBotVideoPipeline
 from mirai.core.moe.routing.depth import (
     MixtureOfDepthsSpec,
@@ -50,11 +50,19 @@ def _cpu_varlen_attention(
 
 
 def _cuda_varlen_attention_available() -> bool:
+    """True only when a packed backend can also backpropagate on this device.
+
+    The packed update below calls ``backward``, so a forward-only FlashAttention
+    build does not satisfy it: dispatch selects the build and the backward then
+    raises. The status is therefore taken from the executed backward probe
+    rather than from import availability. Guarded by ``cuda.is_available`` so no
+    probe runs on a CPU-only machine.
+    """
     if not torch.cuda.is_available():
         return False
     device = torch.device("cuda")
     return any(
-        attention_backend_status(name, device=device, varlen=True).available
+        varlen_attention_backward_status(name, device=device).available
         for name in ("flash4", "flash3")
     )
 

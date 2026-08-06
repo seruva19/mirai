@@ -33,13 +33,15 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
-from magi_compiler import magi_compile
-from magi_compiler.api import magi_register_custom_op
-from magi_compiler.config import CompileConfig
 from torch import Tensor
 from torch.nn import Parameter
 
 from mirai.vendors.magi2_preview.common.magi2_config import Magi2RefinerModelConfig as ModelConfig
+from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
+    CompileConfig,
+    magi_compile,
+    magi_register_custom_op,
+)
 from mirai.vendors.magi2_preview.infra.distributed import psm
 from mirai.vendors.magi2_preview.infra.parallelism.all_to_all_primitive import (
     batch_scatter_head_gather_seqlen,

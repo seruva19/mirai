@@ -395,7 +395,16 @@ class Magi2Refiner:
         ``config.json`` beside the shards, because the release ships none; the
         shards are then loaded strictly, so a checkpoint whose key set does not
         match the declared architecture fails instead of loading partially.
+
+        The refiner's attention is dispatched through operators MagiCompiler
+        registers, so the presence of those operators is a precondition of the
+        stage rather than something to discover mid-forward.
         """
+        from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
+            require_magi2_custom_ops,
+        )
+
+        require_magi2_custom_ops("The MAGI-2 refiner stage")
         if not self.has_weights():
             raise RuntimeError(
                 "--refine requested but no MAGI-2 refiner weights were found under "

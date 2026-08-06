@@ -7,6 +7,10 @@ stage that only a real forward can answer — that the released zero-audio
 conditioning packs and runs, and that the resampled latent geometry survives the
 data proxy — while the geometry and re-noise math are checked on CPU by
 ``tests/test_magi2_preview_contract.py``.
+
+The refiner also dispatches its attention through the ``torch.ops.magi2``
+operators MagiCompiler registers, which is a precondition of the probe rather
+than part of what it measures.
 """
 
 from __future__ import annotations
@@ -80,6 +84,11 @@ def _reduced_proxy_config():
 def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("MAGI-2 refine-stage probe requires CUDA.")
+    from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
+        require_magi2_custom_ops,
+    )
+
+    require_magi2_custom_ops("The MAGI-2 refine-stage probe")
     from mirai.vendors.magi2_preview.model.magi2_refiner import Transformer
     from mirai.vendors.magi2_preview.pipeline.inference_engine import EvalInput
     from mirai.vendors.magi2_preview.pipeline.refiner_data_proxy import (

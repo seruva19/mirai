@@ -218,6 +218,78 @@ def attention_backend_status(
     return AttentionBackendStatus(resolved, True, "external kernel available", capability)
 
 
+@lru_cache(maxsize=None)
+def _varlen_backward_probe(name: str, device_index: int) -> tuple[bool, str]:
+    """Execute one minimal packed backward and report whether it succeeded.
+
+    A FlashAttention distribution can ship forward kernels only; its varlen
+    entry point then imports and runs, and only the backward call raises. The
+    presence of the symbol is therefore not evidence that the backend can train,
+    and the sole deterministic evidence is running a backward once. The result
+    is cached per backend and device, so the probe costs one tiny kernel launch.
+    """
+    try:
+        function = _load_external_function(name, varlen=True)
+    except RuntimeError as exc:
+        return False, str(exc)
+    device = torch.device("cuda", device_index)
+    tokens, heads, head_dim = 8, 1, 64
+    tensors = [
+        torch.randn(
+            tokens,
+            heads,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        for _ in range(3)
+    ]
+    offsets = torch.tensor([0, tokens], device=device, dtype=torch.int32)
+    try:
+        result = function(
+            q=tensors[0],
+            k=tensors[1],
+            v=tensors[2],
+            cu_seqlens_q=offsets,
+            cu_seqlens_k=offsets,
+            max_seqlen_q=tokens,
+            max_seqlen_k=tokens,
+            causal=False,
+        )
+        output = result[0] if isinstance(result, tuple) else result
+        output.float().square().sum().backward()
+    except Exception as exc:  # kernel, build, and dispatch failures alike
+        return False, f"{name} varlen backward failed ({type(exc).__name__}: {exc})"
+    if any(tensor.grad is None for tensor in tensors):
+        return False, f"{name} varlen backward produced no input gradients"
+    return True, "external kernel supports varlen forward and backward"
+
+
+def varlen_attention_backward_status(
+    name: str,
+    *,
+    device: torch.device,
+) -> AttentionBackendStatus:
+    """Availability of ``name`` for packed attention that must also backpropagate.
+
+    Extends :func:`attention_backend_status` with the one property the registry
+    cannot infer from imports. External kernels are probed by execution; engines
+    with a PyTorch autograd definition are reported as their forward status.
+    """
+    status = attention_backend_status(name, device=device, varlen=True)
+    if not status.available:
+        return status
+    if ATTENTION_BACKEND_SPECS[status.name].engine != "external":
+        return status
+    resolved = torch.device(device)
+    index = resolved.index if resolved.index is not None else torch.cuda.current_device()
+    supported, reason = _varlen_backward_probe(status.name, int(index))
+    return AttentionBackendStatus(
+        status.name, supported, reason, status.cuda_capability
+    )
+
+
 def probe_attention_backends(
     *,
     device: torch.device,
@@ -500,4 +572,5 @@ __all__ = [
     "flex_document_ids",
     "normalize_attention_backend",
     "probe_attention_backends",
+    "varlen_attention_backward_status",
 ]

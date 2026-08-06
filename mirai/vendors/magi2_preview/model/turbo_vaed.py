@@ -19,21 +19,11 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
+from mirai.vendors.magi2_preview.common.magi_compiler_compat import magi_compile
 from mirai.vendors.magi2_preview.common.native_config import (
     NativeConfigMixin,
     register_to_config,
 )
-
-try:
-    from magi_compiler.api import magi_compile
-except ImportError:
-    def magi_compile(*_args, **_kwargs):
-        """Use the eager PyTorch implementation when MagiCompiler is unavailable."""
-
-        def decorator(function):
-            return function
-
-        return decorator
 
 
 __all__ = ["TurboVAED"]
