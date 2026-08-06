@@ -174,7 +174,9 @@ rejects non-empty values so unsupported options cannot be silently ignored.
 - **Allowed / range:** provider-defined; rejected by the base provider
 
 Provider-owned extension parameters. Values are preserved by the core config
-loader and validated by the active model-family provider.
+loader and validated by the active model-family provider. The keys a shipped
+family accepts under this table are listed on its page in
+[`model_support/`](model_support/).
 
 ### `variant`
 

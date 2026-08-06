@@ -18,6 +18,7 @@ path = "./models/MAGI-2-preview"
 [model.params.family_params]
 refiner_config_path = ""
 refiner_subfolder = "refiner"
+refiner_attention_backend = "auto"
 
 [training]
 # Inference streams blocks through the same residency path as training. All 40

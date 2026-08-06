@@ -8,6 +8,7 @@ path = "./models/MAGI-2-preview"
 [model.params.family_params]
 refiner_config_path = ""
 refiner_subfolder = "refiner"
+refiner_attention_backend = "auto"
 
 [inference]
 task = "text_to_video"

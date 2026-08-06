@@ -2679,6 +2679,43 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_refiner_native_window_attention",
+      "kind": "generic",
+      "owner": "mirai/core/models/magi2_preview/refiner_attention.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "documentation"
+      ],
+      "symbols": [
+        "Magi2RefinerFlexAttentionBackend",
+        "flex_range_attention",
+        "build_range_union_mask",
+        "attach_refiner_attention_backend",
+        "resolve_magi2_refiner_attention"
+      ],
+      "config_keys": [
+        "model.params.family_params"
+      ],
+      "disabled_config": {
+        "model.params.family_params": {}
+      },
+      "contract_paths": [
+        "tests/test_magi2_refiner_attention.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/vendors/magi2_preview/model/magi2_refiner.py",
+      "readme_claim": "Native MAGI-2 refiner window attention",
+      "readme_claims": [],
+      "provenance": "https://github.com/SandAI-org/MAGI-2-preview; https://github.com/SandAI-org/MagiAttention; https://pytorch.org/blog/flexattention/",
+      "promotion_evidence": ""
+    },
+    {
       "name": "mechanism_driven_preemptive_monitoring",
       "kind": "monitoring",
       "owner": "mirai/core/moe/monitoring/preemptive.py",

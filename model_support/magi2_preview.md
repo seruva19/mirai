@@ -603,6 +603,11 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 - **Native MAGI-2 refiner staging** — Optional default-off second stage that
   resamples the preview latent in time, re-noises it once, and short-denoises it
   through the released refiner checkpoint, producing a full-rate clip.
+- **Native MAGI-2 refiner window attention** — The refiner's local-attention
+  layers run their paired query/key ranges as one PyTorch FlexAttention mask, so
+  the stage needs neither the MagiAttention CUDA extension nor MagiCompiler. A
+  registered `torch.ops.magi2` operator still takes precedence when the released
+  runtime is installed. [(FlexAttention)](https://pytorch.org/blog/flexattention/)
 - **Grouped MAGI-2 expert execution** — Optional grouped-GEMM execution of the
   multi-head routed experts during training, selected by
   `memory.moe_kernel_backend="grouped"`, with the vendored per-expert loop
@@ -636,6 +641,7 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.family_params.config_path` | Override for the vendored architecture JSON; empty resolves to the shipped `magi2_preview.json`. |
 | `model.params.family_params.refiner_config_path` | Override for the vendored refiner profile JSON; empty resolves to the shipped `magi2_refiner.json`. The profile states the refiner architecture, its step count, guidance scale, flow shift, VAE stride and the zero-terminal-SNR index the stage re-noises at, so changing the refinement means pointing this at a different profile. Only read when `--refine` is requested. |
 | `model.params.family_params.refiner_subfolder` | Snapshot subdirectory holding the refiner shards; defaults to `refiner`. Must be relative to the snapshot root and must not traverse upwards. |
+| `model.params.family_params.refiner_attention_backend` | `auto`, `native_flex`, or `vendor_eager`, selecting how the refiner's local-attention layers evaluate their paired query/key ranges. `auto` yields to a registered `torch.ops.magi2.flex_flash_attn_func` operator when MagiCompiler published one and otherwise binds Mirai's native FlexAttention range-union path. `native_flex` binds the native path even when the operator exists. `vendor_eager` never binds it, leaving the vendored dispatch, which needs either MagiCompiler and MagiAttention or a FlashAttention-2 install. The native path implements the union of every key range paired with a query position under one softmax; the vendored eager fallback merges per-range partial softmaxes by their log-sum-exps and therefore double-counts keys reachable through more than one range. Only read when `--refine` is requested. |
 | `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, and it takes part in attention and MoE routing. The training forward redraws it on every call from a family-owned generator seeded from `training.seed`, so a step is reproducible under its seed and the track length never perturbs the process RNG stream; native sampling draws it once per generation from the generation generator. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
 | `model.params.moe_routing_health` | Arms the family's routing-collapse tap. MAGI-2 emits no router statistic without it, so this is the only way `emits_router_metrics` becomes true and the only routing signal an `attn_router` run has. Default off; when off no tap is attached and no diagnostic key appears. |
 | `memory.frozen_weight_quantization` | `none` or `nf4`. `nf4` packs only the three routed expert tensors of each MoE layer and requires bitsandbytes; every other format is rejected. |

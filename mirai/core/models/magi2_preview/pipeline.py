@@ -31,6 +31,11 @@ from mirai.core.models.magi2_preview.refiner import (
     MAGI2_REFINER_SUBFOLDER,
     Magi2RefineSettings,
 )
+from mirai.core.models.magi2_preview.refiner_attention import (
+    MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT,
+    Magi2RefinerAttentionUnsupported,
+    normalize_refiner_attention_backend,
+)
 from mirai.core.models.native_video import NativeVideoPipeline, VideoLatentLayout
 from mirai.core.models.providers import (
     ModelFamilyProvider,
@@ -146,6 +151,7 @@ class Magi2RuntimeOptions:
     audio_tokens: int = -1
     refiner_config_path: str = ""
     refiner_subfolder: str = MAGI2_REFINER_SUBFOLDER
+    refiner_attention_backend: str = MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -222,6 +228,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             ),
             refiner_subfolder=str(
                 family.get("refiner_subfolder") or MAGI2_REFINER_SUBFOLDER
+            ),
+            refiner_attention_backend=normalize_refiner_attention_backend(
+                family.get("refiner_attention_backend")
             ),
         )
         self.runtime_config, self.transformer, self.data_proxy = self._build_model()
@@ -1188,6 +1197,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 self.model_config,
                 config_path=self.options.refiner_config_path,
                 subfolder=self.options.refiner_subfolder,
+                attention_backend=self.options.refiner_attention_backend,
             )
         return self._refiner
 
@@ -1420,6 +1430,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "audio_tokens",
         "refiner_config_path",
         "refiner_subfolder",
+        "refiner_attention_backend",
     }
 
     def __init__(self, model_type: str = "magi2-preview") -> None:
@@ -1444,10 +1455,20 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
         if "audio_tokens" in params and int(params["audio_tokens"]) < -1:
             errors.append("MAGI-2 family_params.audio_tokens must be -1 (auto) or >= 0.")
-        for name in ("refiner_config_path", "refiner_subfolder"):
+        for name in (
+            "refiner_config_path",
+            "refiner_subfolder",
+            "refiner_attention_backend",
+        ):
             value = params.get(name)
             if value is not None and not isinstance(value, str):
                 errors.append(f"MAGI-2 family_params.{name} must be a string.")
+        attention = params.get("refiner_attention_backend")
+        if isinstance(attention, str):
+            try:
+                normalize_refiner_attention_backend(attention)
+            except Magi2RefinerAttentionUnsupported as exc:
+                errors.append(str(exc))
         subfolder = params.get("refiner_subfolder")
         # Both flavours are tested because the rule is about the value, not
         # about the host the config happens to be validated on.

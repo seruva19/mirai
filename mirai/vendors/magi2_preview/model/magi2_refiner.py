@@ -1535,6 +1535,7 @@ def flex_flash_attn_with_cp(
     auto_range_merge: bool,
     sparse_load: bool,
     cp_split_sizes: List[int],
+    attention_backend: Optional[object] = None,
 ) -> torch.Tensor:
     """
     Args:
@@ -1547,6 +1548,7 @@ def flex_flash_attn_with_cp(
         max_seqlen_q: maximum query range length for tile scheduling
         auto_range_merge: merge repeated query ranges before launching magi attention
         sparse_load: enable sparse-load optimization in magi attention
+        attention_backend: Mirai edit -- optional native execution seam
 
     Returns:
         self_attn_out: bsz, seq_len, n_heads, head_dim
@@ -1562,16 +1564,32 @@ def flex_flash_attn_with_cp(
             [q, k, v], cp_split_sizes, psm.get_parallel_group("cp")
         )
 
-    out, _ = resolve_magi2_op("flex_flash_attn_func", flex_flash_attn_func)(
-        q,
-        k,
-        v,
-        q_ranges,
-        k_ranges,
-        attn_type_map,
-        max_seqlen_q,
-        auto_range_merge,
-    )
+    # Mirai edit: a bound attention backend is the selected path. It is bound
+    # only when no torch.ops.magi2 operator was registered, so a real
+    # MagiCompiler install keeps the dispatch below unchanged. auto_range_merge
+    # and sparse_load are kernel scheduling knobs and carry no semantics, so the
+    # backend does not receive them.
+    if attention_backend is not None:
+        out, _ = attention_backend.execute(
+            q,
+            k,
+            v,
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_type_map=attn_type_map,
+            max_seqlen_q=max_seqlen_q,
+        )
+    else:
+        out, _ = resolve_magi2_op("flex_flash_attn_func", flex_flash_attn_func)(
+            q,
+            k,
+            v,
+            q_ranges,
+            k_ranges,
+            attn_type_map,
+            max_seqlen_q,
+            auto_range_merge,
+        )
 
     if psm.get_world_size("cp") > 1:
         out = scatter_seqlen_gather_head(
@@ -1618,6 +1636,9 @@ class Attention(torch.nn.Module):
 
     def __init__(self, config: AttentionConfig):
         super().__init__()
+        # Optional attention-execution seam injected by the Mirai pipeline;
+        # None keeps the torch.ops.magi2 dispatch in flex_flash_attn_with_cp.
+        self._mirai_refiner_attention_backend = None
         self.config = config
 
         self.pre_norm = MultiModalityRMSNorm(
@@ -1748,6 +1769,7 @@ class Attention(torch.nn.Module):
                 auto_range_merge,
                 sparse_load,
                 cp_split_sizes,
+                self._mirai_refiner_attention_backend,
             )
         else:
             self_attn_out = flash_attn_with_cp(q, k, v, cp_split_sizes)

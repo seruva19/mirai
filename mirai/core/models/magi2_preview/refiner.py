@@ -56,6 +56,11 @@ from typing import Any
 
 import torch
 
+from mirai.core.models.magi2_preview.refiner_attention import (
+    MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT,
+    normalize_refiner_attention_backend,
+)
+
 
 # Subfolder of the released snapshot holding the refiner shards. The upstream
 # config states it as ``${MAGI2_CKPT_ROOT}/refiner``; the path is resolved from
@@ -242,10 +247,12 @@ class Magi2Refiner:
         *,
         config_path: str,
         subfolder: str = MAGI2_REFINER_SUBFOLDER,
+        attention_backend: str = MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT,
     ) -> None:
         self.model_config = model_config
         self.config_path = str(config_path)
         self.subfolder = str(subfolder or MAGI2_REFINER_SUBFOLDER)
+        self.attention_backend = normalize_refiner_attention_backend(attention_backend)
         self._transformer: Any | None = None
         self._data_proxy: Any | None = None
         self._runtime_config: Any | None = None
@@ -400,13 +407,30 @@ class Magi2Refiner:
         registers, falling back to the eager implementations vendored beside
         them when the operator namespace is empty. That at least one of the two
         is reachable is a precondition of the stage rather than something to
-        discover mid-forward.
+        discover mid-forward. The precondition covers only the operators the
+        configured architecture actually reaches: a bound native attention
+        backend serves the local-attention operator itself, and a profile whose
+        layers are all local never reaches the dense one.
         """
+        from mirai.core.models.magi2_preview.refiner_attention import (
+            attach_refiner_attention_backend,
+            refiner_required_magi2_ops,
+            resolve_magi2_refiner_attention,
+            validate_refiner_flex_support,
+        )
         from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
             require_magi2_custom_ops,
         )
 
-        require_magi2_custom_ops("The MAGI-2 refiner stage")
+        config = self.runtime_config()
+        backend = resolve_magi2_refiner_attention(self.attention_backend)
+        if backend is not None:
+            validate_refiner_flex_support()
+        required = refiner_required_magi2_ops(
+            config.magi2_refiner_arch_config, backend
+        )
+        if required:
+            require_magi2_custom_ops("The MAGI-2 refiner stage", required)
         if not self.has_weights():
             raise RuntimeError(
                 "--refine requested but no MAGI-2 refiner weights were found under "
@@ -423,7 +447,6 @@ class Magi2Refiner:
                 Magi2RefinerDataProxy,
             )
 
-            config = self.runtime_config()
             transformer = Magi2RefinerTransformer(config.magi2_refiner_arch_config)
             state = load_safetensors_dir(
                 str(self.checkpoint_dir()), desc="Loading MAGI-2 refiner shards"
@@ -437,6 +460,7 @@ class Magi2Refiner:
             self._data_proxy = Magi2RefinerDataProxy(
                 config.evaluation_config.magi2_refiner_data_proxy_config
             )
+        attach_refiner_attention_backend(self._transformer, backend)
         self._place(device=device, residency=residency)
 
     def _place(self, *, device: str, residency: Any | None) -> None:
