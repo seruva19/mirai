@@ -35,25 +35,39 @@ IGNORED_PUBLICATION_ROOTS = {
 }
 
 
-def _public_text_files() -> list[Path]:
-    files: list[Path] = []
+def _publication_relative_paths() -> list[str]:
+    """Repository-relative POSIX paths that a published artifact may contain.
+
+    Git owns the answer: tracked files plus untracked files that survive the
+    standard exclude rules. Anything matched by ``.gitignore`` -- local model
+    snapshots, caches, outputs -- is absent by construction, so no hand-written
+    exclusion list can drift away from the real ignore semantics.
+    """
     result = subprocess.run(
         ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=ROOT,
         capture_output=True,
-        check=False,
+        check=True,
     )
-    candidates = (
-        [
-            ROOT / raw_path
-            for raw_path in result.stdout.decode("utf-8").split("\0")
-            if raw_path
-        ]
-        if result.returncode == 0
-        else ROOT.rglob("*")
-    )
-    for path in candidates:
-        relative = path.relative_to(ROOT)
+    return [raw_path for raw_path in result.stdout.decode("utf-8").split("\0") if raw_path]
+
+
+def _stage_publication_workspace(destination: Path) -> None:
+    """Materialize the publishable file set under ``destination``."""
+    for relative in _publication_relative_paths():
+        source = ROOT / relative
+        # Index entries can outlive the working tree (gitlinks, pending deletions).
+        if not source.is_file():
+            continue
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+
+def _public_text_files() -> list[Path]:
+    files: list[Path] = []
+    for relative_path in _publication_relative_paths():
+        relative = Path(relative_path)
         path = ROOT / relative
         if not path.is_file() or path.suffix.lower() not in PUBLIC_TEXT_SUFFIXES:
             continue
@@ -71,23 +85,13 @@ class PublicationContractTests(unittest.TestCase):
             self.assertIsNone(_resolve_hf_token())
 
     def test_distribution_archives_preserve_the_public_runtime_surface(self) -> None:
+        # TemporaryDirectory removes the tree when the block exits for any
+        # reason, including an assertion failure or a build error, and reports
+        # rather than swallows a removal failure.
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory) / "source"
-            shutil.copytree(
-                ROOT,
-                workspace,
-                ignore=shutil.ignore_patterns(
-                    ".dev-private",
-                    ".git",
-                    ".agents",
-                    ".runtime",
-                    ".tmp",
-                    "__pycache__",
-                    "*.egg-info",
-                    "build",
-                    "dist",
-                ),
-            )
+            workspace.mkdir(parents=True)
+            _stage_publication_workspace(workspace)
             distribution_directory = workspace / "dist"
             command = (
                 "import setuptools.build_meta as backend; "
