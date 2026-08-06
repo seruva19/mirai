@@ -39,8 +39,10 @@ from torch.nn import Parameter
 from mirai.vendors.magi2_preview.common.magi2_config import Magi2RefinerModelConfig as ModelConfig
 from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
     CompileConfig,
+    magi_attention_flex_flash_attn_func,
     magi_compile,
     magi_register_custom_op,
+    resolve_magi2_op,
 )
 from mirai.vendors.magi2_preview.infra.distributed import psm
 from mirai.vendors.magi2_preview.infra.parallelism.all_to_all_primitive import (
@@ -1167,7 +1169,6 @@ class LearnableRotaryEmbeddingCat(nn.Module):
 # _merge_custom_ops
 # ============================================================
 
-HAS_MAGI_ATTENTION = importlib.util.find_spec("magi_attention") is not None
 HAS_FA3 = importlib.util.find_spec("flash_attn_interface") is not None
 
 
@@ -1312,9 +1313,10 @@ def flex_flash_attn_func(
     auto_range_merge: bool = False,
     sparse_load: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if HAS_MAGI_ATTENTION and is_hopper_arch():
-        from magi_attention.api import flex_flash_attn_func as magi_flex_flash_attn_func
-
+    magi_flex_flash_attn_func = (
+        magi_attention_flex_flash_attn_func() if is_hopper_arch() else None
+    )
+    if magi_flex_flash_attn_func is not None:
         kwargs = _adapt_magi_attn_kwargs(
             magi_flex_flash_attn_func,
             {"max_seqlen_q": max_seqlen_q, "auto_range_merge": auto_range_merge, "sparse_load": sparse_load},
@@ -1502,7 +1504,9 @@ def flash_attn_with_cp(
         k = k.unsqueeze(0)
         v = v.unsqueeze(0)
 
-    self_attn_out = torch.ops.magi2.flash_attn_func(q, k, v).squeeze(0)
+    self_attn_out = resolve_magi2_op("flash_attn_func", flash_attn_func)(
+        q, k, v
+    ).squeeze(0)
 
     if psm.get_world_size("cp") > 1:
         self_attn_out = scatter_seqlen_gather_head(
@@ -1558,7 +1562,7 @@ def flex_flash_attn_with_cp(
             [q, k, v], cp_split_sizes, psm.get_parallel_group("cp")
         )
 
-    out, _ = torch.ops.magi2.flex_flash_attn_func(
+    out, _ = resolve_magi2_op("flex_flash_attn_func", flex_flash_attn_func)(
         q,
         k,
         v,

@@ -397,8 +397,10 @@ class Magi2Refiner:
         match the declared architecture fails instead of loading partially.
 
         The refiner's attention is dispatched through operators MagiCompiler
-        registers, so the presence of those operators is a precondition of the
-        stage rather than something to discover mid-forward.
+        registers, falling back to the eager implementations vendored beside
+        them when the operator namespace is empty. That at least one of the two
+        is reachable is a precondition of the stage rather than something to
+        discover mid-forward.
         """
         from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
             require_magi2_custom_ops,

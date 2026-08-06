@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.machinery
+import importlib.util
 import os
 import pathlib
 import subprocess
@@ -1304,6 +1306,144 @@ def test_magi2_refiner_hooks_match_the_seam_the_session_consults() -> None:
         assert not hasattr(BasePipeline, name), name
     session = inspect.signature(InferenceSession._validate_refine_request)
     assert set(session.parameters) == {"self", "refine", "frames", "height", "width"}
+
+
+def _find_spec_stub(present: set[str]):
+    """``find_spec`` that reports ``present`` names as installed, others as absent."""
+    real = importlib.util.find_spec
+
+    def find_spec(name: str, *args, **kwargs):
+        if name in present:
+            return importlib.machinery.ModuleSpec(name, loader=None)
+        if name in _MAGI2_SPEC_PROBED:
+            return None
+        return real(name, *args, **kwargs)
+
+    return find_spec
+
+
+# Names the probes under test ask about; anything else keeps the real answer.
+_MAGI2_SPEC_PROBED = {"magi_attention", "flash_attn"}
+
+
+def test_magi2_attention_ops_resolve_to_the_vendored_eager_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A call site binds to the registered operator, else to the eager function.
+
+    ``magi_register_custom_op`` publishes ``torch.ops.magi2.*`` only under a real
+    MagiCompiler; the callable it decorates is a complete implementation either
+    way. Resolution must therefore follow the implementation, not the
+    registration, while still preferring a registered operator when one exists.
+    """
+    from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
+        MAGI2_OP_NAMESPACE,
+        resolve_magi2_op,
+    )
+
+    namespace = getattr(torch.ops, MAGI2_OP_NAMESPACE)
+
+    def eager(*args: object, **kwargs: object) -> str:
+        return "eager"
+
+    def registered(*args: object, **kwargs: object) -> str:
+        return "registered"
+
+    resolve_magi2_op.cache_clear()
+    try:
+        if not hasattr(namespace, "flex_flash_attn_func"):
+            assert resolve_magi2_op("flex_flash_attn_func", eager) is eager
+            resolve_magi2_op.cache_clear()
+
+        monkeypatch.setattr(
+            namespace, "flex_flash_attn_func", registered, raising=False
+        )
+        assert resolve_magi2_op("flex_flash_attn_func", eager) is registered
+        # The binding is resolved once, so the second call is the same object.
+        assert resolve_magi2_op("flex_flash_attn_func", eager) is registered
+    finally:
+        resolve_magi2_op.cache_clear()
+
+
+def test_magi2_unusable_magi_attention_does_not_select_the_magi_attention_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An importable-but-unusable ``magi_attention`` falls through to eager math.
+
+    MagiAttention's extensions build for compute capability 9.0 only, so the
+    distribution can be on the path while its entry point does not import. A
+    presence probe would send a Hopper-reporting device into a branch that then
+    fails; the usability probe must resolve to nothing so the branch is not
+    taken and the vendored eager path runs instead.
+    """
+    from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
+        magi_attention_flex_flash_attn_func,
+    )
+
+    magi_attention_flex_flash_attn_func.cache_clear()
+    try:
+        monkeypatch.setattr(
+            importlib.util, "find_spec", _find_spec_stub({"magi_attention"})
+        )
+        # Reported as present on the path, yet no entry point resolves.
+        assert importlib.util.find_spec("magi_attention") is not None
+        assert magi_attention_flex_flash_attn_func() is None
+
+        magi_attention_flex_flash_attn_func.cache_clear()
+        monkeypatch.setattr(importlib.util, "find_spec", _find_spec_stub(set()))
+        assert magi_attention_flex_flash_attn_func() is None
+    finally:
+        magi_attention_flex_flash_attn_func.cache_clear()
+
+
+def test_magi2_refiner_precondition_fails_only_when_no_attention_path_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stage is refused when neither operator nor eager math is reachable.
+
+    An empty ``torch.ops.magi2`` namespace is not by itself a blocker: the eager
+    implementations vendored beside the operators still run, provided their
+    FlashAttention-2 dependency is installed. Each of the three states must be
+    reported for what it is.
+    """
+    import types
+
+    from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
+        MAGI2_EAGER_IMPL_MODULE,
+        MAGI2_REFINER_REQUIRED_OPS,
+        missing_magi2_custom_ops,
+        require_magi2_custom_ops,
+    )
+
+    if not missing_magi2_custom_ops(MAGI2_REFINER_REQUIRED_OPS):
+        pytest.skip("a real MagiCompiler registered the operators in this environment")
+
+    eager = types.ModuleType(MAGI2_EAGER_IMPL_MODULE)
+    for name in MAGI2_REFINER_REQUIRED_OPS:
+        setattr(eager, name, lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, MAGI2_EAGER_IMPL_MODULE, eager)
+
+    # Eager implementation present, FlashAttention-2 present: the stage runs.
+    monkeypatch.setattr(importlib.util, "find_spec", _find_spec_stub({"flash_attn"}))
+    require_magi2_custom_ops("The MAGI-2 refiner stage")
+
+    # Eager implementation present, FlashAttention-2 absent.
+    monkeypatch.setattr(importlib.util, "find_spec", _find_spec_stub(set()))
+    with pytest.raises(RuntimeError) as absent_dependency:
+        require_magi2_custom_ops("The MAGI-2 refiner stage")
+    assert "flash_attn" in str(absent_dependency.value)
+
+    # Neither a registered operator nor an eager implementation.
+    monkeypatch.setattr(importlib.util, "find_spec", _find_spec_stub({"flash_attn"}))
+    monkeypatch.setitem(
+        sys.modules, MAGI2_EAGER_IMPL_MODULE, types.ModuleType(MAGI2_EAGER_IMPL_MODULE)
+    )
+    with pytest.raises(RuntimeError) as no_implementation:
+        require_magi2_custom_ops("The MAGI-2 refiner stage")
+    message = str(no_implementation.value)
+    assert "torch.ops.magi2.flex_flash_attn_func" in message
+    assert "torch.ops.magi2.flash_attn_func" in message
+    assert "magi_compiler" in message
 
 
 def test_magi2_refiner_streams_under_the_configured_residency_policy() -> None:
