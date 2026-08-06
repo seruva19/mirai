@@ -15,7 +15,11 @@ import torch
 from torch import nn
 from torch.nn.utils import parametrize
 
-from mirai.core.models.base import MemoryFeatureCapabilities, ModelExtensionCapabilities
+from mirai.core.models.base import (
+    MemoryFeatureCapabilities,
+    ModelExtensionCapabilities,
+    SyntheticBatchSpec,
+)
 from mirai.core.models.native_video import NativeVideoPipeline, VideoLatentLayout
 from mirai.core.models.providers import (
     ModelFamilyProvider,
@@ -197,6 +201,18 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             frame_count_remainder=1,
             frame_count_rule="1 modulo 4 (4n+1)",
             request_spatial_multiple=16,
+        )
+
+    def get_synthetic_batch_spec(self) -> SyntheticBatchSpec:
+        """MAGI-2 rejects any batch outside its own conditioning contract.
+
+        The forward pass requires ``[B, 48, T, H, W]`` latents and ``[B, S,
+        5120]`` Qwen3.5 hidden states, so a synthetic batch carrying the generic
+        placeholder widths cannot reach the denoiser.
+        """
+        return SyntheticBatchSpec(
+            latent_channels=int(self.get_video_latent_layout().latent_channels),
+            text_embed_width=MAGI2_TEXT_EMBED_WIDTH,
         )
 
     def preview_latent_geometry(
@@ -809,6 +825,10 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             sparse_moe=True,
             strict_native_assets_by_default=True,
             batched_cfg_inference=True,
+            # Raw media is encoded by the family-owned Qwen3.5/Wan2.2 encoder
+            # returned from build_native_cache_encoder(); no generic pixel
+            # projection is a valid MAGI-2 latent.
+            native_cache_encoding=True,
             config_defaults_name="magi2_preview",
             inference_tasks=("text_to_video",),
             dataset_caption_formats=("raw",),

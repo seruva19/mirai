@@ -224,6 +224,12 @@ text through the Qwen3.5 encoder and latents through the native Wan2.2 VAE
 trimmed to `8n + 1` and to a multiple of 16 in both spatial dimensions before
 encoding; precomputed `.pt` latents must have shape `[48, T, H, W]`.
 
+The shipped config sets `dataset.auto_preprocess_cache = true`, so a missing
+cache is built from `dataset.path` through that provider-owned encoder on the
+first run. Because the family declares native cache encoding,
+`dataset.preprocess_raw_media_to_pt` defers to the same encoder instead of the
+generic media preprocessor.
+
 Resume from an adapter checkpoint:
 
 ```bash

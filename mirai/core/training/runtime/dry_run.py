@@ -6,6 +6,7 @@ from dataclasses import asdict
 from typing import Any
 
 from mirai.config.runtime_policy import runtime_policy_summary
+from mirai.core.models.base import SyntheticBatchSpec
 from mirai.core.tensors import to_jsonable, to_python_scalar
 from mirai.core.training.data.batches import grad_norm
 from mirai.core.training.residency.device_placement import resolve_compute_dtype
@@ -28,6 +29,7 @@ def build_dry_run_report(
         torch.cuda.reset_peak_memory_stats()
     batch = _build_synthetic_moe_batch(
         config,
+        pipeline=getattr(trainer, "pipeline", None),
         dtype=_resolve_pipeline_input_dtype(trainer, config),
     )
     params = list(trainer.get_trainable_parameters())
@@ -81,26 +83,55 @@ def build_dry_run_report(
     }
 
 
+def _resolve_synthetic_batch_spec(pipeline: Any) -> SyntheticBatchSpec:
+    """Read the model-owned synthetic-batch contract, if the model declares one.
+
+    Keeps the dry-run harness family-agnostic: a model whose forward validates
+    conditioning widths states them here, everything else keeps the generic
+    config-derived shapes.
+    """
+    getter = getattr(pipeline, "get_synthetic_batch_spec", None)
+    return getter() if callable(getter) else SyntheticBatchSpec()
+
+
 def _build_synthetic_moe_batch(
     config: Any,
     *,
+    pipeline: Any | None = None,
     dtype: Any | None = None,
 ) -> dict[str, Any]:
     batch_size = int(config.training.batch_size)
     input_dtype = resolve_compute_dtype(config) if dtype is None else dtype
     params = config.model.params
+    spec = _resolve_synthetic_batch_spec(pipeline)
     frame_buckets = list(getattr(config.dataset, "frame_buckets", []) or [1])
     frame_count = max(1, int(frame_buckets[0]))
-    channels = max(1, int(params.latent_channels))
+    channels = max(
+        1,
+        int(
+            params.latent_channels
+            if spec.latent_channels is None
+            else spec.latent_channels
+        ),
+    )
     patch = max(1, int(params.patch_size))
     height = max(patch * 2, 2)
     width = max(patch * 2, 2)
     numel = batch_size * channels * frame_count * height * width
     latents = torch.linspace(0.1, 0.9, steps=max(1, numel), dtype=input_dtype)
     latents = latents.reshape(batch_size, channels, frame_count, height, width)
+    text_embed_width = spec.text_embed_width
+    text_embeds = (
+        torch.ones((batch_size,), dtype=input_dtype)
+        if text_embed_width is None
+        else torch.ones(
+            (batch_size, max(1, int(spec.text_embed_tokens)), int(text_embed_width)),
+            dtype=input_dtype,
+        )
+    )
     return {
         "latents": latents,
-        "text_embeds": torch.ones((batch_size,), dtype=input_dtype),
+        "text_embeds": text_embeds,
     }
 
 

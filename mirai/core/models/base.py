@@ -64,6 +64,23 @@ class ModelExtensionCapabilities:
     validation_inference: bool = False
 
 
+@dataclass(frozen=True)
+class SyntheticBatchSpec:
+    """Shapes a synthetic (dry-run) batch must carry to reach this model.
+
+    A synthetic batch has no cache lineage behind it, so the model cannot infer
+    its conditioning widths from data. ``None`` means the model constrains
+    nothing beyond the configured latent geometry and the caller keeps its
+    config-derived defaults: ``latent_channels`` falls back to
+    ``model.params.latent_channels`` and an unset ``text_embed_width`` yields
+    the generic per-sample placeholder tensor.
+    """
+
+    latent_channels: int | None = None
+    text_embed_width: int | None = None
+    text_embed_tokens: int = 1
+
+
 class BasePipeline(ABC):
     """Model abstraction the trainer depends on."""
 
@@ -118,6 +135,10 @@ class BasePipeline(ABC):
     def get_required_batch_keys(self, *, strategy_type: str = "") -> list[str]:
         """Cache keys this model requires (beyond latent/text) for a strategy."""
         return list(self.REQUIRED_BATCH_KEYS_BY_STRATEGY.get(str(strategy_type), []))
+
+    def get_synthetic_batch_spec(self) -> SyntheticBatchSpec:
+        """Batch shapes this model requires when no cached batch exists."""
+        return SyntheticBatchSpec()
 
     def get_model_extension_capabilities(self) -> ModelExtensionCapabilities:
         """Return optional model-extension surfaces implemented by this pipeline."""

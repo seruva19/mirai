@@ -2410,6 +2410,11 @@ Auto-build the cache (preprocessing/cache.py).
 - **Allowed / range:** —
 
 Preprocess raw media into `.pt` ([`media_preprocessor.py`](mirai/core/dataset/media/media_preprocessor.py), [`native_encode.py`](mirai/core/dataset/native_encode.py)).
+Applies while `auto_preprocess_cache` builds a missing cache. Model families
+that declare native cache encoding encode raw media with their own provider
+encoder, so this generic step is skipped for them; a family that declares
+neither native cache encoding nor asset-free projection rejects raw video here
+rather than writing a pixel projection that is not a diffusion latent.
 
 ### `max_cache_skip_ratio`
 

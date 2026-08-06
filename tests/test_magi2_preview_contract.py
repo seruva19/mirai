@@ -24,7 +24,10 @@ from mirai.core.models.magi2_preview.grouped_moe import (
 )
 from mirai.core.moe.runtime.gemm import BackendProbe, grouped_mm_op
 from mirai.core.models.magi2_preview.pipeline import LowRankWeight
-from mirai.core.models.providers import get_model_family_provider
+from mirai.core.models.providers import (
+    NativeCacheEncoderConfig,
+    get_model_family_provider,
+)
 from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
 
 
@@ -1091,3 +1094,118 @@ def test_magi2_triton_flash_forward_matches_the_reference_loop() -> None:
     scale = reference.abs().max()
     assert scale > 0.0
     assert (reference - fused).abs().max() <= 2e-2 * scale
+
+
+def test_magi2_provider_declares_native_cache_encoding() -> None:
+    """Raw media must route to the family encoder, not the generic projector.
+
+    The provider implements ``build_native_cache_encoder``; without the matching
+    capability the cache builder disables native encoding and the generic media
+    preprocessor rejects every raw video.
+    """
+    provider = get_model_family_provider("magi2-preview")
+    assert provider is not None
+    assert provider.supports_native_cache_encoding()
+    assert not provider.allows_asset_free_cache_encoding()
+    encoder = provider.build_native_cache_encoder(
+        NativeCacheEncoderConfig(
+            enabled=True,
+            model_type="magi2-preview",
+            variant="preview",
+            model_path="./models/MAGI-2-preview",
+            dtype_name="bf16",
+            max_frames=17,
+        )
+    )
+    assert encoder is not None
+    assert int(encoder.latent_channels) == 48
+
+
+def test_magi2_auto_preprocess_defers_to_the_native_cache_encoder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """`preprocess_raw_media_to_pt` must not reach the generic pixel projector."""
+    from mirai.core.training.data import preprocessing
+
+    config = load_config("configs/magi2_preview/train_offload.toml")
+    assert config.dataset.auto_preprocess_cache
+    assert config.dataset.preprocess_raw_media_to_pt
+    dataset_dir = tmp_path / "videos"
+    dataset_dir.mkdir()
+    (dataset_dir / "clip.mp4").write_bytes(b"")
+    config = dataclasses.replace(
+        config,
+        dataset=dataclasses.replace(
+            config.dataset,
+            path=str(dataset_dir),
+            cache_path=str(tmp_path / "cache" / "dataset_cache.pt"),
+        ),
+    )
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("generic media preprocessing must not run for MAGI-2")
+
+    built: list[object] = []
+    monkeypatch.setattr(preprocessing, "preprocess_video_media_to_pt", _fail)
+    monkeypatch.setattr(
+        preprocessing, "build_cache_from_config", lambda cfg: built.append(cfg)
+    )
+    preprocessing.ensure_cache_artifacts_for_training(config)
+    assert built == [config]
+
+
+def test_magi2_dry_run_batch_satisfies_the_pipeline_conditioning_contract() -> None:
+    """The synthetic dry-run batch must pass MAGI-2's own batch validation.
+
+    The transformer is never built: the validated surfaces are the latent
+    channel check the forward performs and the Qwen3.5 width check in
+    ``_text_features``, both of which reject the generic dry-run shapes.
+    """
+    from mirai.core.models.magi2_preview.pipeline import (
+        MAGI2_TEXT_EMBED_WIDTH,
+        Magi2PreviewPipeline,
+    )
+    from mirai.core.training.runtime.dry_run import _build_synthetic_moe_batch
+
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    config = load_config("configs/magi2_preview/train_offload.toml")
+    batch = _build_synthetic_moe_batch(config, pipeline=pipeline, dtype=torch.float32)
+
+    latents = batch["latents"]
+    assert latents.ndim == 5
+    assert int(latents.shape[0]) == int(config.training.batch_size)
+    assert int(latents.shape[1]) == 48
+    text, lengths = pipeline._text_features(
+        batch["text_embeds"], batch=int(latents.shape[0]), like=latents
+    )
+    assert int(text.shape[-1]) == MAGI2_TEXT_EMBED_WIDTH
+    assert int(text.shape[0]) == int(latents.shape[0])
+    assert int(lengths.sum()) == int(text.shape[0]) * int(text.shape[1])
+
+
+def test_dry_run_batch_keeps_generic_shapes_without_a_model_spec() -> None:
+    """Models that declare no synthetic-batch spec keep the previous shapes."""
+    from mirai.core.training.runtime.dry_run import _build_synthetic_moe_batch
+
+    config = load_config("configs/lingbot_video/train_bf16.toml")
+    batch = _build_synthetic_moe_batch(config, pipeline=None, dtype=torch.float32)
+    frames = max(1, int(list(config.dataset.frame_buckets or [1])[0]))
+    patch = max(1, int(config.model.params.patch_size))
+    assert tuple(batch["latents"].shape) == (
+        int(config.training.batch_size),
+        int(config.model.params.latent_channels),
+        frames,
+        max(patch * 2, 2),
+        max(patch * 2, 2),
+    )
+    assert tuple(batch["text_embeds"].shape) == (int(config.training.batch_size),)
+
+    class _PipelineWithoutSpec:
+        pass
+
+    unspecified = _build_synthetic_moe_batch(
+        config, pipeline=_PipelineWithoutSpec(), dtype=torch.float32
+    )
+    assert tuple(unspecified["latents"].shape) == tuple(batch["latents"].shape)
+    assert tuple(unspecified["text_embeds"].shape) == tuple(batch["text_embeds"].shape)
