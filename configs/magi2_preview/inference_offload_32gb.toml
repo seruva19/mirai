@@ -1,0 +1,48 @@
+# MAGI-2 Preview inference on a 32 GiB device with a 256 GiB host.
+#
+# This file selects the most conservative residency and occupancy the schema
+# offers for this family. Denoiser activation size is set by `--height`,
+# `--width`, and `--frames` on `scripts/infer.py`, which no config key
+# controls, so the request itself is part of the profile: a 32 GiB device
+# requires a small spatial size and a short latent length. The fit is derived
+# from the configured residency, not measured; figures are published only after
+# the GPU validation contract records them.
+preset = "magi2_preview_offload"
+
+[model]
+path = "./models/MAGI-2-preview"
+
+# The optional refiner stage reads these only when `--refine` is passed. The
+# refiner is a second model load and a second denoise; on this device it is a
+# separate decision from the preview run.
+[model.params.family_params]
+refiner_config_path = ""
+refiner_subfolder = "refiner"
+
+[training]
+# Inference streams blocks through the same residency path as training. All 40
+# preview blocks stream from host RAM.
+blocks_to_swap = 40
+# Synchronous transfer keeps one swapped block and no transfer staging buffer
+# on the device at a time.
+block_swap_mode = "sync"
+
+[inference]
+task = "text_to_video"
+# The native sampler packs the conditional and unconditional branches into one
+# B=2 forward; `sequential` is rejected rather than applied.
+cfg_mode = "batched"
+# Text encoding, denoising, and VAE decoding occupy the device sequentially.
+# Neither auxiliary model may co-reside with the denoiser at this capacity.
+keep_text_encoder_resident = false
+keep_vae_resident = false
+
+[memory]
+# Free-RAM guard, not a total-RAM requirement. See the training profile.
+minimum_system_memory_gib = 12.0
+# Page-locked host ceiling; the free remainder after the host-resident
+# transformer is what actually bounds the pinned budget.
+max_pinned_host_gib = 8.0
+
+[logging]
+output_dir = "./outputs/magi2_preview_inference_32gb"

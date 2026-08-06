@@ -77,6 +77,16 @@ Available examples:
 - [`train_nf4.toml`](../configs/lingbot_video/train_nf4.toml) — NF4 compressed
   frozen base with chunked expert reconstruction. This example uses the
   Linux-only bitsandbytes optimizer from `requirements-cu126-linux.txt`.
+- [`train_nf4_32gb.toml`](../configs/lingbot_video/train_nf4_32gb.toml) — NF4
+  compressed frozen base kept **fully resident** on a 32 GiB device. Block
+  swapping is disabled: host-device transfer only pays for itself when the
+  weights do not fit, and the compressed base does. Unlike `train_nf4.toml`
+  this example uses the dependency-free `adamw` optimizer rather than the
+  Linux-only bitsandbytes path, so it runs unchanged on a Windows workstation.
+  On a DGX Spark (128 GiB unified) it applies unchanged: the resident
+  compressed base plus activations fit the unified pool, and
+  `memory.cuda_memory_fraction` with `memory.minimum_system_memory_gib` guard
+  the same pool from both directions.
 
 Set `[model].path`, `[dataset].path`, and `[logging].output_dir`, then run:
 
@@ -149,6 +159,12 @@ image_to_video = 3
 The example [`inference_bf16.toml`](../configs/lingbot_video/inference_bf16.toml)
 enables batched classifier-free guidance and keeps the text encoder and VAE
 resident.
+
+[`inference_nf4_32gb.toml`](../configs/lingbot_video/inference_nf4_32gb.toml)
+is the same generation path on a 32 GiB device: NF4 compressed weights, no
+block swapping, and the text encoder and VAE released between phases instead of
+kept resident. Set either `keep_*_resident` back to `true` only when the
+measured peak leaves room for it.
 
 Prompts use the release’s structured JSON format. Plain text passed through the
 family entrypoint is converted to the required structure.

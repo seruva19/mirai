@@ -15,6 +15,7 @@ def test_attention_backend_registry_and_cpu_probe_are_explicit() -> None:
         "flash",
         "flash3",
         "flash4",
+        "flex",
     )
     statuses = {
         status.name: status
@@ -24,6 +25,63 @@ def test_attention_backend_registry_and_cpu_probe_are_explicit() -> None:
     for name in ("cudnn", "flash", "flash3", "flash4"):
         assert not statuses[name].available
         assert statuses[name].reason == "CUDA device required"
+    # FlexAttention carries an eager lowering, so it is device-portable.
+    assert statuses["flex"].available
+    assert statuses["flex"].reason == "PyTorch FlexAttention"
+
+
+def test_flex_dispatch_matches_sdpa_outputs_and_gradients() -> None:
+    torch.manual_seed(311)
+    values = [
+        torch.randn(1, 6, 3, 8, dtype=torch.float32, requires_grad=True)
+        for _ in range(3)
+    ]
+    references = [value.detach().clone().requires_grad_(True) for value in values]
+
+    observed = attention.dispatch_attention(*values, backend="flex")
+    expected = attention.dispatch_attention(*references, backend="auto")
+    observed.square().mean().backward()
+    expected.square().mean().backward()
+
+    torch.testing.assert_close(observed, expected, rtol=1e-5, atol=1e-5)
+    for value, reference in zip(values, references):
+        torch.testing.assert_close(value.grad, reference.grad, rtol=1e-5, atol=1e-5)
+
+
+def test_flex_varlen_dispatch_isolates_packed_samples_with_gradients() -> None:
+    torch.manual_seed(313)
+    values = [
+        torch.randn(7, 3, 8, dtype=torch.float32, requires_grad=True) for _ in range(3)
+    ]
+    references = [value.detach().clone().requires_grad_(True) for value in values]
+    cu = torch.tensor([0, 2, 7], dtype=torch.int32)
+
+    observed = attention.dispatch_varlen_attention(
+        *values,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=5,
+        max_seqlen_k=5,
+        backend="flex",
+    )
+    expected = torch.cat(
+        [
+            attention.dispatch_attention(
+                references[0][start:end].unsqueeze(0),
+                references[1][start:end].unsqueeze(0),
+                references[2][start:end].unsqueeze(0),
+                backend="auto",
+            ).squeeze(0)
+            for start, end in ((0, 2), (2, 7))
+        ],
+        dim=0,
+    )
+    observed.square().mean().backward()
+    expected.square().mean().backward()
+
+    torch.testing.assert_close(observed, expected, rtol=1e-5, atol=1e-5)
+    for value, reference in zip(values, references):
+        torch.testing.assert_close(value.grad, reference.grad, rtol=1e-5, atol=1e-5)
 
 
 def test_auto_attention_matches_sdpa_outputs_and_gradients() -> None:

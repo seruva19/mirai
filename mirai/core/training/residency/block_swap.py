@@ -133,6 +133,10 @@ class BlockSwapManager:
         for handle in self._backward_hooks:
             handle.remove()
         self._backward_hooks.clear()
+        # Rebinding re-establishes device state from scratch; records from a
+        # previous binding describe transfers into tensors this call replaces.
+        self._prefetch_q.clear()
+        self._prefetch_events.clear()
         self._device = torch.device(device) if torch is not None else device
         self._transfer_stream = (
             torch.cuda.Stream(device=self._device)
@@ -199,6 +203,7 @@ class BlockSwapManager:
                     if managed is not None and managed.device != "cpu":
                         if self._device.type == "cuda" and hasattr(managed, "mark_consumed"):
                             managed.mark_consumed(torch.cuda.current_stream(self._device))
+                        self._discard_prefetch_event(block_index)
                         managed.offload()
                         self.events.append(
                             BlockSwapEvent(kind="backward_swap_out", block_idx=block_index)
@@ -211,8 +216,6 @@ class BlockSwapManager:
     def reset_step(self) -> None:
         self.finish_backward()
         self.events.clear()
-        self._prefetch_q.clear()
-        self._prefetch_events.clear()
 
     def finish_backward(self) -> None:
         for index, unit in self._units.items():
@@ -221,10 +224,27 @@ class BlockSwapManager:
             # Head pins stay resident across the step turn for the next forward.
             if index in self._plan.backward_pin_set:
                 continue
+            self._discard_prefetch_event(index)
             unit.offload()
         self._prefetch_q.clear()
-        self._prefetch_events.clear()
+        # A pinned block that is still resident may carry an unconsumed
+        # transfer; its event is the only thing that will order the next
+        # forward behind that transfer, so it survives the phase turn.
         self._backward_active = False
+
+    def _discard_prefetch_event(self, idx: int) -> None:
+        """Drop the in-flight H2D record for a block that is leaving the device.
+
+        A pending event is only evidence that a transfer was *issued*; it stops
+        being evidence of residency the moment the block is offloaded. Offload
+        can precede the block's forward: a module whose inputs do not require
+        gradients has its full backward hook invoked as soon as gradients with
+        respect to its outputs exist, which is before its checkpointed forward
+        is recomputed. Retaining the event would let the next ``before_block``
+        accept it as proof of residency for host-side weights.
+        """
+
+        self._prefetch_events.pop(idx, None)
 
     def _prefetch_one(self, nxt: int) -> None:
         if not (0 <= nxt < self.total_blocks) or self._is_resident(nxt):
@@ -250,10 +270,18 @@ class BlockSwapManager:
         if unit is not None:
             event = self._prefetch_events.pop(idx, None)
             if event is not None and torch is not None and self._device.type == "cuda":
+                # Order the consumer stream behind the prefetch transfer before
+                # anything reads the block, then hand the transfer-stream
+                # allocations to the consumer for allocator bookkeeping.
                 current = torch.cuda.current_stream(self._device)
                 current.wait_event(event)
-                unit.record_stream(current)
-            elif unit.device == "cpu":
+                if unit.device != "cpu":
+                    unit.record_stream(current)
+            # Residency is established by observation, never inferred from a
+            # consumed event: a prefetched block can be evicted before its
+            # forward runs, and the compute that follows must not read host
+            # tensors.
+            if unit.device == "cpu":
                 unit.load(self._device)
         self.events.append(BlockSwapEvent(kind="swap_in", block_idx=idx))
         if self.mode == "async":
@@ -280,6 +308,7 @@ class BlockSwapManager:
         if unit is not None and self.block_swap_backward and not pin_hold:
             if self._device.type == "cuda" and hasattr(unit, "mark_consumed"):
                 unit.mark_consumed(torch.cuda.current_stream(self._device))
+            self._discard_prefetch_event(idx)
             unit.offload()
         if self.mode == "async" and self._prefetch_q:
             done = self._prefetch_q.popleft()

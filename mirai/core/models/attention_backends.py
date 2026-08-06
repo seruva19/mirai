@@ -66,6 +66,13 @@ ATTENTION_BACKEND_SPECS = {
         function="flash_attn_func",
         varlen_function="flash_attn_varlen_func",
     ),
+    "flex": AttentionBackendSpec(
+        "flex",
+        "flex",
+        modules=("torch.nn.attention.flex_attention",),
+        function="flex_attention",
+        varlen_function="flex_attention",
+    ),
 }
 ALLOWED_ATTENTION_BACKENDS = frozenset(ATTENTION_BACKEND_SPECS)
 
@@ -86,6 +93,24 @@ def _cuda_capability(device: torch.device) -> tuple[int, int] | None:
     if resolved.type != "cuda" or not torch.cuda.is_available():
         return None
     return tuple(int(v) for v in torch.cuda.get_device_capability(resolved))
+
+
+@lru_cache(maxsize=None)
+def _flex_attention_api() -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Return ``(flex_attention, create_block_mask)`` from the installed torch.
+
+    FlexAttention is imported at its execution seam because the module pulls in
+    the higher-order-op and compile machinery, which no other backend needs.
+    """
+    module = importlib.import_module("torch.nn.attention.flex_attention")
+    flex = getattr(module, "flex_attention", None)
+    create_block_mask = getattr(module, "create_block_mask", None)
+    if not callable(flex) or not callable(create_block_mask):
+        raise RuntimeError(
+            "flex backend is unavailable (torch.nn.attention.flex_attention is "
+            "incomplete in this torch build)."
+        )
+    return flex, create_block_mask
 
 
 @lru_cache(maxsize=None)
@@ -137,6 +162,21 @@ def attention_backend_status(
             + "; ".join(f"{status.name}: {status.reason}" for status in candidates)
             + ")",
             capability,
+        )
+    if spec.engine == "flex":
+        # FlexAttention has an eager reference lowering, so it is functional on
+        # any device; only a fused CUDA execution needs a compiled kernel.
+        try:
+            _flex_attention_api()
+        except Exception as exc:
+            return AttentionBackendStatus(
+                resolved,
+                False,
+                f"flex backend is unavailable ({type(exc).__name__}).",
+                capability,
+            )
+        return AttentionBackendStatus(
+            resolved, True, "PyTorch FlexAttention", capability
         )
     if capability is None:
         return AttentionBackendStatus(resolved, False, "CUDA device required", None)
@@ -215,6 +255,79 @@ def _sdpa_selection(name: str) -> list[Any] | None:
     raise ValueError(f"{name!r} is not a PyTorch SDPA backend.")
 
 
+@lru_cache(maxsize=None)
+def _compiled_flex_attention() -> Callable[..., Any]:
+    flex, _ = _flex_attention_api()
+    return torch.compile(flex)
+
+
+def flex_attention_function(*, compiled: bool = False) -> Callable[..., Any]:
+    """Return the FlexAttention entry point, eager or through ``torch.compile``.
+
+    Only the compiled lowering is fused; the eager one is a reference
+    implementation that materializes the score matrix, so callers select it
+    when an inductor toolchain is unavailable or shapes are small.
+    """
+    if compiled:
+        return _compiled_flex_attention()
+    flex, _ = _flex_attention_api()
+    return flex
+
+
+def flex_document_ids(cu_seqlens: torch.Tensor, *, total: int) -> torch.Tensor:
+    """Map every packed token position to the index of the sample owning it."""
+    offsets = cu_seqlens.to(device=cu_seqlens.device, dtype=torch.int64)
+    if offsets.ndim != 1 or offsets.numel() < 2:
+        raise ValueError("Packed cumulative sequence lengths must hold at least one sample.")
+    if int(offsets[0]) != 0 or int(offsets[-1]) != int(total):
+        raise ValueError(
+            "Packed cumulative sequence lengths must start at 0 and end at the "
+            f"token count; got {int(offsets[0])}..{int(offsets[-1])} for {int(total)} tokens."
+        )
+    positions = torch.arange(int(total), device=offsets.device)
+    # right=True places a position exactly on a boundary in the sample that
+    # starts there, so token cu_seqlens[i] belongs to sample i, not i-1.
+    return torch.bucketize(positions, offsets[1:], right=True)
+
+
+def flex_document_block_mask(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    query_tokens: int,
+    key_tokens: int,
+    device: torch.device,
+    compile_mask: bool,
+) -> Any:
+    """Build the varlen document ``BlockMask`` that isolates packed samples.
+
+    ``compile_mask`` selects the compiled mask construction. The eager
+    construction evaluates the mask over the full ``[Q, KV]`` grid, so it is
+    only appropriate for the small shapes used by reference verification.
+    """
+    _, create_block_mask = _flex_attention_api()
+    query_documents = flex_document_ids(cu_seqlens_q, total=int(query_tokens)).to(device)
+    key_documents = flex_document_ids(cu_seqlens_k, total=int(key_tokens)).to(device)
+
+    def document_mask(
+        batch: torch.Tensor,
+        head: torch.Tensor,
+        query_index: torch.Tensor,
+        key_index: torch.Tensor,
+    ) -> torch.Tensor:
+        return query_documents[query_index] == key_documents[key_index]
+
+    return create_block_mask(
+        document_mask,
+        None,
+        None,
+        int(query_tokens),
+        int(key_tokens),
+        device=str(device),
+        _compile=bool(compile_mask),
+    )
+
+
 def dispatch_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -235,6 +348,17 @@ def dispatch_attention(
         function = _load_external_function(name, varlen=False)
         result = function(query, key, value, causal=False)
         return result[0] if isinstance(result, tuple) else result
+
+    if name == "flex":
+        _require_backend(name, device=query.device)
+        flex, _ = _flex_attention_api()
+        output = flex(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            enable_gqa=query.shape[2] != key.shape[2],
+        )
+        return output.transpose(1, 2)
 
     if name != "auto":
         _require_backend(name, device=query.device)
@@ -267,9 +391,30 @@ def dispatch_varlen_attention(
 ) -> torch.Tensor:
     """Execute packed THD attention through FA3/FA4 or an SDPA reference path."""
     name = normalize_attention_backend(backend)
+    if name == "flex":
+        _require_backend(name, device=query.device, varlen=True)
+        flex, _ = _flex_attention_api()
+        block_mask = flex_document_block_mask(
+            cu_seqlens_q,
+            cu_seqlens_k,
+            query_tokens=int(query.shape[0]),
+            key_tokens=int(key.shape[0]),
+            device=query.device,
+            compile_mask=query.device.type == "cuda",
+        )
+        output = flex(
+            query.transpose(0, 1).unsqueeze(0),
+            key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0),
+            block_mask=block_mask,
+            enable_gqa=query.shape[1] != key.shape[1],
+        )
+        return output.squeeze(0).transpose(0, 1)
     candidates = ("flash4", "flash3") if name == "auto" else (name,)
     if any(candidate not in {"flash3", "flash4"} for candidate in candidates):
-        raise ValueError("Packed variable-length attention requires flash3 or flash4.")
+        raise ValueError(
+            "Packed variable-length attention requires flash3, flash4, or flex."
+        )
     failures: list[str] = []
     for candidate in candidates:
         status = attention_backend_status(
@@ -350,6 +495,9 @@ __all__ = [
     "attention_backend_status",
     "dispatch_attention",
     "dispatch_varlen_attention",
+    "flex_attention_function",
+    "flex_document_block_mask",
+    "flex_document_ids",
     "normalize_attention_backend",
     "probe_attention_backends",
 ]

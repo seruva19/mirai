@@ -146,6 +146,76 @@ class TrainingRuntimePolicyTests(unittest.TestCase):
         self.assertTrue(result.non_finite_loss)
         self.assertTrue(result.last_metrics["non_finite_loss"])
 
+    def test_fatal_step_error_reaches_stderr_before_the_exit_code(self) -> None:
+        """An OOM must leave its stack behind, not only a guidance message.
+
+        ``SystemExit`` carries no frames, so without an explicit report the only
+        record of a failing step is its exit status. The raising frame, the
+        exception chain, and the unchanged exit code are all checked together.
+        """
+        import contextlib
+        import io
+
+        def _raise_inside_a_named_frame(_batch):
+            raise RuntimeError("CUDA out of memory. Tried to allocate 40.90 GiB")
+
+        class Trainer:
+            @staticmethod
+            def compute_loss_result(batch):
+                return _raise_inside_a_named_frame(batch)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                accumulate_training_gradients(
+                    trainer=Trainer(),
+                    grad_accum=1,
+                    build_batch=lambda _index: {},
+                    params=[],
+                    gradient_cpu_offload=False,
+                    oom_error_predicate=lambda exc: "out of memory" in str(exc),
+                )
+
+        # SystemExit(str) keeps the interpreter's exit status at 1 for automation.
+        self.assertIsInstance(raised.exception.code, str)
+        self.assertIn("CUDA out of memory detected.", str(raised.exception.code))
+
+        report = stderr.getvalue()
+        self.assertIn("Traceback (most recent call last)", report)
+        self.assertIn("_raise_inside_a_named_frame", report)
+        self.assertIn("RuntimeError: CUDA out of memory", report)
+        self.assertIn(__file__.rsplit("\\", 1)[-1].rsplit("/", 1)[-1], report)
+        # The chained cause survives too: SystemExit is raised ``from`` the OOM.
+        self.assertIs(raised.exception.__cause__.__class__, RuntimeError)
+
+    def test_non_oom_step_error_propagates_with_its_own_traceback(self) -> None:
+        """Only the OOM path is converted; anything else keeps its exception."""
+
+        class Trainer:
+            @staticmethod
+            def compute_loss_result(_batch):
+                raise RuntimeError("unrelated kernel failure")
+
+        import traceback as traceback_module
+
+        try:
+            accumulate_training_gradients(
+                trainer=Trainer(),
+                grad_accum=1,
+                build_batch=lambda _index: {},
+                params=[],
+                gradient_cpu_offload=False,
+                oom_error_predicate=lambda exc: "out of memory" in str(exc),
+            )
+        except RuntimeError as exc:
+            self.assertIn("unrelated kernel failure", str(exc))
+            frames = traceback_module.format_exception(
+                type(exc), exc, exc.__traceback__
+            )
+            self.assertIn("compute_loss_result", "".join(frames))
+        else:
+            self.fail("a non-OOM RuntimeError must propagate")
+
     def test_live_runtime_overrides_round_trip_through_checkpoint_state(self) -> None:
         source = build_training_runtime_overrides()
         source.sample_every_n_steps_override = 7

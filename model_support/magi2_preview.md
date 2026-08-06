@@ -202,6 +202,28 @@ python scripts/train.py \
   --config configs/magi2_preview/train_offload.toml
 ```
 
+[`configs/magi2_preview/train_offload_32gb.toml`](../configs/magi2_preview/train_offload_32gb.toml)
+is the same offload preset stated for a 32 GiB device on a 256 GiB host: batch
+size 1 (the preset leaves the schema default 2), all 40 preview blocks swapped
+synchronously, `attn_only` LoRA rank 8, a single 25-frame 256x448 bucket, and
+host-memory keys sized for a machine whose RAM the BF16 checkpoint nearly
+fills. `memory.minimum_system_memory_gib` is a floor on *free* host RAM, not a
+statement of the profile's total requirement — a value near the machine's
+total aborts the run on contact — so the profile sets a small operating-system
+reserve and a correspondingly small `memory.max_pinned_host_gib`. This host is
+the edge of the profile: quantized frozen experts, which would remove the
+constraint, are not implemented for this family. Its fit is derived from the
+configured residency and shape, not measured; figures are published only after
+the GPU validation contract records them.
+
+**DGX Spark (128 GiB unified).** No separate Spark configs ship for this
+family. MAGI-2 Preview is not addressable there: the BF16 checkpoint is roughly
+228 GiB and the block-swap path requires the whole transformer to be
+host-resident while blocks stream, so a 128 GiB unified pool cannot hold it
+under any setting the schema offers — and because the pool is unified, there is
+no host budget separate from the device budget to trade against. Quantized
+frozen experts, not a config profile, are the prerequisite.
+
 Adapters are LoRA only: `adapter.type` must be `lora`, and `adapter.rank` must
 be positive. The packed-weight LoRA parametrization is shape-preserving and
 does not support adapter dropout — a non-zero `adapter.rank_dropout` or
@@ -259,6 +281,16 @@ python scripts/infer.py \
   --prompt "..." \
   --out outputs/clip.mp4
 ```
+
+[`configs/magi2_preview/inference_offload_32gb.toml`](../configs/magi2_preview/inference_offload_32gb.toml)
+selects the most conservative residency and occupancy the schema offers for
+this family: all 40 blocks swapped synchronously, and neither the text encoder
+nor the VAE resident. Denoiser activation size is set by `--height`, `--width`,
+and `--frames`, which no config key controls, so on a 32 GiB device the request
+is part of the profile — prefer a smaller spatial size and a latent length near
+the floor of the generation envelope, and treat 832x480 at latent `T` 32 as a
+large request rather than a default. `--refine` adds a second model load and a
+second denoise; enable it only once the preview run's peak is known.
 
 The example keeps `inference.keep_text_encoder_resident` and
 `inference.keep_vae_resident` at `false`, so text encoding, denoising, and VAE

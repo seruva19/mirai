@@ -84,6 +84,13 @@ configuration and compatibility rules are documented in
   provider-declared transformer blocks, validates configurable token-shape
   buckets, supplies soft dynamic-shape hints, and reports compiled regions and
   graph counters in dry-run diagnostics. [(repo)](https://github.com/pytorch/pytorch)
+- **Trainable MAGI-2 attention** — `model.attention_backend = "flex"` routes
+  MAGI-2 packed attention through PyTorch FlexAttention, which has a backward
+  pass, instead of the dense-mask reference path autograd otherwise selects.
+  Document block masking keeps packed samples isolated and the per-head
+  attention sinks keep their exact reference semantics, including gradients to
+  the sink parameter.
+  [(FlexAttention)](https://pytorch.org/blog/flexattention/)
 - **Capability-gated attention backends** — A shared registry selects
   automatic PyTorch SDPA, forced cuDNN or PyTorch Flash Attention, and optional
   FlashAttention-3/4 fixed- or variable-length kernels. Packed `auto` execution

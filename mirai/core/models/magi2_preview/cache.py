@@ -17,6 +17,14 @@ from mirai.core.dataset.native_encode import (
 from mirai.core.models.providers import NativeCacheEncoderConfig
 
 
+# Spatial stride of the MAGI-2 preview latent grid. Cached frames must be a
+# multiple of it for the same reason generated frames are: the patch grid cannot
+# express a fractional latent cell. It mirrors the ``spatial_downsample`` the
+# pipeline's ``VideoLatentLayout`` declares, and is duplicated here so cache
+# encoding stays free of the vendored runtime import.
+MAGI2_SPATIAL_STRIDE = 16
+
+
 def magi2_cache_frame_trim(frame_count: int) -> int:
     """Largest ``8n + 1`` frame count that fits ``frame_count``.
 
@@ -77,6 +85,57 @@ class Magi2PreviewNativeCacheEncoder:
             self._vae = get_vae2_2(str(path), device=device, weight_dtype=torch.float32)
         return self._vae
 
+    def _prepare_video_for_vae(self, media_path: Path) -> tuple[torch.Tensor, BucketInfo]:
+        """Trim frames and land the clip on the configured resolution bucket.
+
+        The spatial target is the dataset bucket when bucketing is configured, so
+        a cached sample carries the token count the training geometry declares
+        rather than the source resolution. Without buckets the clip keeps its own
+        size, cropped to the spatial stride the transformer patch grid requires.
+        """
+        video = _load_video_media(media_path, max_frames=self.max_frames)
+        valid_frames = magi2_cache_frame_trim(int(video.shape[1]))
+        video = video[:, :valid_frames]
+        height = int(video.shape[-2])
+        width = int(video.shape[-1])
+        stride = MAGI2_SPATIAL_STRIDE
+        target_height = max(stride, (height // stride) * stride)
+        target_width = max(stride, (width // stride) * stride)
+        if bool(self.config.enable_bucketing) and self.config.resolution_buckets:
+            from mirai.core.dataset.bucketing.bucket_resolve import choose_resolution_bucket
+            from mirai.core.dataset.media.media_resize import resize_crop_tensor
+
+            target_height, target_width = choose_resolution_bucket(
+                height,
+                width,
+                list(self.config.resolution_buckets),
+            )
+            if (
+                target_height % MAGI2_SPATIAL_STRIDE
+                or target_width % MAGI2_SPATIAL_STRIDE
+            ):
+                raise ValueError(
+                    f"MAGI-2 resolution bucket {target_height}x{target_width} is not a "
+                    f"multiple of {MAGI2_SPATIAL_STRIDE}; the preview latent grid cannot "
+                    "express it. Set bucket_resolutions and bucket_round_to accordingly."
+                )
+            video = resize_crop_tensor(
+                video,
+                target_height,
+                target_width,
+                mode=str(self.config.bucket_resize_mode),
+            )
+        elif target_height != height or target_width != width:
+            top = max(0, (height - target_height) // 2)
+            left = max(0, (width - target_width) // 2)
+            video = video[:, :, top : top + target_height, left : left + target_width]
+        return video, BucketInfo(
+            bucket_id=f"{target_height}x{target_width}x{valid_frames}",
+            bucket_h=target_height,
+            bucket_w=target_width,
+            bucket_frames=valid_frames,
+        )
+
     def encode_latent(self, media_path: Path) -> tuple[torch.Tensor, BucketInfo | None]:
         if media_path.suffix.lower() == ".pt":
             payload = torch.load(media_path, map_location="cpu", weights_only=True)
@@ -90,21 +149,11 @@ class Magi2PreviewNativeCacheEncoder:
             return latent.contiguous(), None
         if media_path.suffix.lower() not in VIDEO_MEDIA_SUFFIXES:
             raise ValueError("MAGI-2 training cache accepts videos or native .pt latents.")
-        video = _load_video_media(media_path, max_frames=self.max_frames)
-        valid_frames = magi2_cache_frame_trim(int(video.shape[1]))
-        video = video[:, :valid_frames]
-        height = max(16, int(video.shape[-2]) // 16 * 16)
-        width = max(16, int(video.shape[-1]) // 16 * 16)
-        video = video[:, :, :height, :width].div(127.5).sub(1.0)
+        video, bucket = self._prepare_video_for_vae(media_path)
+        video = video.div(127.5).sub(1.0)
         vae = self._load_vae()
         device = next(vae.vae.parameters()).device
         latent = vae.encode(video.unsqueeze(0).to(device=device, dtype=torch.float32))
-        bucket = BucketInfo(
-            bucket_id=f"{height}x{width}x{valid_frames}",
-            bucket_h=height,
-            bucket_w=width,
-            bucket_frames=valid_frames,
-        )
         return latent[0].detach().cpu().float().contiguous(), bucket
 
     def encode_clip(self, media_path: Path) -> None:

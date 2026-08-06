@@ -1599,6 +1599,130 @@ def test_magi2_cache_encoder_satisfies_the_native_cache_encoder_contract(
     assert encoder.encode_clip(tmp_path / "clip.mp4") is None
 
 
+class _RecordingVae:
+    """Stands in for the Wan2.2 VAE: records its input and honours its strides."""
+
+    def __init__(self) -> None:
+        self.vae = torch.nn.Linear(1, 1)
+        self.seen: list[tuple[int, ...]] = []
+
+    def encode(self, video: torch.Tensor) -> torch.Tensor:
+        self.seen.append(tuple(video.shape))
+        batch, _channels, frames, height, width = video.shape
+        latent_frames = 1 + (int(frames) - 1) // 8
+        return torch.zeros(batch, 48, latent_frames, height // 16, width // 16)
+
+
+def _magi2_cache_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+    source: torch.Tensor,
+    **bucket_config: object,
+) -> tuple[object, _RecordingVae]:
+    """A MAGI-2 cache encoder over a synthetic clip, with the heavy parts stubbed."""
+    from mirai.core.models.magi2_preview import cache as cache_module
+
+    encoder = cache_module.Magi2PreviewNativeCacheEncoder(
+        NativeCacheEncoderConfig(
+            enabled=True,
+            model_type="magi2-preview",
+            variant="preview",
+            model_path="./models/MAGI-2-preview",
+            dtype_name="bf16",
+            max_frames=17,
+            **bucket_config,  # type: ignore[arg-type]
+        )
+    )
+    vae = _RecordingVae()
+    monkeypatch.setattr(
+        cache_module, "_load_video_media", lambda path, max_frames: source.clone()
+    )
+    monkeypatch.setattr(
+        cache_module.Magi2PreviewNativeCacheEncoder, "_load_vae", lambda self: vae
+    )
+    return encoder, vae
+
+
+def _synthetic_clip(frames: int, height: int, width: int) -> torch.Tensor:
+    """A [C, T, H, W] byte-range clip whose content varies across every axis."""
+    torch.manual_seed(3)
+    return torch.randint(0, 256, (3, frames, height, width)).float()
+
+
+def test_magi2_cache_encoding_lands_on_the_configured_resolution_bucket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A clip wider than its bucket is resized to the bucket, not cached native.
+
+    Caching at source resolution is what silently inflates the token count: a
+    2.4:1 source against a 1:2 bucket carries several times the sequence length
+    the training geometry declares, and the mismatch only surfaces as an
+    attention allocation far downstream.
+    """
+    from mirai.core.dataset.media.media_resize import resize_crop_tensor
+
+    source = _synthetic_clip(frames=17, height=80, width=192)
+    encoder, vae = _magi2_cache_encoder(
+        monkeypatch,
+        source,
+        enable_bucketing=True,
+        resolution_buckets=[(32, 64)],
+        frame_buckets=[17],
+    )
+
+    latent, bucket = encoder.encode_latent(tmp_path / "clip.mp4")
+
+    # The VAE saw the bucket, not the source.
+    assert vae.seen == [(1, 3, 17, 32, 64)]
+    assert tuple(latent.shape) == (48, 3, 2, 4)
+    # Lineage records the bucket the sample was actually encoded at.
+    assert (bucket.bucket_h, bucket.bucket_w, bucket.bucket_frames) == (32, 64, 17)
+    assert bucket.bucket_id == "32x64x17"
+
+    # The mismatched aspect follows the shared convention exactly: cover-scale on
+    # the shorter side, then center-crop. Anything else (a stretch, or a corner
+    # crop) would change the framing the dataset layer already assumes.
+    expected = resize_crop_tensor(source, 32, 64, mode="resize_crop")
+    prepared, _bucket = encoder._prepare_video_for_vae(tmp_path / "clip.mp4")
+    torch.testing.assert_close(prepared, expected)
+
+
+def test_magi2_cache_without_buckets_keeps_the_source_on_the_latent_grid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """With no configured bucket the clip is only cropped onto the patch grid."""
+    source = _synthetic_clip(frames=17, height=70, width=100)
+    encoder, vae = _magi2_cache_encoder(monkeypatch, source)
+
+    _latent, bucket = encoder.encode_latent(tmp_path / "clip.mp4")
+
+    assert vae.seen == [(1, 3, 17, 64, 96)]
+    assert (bucket.bucket_h, bucket.bucket_w) == (64, 96)
+
+
+def test_magi2_cache_rejects_a_bucket_off_the_latent_spatial_grid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A bucket the latent grid cannot express fails instead of being encoded."""
+    from mirai.core.models.magi2_preview.cache import MAGI2_SPATIAL_STRIDE
+
+    assert (
+        MAGI2_SPATIAL_STRIDE
+        == _bare_pipeline().get_video_latent_layout().spatial_downsample
+    )
+
+    source = _synthetic_clip(frames=17, height=80, width=192)
+    encoder, vae = _magi2_cache_encoder(
+        monkeypatch,
+        source,
+        enable_bucketing=True,
+        resolution_buckets=[(40, 72)],
+        frame_buckets=[17],
+    )
+    with pytest.raises(ValueError, match="multiple of 16"):
+        encoder.encode_latent(tmp_path / "clip.mp4")
+    assert vae.seen == []
+
+
 def test_magi2_cache_loop_produces_records_without_clip_conditioning(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:

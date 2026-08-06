@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mirai.config.schema import (
     MemoryConfig,
@@ -144,6 +146,219 @@ class BlockSwapManagerTests(unittest.TestCase):
         current = torch.cuda.current_stream(device)
         self.assertTrue(any(stream == current for stream in recorded))
         mgr.finish_backward()
+
+    @unittest.skipIf(
+        torch is None or not torch.cuda.is_available(), "CUDA not available"
+    )
+    def test_async_full_swap_matches_the_resident_reference(self) -> None:
+        """Every block swapped, checkpointed, driven by module hooks.
+
+        With no block held resident the first block is swapped, and its inputs
+        carry no gradient, so its full backward hook releases it before its
+        forward is recomputed. Async prefetch must still hand device weights to
+        that recompute and reproduce the resident gradients exactly.
+        """
+
+        import torch.utils.checkpoint as checkpoint
+
+        class Layer(torch.nn.Module):
+            def __init__(self, width: int) -> None:
+                super().__init__()
+                self.frozen = torch.nn.Parameter(torch.randn(width, width) * 0.05)
+                self.frozen.requires_grad_(False)
+                self.adapter = torch.nn.Linear(width, width, bias=False)
+
+            def forward(self, value):
+                return torch.tanh(self.adapter(torch.matmul(value, self.frozen)))
+
+        class Stack(torch.nn.Module):
+            def __init__(self, width: int, depth: int) -> None:
+                super().__init__()
+                self.layers = torch.nn.ModuleList(
+                    [Layer(width) for _ in range(depth)]
+                )
+
+            def forward(self, value):
+                for layer in self.layers:
+                    value = checkpoint.checkpoint(
+                        lambda item, owner=layer: owner(item),
+                        value,
+                        use_reentrant=False,
+                    )
+                return value
+
+        device = torch.device("cuda")
+        width, depth = 64, 4
+        torch.manual_seed(5)
+        inputs = [torch.randn(16, width, device=device) for _ in range(2)]
+
+        torch.manual_seed(3)
+        reference = Stack(width, depth).to(device)
+        for value in inputs:
+            reference(value).square().mean().backward()
+        expected = [
+            parameter.grad.detach().clone()
+            for parameter in reference.parameters()
+            if parameter.requires_grad
+        ]
+
+        torch.manual_seed(3)
+        actual = Stack(width, depth)
+        for parameter in actual.parameters():
+            if parameter.requires_grad:
+                parameter.data = parameter.data.to(device)
+        manager = BlockSwapManager(
+            total_blocks=depth, blocks_to_swap=depth, mode="async"
+        )
+        units = list(enumerate(actual.layers))
+        manager.bind(units, device=device)
+        for index, layer in units:
+            layer.register_forward_pre_hook(
+                lambda _module, _args, idx=index: manager.before_block(idx)
+            )
+            layer.register_forward_hook(
+                lambda _module, _args, output, idx=index: (
+                    manager.after_block(idx),
+                    output,
+                )[1]
+            )
+        for value in inputs:
+            actual(value).square().mean().backward()
+            manager.finish_backward()
+        observed = [
+            parameter.grad.detach().clone()
+            for parameter in actual.parameters()
+            if parameter.requires_grad
+        ]
+        for observed_grad, expected_grad in zip(observed, expected, strict=True):
+            torch.testing.assert_close(observed_grad, expected_grad)
+
+
+class _RecordingStream:
+    """Consumer stream stub that records the ordering primitives issued on it."""
+
+    def __init__(self, log: list[str]) -> None:
+        self._log = log
+
+    def wait_event(self, event: object) -> None:
+        self._log.append(f"wait_event:{event}")
+
+
+class _StubUnit:
+    """Residency unit stub with observable host/device transitions."""
+
+    def __init__(self, index: int, log: list[str]) -> None:
+        self.index = index
+        self._log = log
+        self._resident = False
+        self.bytes = 0
+        self.backing_store_bytes = 0
+
+    @property
+    def device(self) -> str:
+        return "cuda" if self._resident else "cpu"
+
+    def load(self, device: object, *, stream: object | None = None) -> object | None:
+        self._resident = True
+        if stream is None:
+            self._log.append(f"sync_load:{self.index}")
+            return None
+        self._log.append(f"async_load:{self.index}")
+        return f"event{self.index}"
+
+    def record_stream(self, stream: object) -> None:
+        self._log.append(f"record_stream:{self.index}")
+
+    def offload(self) -> None:
+        self._resident = False
+        self._log.append(f"offload:{self.index}")
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class AsyncBlockSwapOrderingTests(unittest.TestCase):
+    """Async prefetch must prove residency, never assume it.
+
+    A pending transfer event is evidence that a copy was *issued*. It stops
+    being evidence of residency as soon as the block is offloaded, which can
+    happen before the block's forward: a module whose inputs do not require
+    gradients has its full backward hook invoked when gradients with respect to
+    its outputs exist, i.e. before its checkpointed forward is recomputed.
+    """
+
+    def _manager(self, log: list[str]) -> tuple[object, dict[int, _StubUnit]]:
+        manager = BlockSwapManager(total_blocks=3, blocks_to_swap=3, mode="async")
+        # A device that reports type "cuda" drives the async branch without
+        # creating a CUDA context.
+        manager._device = types.SimpleNamespace(type="cuda")
+        manager._transfer_stream = object()
+        units = {idx: _StubUnit(idx, log) for idx in range(3)}
+        manager._units = dict(units)
+        return manager, units
+
+    def test_consumer_stream_waits_on_the_prefetch_before_the_block_runs(self) -> None:
+        log: list[str] = []
+        manager, _ = self._manager(log)
+        with mock.patch(
+            "torch.cuda.current_stream", return_value=_RecordingStream(log)
+        ):
+            manager.before_block(0)
+            manager.after_block(0)
+            manager.before_block(1)
+        self.assertEqual(
+            log,
+            [
+                "sync_load:0",
+                "async_load:1",
+                "offload:0",
+                "wait_event:event1",
+                "record_stream:1",
+                "async_load:2",
+            ],
+        )
+
+    def test_offload_between_prefetch_and_forward_forces_a_synchronous_load(
+        self,
+    ) -> None:
+        log: list[str] = []
+        manager, units = self._manager(log)
+        with mock.patch(
+            "torch.cuda.current_stream", return_value=_RecordingStream(log)
+        ):
+            manager.before_block(0)
+            self.assertEqual(units[1].device, "cuda")
+            # Stands in for the full backward hook of a block whose inputs carry
+            # no gradient: it releases the block before its forward is reached.
+            manager._units[1].offload()
+            manager._discard_prefetch_event(1)
+            manager.before_block(1)
+        self.assertEqual(units[1].device, "cuda")
+        self.assertIn("sync_load:1", log)
+        self.assertNotIn("wait_event:event1", log)
+
+    def test_a_released_block_never_leaves_a_consumable_transfer_record(self) -> None:
+        log: list[str] = []
+        manager, _ = self._manager(log)
+        with mock.patch(
+            "torch.cuda.current_stream", return_value=_RecordingStream(log)
+        ):
+            manager.before_block(0)
+            self.assertIn(1, manager._prefetch_events)
+            manager.after_block(1)
+        self.assertNotIn(1, manager._prefetch_events)
+
+    def test_residency_is_restored_even_if_a_stale_record_survives(self) -> None:
+        log: list[str] = []
+        manager, units = self._manager(log)
+        with mock.patch(
+            "torch.cuda.current_stream", return_value=_RecordingStream(log)
+        ):
+            manager.before_block(0)
+            # Release the block without clearing its record, the exact state the
+            # production failure reached.
+            units[1].offload()
+            manager.before_block(1)
+        self.assertEqual(units[1].device, "cuda")
+        self.assertIn("sync_load:1", log)
 
 
 @unittest.skipIf(torch is None, "torch not installed")

@@ -131,15 +131,20 @@ Compute/param dtype ([`base.py`](mirai/core/models/base.py), models/*).
 
 - **Type:** str
 - **Default:** `"auto"`
-- **Allowed / range:** `auto`, `cudnn`, `flash`, `flash3`, `flash4`
+- **Allowed / range:** `auto`, `cudnn`, `flash`, `flash3`, `flash4`, `flex`
 
 Model-agnostic attention kernel policy. `auto` uses PyTorch SDPA for
 dense/masked attention; for packed variable-length attention it selects an
 available FA4→FA3 kernel, then falls back to an exact per-sequence PyTorch SDPA
 reference path. `cudnn` and `flash` force the corresponding PyTorch SDPA
 backend; `flash3` and `flash4` require the official optional packages and
-compatible CUDA capability. Explicit backends accept maskless attention only
-and fail rather than silently falling back.
+compatible CUDA capability. `flex` selects PyTorch FlexAttention, which has a
+backward pass and therefore serves training as well as inference; packed
+variable-length execution builds a document block mask so samples stay
+isolated, and MAGI-2 additionally reproduces its per-head attention sinks on
+that path ([`flex_attention.py`](mirai/core/models/magi2_preview/flex_attention.py)).
+Explicit backends accept maskless attention only and fail rather than silently
+falling back.
 
 ### `provider_module`
 
@@ -2875,7 +2880,7 @@ implement it.
 - **Default:** `"disabled"`
 - **Allowed / range:** `disabled`, `tiered`
 
-Opt-in resolution from `config/defaults/hardware_tiers.toml`. `tiered` matches compute capability and total VRAM, then fills only unset expert chunk, shared device-residency budget, and compatible INT8 expert-cache budget. Explicit positive values win; unknown or unavailable CUDA hardware fails explicitly.
+Opt-in resolution from `config/defaults/hardware_tiers.toml`. `tiered` matches compute capability and total VRAM, then fills only unset expert chunk, shared device-residency budget, and compatible INT8 expert-cache budget. Explicit positive values win; unknown or unavailable CUDA hardware fails explicitly. The shipped table covers compute capability 8.0-10.9; a device outside that range matches no tier and `tiered` fails closed, so a named hardware profile states its memory keys explicitly.
 
 ### `frozen_weight_quantization`
 
@@ -3011,7 +3016,7 @@ CUDA memory fraction cap ([`memory_safety.py`](mirai/core/training/residency/mem
 - **Default:** `0.0`
 - **Allowed / range:** >=0
 
-Minimum system-RAM guard ([`memory_safety.py`](mirai/core/training/residency/memory_safety.py)).
+Floor on **available (free)** host RAM, not a statement of total RAM required. Residency and packed-state paths abort when the free reading falls below this, and the block-swap pinned budget is `min(free_ram - this, max_pinned_host_gib)`. A value near a machine's total RAM aborts on contact. Requires `psutil` when non-zero ([`memory_safety.py`](mirai/core/training/residency/memory_safety.py)).
 
 ### `max_pinned_host_gib`
 

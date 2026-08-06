@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -36,6 +38,31 @@ class OptimizerUpdateResult:
     global_step: int
     optimizer_offload_ops: int
     non_finite_action: str
+
+
+def report_fatal_training_error(exc: BaseException) -> None:
+    """Write the fatal stack to stderr before the run degrades to ``SystemExit``.
+
+    ``SystemExit`` carries a message and an exit code but no frames, so the stack
+    that produced the failure is unreachable once it is raised. It is printed
+    here, with the ``__cause__``/``__context__`` chain, so a failing run is
+    diagnosable from its own output. CUDA allocator state accompanies it when the
+    allocator can still report it; a secondary failure while reading that state
+    must not displace the traceback it annotates.
+    """
+    stream = sys.stderr
+    print("Fatal training error; full traceback follows.", file=stream)
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=stream)
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                print(torch.cuda.memory_summary(abbreviated=True), file=stream)
+        except Exception as summary_error:  # pragma: no cover - allocator state only
+            print(f"CUDA memory summary unavailable: {summary_error!r}", file=stream)
+    try:
+        stream.flush()
+    except Exception:  # pragma: no cover - closed stream
+        pass
 
 
 def _compute_loss_result(trainer: Any, batch: dict[str, Any]) -> TrainingLossResult:
@@ -134,6 +161,7 @@ def accumulate_training_gradients(
                 )
     except RuntimeError as exc:
         if callable(oom_error_predicate) and oom_error_predicate(exc):
+            report_fatal_training_error(exc)
             raise SystemExit(oom_guidance_message(original_error=str(exc))) from exc
         raise
     return GradientAccumulationResult(

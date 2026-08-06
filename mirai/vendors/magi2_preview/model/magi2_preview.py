@@ -2376,7 +2376,22 @@ def flash_attn_with_sink(
     cp_split_sizes: torch.Tensor,
     attn_softcap: float,
     attn_sinks: Optional[torch.Tensor],
+    attention_backend: Optional[object] = None,
 ) -> torch.Tensor:
+    # Mirai edit: a configured attention-execution backend is the selected path
+    # in every grad mode. None keeps the vendored dispatch below, whose FA3
+    # kernel has no backward and therefore yields to the torch reference
+    # whenever autograd is recording.
+    if attention_backend is not None:
+        return attention_backend.execute(
+            q,
+            k,
+            v,
+            cu_seqlens_q=varlen_handler.cu_seqlens_q,
+            cu_seqlens_k=varlen_handler.cu_seqlens_k,
+            softcap=attn_softcap,
+            sink=attn_sinks,
+        )
     if (
         torch.is_grad_enabled()
         or not _HAS_MAGI2_FAST_ATTENTION
@@ -2423,6 +2438,9 @@ class AttentionConfig:
 class Attention(nn.Module):
     def __init__(self, config: AttentionConfig):
         super().__init__()
+        # Optional attention-execution seam injected by the Mirai pipeline;
+        # None keeps the reference FA3/torch dispatch in flash_attn_with_sink.
+        self._mirai_attention_backend = None
         self.config = config
         self.pre_norm = MultiModalityRMSNorm(
             config.hidden_size, eps=1e-6, num_modality=config.num_modality
@@ -2512,6 +2530,7 @@ class Attention(nn.Module):
             cp_split_sizes,
             self.config.attn_softcap,
             self.sinks,
+            self._mirai_attention_backend,
         )
 
         out = modality_dispatcher._permute(out)

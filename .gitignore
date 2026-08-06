@@ -38,3 +38,4 @@ wandb/
 .tmp_test*.lock.epoch
 _tmp_*.py
 temp_*.toml
+.claude/

@@ -1,0 +1,41 @@
+# LingBot Video inference on a 32 GiB device.
+#
+# The NF4-compressed denoiser stays fully resident; nothing is swapped. The
+# text encoder and VAE are the only components that would have to share the
+# device with it, so they are released between phases instead.
+preset = "lingbot_video_inference_bf16"
+
+[model]
+path = "./models/lingbot-video-moe-30b-a3b"
+
+[model.params]
+variant = "lingbot-video-moe-30b-a3b"
+strict_native_assets = true
+
+[inference]
+task = "text_to_video"
+denoising_strength = 1.0
+cfg_mode = "batched"
+prompt_rewriter = "lingbot_json"
+# Sequential component occupancy: each is loaded for its phase and released.
+# Set either to true only if the measured peak leaves room for it.
+keep_text_encoder_resident = false
+keep_vae_resident = false
+
+[memory]
+# The compressed base is what makes a resident denoiser fit this capacity.
+frozen_weight_quantization = "nf4"
+frozen_weight_quantization_strategy = "compressed_weights"
+quantize_experts_on_load = true
+# Experts are reconstructed per call from compressed storage.
+expert_weight_access = "chunked_dequant"
+# Transient dequantization buffer size for a device of at most 32 GiB.
+expert_dequant_chunk_size = 8
+# Fully resident: no block streaming.
+weight_residency_strategy = "disabled"
+# A workstation GPU also drives the desktop; leave allocator headroom.
+cuda_memory_fraction = 0.95
+minimum_system_memory_gib = 8.0
+
+[logging]
+output_dir = "./outputs/lingbot_inference_nf4_32gb"

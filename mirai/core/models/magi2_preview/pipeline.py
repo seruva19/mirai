@@ -242,7 +242,27 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         transformer.load_state_dict(state, strict=True)
         del state
         transformer.train()
+        self._configure_attention_backend(transformer)
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
+
+    def _configure_attention_backend(self, transformer: nn.Module) -> None:
+        """Select the attention execution path declared by ``model.attention_backend``.
+
+        Only ``flex`` has a MAGI-2 implementation, because the family's
+        attention carries per-head sink logits the shared SDPA and
+        FlashAttention backends do not model. Every other value leaves the
+        vendored dispatch in place.
+        """
+        from mirai.core.models.magi2_preview.flex_attention import (
+            attach_flex_attention_backend,
+            resolve_magi2_flex_attention,
+            validate_flex_attention_support,
+        )
+
+        backend = resolve_magi2_flex_attention(self.model_config)
+        if backend is not None:
+            validate_flex_attention_support()
+        attach_flex_attention_backend(transformer, backend)
 
     def get_video_latent_layout(self) -> VideoLatentLayout:
         """Latent geometry of the released MAGI-2 preview VAE pair.
@@ -609,6 +629,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         ) if enabled else None
 
     def place_offloaded_modules(self, *, device: Any, strategy: str) -> None:
+        manager = self._block_swap_manager
+        if (
+            manager is not None
+            and manager.block_swap_backward
+            and str(self._gradient_checkpointing).strip().lower()
+            in MAGI2_GRADIENT_CHECKPOINTING_OFF
+        ):
+            # A swapped block is released when its forward returns, so backward
+            # reaches device weights only where the forward is recomputed.
+            raise ValueError(
+                "MAGI-2 block residency with training.block_swap_backward=true "
+                "requires training.gradient_checkpointing='standard'; without "
+                "recompute the backward pass reads host-resident block weights."
+            )
         layers = [module for _, module in self.get_block_swap_units()]
         move_trainable_tensors(self.transformer, device=device)
         move_tensors_outside_modules(self.transformer, excluded_modules=layers, device=device)

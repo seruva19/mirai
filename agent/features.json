@@ -2481,6 +2481,42 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_flex_attention_training",
+      "kind": "generic",
+      "owner": "mirai/core/models/magi2_preview/flex_attention.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "Magi2FlexAttentionBackend",
+        "flex_varlen_attention_with_sink",
+        "attach_flex_attention_backend"
+      ],
+      "config_keys": [
+        "model.attention_backend"
+      ],
+      "disabled_config": {
+        "model.attention_backend": "auto"
+      },
+      "contract_paths": [
+        "tests/test_magi2_attention_training.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/vendors/magi2_preview/model/magi2_preview.py",
+      "readme_claim": "Trainable MAGI-2 attention",
+      "readme_claims": [],
+      "provenance": "https://pytorch.org/blog/flexattention/; https://github.com/SandAI-org/MAGI-2-preview",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_grouped_moe_execution",
       "kind": "moe_policy",
       "owner": "mirai/core/models/magi2_preview/grouped_moe.py",
@@ -4621,7 +4657,7 @@
       "stateful": true,
       "optimized": false,
       "reference_path": "",
-      "readme_claim": "Train\u2013inference routing agreement evidence",
+      "readme_claim": "Train–inference routing agreement evidence",
       "readme_claims": [],
       "provenance": "https://arxiv.org/abs/2510.11370",
       "promotion_evidence": ""
