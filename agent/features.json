@@ -496,12 +496,15 @@
       "config_keys": [
         "training.blocks_to_swap",
         "training.block_swap_mode",
+        "inference.blocks_to_swap",
+        "inference.block_swap_mode",
         "memory.block_residency_planner",
         "memory.block_residency_priority",
         "memory.weight_residency_strategy"
       ],
       "disabled_config": {
         "training.blocks_to_swap": 0,
+        "inference.blocks_to_swap": 0,
         "memory.weight_residency_strategy": "disabled"
       },
       "contract_paths": [

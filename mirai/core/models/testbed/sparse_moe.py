@@ -30,6 +30,9 @@ from mirai.core.moe.adaptation.balance import resolve_moe_balance_weights
 from mirai.core.moe.routing.layers import SparseMoEFeedForward
 from mirai.core.tensors import is_torch_tensor
 from mirai.core.training.residency.block_swap import BlockSwapManager
+from mirai.core.training.residency.device_placement import WeightResidencyExecutionMode
+from mirai.core.training.residency.tensor_residency import move_tensors_outside_modules
+from mirai.core.training.residency.tensor_residency import move_trainable_tensors
 
 try:
     import torch
@@ -198,6 +201,7 @@ class SparseMoETestPipeline(nn.Module, NativeVideoPipeline):
         self._text_encoder_loaded = False
         self._block_swap_manager: BlockSwapManager | None = None
         self._weight_residency_strategy = "disabled"
+        self._weight_residency_execution_mode = WeightResidencyExecutionMode.TRAINING
         self._block_swap_state: dict[str, Any] = {
             "enabled": False,
             "blocks_to_swap": 0,
@@ -487,8 +491,14 @@ class SparseMoETestPipeline(nn.Module, NativeVideoPipeline):
         block_swap_prefetch_depth: int = 1,
         block_residency_priority: str = "index",
         block_swap_transfer_strategy: str = "per_tensor",
+        execution_mode: WeightResidencyExecutionMode | str = (
+            WeightResidencyExecutionMode.TRAINING
+        ),
     ) -> None:
         _ = offload_dir
+        self._weight_residency_execution_mode = WeightResidencyExecutionMode.coerce(
+            execution_mode
+        )
         resolved = str(strategy).strip().lower() or "disabled"
         block_count = len(self.model.blocks)
         swap_count = max(0, min(int(blocks_to_swap), block_count))
@@ -514,6 +524,9 @@ class SparseMoETestPipeline(nn.Module, NativeVideoPipeline):
             "mode": str(mode).strip().lower(),
             "block_swap_backward": bool(block_swap_backward),
             "weight_residency_strategy": resolved,
+            "weight_residency_execution_mode": (
+                self._weight_residency_execution_mode.value
+            ),
             "events": [],
         }
 
@@ -527,7 +540,35 @@ class SparseMoETestPipeline(nn.Module, NativeVideoPipeline):
             state.update(manager.snapshot())
             state["enabled"] = True
             state["weight_residency_strategy"] = self._weight_residency_strategy
+            state["weight_residency_execution_mode"] = (
+                self._weight_residency_execution_mode.value
+            )
         return state
+
+    def place_offloaded_modules(self, *, device: Any, strategy: str) -> None:
+        """Bind the residency manager to this model's blocks.
+
+        Placement never changes the compute graph: the same weights reach the
+        same kernels, only their residence between blocks differs.
+        """
+
+        resolved = str(strategy or "disabled").strip().lower()
+        manager = self._block_swap_manager
+        if resolved in {"", "none", "off", "disabled"} or manager is None:
+            self.model.to(device=device)
+            return
+        if (
+            self._weight_residency_execution_mode
+            is WeightResidencyExecutionMode.INFERENCE
+            and bool(self.model.training)
+        ):
+            raise RuntimeError(
+                "Inference-mode block residency requires the denoiser in eval()."
+            )
+        blocks = [module for _, module in self.get_block_swap_units()]
+        move_trainable_tensors(self.model, device=device)
+        move_tensors_outside_modules(self.model, excluded_modules=blocks, device=device)
+        manager.bind(self.get_block_swap_units(), device=device)
 
     def flush_runtime_offloads(self) -> None:
         if self._block_swap_manager is not None:

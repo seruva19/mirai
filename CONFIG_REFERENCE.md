@@ -1034,6 +1034,22 @@ Keeps native VAE weights on their compute device across repeated `InferenceSessi
 
 `>= 1`. Cache entries held per MoE layer. Sequential classifier-free guidance visits each layer twice per timestep along two unrelated trajectories, so the default of `2` keeps them in separate entries; `1` halves cache residency and makes those visits evict each other ([`expert_feature_cache.py`](mirai/core/moe/runtime/expert_feature_cache.py)).
 
+### `blocks_to_swap`
+
+- **Type:** int
+- **Default:** `0`
+- **Allowed / range:** `>= 0`
+
+Denoiser blocks streamed from host RAM during sampling, clamped to the block count. `0` keeps the denoiser fully resident and leaves the residency owner unarmed, so an existing config is unaffected. Above `0` it is the inference-entrypoint opt-in to the same `BlockSwapManager` that serves training, armed in inference mode: the adapter and `training.gradient_checkpointing` preconditions of the training path do not apply, because a sampling forward builds no autograd graph that could read an evicted block. Requires `memory.weight_residency_strategy='block_swap'` or `'stream_disk'` for transport, and rejects `memory.block_residency_planner='phase_aware'`, whose forward-to-backward pins have no backward to serve. Unlike the training key, it works with uncompressed `memory.frozen_weight_quantization='none'` weights. `training.blocks_to_swap` governs the training entrypoint only and is ignored here. Placement never changes the compute graph, so a swapped run samples the same result as the resident one ([`device_placement.py`](mirai/core/training/residency/device_placement.py), [`block_swap.py`](mirai/core/training/residency/block_swap.py), [`session.py`](mirai/core/inference/session.py)).
+
+### `block_swap_mode`
+
+- **Type:** str
+- **Default:** `"sync"`
+- **Allowed / range:** `sync`, `async`
+
+Transfer scheduling for `inference.blocks_to_swap`. `sync` copies each block in on the compute stream immediately before its forward; `async` issues `memory.block_swap_prefetch_depth` blocks ahead on a dedicated transfer stream so a copy overlaps the preceding block's compute, at the cost of holding the in-flight blocks on the device. Inert while `inference.blocks_to_swap = 0` ([`block_swap.py`](mirai/core/training/residency/block_swap.py)).
+
 ## `[training]` — TrainingSection
 
 ### `seed`

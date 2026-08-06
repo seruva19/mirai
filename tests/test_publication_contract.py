@@ -421,9 +421,24 @@ class PublicationContractTests(unittest.TestCase):
                     f"{path.relative_to(ROOT)} selects dequantized expert access for full-precision weights",
                 )
                 self.assertEqual(config.memory.expert_dequant_chunk_size, 0)
-                self.assertEqual(config.memory.weight_residency_strategy, "disabled")
+                # Training-entrypoint block residency requires a compressed
+                # base, so an uncompressed example never carries it. Streaming
+                # uncompressed weights is an inference-only capability, and the
+                # inference opt-in is the only thing that may turn a residency
+                # strategy on here.
                 self.assertEqual(config.training.block_swap_mode, "sync")
                 self.assertEqual(config.training.blocks_to_swap, 0)
+                if config.inference.blocks_to_swap > 0:
+                    self.assertIn(
+                        config.memory.weight_residency_strategy,
+                        {"block_swap", "stream_disk"},
+                        f"{path.relative_to(ROOT)} sets inference.blocks_to_swap "
+                        "without a transport",
+                    )
+                else:
+                    self.assertEqual(
+                        config.memory.weight_residency_strategy, "disabled"
+                    )
 
 if __name__ == "__main__":
     unittest.main()

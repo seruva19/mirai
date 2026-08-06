@@ -39,6 +39,7 @@ from mirai.core.training.runtime.cli import (
     load_runtime_config,
 )
 from mirai.core.training.residency.device_placement import (
+    configure_inference_weight_residency,
     place_pipeline_on_device,
     resolve_compute_device,
     resolve_compute_dtype,
@@ -298,8 +299,20 @@ class InferenceSession:
         inference_mode = resolve_inference_mode(trainer.pipeline)
         compute_device = _device_fn()
         compute_dtype = _dtype_fn(cfg)
-        residency_strategy = str(
-            getattr(trainer, "weight_residency_strategy", "disabled")
+        # Weight residency is a property of the run, not of the trainer that
+        # built the pipeline: the trainer resolves it from the training keys,
+        # which an inference config leaves at their defaults. Opting in through
+        # inference.blocks_to_swap re-arms the same residency owner for a
+        # no-grad forward; without the opt-in nothing is reconfigured and the
+        # trainer-resolved strategy stands.
+        inference_residency_strategy = configure_inference_weight_residency(
+            trainer.pipeline,
+            config=cfg,
+        )
+        residency_strategy = (
+            inference_residency_strategy
+            if inference_residency_strategy is not None
+            else str(getattr(trainer, "weight_residency_strategy", "disabled"))
         )
         if place_on_device:
             # Same placement contract as training: without it the denoiser
@@ -538,6 +551,11 @@ class InferenceSession:
         decode_latent_path = str(decode_latent or "").strip()
         if not decode_latent_path:
             self._ensure_base_placement()
+            if self._residency_strategy not in {"", "disabled"}:
+                # A swapped run has no training step boundary, so the residency
+                # owner would otherwise carry one run's transfer log into the
+                # next call of a batched session.
+                self.pipeline.flush_runtime_offloads()
         from mirai.core.inference.conditioning import (
             TEXT_TO_IMAGE,
             TEXT_TO_VIDEO,

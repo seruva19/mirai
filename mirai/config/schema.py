@@ -344,6 +344,10 @@ class InferenceConfig:
     expert_feature_cache_drift_threshold: float = 0.05
     expert_feature_cache_max_reuse_span: int = 2
     expert_feature_cache_slots: int = 2
+    # Inference-entrypoint frozen-weight block residency. 0 keeps the denoiser
+    # fully resident; above 0 it requires memory.weight_residency_strategy.
+    blocks_to_swap: int = 0
+    block_swap_mode: str = "sync"
 
 
 @dataclass
@@ -727,8 +731,42 @@ class TrainingConfig:
                 "expert_feature_cache_drift_threshold",
                 "expert_feature_cache_max_reuse_span",
                 "expert_feature_cache_slots",
+                "blocks_to_swap",
+                "block_swap_mode",
             },
         )
+        inference_blocks_to_swap = int(inference_table.get("blocks_to_swap", 0))
+        if inference_blocks_to_swap < 0:
+            raise ConfigError("inference.blocks_to_swap must be >= 0.")
+        inference_block_swap_mode = str(
+            inference_table.get("block_swap_mode", "sync")
+        ).strip().lower()
+        if inference_block_swap_mode not in {"sync", "async"}:
+            raise ConfigError(
+                "inference.block_swap_mode must be 'sync' or 'async'; "
+                f"got '{inference_block_swap_mode}'."
+            )
+        if inference_blocks_to_swap > 0:
+            configured_residency_strategy = (
+                str(
+                    _expect_table("memory", payload.get("memory", {})).get(
+                        "weight_residency_strategy", "disabled"
+                    )
+                )
+                .strip()
+                .lower()
+            )
+            if configured_residency_strategy not in {
+                "",
+                "auto",
+                "block_swap",
+                "stream_disk",
+            }:
+                raise ConfigError(
+                    "inference.blocks_to_swap > 0 requires "
+                    "memory.weight_residency_strategy='block_swap' or "
+                    f"'stream_disk'; got '{configured_residency_strategy}'."
+                )
         from mirai.core.inference.conditioning import normalize_inference_task
 
         try:
@@ -3286,6 +3324,8 @@ class TrainingConfig:
                     expert_feature_cache_policy.max_reuse_span
                 ),
                 expert_feature_cache_slots=expert_feature_cache_policy.slots,
+                blocks_to_swap=inference_blocks_to_swap,
+                block_swap_mode=inference_block_swap_mode,
             ),
             training=training,
             optimizer=optimizer,

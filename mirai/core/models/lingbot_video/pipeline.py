@@ -286,6 +286,7 @@ from mirai.core.moe.adaptation.router_training import RouterAdapterBinding
 from mirai.core.moe.adaptation.router_training import RouterTrainingPolicy
 from mirai.core.moe.artifacts.verification import verify_downloaded_snapshot
 from mirai.core.training.residency.block_swap import BlockSwapManager
+from mirai.core.training.residency.device_placement import WeightResidencyExecutionMode
 from mirai.core.training.residency.device_residency import DeviceResidencyPlanner
 from mirai.core.training.residency.residency_plan import block_scores_from_router_loads
 from mirai.core.training.residency.tensor_residency import cast_trainable_tensors
@@ -1538,6 +1539,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         self._condenser_alpha = 1.0
         self._condenser_init = "kaiming"
         self._weight_residency_strategy = "disabled"
+        self._weight_residency_execution_mode = WeightResidencyExecutionMode.TRAINING
         self._trainable_parameter_offload = False
         self._optimizer_compute_device = torch.device("cpu")
         self._block_swap_manager: BlockSwapManager | None = None
@@ -4753,7 +4755,11 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         block_swap_prefetch_depth: int = 1,
         block_residency_priority: str = "index",
         block_swap_transfer_strategy: str = "per_tensor",
+        execution_mode: WeightResidencyExecutionMode | str = (
+            WeightResidencyExecutionMode.TRAINING
+        ),
     ) -> None:
+        phase = WeightResidencyExecutionMode.coerce(execution_mode)
         resolved = str(strategy or "disabled").strip().lower()
         if resolved in {"", "none", "off"}:
             resolved = "disabled"
@@ -4776,14 +4782,23 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             requested_swap_count = block_count
         swap_count = max(0, min(requested_swap_count, block_count))
         enabled = resolved != "disabled" and swap_count > 0
-        if enabled and self._lora_report is None:
-            raise ValueError("LingBot-Video H2D residency requires a configured LoRA adapter.")
-        if enabled and self._gradient_checkpointing in {"off", "false", "none", "0", ""}:
-            raise ValueError(
-                "LingBot-Video H2D residency requires training.gradient_checkpointing "
-                "to be standard or aggressive."
-            )
+        # Both preconditions below exist because a training forward feeds a
+        # backward: the adapter is what keeps the streamed base frozen, and
+        # recompute is what re-materializes an evicted block's weights before
+        # backward reads them. An inference forward has neither, so neither
+        # precondition describes it.
+        if enabled and phase is WeightResidencyExecutionMode.TRAINING:
+            if self._lora_report is None:
+                raise ValueError(
+                    "LingBot-Video H2D residency requires a configured LoRA adapter."
+                )
+            if self._gradient_checkpointing in {"off", "false", "none", "0", ""}:
+                raise ValueError(
+                    "LingBot-Video H2D residency requires training.gradient_checkpointing "
+                    "to be standard or aggressive."
+                )
         self._weight_residency_strategy = resolved
+        self._weight_residency_execution_mode = phase
         self._block_swap_manager = (
             BlockSwapManager(
                 total_blocks=block_count,
@@ -4812,6 +4827,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             "mode": str(mode).strip().lower(),
             "block_swap_backward": bool(block_swap_backward),
             "weight_residency_strategy": resolved,
+            "weight_residency_execution_mode": phase.value,
             "h2d_only_frozen_base": enabled,
             "block_swap_transfer_strategy": str(
                 block_swap_transfer_strategy
@@ -4854,6 +4870,9 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             state.update(manager.snapshot())
             state["enabled"] = True
             state["weight_residency_strategy"] = self._weight_residency_strategy
+            state["weight_residency_execution_mode"] = (
+                self._weight_residency_execution_mode.value
+            )
             state["h2d_only_frozen_base"] = True
         return state
 
@@ -4869,16 +4888,37 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             raise ValueError(
                 "LingBot-Video offloaded placement supports block_swap or stream_disk."
             )
-        if self._lora_report is None:
-            raise ValueError("LingBot-Video offloaded placement requires LoRA.")
-        if not self.has_quantized_frozen_weights():
-            raise ValueError(
-                "LingBot-Video H2D residency requires "
-                "a compressed_weights frozen-weight quantization format."
-            )
+        inference_phase = (
+            self._weight_residency_execution_mode
+            is WeightResidencyExecutionMode.INFERENCE
+        )
+        if inference_phase:
+            # The whole relaxation rests on there being no autograd graph. A
+            # module left in training mode would build one, and the block this
+            # manager evicts after its forward would then be read again during
+            # backward from host memory.
+            if bool(self.transformer.training):
+                raise RuntimeError(
+                    "Inference-mode LingBot-Video block residency requires the "
+                    "denoiser in eval(); a training-mode forward retains evicted "
+                    "block weights in the autograd graph."
+                )
+        else:
+            if self._lora_report is None:
+                raise ValueError("LingBot-Video offloaded placement requires LoRA.")
+            if not self.has_quantized_frozen_weights():
+                raise ValueError(
+                    "LingBot-Video H2D residency requires "
+                    "a compressed_weights frozen-weight quantization format."
+                )
         manager = self._block_swap_manager
         if manager is None:
-            raise RuntimeError("Lingbot block residency manager is not configured.")
+            raise RuntimeError(
+                "LingBot-Video block residency manager is not configured: "
+                f"weight residency strategy '{resolved}' was requested but "
+                "no block count was resolved (training.blocks_to_swap for a "
+                "training run, inference.blocks_to_swap for an inference run)."
+            )
         blocks = list(self.transformer.blocks)
         self._optimizer_compute_device = torch.device(device)
         if self._trainable_parameter_offload:

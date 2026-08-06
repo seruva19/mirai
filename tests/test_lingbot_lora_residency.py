@@ -29,6 +29,9 @@ from mirai.core.models.adapters.lora import (
 )
 from mirai.core.models.adapters.lora_adaptive_rank import allocate_adaptive_ranks
 from mirai.core.models.adapters.lora_adaptive_rank import save_adaptive_rank_plan
+from mirai.core.training.residency.device_placement import (
+    WeightResidencyExecutionMode,
+)
 from mirai.core.training.calibration.gora import maybe_initialize_gora
 from mirai.core.training.calibration.esft import maybe_initialize_esft
 from mirai.core.training.adapters import normalize_adapter_state
@@ -1679,6 +1682,52 @@ class LingBotLoRAResidencyTests(unittest.TestCase):
             trainer.pipeline.place_offloaded_modules(
                 device=torch.device("cpu"),
                 strategy="block_swap",
+            )
+
+    def _adapter_free_pipeline(self) -> LingBotVideoPipeline:
+        """A denoiser built the way an inference run needs it: no adapter."""
+
+        pipeline = LingBotVideoPipeline(self._config().model)
+        self.assertIsNone(pipeline._lora_report)
+        self.assertFalse(pipeline.has_quantized_frozen_weights())
+        return pipeline
+
+    def test_inference_residency_needs_no_adapter_or_recompute(self) -> None:
+        pipeline = self._adapter_free_pipeline()
+        pipeline.set_weight_residency_strategy(
+            strategy="block_swap",
+            blocks_to_swap=1,
+            mode="sync",
+            execution_mode=WeightResidencyExecutionMode.INFERENCE,
+        )
+        state = pipeline.get_block_swap_state()
+        self.assertTrue(state["enabled"])
+        self.assertEqual(state["weight_residency_execution_mode"], "inference")
+
+    def test_inference_residency_places_uncompressed_bf16_weights(self) -> None:
+        pipeline = self._adapter_free_pipeline()
+        pipeline.eval()
+        pipeline.set_weight_residency_strategy(
+            strategy="block_swap",
+            blocks_to_swap=1,
+            mode="sync",
+            execution_mode=WeightResidencyExecutionMode.INFERENCE,
+        )
+        pipeline.place_offloaded_modules(
+            device=torch.device("cpu"),
+            strategy="block_swap",
+        )
+        state = pipeline.get_block_swap_state()
+        self.assertTrue(state["enabled"])
+        self.assertGreater(state["offloaded_bytes"], 0)
+
+    def test_training_residency_still_requires_an_adapter(self) -> None:
+        pipeline = self._adapter_free_pipeline()
+        with self.assertRaisesRegex(ValueError, "LoRA adapter"):
+            pipeline.set_weight_residency_strategy(
+                strategy="block_swap",
+                blocks_to_swap=1,
+                mode="sync",
             )
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA required")

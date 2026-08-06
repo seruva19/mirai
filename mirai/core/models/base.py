@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     from mirai.core.moe.routing.saliency import SharpMoESpec
     from mirai.core.moe.routing.selective_sinkhorn import SelectiveSinkhornController
     from mirai.core.moe.runtime.token_chunking import MoETokenChunkPolicy
+    from mirai.core.training.residency.device_placement import (
+        WeightResidencyExecutionMode,
+    )
     from mirai.core.training.policies.dispersive_loss import DispersiveLossController
     from mirai.core.training.runtime.compilation import (
         CompilationRegion,
@@ -597,7 +600,11 @@ class BasePipeline(ABC):
             )
 
     def place_offloaded_modules(self, *, device: Any, strategy: str) -> None:
-        """Place modules for an offloaded training residency strategy."""
+        """Place modules for an offloaded residency strategy.
+
+        The execution phase is not an argument here: it is established once by
+        ``set_weight_residency_strategy`` and owned by the implementation.
+        """
         _ = device, strategy
 
     def set_weight_residency_strategy(
@@ -612,8 +619,14 @@ class BasePipeline(ABC):
         block_swap_prefetch_depth: int = 1,
         block_residency_priority: str = "index",
         block_swap_transfer_strategy: str = "per_tensor",
+        execution_mode: "WeightResidencyExecutionMode | str" = "training",
     ) -> None:
-        """Configure frozen-weight residency behavior for training."""
+        """Configure frozen-weight residency behavior.
+
+        ``execution_mode`` selects which preconditions apply. It defaults to
+        ``"training"``, so an implementation that ignores it keeps its existing
+        training contract.
+        """
 
     def flush_runtime_offloads(self) -> None:
         """Flush runtime swap/offload state at safe boundaries."""

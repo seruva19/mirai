@@ -296,6 +296,25 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
         "training.gradient_checkpointing must be one of: off, standard, selective, aggressive.",
     )
     _check(int(config.training.blocks_to_swap) >= 0, "training.blocks_to_swap must be >= 0.")
+    _check(int(config.inference.blocks_to_swap) >= 0, "inference.blocks_to_swap must be >= 0.")
+    _check(
+        str(config.inference.block_swap_mode).strip().lower() in ALLOWED_BLOCK_SWAP_MODES,
+        "inference.block_swap_mode must be one of: sync, async.",
+    )
+    _check(
+        int(config.inference.blocks_to_swap) == 0
+        or str(config.memory.weight_residency_strategy).strip().lower()
+        in {"", "auto", "block_swap", "stream_disk"},
+        "inference.blocks_to_swap > 0 requires "
+        "memory.weight_residency_strategy='block_swap' or 'stream_disk'.",
+    )
+    _check(
+        int(config.inference.blocks_to_swap) == 0
+        or str(config.memory.block_residency_planner).strip().lower()
+        in {"", "uniform", "none", "off"},
+        "memory.block_residency_planner='phase_aware' is a training-phase policy "
+        "and cannot be combined with inference.blocks_to_swap.",
+    )
     _check(
         str(config.training.block_swap_mode).strip().lower() in ALLOWED_BLOCK_SWAP_MODES,
         "training.block_swap_mode must be one of: sync, async.",

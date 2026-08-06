@@ -1,0 +1,48 @@
+# LingBot Video inference with BF16 weights on a device that cannot hold them.
+#
+# The denoiser keeps its uncompressed BF16 weights, so the sampled result is the
+# one `inference_bf16.toml` produces; only where the block weights live between
+# their forwards differs. Blocks beyond the resident set are staged in host RAM
+# and copied in for their own forward, which trades PCIe bandwidth per denoise
+# step for device capacity.
+#
+# The host must be able to hold the streamed blocks: the BF16 denoiser is the
+# full base-model size in RAM, not on the card.
+preset = "lingbot_video_inference_bf16"
+
+[model]
+path = "./models/lingbot-video-moe-30b-a3b"
+
+[model.params]
+variant = "lingbot-video-moe-30b-a3b"
+strict_native_assets = true
+
+[inference]
+task = "text_to_video"
+denoising_strength = 1.0
+cfg_mode = "batched"
+prompt_rewriter = "lingbot_json"
+# Sequential component occupancy: the streamed denoiser wants the whole card.
+keep_text_encoder_resident = false
+keep_vae_resident = false
+# Number of transformer blocks streamed from host RAM. Raise it until the
+# measured peak fits the device; every streamed block is one that no longer
+# occupies VRAM and one more host-to-device transfer per denoise step.
+blocks_to_swap = 40
+# Overlap the next block's transfer with the current block's compute.
+block_swap_mode = "async"
+
+[memory]
+# Uncompressed base weights: this config trades bandwidth, not precision.
+frozen_weight_quantization = "none"
+frozen_weight_quantization_strategy = "disabled"
+# Host-to-device block streaming; the transport for inference.blocks_to_swap.
+weight_residency_strategy = "block_swap"
+# One block in flight ahead of the one being computed.
+block_swap_prefetch_depth = 1
+# A workstation GPU also drives the desktop; leave allocator headroom.
+cuda_memory_fraction = 0.95
+minimum_system_memory_gib = 8.0
+
+[logging]
+output_dir = "./outputs/lingbot_inference_bf16_block_swap"

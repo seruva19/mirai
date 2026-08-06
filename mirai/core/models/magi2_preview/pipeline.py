@@ -49,6 +49,7 @@ from mirai.core.moe.runtime.specs import (
     validate_expert_tensor_specs,
 )
 from mirai.core.training.residency.block_swap import BlockSwapManager
+from mirai.core.training.residency.device_placement import WeightResidencyExecutionMode
 from mirai.core.training.residency.tensor_residency import (
     move_tensors_outside_modules,
     move_trainable_tensors,
@@ -241,6 +242,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         if bool(getattr(model_config.params, "moe_routing_health", False)):
             self._enable_routing_collapse_telemetry()
         self._block_swap_manager: BlockSwapManager | None = None
+        self._weight_residency_execution_mode = WeightResidencyExecutionMode.TRAINING
         self._block_hook_handles: list[Any] = []
         self._gradient_checkpointing = "off"
         self._adapter_configured = False
@@ -881,10 +883,21 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         block_swap_prefetch_depth: int = 1,
         block_residency_priority: str = "index",
         block_swap_transfer_strategy: str = "per_tensor",
+        execution_mode: WeightResidencyExecutionMode | str = (
+            WeightResidencyExecutionMode.TRAINING
+        ),
     ) -> None:
+        phase = WeightResidencyExecutionMode.coerce(execution_mode)
+        self._weight_residency_execution_mode = phase
         resolved = str(strategy).strip().lower()
         enabled = resolved != "disabled" and int(blocks_to_swap) > 0
-        if enabled and not self._adapter_configured:
+        # The adapter is what keeps the streamed base frozen under a training
+        # backward; an inference forward has no backward to protect.
+        if (
+            enabled
+            and phase is WeightResidencyExecutionMode.TRAINING
+            and not self._adapter_configured
+        ):
             raise ValueError("MAGI-2 block residency requires a configured adapter.")
         self._residency_request = Magi2ResidencyRequest(
             enabled=enabled,
@@ -911,8 +924,19 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
     def place_offloaded_modules(self, *, device: Any, strategy: str) -> None:
         manager = self._block_swap_manager
+        inference_phase = (
+            self._weight_residency_execution_mode
+            is WeightResidencyExecutionMode.INFERENCE
+        )
+        if inference_phase and manager is not None and bool(self.transformer.training):
+            raise RuntimeError(
+                "Inference-mode MAGI-2 block residency requires the denoiser in "
+                "eval(); a training-mode forward retains evicted block weights "
+                "in the autograd graph."
+            )
         if (
             manager is not None
+            and not inference_phase
             and manager.block_swap_backward
             and str(self._gradient_checkpointing).strip().lower()
             in MAGI2_GRADIENT_CHECKPOINTING_OFF

@@ -641,5 +641,63 @@ class FamilyGenerationDefaultsTests(unittest.TestCase):
         )
 
 
+@unittest.skipIf(torch is None, "torch not installed")
+class InferenceSessionWeightResidencyTests(unittest.TestCase):
+    """``inference.blocks_to_swap`` reaches the residency owner from the CLI path.
+
+    Block swapping was reachable only from the training entrypoint; these pin
+    that the shipped inference session arms the same owner, and that a config
+    without the opt-in still resolves the fully resident path.
+    """
+
+    _BLOCK_SWAP_CONFIG = (
+        'preset = "sparse_moe_test"\n\n'
+        '[model]\ntype = "sparse_moe_test"\n\n'
+        "[inference]\nblocks_to_swap = 2\nblock_swap_mode = \"async\"\n\n"
+        '[memory]\nweight_residency_strategy = "block_swap"\n'
+    )
+
+    def test_default_inference_config_keeps_the_resident_path(self) -> None:
+        from mirai.core.inference.session import InferenceSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.toml"
+            _write_config(cfg_path)
+            session = InferenceSession.from_config(str(cfg_path))
+            self.assertEqual(session._residency_strategy, "disabled")
+            self.assertIsNone(session.pipeline._block_swap_manager)
+
+    def test_block_swap_config_arms_the_session_residency_owner(self) -> None:
+        from mirai.core.inference.session import InferenceSession
+        from mirai.core.training.residency.block_swap import BlockSwapManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.toml"
+            cfg_path.write_text(self._BLOCK_SWAP_CONFIG, encoding="utf-8")
+            session = InferenceSession.from_config(str(cfg_path))
+            self.assertEqual(session._residency_strategy, "block_swap")
+            self.assertIsInstance(
+                session.pipeline._block_swap_manager, BlockSwapManager
+            )
+            state = session.pipeline.get_block_swap_state()
+            self.assertEqual(state["blocks_to_swap"], 2)
+            self.assertEqual(state["mode"], "async")
+            self.assertEqual(state["weight_residency_execution_mode"], "inference")
+
+    def test_block_swap_without_a_transport_fails_explicitly(self) -> None:
+        from mirai.config.loader import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.toml"
+            cfg_path.write_text(
+                'preset = "sparse_moe_test"\n\n'
+                '[model]\ntype = "sparse_moe_test"\n\n'
+                "[inference]\nblocks_to_swap = 2\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(Exception, "weight_residency_strategy"):
+                load_config(cfg_path)
+
+
 if __name__ == "__main__":
     unittest.main()

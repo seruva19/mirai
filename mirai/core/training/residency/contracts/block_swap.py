@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from mirai.config.schema import (
+    InferenceConfig,
     MemoryConfig,
     ModelConfig,
     ModelParams,
@@ -18,6 +19,11 @@ from mirai.config.schema import (
 )
 from mirai.core.builtins import register_builtin_components
 from mirai.core.training.residency.block_swap import BlockSwapManager
+from mirai.core.training.residency.device_placement import (
+    WeightResidencyExecutionMode,
+    configure_inference_weight_residency,
+    resolve_inference_weight_residency,
+)
 from mirai.core.training.residency.selective_checkpoint import (
     make_selective_checkpoint_context_fn,
 )
@@ -787,6 +793,176 @@ class SelectiveActivationOffloadStagingTests(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertEqual(session.diagnostics()["reserved_bytes"], 0)
         session.close()
+
+
+class InferenceWeightResidencyContractTests(unittest.TestCase):
+    """Inference-entrypoint block residency.
+
+    The inference path reuses the one residency owner; only the preconditions
+    differ, because a sampling forward builds no autograd graph that could read
+    an evicted block.
+    """
+
+    def _config(
+        self,
+        *,
+        inference_blocks_to_swap: int = 0,
+        weight_residency_strategy: str = "disabled",
+        block_residency_planner: str = "uniform",
+        block_swap_mode: str = "sync",
+    ) -> TrainingConfig:
+        return TrainingConfig(
+            model=ModelConfig(
+                type="sparse_moe_test",
+                path="./models/sparse_moe_test",
+                dtype="float32",
+                attention_backend="auto",
+                params=ModelParams(
+                    variant="tiny-video",
+                    flow_shift=3.0,
+                    vae_chunk_size=16,
+                    num_layers=4,
+                ),
+            ),
+            strategy=StrategyConfig(type="text_to_video", params={}),
+            inference=InferenceConfig(
+                blocks_to_swap=inference_blocks_to_swap,
+                block_swap_mode=block_swap_mode,
+            ),
+            training=TrainingSection(seed=0, batch_size=2, blocks_to_swap=0),
+            memory=MemoryConfig(
+                weight_residency_strategy=weight_residency_strategy,
+                block_residency_planner=block_residency_planner,
+            ),
+        )
+
+    def test_nonzero_swap_count_requires_a_transport(self) -> None:
+        with self.assertRaisesRegex(ValueError, "weight_residency_strategy"):
+            resolve_inference_weight_residency(
+                self._config(
+                    inference_blocks_to_swap=2,
+                    weight_residency_strategy="disabled",
+                )
+            )
+
+    def test_phase_aware_planner_is_rejected_for_inference(self) -> None:
+        # Phase pins survive the forward->backward turn; an inference run has no
+        # backward, so a pinned block would never be released.
+        with self.assertRaisesRegex(ValueError, "phase_aware"):
+            resolve_inference_weight_residency(
+                self._config(
+                    inference_blocks_to_swap=2,
+                    weight_residency_strategy="block_swap",
+                    block_residency_planner="phase_aware",
+                )
+            )
+
+    def test_default_config_resolves_to_the_resident_path(self) -> None:
+        request = resolve_inference_weight_residency(self._config())
+        self.assertFalse(request.enabled)
+        self.assertEqual(request.strategy, "disabled")
+
+    def test_execution_mode_rejects_an_unknown_phase(self) -> None:
+        with self.assertRaisesRegex(ValueError, "execution mode"):
+            WeightResidencyExecutionMode.coerce("preview")
+
+    @unittest.skipIf(torch is None, "torch not installed")
+    def test_disabled_residency_never_arms_the_owner(self) -> None:
+        register_builtin_components()
+        cfg = self._config()
+        trainer = Trainer(cfg)
+        armed = configure_inference_weight_residency(trainer.pipeline, config=cfg)
+        self.assertIsNone(armed)
+        self.assertIsNone(trainer.pipeline._block_swap_manager)
+        self.assertFalse(trainer.pipeline.get_block_swap_state()["enabled"])
+
+    @unittest.skipIf(torch is None, "torch not installed")
+    def test_inference_config_arms_the_shared_residency_owner(self) -> None:
+        register_builtin_components()
+        cfg = self._config(
+            inference_blocks_to_swap=2,
+            weight_residency_strategy="block_swap",
+            block_swap_mode="async",
+        )
+        trainer = Trainer(cfg)
+        # The trainer resolves residency from the training keys, which an
+        # inference config leaves at their defaults.
+        self.assertIsNone(trainer.pipeline._block_swap_manager)
+        armed = configure_inference_weight_residency(trainer.pipeline, config=cfg)
+        self.assertEqual(armed, "block_swap")
+        self.assertIsInstance(trainer.pipeline._block_swap_manager, BlockSwapManager)
+        state = trainer.pipeline.get_block_swap_state()
+        self.assertTrue(state["enabled"])
+        self.assertEqual(state["blocks_to_swap"], 2)
+        self.assertEqual(state["mode"], "async")
+        self.assertEqual(state["weight_residency_execution_mode"], "inference")
+
+    @unittest.skipIf(torch is None, "torch not installed")
+    def test_inference_residency_requires_no_adapter_state(self) -> None:
+        register_builtin_components()
+        cfg = self._config(
+            inference_blocks_to_swap=2,
+            weight_residency_strategy="block_swap",
+        )
+        trainer = Trainer(cfg)
+        trainer.pipeline.eval()
+        configure_inference_weight_residency(trainer.pipeline, config=cfg)
+        # Placement must not consult adapter or optimizer state: nothing here
+        # has been trained, loaded, or merged.
+        trainer.pipeline.place_offloaded_modules(
+            device=torch.device("cpu"), strategy="block_swap"
+        )
+        self.assertTrue(trainer.pipeline.get_block_swap_state()["enabled"])
+
+    @unittest.skipIf(torch is None, "torch not installed")
+    def test_inference_placement_rejects_a_training_mode_module(self) -> None:
+        register_builtin_components()
+        cfg = self._config(
+            inference_blocks_to_swap=2,
+            weight_residency_strategy="block_swap",
+        )
+        trainer = Trainer(cfg)
+        configure_inference_weight_residency(trainer.pipeline, config=cfg)
+        trainer.pipeline.train()
+        with self.assertRaisesRegex(RuntimeError, "eval"):
+            trainer.pipeline.place_offloaded_modules(
+                device=torch.device("cpu"), strategy="block_swap"
+            )
+
+    @unittest.skipIf(torch is None, "torch not installed")
+    def test_swapped_inference_forward_matches_the_resident_forward(self) -> None:
+        """Residency moves weights between hosts; it does not change the math."""
+
+        register_builtin_components()
+        generator = torch.Generator().manual_seed(5)
+        latents = torch.randn(2, 4, generator=generator)
+        timesteps = torch.zeros(2)
+        text_embeds = {"prompt_embeds": torch.zeros(2, 4)}
+
+        reference_trainer = Trainer(self._config())
+        reference_trainer.pipeline.eval()
+        with torch.no_grad():
+            reference = reference_trainer.pipeline(latents, timesteps, text_embeds)
+
+        cfg = self._config(
+            inference_blocks_to_swap=3,
+            weight_residency_strategy="block_swap",
+        )
+        swapped_trainer = Trainer(cfg)
+        swapped_trainer.pipeline.load_state_dict(
+            reference_trainer.pipeline.state_dict()
+        )
+        swapped_trainer.pipeline.eval()
+        configure_inference_weight_residency(swapped_trainer.pipeline, config=cfg)
+        swapped_trainer.pipeline.place_offloaded_modules(
+            device=torch.device("cpu"), strategy="block_swap"
+        )
+        with torch.no_grad():
+            actual = swapped_trainer.pipeline(latents, timesteps, text_embeds)
+
+        state = swapped_trainer.pipeline.get_block_swap_state()
+        self.assertTrue(any(event["kind"] == "swap_in" for event in state["events"]))
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

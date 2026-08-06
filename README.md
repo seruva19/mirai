@@ -341,7 +341,8 @@ configuration and compatibility rules are documented in
 - **Aligned expert shards** — Safetensors expert payloads can be aligned for
   bounded direct reads and deterministic shard addressing.
 - **RAM-to-VRAM block swapping** — Transformer blocks move between host and
-  device under an explicit synchronous or overlapped residency policy.
+  device under an explicit synchronous or overlapped residency policy, for
+  training runs and for sampling runs that stream an uncompressed base.
 - **Explicit disk-backed block streaming** — Frozen tensors from non-resident
   transformer blocks are held in atomic safetensors-backed mappings and loaded
   through the same bounded residency schedule; trainable adapter state remains
