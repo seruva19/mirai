@@ -19,7 +19,9 @@ Backends (``MOE_GEMM_BACKENDS``):
                        falls back to the private ``torch._grouped_mm`` when the
                        public name is absent). BF16 CUDA SM80+ jagged-offset
                        contract, plus a 16-byte operand stride precondition
-                       checked by :func:`grouped_mm_stride_violation`.
+                       checked by :func:`grouped_mm_stride_violation` and a
+                       1024-group per-call cap handled by
+                       :func:`run_grouped_mm`.
 * ``deepgemm_fp8``  -- native M-grouped DeepGEMM forward for block-scaled FP8
                        experts (CUDA SM90; optional external dependency).
 
@@ -38,7 +40,7 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional, Sequence
 
 try:
     import torch
@@ -350,6 +352,136 @@ def grouped_mm_stride_violations(
 
 
 # ---------------------------------------------------------------------------
+# Group-count precondition (the op caps the number of groups per call)
+# ---------------------------------------------------------------------------
+
+
+# ``torch grouped_mm`` processes at most this many groups in a single call: the
+# ATen implementation raises ``RuntimeError: Can't process more than 1024
+# groups`` when ``offs`` carries more entries. A packed MoE layer that flattens
+# a second axis onto the group axis (e.g. head * num_experts) exceeds it, so
+# every call site routes through :func:`run_grouped_mm`, which splits the work
+# into contiguous group segments. The limit is a property of the primitive, not
+# of any one consumer, so it lives beside the primitive.
+GROUPED_MM_MAX_GROUPS = 1024
+
+
+@dataclass(frozen=True)
+class GroupedMMSegment:
+    """One contiguous group range and the sorted row range it owns.
+
+    ``group_start``/``group_stop`` index the leading (group) axis of the packed
+    weight; ``row_start``/``row_stop`` index the sorted activation rows. The two
+    agree only because the jagged-offset contract requires rows to be sorted by
+    group, so every group's rows are contiguous and a group range owns one row
+    range.
+    """
+
+    group_start: int
+    group_stop: int
+    row_start: int
+    row_stop: int
+
+    @property
+    def group_count(self) -> int:
+        return self.group_stop - self.group_start
+
+    @property
+    def row_count(self) -> int:
+        return self.row_stop - self.row_start
+
+
+def grouped_mm_segments(
+    boundaries: Sequence[int],
+    *,
+    max_groups: int = GROUPED_MM_MAX_GROUPS,
+) -> tuple[GroupedMMSegment, ...]:
+    """Split cumulative group ``boundaries`` into segments of ``max_groups``.
+
+    ``boundaries[g]`` is the exclusive END row of group ``g`` in the sorted
+    layout, i.e. exactly the ``offs`` tensor grouped_mm receives. A group count
+    at or below the limit yields a single segment covering everything, so the
+    unchunked call stays the fast path. Empty groups (repeated boundary values)
+    are carried unchanged, including across a segment split.
+    """
+    if max_groups < 1:
+        raise ValueError("max_groups must be at least 1.")
+    ends = [int(value) for value in boundaries]
+    previous = 0
+    for index, value in enumerate(ends):
+        if value < previous:
+            raise ValueError(
+                "grouped_mm offsets must be non-decreasing cumulative row ends; "
+                f"entry {index} is {value} after {previous}."
+            )
+        previous = value
+    segments: list[GroupedMMSegment] = []
+    for start in range(0, len(ends), max_groups):
+        stop = min(start + max_groups, len(ends))
+        segments.append(
+            GroupedMMSegment(
+                group_start=start,
+                group_stop=stop,
+                row_start=ends[start - 1] if start > 0 else 0,
+                row_stop=ends[stop - 1],
+            )
+        )
+    return tuple(segments)
+
+
+def run_grouped_mm(
+    op: Callable,
+    lhs,
+    weight,
+    offsets,
+    *,
+    max_groups: int = GROUPED_MM_MAX_GROUPS,
+):
+    """Execute ``op(lhs, weight, offs=offsets)`` within the group-count limit.
+
+    ``weight`` is ``[groups, K, N]`` (a transposed VIEW for the dX role, which
+    slicing along the group axis preserves: per-operand strides do not change,
+    so the 16-byte stride precondition is decided identically for a segment and
+    for the whole call). When the group count fits, ``op`` is called once and
+    nothing is allocated. Otherwise each segment receives its own contiguous row
+    slice of ``lhs``, its own slice of ``weight``, and its offsets rebased to
+    segment-local zero; the segment outputs concatenate back into the original
+    row order.
+    """
+    groups = int(weight.shape[0])
+    if groups <= max_groups:
+        return op(lhs, weight, offs=offsets)
+    boundaries = offsets.detach().to(device="cpu", dtype=torch.int64).tolist()
+    if len(boundaries) != groups:
+        raise ValueError(
+            f"grouped_mm received {len(boundaries)} offsets for {groups} packed "
+            "weight groups; the jagged-offset contract requires one cumulative "
+            "row end per group."
+        )
+    outputs = []
+    for segment in grouped_mm_segments(boundaries, max_groups=max_groups):
+        if segment.row_count == 0:
+            # A segment whose groups are all empty contributes no output rows,
+            # and the op rejects an empty problem.
+            continue
+        outputs.append(
+            op(
+                lhs[segment.row_start : segment.row_stop],
+                weight[segment.group_start : segment.group_stop],
+                offs=(
+                    offsets[segment.group_start : segment.group_stop]
+                    - segment.row_start
+                ).contiguous(),
+            )
+        )
+    if not outputs:
+        return lhs.new_empty((0, int(weight.shape[-1])))
+    if len(outputs) == 1:
+        return outputs[0]
+    return torch.cat(outputs, dim=0)
+
+
+# ---------------------------------------------------------------------------
 # Resolution (per-role config over main config, fail-fast on explicit)
 # ---------------------------------------------------------------------------
 
@@ -450,7 +582,9 @@ def run_grouped_dx(
         op = grouped_mm_op()
         if op is None:
             raise RuntimeError("torch grouped_mm is unavailable for the dX role.")
-        return op(grad_output.contiguous(), weight.contiguous(), offs=offsets)
+        return run_grouped_mm(
+            op, grad_output.contiguous(), weight.contiguous(), offsets
+        )
     if selected == "persistent":
         from mirai.core.models.compressed_weights.execution.persistent import (
             grouped_gemm_expert_slice,

@@ -16,6 +16,11 @@ a multiple of 16 bytes, which for BF16 experts means ``d_head`` and
 decides this before any forward runs: an ``auto`` selection resolves to ``bmm``
 when the layout does not satisfy it, and an explicit ``torch_grouped`` selection
 raises. There is no per-call downgrade.
+
+The flattened ``head * num_experts`` axis makes the group count of a full-size
+variant exceed the primitive's 1024-group per-call cap, so every
+``torch_grouped`` call goes through ``run_grouped_mm``, which splits it into
+contiguous group segments. The ``bmm`` path loops per group and has no cap.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from mirai.core.moe.runtime.gemm import (
     normalize_moe_gemm_role_backend,
     probe_backend,
     run_grouped_dx,
+    run_grouped_mm,
 )
 from mirai.core.moe.runtime.specs import (
     MoEOptimizationPolicy,
@@ -202,7 +208,7 @@ def _grouped_linear(
                 "MAGI-2 grouped MoE requested torch grouped_mm, which this torch "
                 "build does not provide."
             )
-        return op(x_sorted.contiguous(), weight, offs=offsets)
+        return run_grouped_mm(op, x_sorted.contiguous(), weight, offsets)
     result = x_sorted.new_empty((int(x_sorted.shape[0]), int(weight.shape[-1])))
     start = 0
     for group, stop in enumerate(_grouped_boundaries(offsets)):
@@ -231,7 +237,7 @@ def _grouped_linear_dx(
                 "MAGI-2 grouped MoE requested torch grouped_mm for the dX role, "
                 "which this torch build does not provide."
             )
-        return op(grad_output.contiguous(), weight_t, offs=offsets)
+        return run_grouped_mm(op, grad_output.contiguous(), weight_t, offsets)
     return run_grouped_dx(grad_output, weight_t, offsets, backend=backend)
 
 
