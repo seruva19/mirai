@@ -1305,6 +1305,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         seed: int,
         device: str,
         dtype: Any | None,
+        conditioning: Any | None = None,
     ) -> Any:
         from mirai.core.models.magi2_preview.refiner import run_refine
 
@@ -1313,7 +1314,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 "MAGI-2 refinement must be validated before it runs; "
                 "validate_refinement_request() resolves the release profile."
             )
-        _ = request
+        # MAGI-2 declares text_to_video only, so a conditioned request never
+        # reaches this stage; the parameter exists to satisfy the shared contract.
+        _ = request, conditioning
         return run_refine(
             pipeline=self,
             refiner=self._refiner_assets(),

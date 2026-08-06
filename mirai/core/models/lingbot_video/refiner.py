@@ -20,6 +20,16 @@ This module owns two things:
    / ``encode_video_native`` / ``load_refiner`` / ``refiner_forward`` /
    ``release_base_transformer``), never model internals.
 
+Two conditioning rules are specific to this stage and differ from the base pass:
+
+- The refiner conditions on TEXT ONLY. It calls the text-only ``encode_prompt``
+  hook, never ``encode_conditioned_prompt``, so the condition image does not
+  reach the VLM text encoder here.
+- For an image-conditioned task the condition frame is re-encoded at the
+  REFINER's geometry (see :func:`resolve_refiner_conditioning`) and frame 0 is
+  re-pinned to it before the loop, before every forward, and after every solver
+  step. Text-only refines prepare no conditioning and pin nothing.
+
 The pure math (:func:`compute_refiner_sigmas`, :func:`prepare_refiner_latent`,
 :func:`resize_video_bicubic`) mirrors upstream ``lingbot_video/utils.py`` 1:1 and
 is unit-tested on CPU without any real weights.
@@ -53,6 +63,11 @@ LINGBOT_REFINER_DEFAULTS: dict[str, Any] = {
     "height": 1088,
     "width": 1920,
 }
+
+# The tail extends the sigma grid between the last shifted grid point and 0.0.
+# Beyond this the tail dominates the schedule instead of refining it, which is
+# a request error rather than a supported configuration.
+MAX_REFINER_SIGMA_TAIL_STEPS = 64
 
 
 _HF_REFINER_HINT = (
@@ -223,6 +238,67 @@ def build_refiner_solver(scheduler_name: str, sigmas: "torch.Tensor", *, shift: 
     return solver
 
 
+def resolve_refiner_conditioning(
+    pipeline: Any,
+    conditioning: Any | None,
+    *,
+    height: int,
+    width: int,
+    device: str,
+    generator: Any,
+) -> Any | None:
+    """Prepare the frame-0 condition latent at the REFINER's output geometry.
+
+    Returns ``None`` for an unconditioned request, so a text-only refine keeps
+    its previous behaviour exactly. For an image-conditioned request the
+    condition image is re-encoded at ``height``/``width`` — the base pass encoded
+    it at the base geometry, and that latent has the wrong spatial shape for the
+    upscaled tail — and the resulting
+    :class:`~mirai.core.inference.conditioning.PreparedInferenceConditioning`
+    carries the ``pin_condition`` used by the tail loop.
+
+    A source-video request needs no pin: the refiner already starts from the
+    upscaled base result, which is the source-derived state itself.
+    """
+    from mirai.core.inference.conditioning import (
+        IMAGE_TO_VIDEO,
+        InferenceConditioningRequest,
+    )
+
+    if conditioning is None:
+        return None
+    if not isinstance(conditioning, InferenceConditioningRequest):
+        raise TypeError(
+            "LingBot-Video refinement expects an InferenceConditioningRequest, "
+            f"got {type(conditioning).__name__}."
+        )
+    if conditioning.task != IMAGE_TO_VIDEO:
+        return None
+
+    prepare = getattr(pipeline, "prepare_inference_conditioning", None)
+    if not callable(prepare):
+        raise RuntimeError(
+            "Image-conditioned LingBot-Video refinement requires the pipeline's "
+            "prepare_inference_conditioning() hook to re-encode the condition "
+            "frame at the refiner geometry."
+        )
+    request = InferenceConditioningRequest(
+        task=conditioning.task,
+        input_image=conditioning.input_image,
+        denoising_strength=1.0,
+        frame_count=int(conditioning.frame_count),
+        height=int(height),
+        width=int(width),
+    ).validate()
+    prepared = prepare(request, device=str(device), generator=generator)
+    if prepared is None or getattr(prepared, "condition_latent", None) is None:
+        raise RuntimeError(
+            "Image-conditioned LingBot-Video refinement produced no condition "
+            "latent; the refined frame 0 would drift from the input image."
+        )
+    return prepared
+
+
 # --------------------------------------------------------------------------- #
 # Refiner transformer lifecycle (on-demand load / release)
 # --------------------------------------------------------------------------- #
@@ -325,12 +401,20 @@ def run_refine(
     scheduler: str,
     device: str,
     dtype: Any | None = None,
+    conditioning: Any | None = None,
 ) -> "torch.Tensor":
     """Upscale -> re-noise -> tail-denoise a base latent into a refined latent.
 
     Returns the refined latent as ``[C,T,H,W]`` (DiT space) so it flows straight
     into the standard native VAE decode path. Model access is entirely through
     the pipeline's provider hooks.
+
+    ``conditioning`` is the media request that drove the base pass. For an
+    image-conditioned task the condition image is re-encoded at the REFINER's
+    geometry — the base-resolution condition latent has the wrong spatial shape
+    — and frame 0 is pinned to it before the loop, before every forward, and
+    after every solver step, so the conditioned frame cannot drift while the
+    remainder of the clip denoises against it.
 
     The base DiT is released before refiner assets are loaded. This operation
     does not restore it; the owning inference session must restore placement
@@ -377,10 +461,27 @@ def run_refine(
     )
     latents = prepare_refiner_latent(x_up, noise, float(t_thresh))
 
+    # (c) condition pinning: re-encode the condition media at the refiner's own
+    # geometry. Drawn AFTER the re-noise so the unconditioned schedule consumes
+    # exactly the same generator sequence as before.
+    prepared = resolve_refiner_conditioning(
+        pipeline,
+        conditioning,
+        height=int(height),
+        width=int(width),
+        device=str(compute_device),
+        generator=generator,
+    )
+    if prepared is not None:
+        prepared.pin_condition(latents)
+
     # Base DiT was already released above (before the VAE stage).
     try:
         refiner.load(device=str(compute_device), dtype=dtype)
-        # (e) same prompt + negative prompt conditioning as the base pass.
+        # (e) TEXT-ONLY conditioning, by contract. The base pass may feed the
+        # condition image to the VLM text encoder via ``encode_conditioned_prompt``;
+        # the refiner deliberately does not, and re-anchors frame 0 through
+        # ``pin_condition`` instead. ``encode_prompt`` is the text-only hook.
         pipeline.load_text_encoder(device="cpu")
         try:
             context = _as_context_tensor(
@@ -416,6 +517,8 @@ def run_refine(
         )
         with torch.no_grad(), autocast_ctx:
             for sigma in solver.timesteps:
+                if prepared is not None:
+                    prepared.pin_condition(latents)
                 timestep = sigma.reshape(1).to(compute_device)
                 if scale <= 1.0:
                     v_out = pipeline.refiner_forward(latents, timestep, {"t5": context})
@@ -428,6 +531,8 @@ def run_refine(
                 result = solver.step(v_out.squeeze(0), timestep, latents.squeeze(0))
                 prev = result.prev_sample
                 latents = prev.unsqueeze(0) if prev.ndim == 4 else prev
+                if prepared is not None:
+                    prepared.pin_condition(latents)
     finally:
         refiner.release()
     refined = latents.squeeze(0) if latents.ndim == 5 else latents  # [C,T,H,W]
@@ -447,12 +552,33 @@ def resolve_refiner_request(
         value = request.get(key)
         resolved[key] = type(default)(default if value is None else value)
     resolved["scheduler"] = str(request.get("scheduler") or scheduler)
+
+    # Pre-flight range checks: the schedule is built after the base denoise and
+    # after the refiner weights are placed, so an out-of-range value must be
+    # rejected here rather than deep inside the tail loop.
+    t_value = float(resolved["t_thresh"])
+    if not (0.0 < t_value <= 1.0):
+        raise RuntimeError(
+            f"refiner t_thresh must lie in (0, 1], got {t_value}."
+        )
+    tail = int(resolved["sigma_tail_steps"])
+    if not 0 <= tail <= MAX_REFINER_SIGMA_TAIL_STEPS:
+        raise RuntimeError(
+            "refiner sigma_tail_steps must lie in "
+            f"[0, {MAX_REFINER_SIGMA_TAIL_STEPS}], got {tail}."
+        )
+    if int(resolved["steps"]) < 1:
+        raise RuntimeError(
+            f"refiner steps must be >= 1, got {int(resolved['steps'])}."
+        )
     return resolved
 
 
 __all__ = [
     "LINGBOT_REFINER_DEFAULTS",
+    "MAX_REFINER_SIGMA_TAIL_STEPS",
     "LingBotRefiner",
+    "resolve_refiner_conditioning",
     "resolve_refiner_request",
     "build_refiner_solver",
     "compute_refiner_sigmas",

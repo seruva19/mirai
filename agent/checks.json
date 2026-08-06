@@ -397,7 +397,7 @@
         "inference/lingbot_video/"
       ],
       "commands": [
-        "python -m pytest tests/test_sparse_moe_contract.py tests/test_lingbot_native_inference.py tests/test_lingbot_lora_residency.py tests/test_magi2_preview_contract.py tests/test_magi2_attention_training.py tests/test_magi2_refiner_attention.py tests/test_magi2_nf4_experts.py tests/test_grouped_mm_chunking.py tests/test_snapshot_verification.py mirai/core/models/contracts/attention_backends.py mirai/core/models/lingbot_video/contracts/dynamic_flow_shift.py -q",
+        "python -m pytest tests/test_sparse_moe_contract.py tests/test_lingbot_native_inference.py tests/test_lingbot_lora_residency.py tests/test_magi2_preview_contract.py tests/test_magi2_attention_training.py tests/test_magi2_refiner_attention.py tests/test_magi2_nf4_experts.py tests/test_grouped_mm_chunking.py tests/test_snapshot_verification.py mirai/core/models/contracts/attention_backends.py mirai/core/models/lingbot_video/contracts/dynamic_flow_shift.py mirai/core/models/lingbot_video/contracts/refiner_stage.py -q",
         "python mirai/core/models/magi2_preview/contracts/native_train_step.py",
         "python mirai/core/models/magi2_preview/contracts/native_refine_step.py"
       ],

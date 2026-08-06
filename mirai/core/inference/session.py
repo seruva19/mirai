@@ -626,6 +626,7 @@ class InferenceSession:
             self._expert_feature_cache.reset()
 
         ran_denoise_loop = True
+        conditioning = None
         video_written = False
         media_written = False
         media_path: Path | None = None
@@ -699,6 +700,7 @@ class InferenceSession:
                 seed=int(seed),
                 device=str(device),
                 dtype=dtype,
+                conditioning=conditioning,
             )
             if timings is not None:
                 timings["refine_s"] = _sync_perf_counter() - _refine_t0

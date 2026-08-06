@@ -214,7 +214,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Extra low-noise sigmas appended to the tail, for families whose "
-        "refiner extends its sigma grid.",
+        "refiner extends its sigma grid. Out-of-range values are rejected "
+        "before the base denoise runs.",
     )
     p.add_argument(
         "--refiner-scheduler",

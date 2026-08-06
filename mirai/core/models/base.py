@@ -361,9 +361,18 @@ class BasePipeline(ABC):
         seed: int,
         device: str,
         dtype: Any | None,
+        conditioning: Any | None = None,
     ) -> Any:
-        """Run a validated family-owned refinement stage."""
+        """Run a validated family-owned refinement stage.
+
+        ``conditioning`` is the :class:`InferenceConditioningRequest` that drove
+        the base pass, or ``None`` for an unconditioned run. A refiner that
+        re-renders at its own geometry needs the original media request rather
+        than the base-resolution condition latent, so the request is forwarded
+        rather than the prepared tensors.
+        """
         _ = base_latent, request, prompt, negative_prompt, seed, device, dtype
+        _ = conditioning
         raise RuntimeError(
             f"{type(self).__name__} does not support an inference refinement stage."
         )

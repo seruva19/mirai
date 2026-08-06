@@ -2431,7 +2431,8 @@
       "disabled_config": {},
       "contract_paths": [
         "tests/test_sparse_moe_contract.py",
-        "tests/test_lingbot_native_inference.py"
+        "tests/test_lingbot_native_inference.py",
+        "mirai/core/models/lingbot_video/contracts/refiner_stage.py"
       ],
       "default_off": false,
       "stateful": true,

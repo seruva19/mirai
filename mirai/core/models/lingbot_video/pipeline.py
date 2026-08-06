@@ -1982,6 +1982,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         seed: int,
         device: str,
         dtype: Any | None,
+        conditioning: Any | None = None,
     ) -> Any:
         from mirai.core.models.lingbot_video.refiner import run_refine
 
@@ -2002,6 +2003,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             scheduler=str(request["scheduler"]),
             device=str(device),
             dtype=dtype,
+            conditioning=conditioning,
         )
 
     def has_refiner_weights(self) -> bool:
