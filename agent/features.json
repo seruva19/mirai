@@ -1261,6 +1261,46 @@
       "promotion_evidence": ""
     },
     {
+      "name": "expert_branch_feature_cache",
+      "kind": "inference",
+      "owner": "mirai/core/moe/runtime/expert_feature_cache.py",
+      "check": "inference",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "native_execution",
+        "documentation"
+      ],
+      "symbols": [
+        "ExpertFeatureCache",
+        "ExpertFeatureCachePolicy",
+        "CachedExpertExecution",
+        "ExpertFeatureCacheTelemetry"
+      ],
+      "config_keys": [
+        "inference.expert_feature_cache",
+        "inference.expert_feature_cache_drift_threshold",
+        "inference.expert_feature_cache_max_reuse_span",
+        "inference.expert_feature_cache_slots"
+      ],
+      "disabled_config": {
+        "inference.expert_feature_cache": "off"
+      },
+      "contract_paths": [
+        "tests/test_expert_feature_cache.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/models/magi2_preview/grouped_moe.py",
+      "readme_claim": "Expert-branch feature caching",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2606.15615",
+      "promotion_evidence": ""
+    },
+    {
       "name": "expert_choice_capacity_schedule",
       "kind": "moe_policy",
       "owner": "mirai/core/moe/routing/expert_choice.py",
@@ -4700,7 +4740,7 @@
       "stateful": true,
       "optimized": false,
       "reference_path": "",
-      "readme_claim": "Train\u2013inference routing agreement evidence",
+      "readme_claim": "Train–inference routing agreement evidence",
       "readme_claims": [],
       "provenance": "https://arxiv.org/abs/2510.11370",
       "promotion_evidence": ""
@@ -4851,6 +4891,42 @@
       "readme_claim": "Weight-decomposed low-rank adaptation (DoRA)",
       "readme_claims": [],
       "provenance": "https://arxiv.org/abs/2402.09353",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routing_collapse_telemetry",
+      "kind": "monitoring",
+      "owner": "mirai/core/moe/monitoring/collapse.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "RouterLoadSignature",
+        "RoutingCollapseTracker",
+        "selection_load_signatures",
+        "router_expert_counts"
+      ],
+      "config_keys": [
+        "model.params.moe_routing_health"
+      ],
+      "disabled_config": {
+        "model.params.moe_routing_health": false
+      },
+      "contract_paths": [
+        "tests/test_routing_collapse_telemetry.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "MAGI-2 routing-collapse telemetry",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2605.19378",
       "promotion_evidence": ""
     }
   ]

@@ -191,6 +191,11 @@ weight-gradient GEMM no consumer) are accepted only at values that request no
 behavior. Packing the experts adds three consumed keys, listed under
 [NF4 routed experts](#nf4-routed-experts).
 
+The grouped seam is also what exposes each layer's pre-combine expert features,
+so `inference.expert_feature_cache` — cross-timestep expert-branch reuse during
+sampling — requires `memory.moe_kernel_backend = "grouped"`. Its knobs are
+described in [`CONFIG_REFERENCE.md`](../CONFIG_REFERENCE.md).
+
 ## NF4 routed experts
 
 `memory.frozen_weight_quantization = "nf4"` stores the routed expert stack in
@@ -332,11 +337,66 @@ Two target presets are supported:
 | `attn_only` (default) | `.attention.linear_qkv`, `.attention.linear_proj` |
 | `attn_router` | the two attention projections plus `.mlp.moe_mlp.gate` |
 
-`attn_router` trains the router projection itself. Consider this carefully: the
-family declares `emits_router_metrics = false` and carries no balance or
-z-loss objective, so a router-training run produces no routing-health signal
-and no load-balancing pressure. Routing drift is not observable from the
-training loop.
+`attn_router` trains the router projection itself. The family carries no
+balance or z-loss objective, so a router-training run has no load-balancing
+pressure of its own. Routing becomes observable only through the opt-in
+telemetry below, which the family declares by reporting
+`emits_router_metrics = true` when — and only when — that gate is set.
+
+### Routing-collapse telemetry
+
+`model.params.moe_routing_health = true` (default `false`) arms detached
+per-step routing diagnostics for this family
+([`routing_collapse.py`](../mirai/core/models/magi2_preview/routing_collapse.py),
+[`collapse.py`](../mirai/core/moe/monitoring/collapse.py)). MAGI-2's router
+publishes nothing on its own, so the metrics come from a monitoring tap on the
+one seam that sees a completed routing decision: the optional expert-execution
+backend the vendored `CoreMultiHeadMoE` consults. The tap reads the selected
+expert indices under `no_grad` and then delegates execution unchanged — to the
+configured grouped backend when one is attached, otherwise to the same vendored
+path the untapped layer would have taken. No vendored file is modified, the
+forward result is unchanged, and nothing enters the loss graph.
+
+Aggregation is per `(layer, head)`: each of the 36 MoE layers routes 12 heads
+independently, so 432 routing surfaces are summarized, each reduced on device
+to five scalars before anything is read back. Neither the token count nor the
+256-wide expert axis reaches host memory, and cross-step state is a streak
+counter plus a short ring of recent values per surface.
+
+Emitted metrics, per step, in `diagnostics`:
+
+| metric | meaning |
+|---|---|
+| `moe_minority_expert_share` | mean share of routed slots held by each router's least-used expert |
+| `moe_normalized_minority_share` | the same share divided by the uniform share `1/num_experts`; `1.0` is balanced |
+| `moe_dead_expert_fraction` | mean fraction of experts that received no routed slot |
+| `moe_underused_expert_fraction` | mean fraction of experts below the health baseline |
+| `moe_collapsed_router_fraction` / `moe_collapsed_router_count` | routers under the baseline this step |
+| `moe_worst_normalized_minority_share` | the worst router's normalized minority share |
+| `moe_max_collapse_duration` | longest consecutive collapsed run, in steps |
+| `moe_collapse_rebound_count` | routers that crossed back above the baseline after a sustained collapse |
+| `moe_collapse_plateau_fraction` | collapsed routers whose share stopped moving over the window |
+| `moe_deadlocked_layer_count*` / `moe_max_deadlock_duration*` | the shared dominant-side deadlock counters, including depth quartiles, computed from the same observation |
+
+The health baseline is a ratio to the uniform share rather than an absolute
+one: the diagnosis this follows
+([arXiv:2605.19378](https://arxiv.org/abs/2605.19378)) calls a layer healthy
+while its minority expert holds at least 10% of the tokens against a 50%
+uniform share, i.e. one fifth of uniform, and that ratio is what carries to a
+router with 256 experts. The dominant-side threshold does not: a 256-expert
+top-6 router cannot reach a 90% single-expert share even when almost every
+expert is dead, which is why the minority side is measured separately.
+
+Two estimators of the same study stay unavailable for this family.
+`moe_expert_output_cossim` needs the complete per-token router score matrix,
+which the tap does not see — only the selected top-k survives the seam, and
+recomputing the full scores would repeat the router matmul. The router-update
+underflow fraction rides the shared gradient-breakdown path and is unaffected
+by this tap.
+
+Eval and inference forwards observe nothing: the observer is silenced with the
+module's training flag, so the denoise loop pays no reduction and advances no
+cross-step state.
 
 Captions are cached in the family's `raw` format. The native cache path encodes
 text through the Qwen3.5 encoder and latents through the native Wan2.2 VAE
@@ -555,6 +615,10 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   Grouped execution dequantizes contiguous group segments on demand and
   re-materializes them in backward, so no dense expert weight survives in
   autograd. [(QLoRA)](https://arxiv.org/abs/2305.14314)
+- **MAGI-2 routing-collapse telemetry** — Optional default-off per-`(layer,
+  head)` routing diagnostics for a family that publishes no router statistic of
+  its own, taken from the expert-execution seam without modifying the vendored
+  runtime. [(diagnosis)](https://arxiv.org/abs/2605.19378)
 
 ## Model-specific configuration
 
@@ -573,6 +637,7 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.family_params.refiner_config_path` | Override for the vendored refiner profile JSON; empty resolves to the shipped `magi2_refiner.json`. The profile states the refiner architecture, its step count, guidance scale, flow shift, VAE stride and the zero-terminal-SNR index the stage re-noises at, so changing the refinement means pointing this at a different profile. Only read when `--refine` is requested. |
 | `model.params.family_params.refiner_subfolder` | Snapshot subdirectory holding the refiner shards; defaults to `refiner`. Must be relative to the snapshot root and must not traverse upwards. |
 | `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, and it takes part in attention and MoE routing. The training forward redraws it on every call from a family-owned generator seeded from `training.seed`, so a step is reproducible under its seed and the track length never perturbs the process RNG stream; native sampling draws it once per generation from the generation generator. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
+| `model.params.moe_routing_health` | Arms the family's routing-collapse tap. MAGI-2 emits no router statistic without it, so this is the only way `emits_router_metrics` becomes true and the only routing signal an `attn_router` run has. Default off; when off no tap is attached and no diagnostic key appears. |
 | `memory.frozen_weight_quantization` | `none` or `nf4`. `nf4` packs only the three routed expert tensors of each MoE layer and requires bitsandbytes; every other format is rejected. |
 | `memory.expert_weight_access` | `auto`, `disabled`, and `full_dequant` dequantize the whole group axis per call; `chunked_dequant` dequantizes `memory.expert_dequant_chunk_size` groups at a time. `active_dequant` and `fused_kernel` are rejected — the flattened head-major axis carries one weight slice per `(head, expert)` pair, not a per-routed-expert operand. Any non-default value requires `frozen_weight_quantization = "nf4"`. |
 | `memory.expert_dequant_chunk_size` | Groups per dequantization on the flattened `head * num_experts + expert` axis, not experts of one head. Required to be positive with `chunked_dequant`. |

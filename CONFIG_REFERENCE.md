@@ -910,7 +910,7 @@ Offline per-tensor precision-planning gate. `imatrix` arms [`scripts/tools/calib
 - **Default:** `False`
 - **Allowed / range:** —
 
-Routing-health diagnostics pack ([`routing_health.py`](mirai/core/moe/monitoring/health.py), [`router_drift.py`](mirai/core/moe/monitoring/drift.py), [`preemptive.py`](mirai/core/moe/monitoring/preemptive.py); applied by the active model provider). Opt-in, detached telemetry only — never touches the loss/gradient path, defaults byte-identical. Adds expert-response homogenization, deadlock duration, raw-logit reference drift, router gradient/update ratios, numerical-underflow alarms, mechanism-driven full-softmax router and Q/K update-spectrum indicators, and the exact per-layer Fisher-Rao distance from the current token population's marginal routing distribution to uniform routing (`moe_fisher_specialization_*`). The normalized Fisher value divides by `2·acos(1/sqrt(num_experts))`. Mirai does not emit the FHS>1 alarm from arXiv:2604.14500 because the paper's printed FHS equation and proof define different statistics. Default-off because the response estimator, effective-weight summaries, and factor snapshots add per-step work.
+Routing-health diagnostics pack ([`routing_health.py`](mirai/core/moe/monitoring/health.py), [`router_drift.py`](mirai/core/moe/monitoring/drift.py), [`preemptive.py`](mirai/core/moe/monitoring/preemptive.py); applied by the active model provider). Also arms [`collapse.py`](mirai/core/moe/monitoring/collapse.py); for MAGI-2 Preview this gate is the only routing signal the family has and is what makes it report `emits_router_metrics = true`. Opt-in, detached telemetry only — never touches the loss/gradient path, defaults byte-identical. Adds expert-response homogenization, deadlock duration, raw-logit reference drift, router gradient/update ratios, numerical-underflow alarms, mechanism-driven full-softmax router and Q/K update-spectrum indicators, and the exact per-layer Fisher-Rao distance from the current token population's marginal routing distribution to uniform routing (`moe_fisher_specialization_*`). The normalized Fisher value divides by `2·acos(1/sqrt(num_experts))`. Mirai does not emit the FHS>1 alarm from arXiv:2604.14500 because the paper's printed FHS equation and proof define different statistics. Default-off because the response estimator, effective-weight summaries, and factor snapshots add per-step work.
 
 ### `moe_selection_margin`
 
@@ -1003,6 +1003,34 @@ Keeps native text-encoder weights on their compute device across repeated `Infer
 - **Default:** `False`
 
 Keeps native VAE weights on their compute device across repeated `InferenceSession.generate()` calls. Increases VRAM use; the CLI BooleanOptional override is `--keep-vae-resident` ([`session.py`](mirai/core/inference/session.py)).
+
+### `expert_feature_cache`
+
+- **Type:** str
+- **Default:** `"off"`
+
+`off`, `branch`. `branch` arms cross-timestep reuse of per-routed-slot expert features during sampling: each MoE layer keeps its pre-combine expert outputs, and on the next visit only the slots whose routed expert changed are recomputed while the rest are reused and re-weighted with the current routing probabilities. Requires `memory.moe_kernel_backend='grouped'`, because the per-expert reference loop and the fused kernel expose only a combined layer output. The cache never engages while autograd is enabled, so training is unaffected. It is lossy — the uncached execution is the reference path — and it holds `layers x slots x routed_slots x d_head` cached elements plus one layer input per entry, on the layer's device. Each cached layer visit reads one host-visible drift scalar, which synchronizes the compute device. Reuse counters appear as `expert_feature_cache` in the `InferenceSession.generate()` report ([`expert_feature_cache.py`](mirai/core/moe/runtime/expert_feature_cache.py), [`session.py`](mirai/core/inference/session.py), [arXiv:2606.15615](https://arxiv.org/abs/2606.15615)).
+
+### `expert_feature_cache_drift_threshold`
+
+- **Type:** float
+- **Default:** `0.05`
+
+`[0,1]`. Relative L2 drift of a layer's input against the cached anchor above which the whole cache entry is invalidated and every expert branch recomputed. `0` reuses only when the input is bit-identical. Inert while `expert_feature_cache="off"` ([`expert_feature_cache.py`](mirai/core/moe/runtime/expert_feature_cache.py)).
+
+### `expert_feature_cache_max_reuse_span`
+
+- **Type:** int
+- **Default:** `2`
+
+`>= 0`. Consecutive visits of one layer that may reuse cached branches before a full recompute is forced, bounding how far reuse error can accumulate. `0` keeps the cache armed but never reuses, which reproduces the uncached execution bit-for-bit. Inert while `expert_feature_cache="off"` ([`expert_feature_cache.py`](mirai/core/moe/runtime/expert_feature_cache.py)).
+
+### `expert_feature_cache_slots`
+
+- **Type:** int
+- **Default:** `2`
+
+`>= 1`. Cache entries held per MoE layer. Sequential classifier-free guidance visits each layer twice per timestep along two unrelated trajectories, so the default of `2` keeps them in separate entries; `1` halves cache residency and makes those visits evict each other ([`expert_feature_cache.py`](mirai/core/moe/runtime/expert_feature_cache.py)).
 
 ## `[training]` — TrainingSection
 
@@ -2378,6 +2406,12 @@ Detached per-step alarms from visual-DiT routing diagnosis and router-adaptation
 - `moe_router_conditioning_ratio` — `max_i ||w_i-w̄|| / ||w̄||`, emitted only when every expert row and the common mean are nonzero. Small values identify a common-mode-dominated parameterization; softmax removes that common mode exactly.
 - `moe_router_per_token_entropy` / `moe_router_per_token_entropy_fraction` — Equation 8 mean entropy of every token's complete effective routing distribution and the same value divided by `log(num_experts)`. This is distinct from `moe_routing_entropy`, which summarizes the batch's discrete top-k assignment counts.
 - `moe_attention_qk_delta2_spectral_entropy` / `moe_attention_qk_delta2_effective_rank` — alpha-2 spectral shape of the exact first-order QK-product increment `Δ2=ΔWq·Wkᵀ+Wq·ΔWkᵀ`, averaged over eligible heads. Nonzero singular values are computed from QR cores without materializing the hidden-width-square operator. Min/max, head count, and changed-layer count accompany the mean.
+- `moe_minority_expert_share` / `moe_normalized_minority_share` — mean share of routed slots held by each router's least-used expert, raw and divided by the uniform share `1/num_experts` (`1.0` is balanced). This is the minority side of arXiv:2605.19378's per-layer statistic; the dominant-side `moe_top1_monopoly` cannot express it for wide routers, where the top-1 share is bounded near `top_k/num_experts` while most experts are dead.
+- `moe_dead_expert_fraction` / `moe_underused_expert_fraction` — mean fraction of experts that received no routed slot, and the fraction below the health baseline (one fifth of the uniform share, the paper's 10%-of-tokens line against a 50% uniform share).
+- `moe_collapsed_router_fraction` / `moe_collapsed_router_count` / `moe_worst_normalized_minority_share` — routers under that baseline this step, and the worst one.
+- `moe_max_collapse_duration` — longest consecutive collapsed run in steps, on the minority criterion (`moe_max_deadlock_duration` is the same idea on the ≥0.90 monopoly criterion).
+- `moe_collapse_rebound_count` — routers that crossed back above the baseline after a sustained collapse; the paper's only observed self-recovery.
+- `moe_collapse_plateau_fraction` — collapsed routers whose normalized minority share stopped moving over the window, the signature of a deadlock no balance pressure moves.
 
 The Q/K monitor applies when both projections expose a static additive LoRA weight over a dense frozen linear base. Input-dependent timestep rank masks, TC-LoRA gates, DoRA normalization, and projection variants without the paper's explicit MHA `Wq/Wk` algebra are omitted rather than approximated. Its checkpointed factor snapshots define a window spanning one actually changed effective weight state. The source does not specify a numeric sampling interval or a universal healthy threshold, so Mirai emits no automatic preemptive alarm; a trajectory must be compared with a workload-specific healthy baseline.
 

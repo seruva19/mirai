@@ -202,6 +202,20 @@ class BasePipeline(ABC):
                 f"{type(self).__name__} does not implement MoE optimization policy controls."
             )
 
+    def configure_expert_feature_cache(self, cache: Any) -> None:
+        """Arm cross-timestep expert-branch feature reuse when supported.
+
+        ``cache`` is a
+        :class:`mirai.core.moe.runtime.expert_feature_cache.ExpertFeatureCache`.
+        A disabled cache is a no-op for every family; an enabled one requires the
+        family to expose its branch decomposition at the MoE execution seam.
+        """
+        if getattr(cache, "enabled", False):
+            raise ValueError(
+                f"{type(self).__name__} does not implement "
+                "inference.expert_feature_cache."
+            )
+
     def _unsupported_training_policy(self, name: str) -> None:
         raise ValueError(
             f"{type(self).__name__} does not implement training policy '{name}'."

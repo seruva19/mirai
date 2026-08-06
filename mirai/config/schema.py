@@ -338,6 +338,12 @@ class InferenceConfig:
     cfg_mode: str = "sequential"
     keep_text_encoder_resident: bool = False
     keep_vae_resident: bool = False
+    # Cross-timestep expert-branch feature reuse (default-off, lossy). See
+    # mirai/core/moe/runtime/expert_feature_cache.py.
+    expert_feature_cache: str = "off"
+    expert_feature_cache_drift_threshold: float = 0.05
+    expert_feature_cache_max_reuse_span: int = 2
+    expert_feature_cache_slots: int = 2
 
 
 @dataclass
@@ -717,6 +723,10 @@ class TrainingConfig:
                 "cfg_mode",
                 "keep_text_encoder_resident",
                 "keep_vae_resident",
+                "expert_feature_cache",
+                "expert_feature_cache_drift_threshold",
+                "expert_feature_cache_max_reuse_span",
+                "expert_feature_cache_slots",
             },
         )
         from mirai.core.inference.conditioning import normalize_inference_task
@@ -748,6 +758,45 @@ class TrainingConfig:
                 "inference.cfg_mode must be 'sequential' or 'batched'; "
                 f"got '{cfg_mode}'."
             )
+        from mirai.core.moe.runtime.expert_feature_cache import (
+            ExpertFeatureCacheError,
+            ExpertFeatureCachePolicy,
+        )
+
+        try:
+            expert_feature_cache_policy = ExpertFeatureCachePolicy(
+                mode=inference_table.get("expert_feature_cache", "off"),
+                drift_threshold=float(
+                    inference_table.get(
+                        "expert_feature_cache_drift_threshold", 0.05
+                    )
+                ),
+                max_reuse_span=int(
+                    inference_table.get("expert_feature_cache_max_reuse_span", 2)
+                ),
+                slots=int(inference_table.get("expert_feature_cache_slots", 2)),
+            )
+        except ExpertFeatureCacheError as exc:
+            raise ConfigError(str(exc)) from exc
+        if expert_feature_cache_policy.enabled:
+            # Branch-level reuse needs the grouped expert-execution seam: the
+            # per-expert reference loop and the fused kernel both produce only a
+            # combined layer output, which has no branch to cache.
+            configured_kernel_backend = (
+                str(
+                    _expect_table("memory", payload.get("memory", {})).get(
+                        "moe_kernel_backend", "auto"
+                    )
+                )
+                .strip()
+                .lower()
+            )
+            if configured_kernel_backend != "grouped":
+                raise ConfigError(
+                    "inference.expert_feature_cache requires "
+                    "memory.moe_kernel_backend='grouped'; got "
+                    f"'{configured_kernel_backend}'."
+                )
         model_params_table = _expect_table("model.params", model_table.get("params", {}))
         model_params_allowed = {
             "variant",
@@ -3229,6 +3278,14 @@ class TrainingConfig:
                 keep_vae_resident=bool(
                     inference_table.get("keep_vae_resident", False)
                 ),
+                expert_feature_cache=expert_feature_cache_policy.mode,
+                expert_feature_cache_drift_threshold=(
+                    expert_feature_cache_policy.drift_threshold
+                ),
+                expert_feature_cache_max_reuse_span=(
+                    expert_feature_cache_policy.max_reuse_span
+                ),
+                expert_feature_cache_slots=expert_feature_cache_policy.slots,
             ),
             training=training,
             optimizer=optimizer,

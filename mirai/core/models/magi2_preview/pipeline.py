@@ -176,6 +176,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     _refine_settings: "Magi2RefineSettings | None" = None
     _residency_request: "Magi2ResidencyRequest | None" = None
     _expert_stores: "dict[str, Magi2Nf4ExpertStore]" = {}
+    _routing_collapse: Any | None = None
+    _last_diagnostics: "dict[str, float]" = {}
 
     def __init__(
         self,
@@ -200,6 +202,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         )
         self._expert_stores: dict[str, Magi2Nf4ExpertStore] = {}
         self._moe_optimization_policy = MoEOptimizationPolicy()
+        # Armed only by inference.expert_feature_cache; None keeps the MoE seam
+        # exactly as the memory policy resolved it.
+        self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
         default_config = (
             Path(__file__).resolve().parents[3]
@@ -220,6 +225,12 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             ),
         )
         self.runtime_config, self.transformer, self.data_proxy = self._build_model()
+        # Routing telemetry is opt-in: with the gate off no observer, tracker, or
+        # tap exists and the monitoring module is never imported.
+        self._routing_collapse: Any | None = None
+        self._last_diagnostics: dict[str, float] = {}
+        if bool(getattr(model_config.params, "moe_routing_health", False)):
+            self._enable_routing_collapse_telemetry()
         self._block_swap_manager: BlockSwapManager | None = None
         self._block_hook_handles: list[Any] = []
         self._gradient_checkpointing = "off"
@@ -572,6 +583,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._moe_optimization_policy = policy
         self._attach_moe_execution()
 
+    def configure_expert_feature_cache(self, cache: Any) -> None:
+        """Arm (or clear) cross-timestep expert-branch reuse on the MoE seam."""
+        self._expert_feature_cache = cache if getattr(cache, "enabled", False) else None
+        self._attach_moe_execution()
+
     def _attach_moe_execution(self) -> None:
         """Resolve and bind the expert-execution seam for the current storage.
 
@@ -581,6 +597,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         """
         from mirai.core.models.magi2_preview.grouped_moe import (
             Magi2GroupedMoEBackend,
+            Magi2GroupedMoEPolicyError,
             Magi2QuantizedGroupedMoEBackend,
             attach_grouped_moe_backend,
             resolve_magi2_moe_execution,
@@ -601,7 +618,50 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             backend = Magi2QuantizedGroupedMoEBackend(plan)
         else:
             backend = Magi2GroupedMoEBackend(plan)
+        cache = getattr(self, "_expert_feature_cache", None)
+        if cache is not None and getattr(cache, "enabled", False):
+            from mirai.core.moe.runtime.expert_feature_cache import (
+                CachedExpertExecution,
+            )
+
+            if backend is None:
+                raise Magi2GroupedMoEPolicyError(
+                    "inference.expert_feature_cache needs the grouped "
+                    "expert-execution seam to expose per-branch features; set "
+                    "memory.moe_kernel_backend='grouped'."
+                )
+            backend = CachedExpertExecution(inner=backend, cache=cache)
         attach_grouped_moe_backend(self.transformer, backend)
+        # The grouped attach rebinds the execution seam this family's routing
+        # telemetry rides on, so the tap is re-wrapped around whatever backend
+        # the policy just selected.
+        self._reattach_routing_collapse_tap()
+
+    def _enable_routing_collapse_telemetry(self) -> None:
+        """Arm the opt-in routing-collapse telemetry for this family.
+
+        MAGI-2 carries no balance loss and no router statistic of its own, so
+        the metrics come from a monitoring tap on the expert-execution seam.
+        """
+        from mirai.core.models.magi2_preview.routing_collapse import (
+            Magi2RoutingCollapseState,
+            attach_routing_collapse_tap,
+        )
+
+        state = Magi2RoutingCollapseState.create()
+        attach_routing_collapse_tap(self.transformer, state.observer)
+        self._routing_collapse = state
+
+    def _reattach_routing_collapse_tap(self) -> None:
+        """Re-wrap the execution seam after a backend change; no-op when off."""
+        state = getattr(self, "_routing_collapse", None)
+        if state is None:
+            return
+        from mirai.core.models.magi2_preview.routing_collapse import (
+            attach_routing_collapse_tap,
+        )
+
+        attach_routing_collapse_tap(self.transformer, state.observer)
 
     def _bind_quantized_expert_runtime_policy(self) -> None:
         """Push the configured dequantization granularity onto every store."""
@@ -690,7 +750,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             num_routed_experts=int(arch.moe_config.num_experts),
             num_shared_experts=2,
             num_activated_experts=int(arch.moe_config.top_k),
-            emits_router_metrics=False,
+            # The family emits no router statistic of its own; the opt-in
+            # routing-collapse tap is what makes routing observable here.
+            emits_router_metrics=getattr(self, "_routing_collapse", None) is not None,
         )
 
     def get_adapter_target_presets(self) -> dict[str, list[str]]:
@@ -984,7 +1046,24 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         prediction = self.transformer(*packed)
         video, audio_prediction = self.data_proxy.process_output(prediction)
         self._last_audio_prediction = audio_prediction
+        self._collect_routing_diagnostics()
         return video
+
+    def _collect_routing_diagnostics(self) -> None:
+        """Fold this forward's routing observations into the step diagnostics.
+
+        Cross-step collapse state advances on training forwards only, so an
+        inference denoise loop neither pays for the reduction nor perturbs the
+        streak counters.
+        """
+        state = getattr(self, "_routing_collapse", None)
+        if state is None:
+            return
+        if not bool(self.transformer.training):
+            state.observer.clear()
+            self._last_diagnostics = {}
+            return
+        self._last_diagnostics = state.collect()
 
     @torch.inference_mode()
     def sample_native_preview(
@@ -1296,8 +1375,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     def get_training_model(self) -> Any:
         return self.transformer
 
+    def get_training_diagnostics(self) -> dict[str, Any]:
+        return dict(getattr(self, "_last_diagnostics", {}))
+
     def train(self, mode: bool = True):
         self.transformer.train(mode)
+        state = getattr(self, "_routing_collapse", None)
+        if state is not None:
+            state.observer.set_enabled(bool(mode))
         return self
 
     def eval(self):

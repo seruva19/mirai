@@ -216,6 +216,14 @@ configuration and compatibility rules are documented in
   first-frame latent fixed throughout denoising; V2V truncates the solver
   schedule by an explicit denoising strength.
   [(DiffSynth PR)](https://github.com/modelscope/DiffSynth-Studio/pull/1545)
+- **Expert-branch feature caching** — Opt-in cross-timestep reuse of per-routed-slot
+  expert features during sampling. A layer's pre-combine expert outputs are held
+  between visits; only the slots whose routed expert changed are recomputed, and
+  reused features are re-weighted with the current routing probabilities. Input
+  drift and an explicit reuse span bound how long an entry survives. Requires
+  grouped expert execution, is lossy against the uncached path, and reports its
+  per-layer reuse and invalidation counters.
+  [(paper)](https://arxiv.org/abs/2606.15615)
 - **Operational runtime controls** — Synthetic-step dry-run diagnostics,
   structured metrics/events, resource telemetry, and GPU leases. Dry-run still
   constructs the configured model and therefore requires its model assets and

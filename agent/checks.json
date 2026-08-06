@@ -193,7 +193,7 @@
       "name": "moe_routing",
         "paths": ["mirai/core/moe/", "mirai/core/models/testbed/", "mirai/core/parity/", "scripts/tools/calibrate_routing_agreement.py", "scripts/tools/estimate_moe_capacity.py", "scripts/tools/router_health_report.py", "scripts/tools/router_quantization_agreement.py"],
       "commands": [
-        "python -m pytest tests/test_sparse_moe_contract.py tests/test_grouped_mm_chunking.py mirai/core/moe/contracts/training_losses.py mirai/core/moe/contracts/dynamic_topk.py mirai/core/moe/contracts/spatiotemporal_routing.py mirai/core/moe/contracts/runtime_controls.py mirai/core/moe/contracts/lightweight_experts.py mirai/core/moe/contracts/adjugate_experts.py mirai/core/moe/contracts/decoupled_routing.py mirai/core/moe/contracts/chain_of_experts.py mirai/core/moe/contracts/selective_sinkhorn.py mirai/core/moe/contracts/prototypical_routing.py mirai/core/moe/contracts/sharp_moe.py mirai/core/moe/contracts/mixture_of_depths.py mirai/core/moe/contracts/timestep_capacity.py mirai/core/moe/contracts/layer_router_policy.py mirai/core/moe/contracts/progressive_sparsification.py mirai/core/moe/contracts/balance_schedule.py mirai/core/moe/contracts/global_batch_balance.py mirai/core/moe/contracts/subset_routing.py mirai/core/moe/contracts/routing_health.py mirai/core/moe/contracts/parity.py -q",
+        "python -m pytest tests/test_sparse_moe_contract.py tests/test_grouped_mm_chunking.py tests/test_routing_collapse_telemetry.py mirai/core/moe/contracts/training_losses.py mirai/core/moe/contracts/dynamic_topk.py mirai/core/moe/contracts/spatiotemporal_routing.py mirai/core/moe/contracts/runtime_controls.py mirai/core/moe/contracts/lightweight_experts.py mirai/core/moe/contracts/adjugate_experts.py mirai/core/moe/contracts/decoupled_routing.py mirai/core/moe/contracts/chain_of_experts.py mirai/core/moe/contracts/selective_sinkhorn.py mirai/core/moe/contracts/prototypical_routing.py mirai/core/moe/contracts/sharp_moe.py mirai/core/moe/contracts/mixture_of_depths.py mirai/core/moe/contracts/timestep_capacity.py mirai/core/moe/contracts/layer_router_policy.py mirai/core/moe/contracts/progressive_sparsification.py mirai/core/moe/contracts/balance_schedule.py mirai/core/moe/contracts/global_batch_balance.py mirai/core/moe/contracts/subset_routing.py mirai/core/moe/contracts/routing_health.py mirai/core/moe/contracts/parity.py -q",
         "python -m pytest tests/test_compressed_weights_quantization.py::CompressedWeightQuantizationTests::test_prepare_supports_provider_declared_two_projection_gelu_experts tests/test_compressed_weights_quantization.py::CompressedWeightQuantizationTests::test_provider_and_module_execution_specs_must_match tests/test_compressed_weights_quantization.py::CompressedWeightQuantizationTests::test_megablocks_linear_rematerializes_frozen_weight_in_backward -q"
       ],
       "invariants": [
@@ -370,12 +370,14 @@
       "name": "inference",
       "paths": ["mirai/core/inference/", "mirai/core/training/preview/", "scripts/infer.py", "inference/"],
       "commands": [
-        "python -m pytest mirai/core/inference/contracts/conditioning.py tests/test_inference_session.py tests/test_lingbot_native_inference.py tests/test_cfg_batching.py tests/test_preview_solvers.py tests/test_sampler_parity.py -q"
+        "python -m pytest mirai/core/inference/contracts/conditioning.py tests/test_inference_session.py tests/test_lingbot_native_inference.py tests/test_cfg_batching.py tests/test_preview_solvers.py tests/test_sampler_parity.py tests/test_expert_feature_cache.py -q"
       ],
       "invariants": [
         "single and batched CFG preserve conditioning order",
         "solver outputs match their reference recurrences",
-        "inference never depends on training-only mutable state"
+        "inference never depends on training-only mutable state",
+        "a disabled expert-feature cache holds no state and changes no output",
+        "an armed expert-feature cache that never reuses is bit-identical to uncached execution"
       ],
       "cost": "fast",
       "remote_gpu": false

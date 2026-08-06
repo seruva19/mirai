@@ -376,6 +376,75 @@ class Magi2GroupedMoEBackend:
             x_sorted, getattr(module, key), offsets, forward_backend, dx_backend
         )
 
+    def plan_branches(
+        self,
+        module: Any,
+        x_heads: torch.Tensor,
+        topk_probs: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> "Magi2ExpertBranchPlan":
+        """Routed layout of one layer visit, with no expert matmul yet run.
+
+        This is the branch decomposition
+        :mod:`mirai.core.moe.runtime.expert_feature_cache` consumes. The
+        canonical slot order is ``(head, token, k)`` flattened, which is the
+        order ``topk_indices`` already carries, so a slot keeps its identity
+        across visits of the same layer even when its routed expert changes.
+        """
+        forward_backend, dx_backend = self._resolve(x_heads.device, module)
+        device = x_heads.device
+        tokens = int(x_heads.shape[0])
+        num_heads = int(x_heads.shape[1])
+        num_experts = int(module.num_experts)
+        head_axis = torch.arange(num_heads, device=device).view(num_heads, 1, 1)
+        token_axis = torch.arange(tokens, device=device).view(1, tokens, 1)
+        return Magi2ExpertBranchPlan(
+            backend=self,
+            module=module,
+            x_heads=x_heads,
+            topk_probs=topk_probs,
+            flat_experts=(topk_indices + head_axis * num_experts).reshape(-1),
+            rows=(token_axis * num_heads + head_axis)
+            .expand_as(topk_indices)
+            .reshape(-1),
+            groups=num_heads * num_experts,
+            forward_backend=forward_backend,
+            dx_backend=dx_backend,
+        )
+
+    def branch_features(
+        self,
+        module: Any,
+        x_heads: torch.Tensor,
+        sorted_rows: torch.Tensor,
+        offsets: torch.Tensor,
+        forward_backend: str,
+        dx_backend: str,
+    ) -> torch.Tensor:
+        """Pre-combine expert output of every row of a sorted routed layout."""
+        tokens = int(x_heads.shape[0])
+        num_heads = int(x_heads.shape[1])
+        d_head = int(x_heads.shape[2])
+        x_rows = x_heads.reshape(tokens * num_heads, d_head)
+        x_sorted = x_rows.index_select(0, sorted_rows)
+        gate = self.project(
+            module, "W_gate", x_sorted, offsets, forward_backend, dx_backend
+        )
+        up = self.project(
+            module, "W_up", x_sorted, offsets, forward_backend, dx_backend
+        )
+        gate = gate.float().clamp(max=7.0)
+        up = up.float().clamp(min=-7.0, max=7.0)
+        hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+        return self.project(
+            module,
+            "W_down",
+            hidden.to(self.expert_weight_dtype(module, "W_down")),
+            offsets,
+            forward_backend,
+            dx_backend,
+        )
+
     def execute(
         self,
         module: Any,
@@ -404,29 +473,97 @@ class Magi2GroupedMoEBackend:
         counts = torch.bincount(flat_experts, minlength=groups)
         offsets = counts.cumsum(0).to(torch.int32)
 
-        x_rows = x_heads.reshape(tokens * num_heads, d_head)
-        x_sorted = x_rows.index_select(0, sorted_rows)
-        gate = self.project(
-            module, "W_gate", x_sorted, offsets, forward_backend, dx_backend
-        )
-        up = self.project(
-            module, "W_up", x_sorted, offsets, forward_backend, dx_backend
-        )
-        gate = gate.float().clamp(max=7.0)
-        up = up.float().clamp(min=-7.0, max=7.0)
-        hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
-        expert_output = self.project(
-            module,
-            "W_down",
-            hidden.to(self.expert_weight_dtype(module, "W_down")),
-            offsets,
-            forward_backend,
-            dx_backend,
+        expert_output = self.branch_features(
+            module, x_heads, sorted_rows, offsets, forward_backend, dx_backend
         )
         weighted = expert_output * sorted_probs.to(expert_output.dtype)[:, None]
         output = torch.zeros(
             tokens * num_heads, d_head, device=device, dtype=x_heads.dtype
         ).index_add(0, sorted_rows, weighted.to(x_heads.dtype))
+        return output.view(tokens, num_heads, d_head)
+
+
+@dataclass
+class Magi2ExpertBranchPlan:
+    """Branch decomposition of one MAGI-2 MoE layer visit.
+
+    Implements the family-agnostic ``ExpertBranchPlan`` contract owned by
+    :mod:`mirai.core.moe.runtime.expert_feature_cache`. ``compute_branch_features``
+    followed by ``combine_branch_features`` reproduces
+    :meth:`Magi2GroupedMoEBackend.execute` exactly: the canonical buffer is
+    filled and read back through the same sort permutation, so the operand
+    values, the operand order, and the accumulation order of the combine are the
+    ones the uncached path uses.
+    """
+
+    backend: Magi2GroupedMoEBackend
+    module: Any
+    x_heads: torch.Tensor
+    topk_probs: torch.Tensor
+    flat_experts: torch.Tensor
+    rows: torch.Tensor
+    groups: int
+    forward_backend: str
+    dx_backend: str
+
+    @property
+    def expert_ids(self) -> torch.Tensor:
+        return self.flat_experts
+
+    def _grouped_offsets(self, experts: torch.Tensor) -> torch.Tensor:
+        return (
+            torch.bincount(experts, minlength=self.groups).cumsum(0).to(torch.int32)
+        )
+
+    def compute_branch_features(
+        self, slot_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Expert output of the selected routed slots, canonical order.
+
+        Rows outside ``slot_mask`` are zero. A masked subset is sorted and
+        grouped on its own, which the jagged-offset contract makes exact: a
+        routed slot's expert matmul reads only that slot's row, so recomputing a
+        subset yields the values a full recompute would have produced for it.
+        """
+        if slot_mask is None:
+            selected = None
+            experts = self.flat_experts
+            rows = self.rows
+        else:
+            selected = slot_mask.reshape(-1).nonzero(as_tuple=True)[0]
+            experts = self.flat_experts.index_select(0, selected)
+            rows = self.rows.index_select(0, selected)
+        order = experts.argsort(stable=True)
+        computed = self.backend.branch_features(
+            self.module,
+            self.x_heads,
+            rows.index_select(0, order),
+            self._grouped_offsets(experts),
+            self.forward_backend,
+            self.dx_backend,
+        )
+        target = order if selected is None else selected.index_select(0, order)
+        canonical = computed.new_zeros(
+            (int(self.flat_experts.numel()), int(computed.shape[-1]))
+        )
+        return canonical.index_copy(0, target, computed)
+
+    def combine_branch_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Routing-weighted combine of canonical branch features."""
+        order = self.flat_experts.argsort(stable=True)
+        sorted_rows = self.rows.index_select(0, order)
+        sorted_probs = self.topk_probs.reshape(-1).index_select(0, order)
+        expert_output = features.index_select(0, order)
+        weighted = expert_output * sorted_probs.to(expert_output.dtype)[:, None]
+        tokens = int(self.x_heads.shape[0])
+        num_heads = int(self.x_heads.shape[1])
+        d_head = int(self.x_heads.shape[2])
+        output = torch.zeros(
+            tokens * num_heads,
+            d_head,
+            device=self.x_heads.device,
+            dtype=self.x_heads.dtype,
+        ).index_add(0, sorted_rows, weighted.to(self.x_heads.dtype))
         return output.view(tokens, num_heads, d_head)
 
 

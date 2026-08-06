@@ -222,6 +222,9 @@ class InferenceSession:
         self._compute_dtype = compute_dtype
         self._residency_strategy = str(residency_strategy)
         self._base_placement_dirty = False
+        # Armed by from_config only when inference.expert_feature_cache is on;
+        # None means no cache object exists anywhere in the run.
+        self._expert_feature_cache: Any = None
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -367,11 +370,43 @@ class InferenceSession:
             text_encoder_override=keep_text_encoder_resident,
             vae_override=keep_vae_resident,
         )
+        session._arm_expert_feature_cache()
         if component_residency.text_encoder:
             session._make_text_encoder_resident()
         if component_residency.vae:
             session._make_vae_resident()
         return session
+
+    # -- expert-branch feature cache ----------------------------------------
+    def _arm_expert_feature_cache(self) -> None:
+        """Build and attach the cross-timestep branch cache when configured.
+
+        Nothing is imported or constructed while
+        ``inference.expert_feature_cache='off'``, so the default run holds no
+        cache object and the MoE seam is the one the memory policy resolved.
+        """
+        inference_cfg = self.cfg.inference
+        if str(getattr(inference_cfg, "expert_feature_cache", "off")) == "off":
+            return
+        from mirai.core.moe.runtime.expert_feature_cache import (
+            ExpertFeatureCache,
+            ExpertFeatureCachePolicy,
+        )
+
+        cache = ExpertFeatureCache(
+            ExpertFeatureCachePolicy(
+                mode=str(inference_cfg.expert_feature_cache),
+                drift_threshold=float(
+                    inference_cfg.expert_feature_cache_drift_threshold
+                ),
+                max_reuse_span=int(
+                    inference_cfg.expert_feature_cache_max_reuse_span
+                ),
+                slots=int(inference_cfg.expert_feature_cache_slots),
+            )
+        )
+        self.pipeline.configure_expert_feature_cache(cache)
+        self._expert_feature_cache = cache
 
     # -- resident-weight seams ---------------------------------------------
     # These opt-in flags leave the pipeline unchanged when disabled. When
@@ -574,6 +609,11 @@ class InferenceSession:
             run_native_denoise_loop,
         )
 
+        if self._expert_feature_cache is not None:
+            # Branch features are only comparable within one denoising
+            # trajectory, so nothing survives across generate() calls.
+            self._expert_feature_cache.reset()
+
         ran_denoise_loop = True
         video_written = False
         media_written = False
@@ -719,6 +759,14 @@ class InferenceSession:
             payload["original_negative_prompt"] = original_negative_prompt
         if cfg_mode_key != "sequential":
             payload["cfg_mode"] = cfg_mode_key
+        if self._expert_feature_cache is not None:
+            payload["expert_feature_cache"] = {
+                "mode": self._expert_feature_cache.policy.mode,
+                "drift_threshold": self._expert_feature_cache.policy.drift_threshold,
+                "max_reuse_span": self._expert_feature_cache.policy.max_reuse_span,
+                "slots": self._expert_feature_cache.policy.slots,
+                **self._expert_feature_cache.telemetry.snapshot(),
+            }
         return payload
 
 
