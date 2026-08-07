@@ -26,11 +26,12 @@ representation and residency policy.
 git clone https://github.com/seruva19/mirai.git
 cd mirai
 python -m pip install -r requirements-cu126.txt
-python -m pip install -e .
 ```
 
-On Linux, use `requirements-cu126-linux.txt` instead; it includes the common
-CUDA 12.6 requirements and the Linux-only dependencies.
+Mirai has one dependency set for its complete supported surface. The requirements
+file selects the CUDA 12.6 Torch wheels and installs the project with that set;
+platform markers select packages such as Triton where a platform-specific wheel
+is required.
 
 ## Model support
 

@@ -50,34 +50,25 @@ which is the default `model.params.family_params.config_path`.
 
 ## Install
 
-MAGI-2 pulls dependencies the rest of Mirai does not need. Install them with
-the family extra:
-
-```bash
-pip install -e ".[magi2-preview]"
-```
-
-The extra adds Triton (the fused multi-head MoE kernels in the vendored
-transformer), `tqdm` (shard loading and sampler progress), SciPy (audio-feature
-resampling in the vendored inference engine), `pydantic-settings` (the typed
-architecture and engine config models), and `unfoldNd` (the n-dimensional
-unfold in the vendored data proxies). The last two are imported by this family
-alone, so they install with the extra rather than with the base package.
-Diffusers is not
-part of the extra: the vendored TurboVAE decoder and Flow-UniPC scheduler carry
+The standard Mirai installation includes Triton (the fused multi-head MoE
+kernels in the vendored transformer), `tqdm` (shard loading and sampler
+progress), SciPy (audio-feature resampling in the vendored inference engine),
+`pydantic-settings` (the typed architecture and engine config models), and
+`unfoldNd` (the n-dimensional unfold in the vendored data proxies). Diffusers
+is not a dependency: the vendored TurboVAE decoder and Flow-UniPC scheduler carry
 their own constructor-argument registration in
 `mirai/vendors/magi2_preview/common/native_config.py`. `einops` and the pinned
-`transformers` runtime that provides the Qwen3.5 text-encoder classes are
-already base dependencies. The Triton requirement carries a
+`transformers` runtime provide the Qwen3.5 text-encoder classes. The Triton
+requirement carries a
 `sys_platform == "linux"` marker because the PyPI package is Linux-only; a
 Windows host needs a Windows Triton build installed manually.
 
-The optional accelerated runtime — the pinned MagiAttention, MagiCompiler, and
-FlashAttention packages described by the upstream release — is deliberately not
-part of the extra. Every one of those imports is guarded, and Mirai retains a
-differentiable Torch reference path for training and for environments where
-those kernels are unavailable. Install them manually only if you want the
-accelerated attention and compile paths. MagiAttention reads
+The additional MagiAttention, MagiCompiler, and FlashAttention packages
+described by the upstream release are deliberately not package dependencies.
+Every one of those imports is guarded, and Mirai retains a differentiable Torch
+reference path for training and for environments where those kernels are
+unavailable. Install them manually only if you want the accelerated attention
+and compile paths. MagiAttention reads
 `MAGI_ATTENTION_WORKSPACE_BASE` when it is imported; Mirai never writes it for
 you, so set it in the environment that starts the process if you install that
 package.

@@ -22,8 +22,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.8",
-    "torchvision>=0.23",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
     "safetensors>=0.7.0",
     "einops>=0.7.0",
     "transformers==5.5.0",
@@ -34,32 +34,16 @@ dependencies = [
     "opencv-python>=4.9.0",
     "zstandard>=0.23.0",
     "psutil>=7.0",
-]
-
-[project.optional-dependencies]
-telemetry = [
+    "av>=12.0.0",
     "tensorboard>=2.19.0",
     "wandb>=0.18",
-]
-preview = [
-    "av>=12.0.0",
-]
-tools = [
     "requests>=2.32.0",
-]
-magi2-preview = [
-    # Fused multi-head MoE kernels in the vendored native transformer.
     "triton>=3.0.0; sys_platform == 'linux'",
-    # Typed architecture/engine config models in the vendored MAGI-2 config.
     "pydantic-settings==2.14.1",
-    # N-dimensional unfold in the vendored MAGI-2 data proxies.
     "unfoldNd==0.2.3",
-    # Shard-loading and sampler progress reporting.
     "tqdm>=4.66.0",
-    # Audio-feature resampling in the vendored inference engine.
     "scipy>=1.11.0",
-]
-dev = [
+    "bitsandbytes==0.49.2",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.3.0",
     "pytest-timeout>=2.4.0",

@@ -76,7 +76,7 @@ Available examples:
   base with native routed-expert execution.
 - [`train_nf4.toml`](../configs/lingbot_video/train_nf4.toml) — NF4 compressed
   frozen base with chunked expert reconstruction. This example uses the
-  Linux-only bitsandbytes optimizer from `requirements-cu126-linux.txt`.
+  bitsandbytes optimizer installed with Mirai.
 - [`train_nf4_32gb.toml`](../configs/lingbot_video/train_nf4_32gb.toml) — NF4
   compressed frozen base kept **fully resident** on a 32 GiB device. Block
   swapping is disabled: host-device transfer only pays for itself when the

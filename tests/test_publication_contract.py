@@ -78,6 +78,31 @@ def _public_text_files() -> list[Path]:
 
 
 class PublicationContractTests(unittest.TestCase):
+    def test_project_uses_one_mandatory_dependency_set(self) -> None:
+        metadata = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertNotIn("[project.optional-dependencies]", metadata)
+        for dependency in (
+            "av>=12.0.0",
+            "bitsandbytes==0.49.2",
+            "pydantic-settings==2.14.1",
+            "pytest>=8.4.2",
+            "requests>=2.32.0",
+            "ruff==0.14.8",
+            "scipy>=1.11.0",
+            "tensorboard>=2.19.0",
+            "tqdm>=4.66.0",
+            "triton>=3.0.0; sys_platform == 'linux'",
+            "unfoldNd==0.2.3",
+            "wandb>=0.18",
+        ):
+            self.assertIn(f'"{dependency}"', metadata)
+
+        requirements = (ROOT / "requirements-cu126.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("-e .", requirements.splitlines())
+        self.assertFalse((ROOT / "requirements-cu126-linux.txt").exists())
+
     def test_public_model_download_does_not_require_credentials(self) -> None:
         with patch.dict(os.environ, {}, clear=True), patch.dict(
             sys.modules, {"huggingface_hub": None}

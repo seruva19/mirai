@@ -479,6 +479,8 @@ class AgentValidationContractTests(unittest.TestCase):
         self.assertNotIn("pytest tests/ -q -m production_contract", workflow)
         self.assertIn("--all-local --run --max-cost extended", workflow)
         self.assertNotIn("--max-cost wave", workflow)
+        self.assertEqual(workflow.count("run: python -m pip install -e ."), 3)
+        self.assertNotIn('pip install -e ".[', workflow)
 
     def test_all_local_selection_covers_colocated_contracts_without_gpu(self) -> None:
         checks = select_local_checks(load_manifest())

@@ -1,6 +1,5 @@
 include CONFIG_REFERENCE.md
 include requirements-cu126.txt
-include requirements-cu126-linux.txt
 recursive-include assets *.png
 recursive-include agent *.md *.json
 recursive-include configs *.toml
