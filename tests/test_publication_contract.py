@@ -89,11 +89,13 @@ class PublicationContractTests(unittest.TestCase):
             "requests>=2.32.0",
             "ruff==0.14.8",
             "scipy>=1.11.0",
+            "setuptools>=77",
             "tensorboard>=2.19.0",
             "tqdm>=4.66.0",
             "triton>=3.0.0; sys_platform == 'linux'",
             "unfoldNd==0.2.3",
             "wandb>=0.18",
+            "wheel>=0.45.1",
         ):
             self.assertIn(f'"{dependency}"', metadata)
 
