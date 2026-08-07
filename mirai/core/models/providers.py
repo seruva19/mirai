@@ -58,6 +58,9 @@ class FamilyGenerationDefaults:
     steps: int | None = None
     cfg_scale: float | None = None
     scheduler: str | None = None
+    width: int | None = None
+    height: int | None = None
+    frames: int | None = None
 
     def declares_negative_prompt(self) -> bool:
         return self.negative_prompt is not None
@@ -82,6 +85,18 @@ class FamilyGenerationDefaults:
         if requested is not None and str(requested).strip():
             return str(requested)
         return str(self.scheduler or fallback)
+
+    def resolve_width(self, requested: int | None, *, fallback: int) -> int:
+        value = self.width if requested is None else requested
+        return int(fallback if value is None else value)
+
+    def resolve_height(self, requested: int | None, *, fallback: int) -> int:
+        value = self.height if requested is None else requested
+        return int(fallback if value is None else value)
+
+    def resolve_frames(self, requested: int | None, *, fallback: int) -> int:
+        value = self.frames if requested is None else requested
+        return int(fallback if value is None else value)
 
     def empty_negative_prompt_warning(self, resolved: str, *, model_type: str) -> str | None:
         """Message for a run that discards a declared family negative prompt.

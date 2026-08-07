@@ -38,6 +38,10 @@ from mirai.core.models.magi2_preview.refiner_attention import (
     refiner_required_magi2_ops,
     resolve_magi2_refiner_attention,
 )
+from mirai.core.models.magi2_preview.refiner import (
+    attach_refiner_attention_chunking,
+    attach_refiner_mlp_chunking,
+)
 
 
 HEAD_DIM = 16
@@ -210,6 +214,27 @@ def test_uncovered_query_positions_map_to_the_empty_segment() -> None:
     assert bool(mask.query_has_keys[8:16].all())
 
 
+def test_repeated_ranges_stay_compact() -> None:
+    """Range count must not expand into range-by-covered-segment pairs."""
+    q_pairs: list[tuple[int, int]] = []
+    k_pairs: list[tuple[int, int]] = []
+    for segment in range(64):
+        start = segment * 128
+        end = start + 128
+        # Duplicate metadata rows exercise compact range coverage without
+        # materializing a range-by-covered-segment index table.
+        for _ in range(128):
+            q_pairs.extend(((start, end), (start, end)))
+            k_pairs.extend(((max(0, start - 128), min(8192, end + 128)), (8000, 8192)))
+    mask = build_range_union_mask(
+        _ranges(q_pairs), _ranges(k_pairs), query_tokens=8192, key_tokens=8192
+    )
+    assert mask.interval_starts.shape == (65, 2)
+    assert mask.interval_ends.shape == (65, 2)
+    block_mask = mask.block_mask(query_tokens=8192)
+    assert block_mask.shape == (1, 1, 8192, 8192)
+
+
 # --------------------------------------------------------------------------- #
 # Attention semantics
 # --------------------------------------------------------------------------- #
@@ -335,6 +360,139 @@ def test_asymmetric_key_length_is_accepted() -> None:
     torch.testing.assert_close(observed, expected, rtol=2e-2, atol=2e-2)
 
 
+def test_backend_reuses_block_metadata_for_identical_range_content() -> None:
+    query, key, value = _inputs(
+        query_tokens=32, key_tokens=32, heads_q=4, heads_kv=2, seed=19
+    )
+    q_ranges = _ranges([(0, 16), (16, 32)])
+    k_ranges = _ranges([(0, 24), (8, 32)])
+    backend = Magi2RefinerFlexAttentionBackend()
+    first, _ = backend.execute(
+        query,
+        key,
+        value,
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        attn_type_map=None,
+        max_seqlen_q=16,
+    )
+    cached_mask = backend._cached_range_mask
+    cached_blocks = backend._cached_block_mask
+    second, _ = backend.execute(
+        query,
+        key,
+        value,
+        q_ranges=q_ranges.clone(),
+        k_ranges=k_ranges.clone(),
+        attn_type_map=None,
+        max_seqlen_q=16,
+    )
+    assert backend._cached_range_mask is cached_mask
+    assert backend._cached_block_mask is cached_blocks
+    assert torch.equal(first, second)
+
+
+def test_refiner_mlp_token_chunking_preserves_modality_outputs(
+    vendored_refiner_module,
+) -> None:
+    config = vendored_refiner_module.MLPConfig(
+        hidden_size=16,
+        intermediate_size=16,
+        activation_type=vendored_refiner_module.MLPActivationType.SWIGLU7,
+        params_dtype=torch.bfloat16,
+        num_modality=3,
+        gated_act=True,
+    )
+    mlp = vendored_refiner_module.MLP(config).eval()
+    with torch.no_grad():
+        for parameter in mlp.parameters():
+            parameter.copy_(
+                torch.linspace(
+                    -0.05,
+                    0.05,
+                    parameter.numel(),
+                    dtype=parameter.dtype,
+                ).reshape_as(parameter)
+            )
+    mapping = torch.tensor([0] * 5 + [1] * 3 + [2] * 4)
+    dispatcher = vendored_refiner_module.ModalityDispatcher(mapping, 3)
+    value = torch.randn(12, 16, generator=torch.Generator().manual_seed(31)).to(
+        torch.bfloat16
+    )
+    expected = mlp(value, dispatcher)
+    assert attach_refiner_mlp_chunking(mlp, chunk_tokens=4) == 1
+    observed = mlp(value, dispatcher)
+    assert observed.dtype == torch.float32
+    torch.testing.assert_close(observed, expected, rtol=0.0, atol=0.0)
+
+
+def test_refiner_attention_chunking_preserves_projection_and_rotary_outputs(
+    vendored_refiner_module,
+) -> None:
+    config = vendored_refiner_module.AttentionConfig(
+        hidden_size=16,
+        num_heads_q=2,
+        num_heads_kv=2,
+        head_dim=8,
+        params_dtype=torch.bfloat16,
+        checkpoint_qk_layernorm_rope=False,
+        num_modality=3,
+        num_layers=1,
+        use_local_attn=True,
+        enable_attn_gating=True,
+    )
+    attention = vendored_refiner_module.Attention(config).eval()
+    with torch.no_grad():
+        for parameter in attention.parameters():
+            parameter.copy_(
+                torch.linspace(
+                    -0.04,
+                    0.04,
+                    parameter.numel(),
+                    dtype=parameter.dtype,
+                ).reshape_as(parameter)
+            )
+
+    class EchoBackend:
+        @staticmethod
+        def execute(query, key, value, **_kwargs):
+            del key, value
+            return query, torch.zeros(
+                query.shape[:2], dtype=torch.float32, device=query.device
+            )
+
+    attention._mirai_refiner_attention_backend = EchoBackend()
+    mapping = torch.tensor([2, 0, 1, 0, 2, 0, 1, 2, 0])
+    dispatcher = vendored_refiner_module.ModalityDispatcher(mapping, 3)
+    hidden = torch.randn(9, 16, generator=torch.Generator().manual_seed(37)).to(
+        torch.bfloat16
+    )[dispatcher.permute_mapping]
+    rope = torch.randn(9, 8, generator=torch.Generator().manual_seed(41))
+    handler = types.SimpleNamespace(
+        q_ranges=_ranges([(0, 9)]),
+        k_ranges=_ranges([(0, 9)]),
+        attn_type_map=torch.zeros(1, dtype=torch.int32),
+        max_seqlen_q=9,
+        auto_range_merge=False,
+        sparse_load=False,
+    )
+    args = (
+        hidden,
+        rope,
+        dispatcher.permute_mapping,
+        dispatcher.inv_permute_mapping,
+        None,
+        handler,
+        dispatcher,
+        [],
+    )
+    expected = attention(*args)
+    assert attach_refiner_attention_chunking(attention, chunk_tokens=3) == 1
+    observed = attention(*args)
+    assert observed.dtype == torch.bfloat16
+    torch.testing.assert_close(observed, expected, rtol=0.0, atol=0.0)
+
+
 # --------------------------------------------------------------------------- #
 # Explicit rejections
 # --------------------------------------------------------------------------- #
@@ -408,8 +566,12 @@ def test_backend_names_normalize_and_reject_unknown_values() -> None:
 def test_precedence_prefers_a_registered_operator_under_auto(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import mirai.core.models.magi2_preview.refiner_attention as refiner_attention
     import mirai.vendors.magi2_preview.common.magi_compiler_compat as compat
 
+    monkeypatch.setattr(
+        refiner_attention, "_magi_attention_hopper_kernel_available", lambda: False
+    )
     monkeypatch.setattr(compat, "missing_magi2_custom_ops", lambda names: ())
     assert resolve_magi2_refiner_attention("auto") is None
     # An explicit selection is not a preference; it overrides the operator.
@@ -425,6 +587,21 @@ def test_precedence_prefers_a_registered_operator_under_auto(
         resolve_magi2_refiner_attention("auto"), Magi2RefinerFlexAttentionBackend
     )
     assert resolve_magi2_refiner_attention("vendor_eager") is None
+
+
+def test_auto_prefers_the_authors_single_gpu_hopper_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mirai.core.models.magi2_preview.refiner_attention as refiner_attention
+    import mirai.vendors.magi2_preview.common.magi_compiler_compat as compat
+
+    monkeypatch.setattr(
+        compat, "missing_magi2_custom_ops", lambda names: tuple(names)
+    )
+    monkeypatch.setattr(
+        refiner_attention, "_magi_attention_hopper_kernel_available", lambda: True
+    )
+    assert resolve_magi2_refiner_attention("auto") is None
 
 
 def test_attachment_covers_every_refiner_attention_module(

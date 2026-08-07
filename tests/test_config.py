@@ -246,6 +246,41 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.training.moe_token_chunk_size, 2048)
         validate_training_runtime_config(cfg)
 
+    def test_inference_moe_token_chunking_parses_and_validates(self) -> None:
+        path = self._write(
+            """
+            [inference]
+            moe_token_chunk_size = 8192
+            """
+        )
+        cfg = load_config(path)
+
+        self.assertEqual(cfg.inference.moe_token_chunk_size, 8192)
+
+    def test_inference_moe_token_chunking_rejects_negative_size(self) -> None:
+        path = self._write(
+            """
+            [inference]
+            moe_token_chunk_size = -1
+            """
+        )
+        with self.assertRaisesRegex(ValueError, "must be >= 0"):
+            load_config(path)
+
+    def test_inference_moe_token_chunking_rejects_branch_cache(self) -> None:
+        path = self._write(
+            """
+            [inference]
+            expert_feature_cache = "branch"
+            moe_token_chunk_size = 8
+
+            [memory]
+            moe_kernel_backend = "grouped"
+            """
+        )
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            load_config(path)
+
     def test_moe_token_chunking_rejects_parameter_dropout(self) -> None:
         path = self._write(
             """

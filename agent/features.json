@@ -2836,10 +2836,12 @@
         "MoETokenChunkPolicy"
       ],
       "config_keys": [
-        "training.moe_token_chunk_size"
+        "training.moe_token_chunk_size",
+        "inference.moe_token_chunk_size"
       ],
       "disabled_config": {
-        "training.moe_token_chunk_size": 0
+        "training.moe_token_chunk_size": 0,
+        "inference.moe_token_chunk_size": 0
       },
       "contract_paths": [
         "mirai/core/training/policies/contracts/moe_token_chunking.py"

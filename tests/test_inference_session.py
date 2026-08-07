@@ -23,6 +23,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 try:
     import torch
@@ -134,6 +136,143 @@ class InferenceSessionEquivalenceTests(unittest.TestCase):
                 scheduler="flow_match_euler", device="cpu",
             )
         self.assertTrue(refiner.released)
+
+    def test_inference_moe_token_chunking_is_default_off_and_typed_when_on(self) -> None:
+        from mirai.core.inference.session import InferenceSession
+        from mirai.core.moe.runtime.token_chunking import MoETokenChunkPolicy
+
+        class _Pipeline:
+            policy = None
+
+            def configure_moe_token_chunking(self, policy):
+                self.policy = policy
+
+        session = object.__new__(InferenceSession)
+        session.pipeline = _Pipeline()
+        session.cfg = SimpleNamespace(
+            inference=SimpleNamespace(moe_token_chunk_size=0)
+        )
+        session._arm_moe_token_chunking()
+        self.assertIsNone(session.pipeline.policy)
+
+        session.cfg.inference.moe_token_chunk_size = 4096
+        session._arm_moe_token_chunking()
+        self.assertIsInstance(session.pipeline.policy, MoETokenChunkPolicy)
+        self.assertEqual(session.pipeline.policy.token_chunk_size, 4096)
+
+    def test_saved_preview_latent_can_enter_refiner_without_base_denoise(self) -> None:
+        import mirai.core.inference.session as session_module
+        from mirai.core.inference.session import InferenceSession
+
+        source = torch.randn(2, 3, 4)
+
+        class _Defaults:
+            @staticmethod
+            def empty_negative_prompt_warning(_prompt, *, model_type):
+                _ = model_type
+                return None
+
+        class _Provider:
+            model_type = "resume_test"
+            inference_tasks = ("text_to_video",)
+
+            @staticmethod
+            def generation_defaults():
+                return _Defaults()
+
+            @staticmethod
+            def validate_inference_prompt_rewriter(_name):
+                return None
+
+            @staticmethod
+            def supports_inference_task(task):
+                return task == "text_to_video"
+
+            @staticmethod
+            def supports_batched_cfg_inference():
+                return False
+
+        class _Pipeline:
+            def __init__(self) -> None:
+                self.refine_inputs = []
+                self.discarded = 0
+
+            def discard_refiner_context(self) -> None:
+                self.discarded += 1
+
+            @staticmethod
+            def validate_refinement_request(request, *, frames, height, width):
+                _ = (frames, height, width)
+                return {**request, "resolved": True}
+
+            def refine_inference_latent(self, *, base_latent, **kwargs):
+                self.refine_inputs.append((base_latent.detach().clone(), kwargs))
+                return base_latent + 1
+
+        pipeline = _Pipeline()
+        session = object.__new__(InferenceSession)
+        session.pipeline = pipeline
+        session.cfg = SimpleNamespace(
+            model=SimpleNamespace(type="resume_test"),
+            inference=SimpleNamespace(
+                task="text_to_video",
+                denoising_strength=1.0,
+                prompt_rewriter="none",
+                cfg_mode="sequential",
+            ),
+        )
+        session.use_native = True
+        session._expert_feature_cache = None
+        session._compute_device = torch.device("cpu")
+        session._compute_dtype = torch.float32
+        session._base_placement_dirty = False
+        session._residency_strategy = ""
+        session.checkpoint = ""
+        session.adapter = ""
+        session.lora_scale = 1.0
+        session.effective_scale = 1.0
+        session.lora_format = ""
+        session.merge = False
+        session.inference_mode = "native"
+        session.runtime_policy_notes = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            latent_path = Path(tmp) / "preview.pt"
+            output_path = Path(tmp) / "refined.mp4"
+            torch.save(source, latent_path)
+            with (
+                mock.patch.object(
+                    session_module, "get_model_family_provider", return_value=_Provider()
+                ),
+                mock.patch.object(session_module, "runtime_policy_summary", return_value={}),
+                mock.patch.object(
+                    session_module,
+                    "decode_pipeline_media",
+                    return_value=output_path,
+                ),
+            ):
+                payload = session.generate(
+                    prompt="warm room",
+                    negative_prompt="negative",
+                    out_path=output_path,
+                    decode_latent=str(latent_path),
+                    refine={"steps": 1},
+                    frames=9,
+                    height=64,
+                    width=64,
+                )
+
+            restored = torch.load(
+                output_path.with_suffix(".pt"), map_location="cpu", weights_only=True
+            )
+
+        self.assertEqual(pipeline.discarded, 1)
+        self.assertEqual(len(pipeline.refine_inputs), 1)
+        torch.testing.assert_close(pipeline.refine_inputs[0][0], source)
+        torch.testing.assert_close(restored, source + 1)
+        self.assertTrue(payload["refined"])
+        self.assertEqual(payload["decode_latent"], str(latent_path))
+        self.assertTrue(payload["refiner"]["resolved"])
 
     def test_refiner_prompt_failure_offloads_text_encoder(self) -> None:
         from mirai.core.models.lingbot_video.refiner import run_refine
@@ -489,6 +628,18 @@ class FamilyGenerationDefaultsTests(unittest.TestCase):
             )
         )
 
+    def test_magi2_declares_the_released_preview_profile(self) -> None:
+        declared = self._defaults("magi2-preview")
+        self.assertEqual(declared.steps, 100)
+        self.assertEqual(declared.cfg_scale, 5.0)
+        self.assertEqual(declared.scheduler, "unipc")
+        self.assertEqual(
+            (declared.width, declared.height, declared.frames), (896, 512, 249)
+        )
+        negative = declared.resolve_negative_prompt(None)
+        self.assertIn("blurred details", negative)
+        self.assertIn("digital clipping", negative)
+
     def test_explicit_request_always_wins_and_empty_is_reported(self) -> None:
         declared = self._defaults("lingbot-video")
         self.assertEqual(declared.resolve_negative_prompt("blurry"), "blurry")
@@ -509,6 +660,9 @@ class FamilyGenerationDefaultsTests(unittest.TestCase):
         self.assertIsNone(none_declared.steps)
         self.assertIsNone(none_declared.cfg_scale)
         self.assertIsNone(none_declared.scheduler)
+        self.assertIsNone(none_declared.width)
+        self.assertIsNone(none_declared.height)
+        self.assertIsNone(none_declared.frames)
         self.assertFalse(none_declared.declares_negative_prompt())
         # Caller fallbacks survive untouched.
         self.assertEqual(none_declared.resolve_steps(None, fallback=20), 20)
@@ -516,6 +670,9 @@ class FamilyGenerationDefaultsTests(unittest.TestCase):
         self.assertEqual(
             none_declared.resolve_scheduler(None, fallback="euler"), "euler"
         )
+        self.assertEqual(none_declared.resolve_width(None, fallback=832), 832)
+        self.assertEqual(none_declared.resolve_height(None, fallback=480), 480)
+        self.assertEqual(none_declared.resolve_frames(None, fallback=17), 17)
         self.assertEqual(none_declared.resolve_negative_prompt(None), "")
         # A family that declares nothing cannot be degraded by an empty one.
         self.assertIsNone(
@@ -536,6 +693,9 @@ class FamilyGenerationDefaultsTests(unittest.TestCase):
             steps=3,
             cfg_scale=2.0,
             scheduler="euler",
+            width=64,
+            height=64,
+            frames=5,
         )
         infer.resolve_family_generation_defaults = lambda _model_type: declared
 
@@ -550,9 +710,6 @@ class FamilyGenerationDefaultsTests(unittest.TestCase):
                     "--config", str(cfg_path),
                     "--prompt", "a red cube spinning",
                     "--seed", "7",
-                    "--frames", "5",
-                    "--height", "64",
-                    "--width", "64",
                     "--out", str(tmpdir / out_name),
                 ] + extra
                 old_argv = sys.argv

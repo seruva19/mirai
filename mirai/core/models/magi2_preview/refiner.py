@@ -51,6 +51,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
 import torch
@@ -74,6 +75,11 @@ MAGI2_REFINER_VAE_TEMPORAL_STRIDE = 4
 # Playback rate of a refined clip: the decoder emits the full requested frame
 # count instead of the preview's half-rate expansion.
 MAGI2_REFINER_OUTPUT_FPS = 25.0
+MAGI2_RELEASED_REFINER_HEIGHT = 1088
+MAGI2_RELEASED_REFINER_WIDTH = 1920
+# Bound the refiner MLP's temporary up-projection by evaluating independent
+# token rows in deterministic chunks.
+MAGI2_REFINER_MLP_CHUNK_TOKENS = 16_384
 
 # The vendored refiner sampler is Flow-UniPC, as the preview sampler is.
 MAGI2_REFINER_SOLVER = "unipc"
@@ -87,6 +93,286 @@ _MAGI2_REFINER_ASSET_HINT = (
     "Fetch it from the release and point model.path at a snapshot root that "
     "contains it."
 )
+
+
+class _ModalityChunkDispatcher:
+    """Minimal dispatcher view for one contiguous modality/token chunk."""
+
+    def __init__(self, *, modality: int, tokens: int, modalities: int) -> None:
+        self.group_size_cpu = [0] * int(modalities)
+        self.group_size_cpu[int(modality)] = int(tokens)
+
+    def dispatch(self, value: torch.Tensor) -> list[torch.Tensor]:
+        return list(torch.split(value, self.group_size_cpu, dim=0))
+
+    @staticmethod
+    def undispatch(*groups: torch.Tensor) -> torch.Tensor:
+        return torch.cat(groups, dim=0)
+
+
+def _refiner_mlp_forward(
+    module: Any, value: torch.Tensor, modality_dispatcher: Any
+) -> torch.Tensor:
+    """The vendored MLP's exact operations, factored for bounded token chunks."""
+    value = module.pre_norm(
+        value, modality_dispatcher=modality_dispatcher
+    ).to(torch.bfloat16)
+    value = module.up_gate_proj(
+        value, modality_dispatcher=modality_dispatcher
+    ).to(torch.float32)
+    value = module.activation_func(value).to(torch.bfloat16)
+    return module.down_proj(
+        value, modality_dispatcher=modality_dispatcher
+    ).to(torch.float32)
+
+
+@torch.compiler.disable
+def _chunked_refiner_mlp_forward(
+    module: Any, value: torch.Tensor, modality_dispatcher: Any
+) -> torch.Tensor:
+    """Evaluate MLP rows in chunks while preserving modality-expert routing."""
+    chunk_tokens = int(module._mirai_chunk_tokens)
+    if int(value.shape[0]) <= chunk_tokens:
+        return _refiner_mlp_forward(module, value, modality_dispatcher)
+
+    modalities = int(module.pre_norm.num_modality)
+    if modalities > 1:
+        group_sizes = [int(size) for size in modality_dispatcher.group_size_cpu]
+    else:
+        group_sizes = [int(value.shape[0])]
+    if value.is_cuda:
+        # Layer rotation produces allocator segments with different shapes.
+        # Flush at this full-output boundary so the next contiguous output can
+        # reuse them; chunk arithmetic and values are unchanged.
+        torch.cuda.empty_cache()
+    output = torch.empty(
+        (int(value.shape[0]), int(module.down_proj.out_features)),
+        device=value.device,
+        dtype=torch.float32,
+    )
+    group_offset = 0
+    for modality, group_tokens in enumerate(group_sizes):
+        group_end = group_offset + group_tokens
+        for start in range(group_offset, group_end, chunk_tokens):
+            end = min(start + chunk_tokens, group_end)
+            dispatcher = (
+                _ModalityChunkDispatcher(
+                    modality=modality,
+                    tokens=end - start,
+                    modalities=modalities,
+                )
+                if modalities > 1
+                else modality_dispatcher
+            )
+            chunk = _refiner_mlp_forward(module, value[start:end], dispatcher)
+            output[start:end].copy_(chunk)
+            del chunk
+        group_offset = group_end
+    return output
+
+
+def attach_refiner_mlp_chunking(
+    transformer: Any, *, chunk_tokens: int = MAGI2_REFINER_MLP_CHUNK_TOKENS
+) -> int:
+    """Arm bounded-memory MLP execution on every released refiner layer."""
+    from mirai.vendors.magi2_preview.model.magi2_refiner import MLP
+
+    resolved = int(chunk_tokens)
+    if resolved < 1:
+        raise ValueError("MAGI-2 refiner MLP chunk size must be >= 1 token.")
+    attached = 0
+    for module in transformer.modules():
+        if not isinstance(module, MLP):
+            continue
+        module._mirai_chunk_tokens = resolved
+        module.forward = MethodType(_chunked_refiner_mlp_forward, module)
+        attached += 1
+    return attached
+
+
+@torch.compiler.disable
+def _chunked_refiner_attention_forward(
+    module: Any,
+    hidden_states: torch.Tensor,
+    rope: torch.Tensor,
+    permute_mapping: torch.Tensor,
+    inv_permute_mapping: torch.Tensor,
+    varlen_handler: Any,
+    local_attn_handler: Any,
+    modality_dispatcher: Any,
+    cp_split_sizes: list[int],
+) -> torch.Tensor:
+    """Bound full-token QKV/rotary temporaries on the single-GPU path."""
+    del inv_permute_mapping, varlen_handler
+    from mirai.vendors.magi2_preview.model.magi2_refiner import (
+        apply_rotary_emb,
+        flash_attn_with_cp,
+        flex_flash_attn_with_cp,
+    )
+
+    tokens = int(hidden_states.shape[0])
+    chunk_tokens = int(module._mirai_chunk_tokens)
+    modalities = int(module.pre_norm.num_modality)
+    group_sizes = (
+        [int(size) for size in modality_dispatcher.group_size_cpu]
+        if modalities > 1
+        else [tokens]
+    )
+    q = torch.empty(
+        (tokens, int(module.config.num_heads_q), int(module.config.head_dim)),
+        device=hidden_states.device,
+        dtype=torch.bfloat16,
+    )
+    k = torch.empty(
+        (tokens, int(module.config.num_heads_kv), int(module.config.head_dim)),
+        device=hidden_states.device,
+        dtype=torch.bfloat16,
+    )
+    v = torch.empty_like(k)
+    gate = (
+        torch.empty(
+            (tokens, int(module.config.num_heads_q), 1),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        if bool(module.config.enable_attn_gating)
+        else None
+    )
+    sin_emb, cos_emb = rope.tensor_split(2, -1)
+    group_offset = 0
+    for modality, group_tokens in enumerate(group_sizes):
+        group_end = group_offset + group_tokens
+        for start in range(group_offset, group_end, chunk_tokens):
+            end = min(start + chunk_tokens, group_end)
+            dispatcher = (
+                _ModalityChunkDispatcher(
+                    modality=modality,
+                    tokens=end - start,
+                    modalities=modalities,
+                )
+                if modalities > 1
+                else modality_dispatcher
+            )
+            normalized = module.pre_norm(
+                hidden_states[start:end], modality_dispatcher=dispatcher
+            ).to(torch.bfloat16)
+            qkv = module.linear_qkv(
+                normalized, modality_dispatcher=dispatcher
+            ).to(torch.float32)
+            q_chunk, k_chunk, v_chunk = torch.split(
+                qkv, [module.q_size, module.kv_size, module.kv_size], dim=1
+            )
+            q_chunk = q_chunk.view(
+                -1, module.config.num_heads_q, module.config.head_dim
+            )
+            k_chunk = k_chunk.view(
+                -1, module.config.num_heads_kv, module.config.head_dim
+            )
+            v_chunk = v_chunk.view(
+                -1, module.config.num_heads_kv, module.config.head_dim
+            )
+            q_chunk = module.q_norm(
+                q_chunk, modality_dispatcher=dispatcher
+            )
+            k_chunk = module.k_norm(
+                k_chunk, modality_dispatcher=dispatcher
+            )
+            original_positions = permute_mapping[start:end]
+            q_chunk = apply_rotary_emb(
+                q_chunk.unsqueeze(0),
+                cos_emb[original_positions],
+                sin_emb[original_positions],
+            ).squeeze(0)
+            k_chunk = apply_rotary_emb(
+                k_chunk.unsqueeze(0),
+                cos_emb[original_positions],
+                sin_emb[original_positions],
+            ).squeeze(0)
+            q.index_copy_(0, original_positions, q_chunk.to(torch.bfloat16))
+            k.index_copy_(0, original_positions, k_chunk.to(torch.bfloat16))
+            v.index_copy_(0, original_positions, v_chunk.to(torch.bfloat16))
+            if gate is not None:
+                gate[start:end].copy_(
+                    module.linear_g(
+                        normalized, modality_dispatcher=dispatcher
+                    ).to(torch.float32).unsqueeze(-1)
+                )
+        group_offset = group_end
+    del normalized, qkv, q_chunk, k_chunk, v_chunk
+
+    if module.config.use_local_attn:
+        attended = flex_flash_attn_with_cp(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            local_attn_handler.q_ranges,
+            local_attn_handler.k_ranges,
+            local_attn_handler.attn_type_map,
+            local_attn_handler.max_seqlen_q,
+            bool(getattr(local_attn_handler, "auto_range_merge", False)),
+            bool(getattr(local_attn_handler, "sparse_load", False)),
+            cp_split_sizes,
+            module._mirai_refiner_attention_backend,
+        )
+    else:
+        attended = flash_attn_with_cp(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), cp_split_sizes
+        )
+    del q, k, v
+
+    output = torch.empty(
+        (tokens, int(module.linear_proj.out_features)),
+        device=hidden_states.device,
+        dtype=torch.bfloat16,
+    )
+    group_offset = 0
+    for modality, group_tokens in enumerate(group_sizes):
+        group_end = group_offset + group_tokens
+        for start in range(group_offset, group_end, chunk_tokens):
+            end = min(start + chunk_tokens, group_end)
+            dispatcher = (
+                _ModalityChunkDispatcher(
+                    modality=modality,
+                    tokens=end - start,
+                    modalities=modalities,
+                )
+                if modalities > 1
+                else modality_dispatcher
+            )
+            original_positions = permute_mapping[start:end]
+            attended_chunk = attended[original_positions]
+            if gate is not None:
+                attended_chunk = attended_chunk * torch.sigmoid(gate[start:end])
+            attended_chunk = attended_chunk.reshape(
+                -1, module.config.num_heads_q * module.config.head_dim
+            ).to(torch.bfloat16)
+            output[start:end].copy_(
+                module.linear_proj(
+                    attended_chunk, modality_dispatcher=dispatcher
+                ).to(torch.bfloat16)
+            )
+            del attended_chunk
+        group_offset = group_end
+    return output
+
+
+def attach_refiner_attention_chunking(
+    transformer: Any, *, chunk_tokens: int = MAGI2_REFINER_MLP_CHUNK_TOKENS
+) -> int:
+    """Arm bounded QKV/rotary projections on every refiner attention layer."""
+    from mirai.vendors.magi2_preview.model.magi2_refiner import Attention
+
+    resolved = int(chunk_tokens)
+    if resolved < 1:
+        raise ValueError("MAGI-2 refiner attention chunk size must be >= 1 token.")
+    attached = 0
+    for module in transformer.modules():
+        if not isinstance(module, Attention):
+            continue
+        module._mirai_chunk_tokens = resolved
+        module.forward = MethodType(_chunked_refiner_attention_forward, module)
+        attached += 1
+    return attached
 
 
 # --------------------------------------------------------------------------- #
@@ -310,8 +596,8 @@ class Magi2Refiner:
         """Resolve a request against the release profile.
 
         An absent value takes the released refiner profile; a supplied value
-        overrides it. The target resolution falls back to the preview request,
-        which makes the default refinement purely temporal.
+        overrides it. The target resolution falls back to the released 1080p
+        delivery grid.
         """
         evaluation = self.runtime_config().evaluation_config
         resolved_scheduler = str(scheduler or MAGI2_REFINER_SOLVER).strip().lower()
@@ -336,8 +622,8 @@ class Magi2Refiner:
                 else cfg_scale
             ),
             shift=resolved_shift if shift is None else float(shift),
-            height=int(preview_height if height is None else height),
-            width=int(preview_width if width is None else width),
+            height=int(MAGI2_RELEASED_REFINER_HEIGHT if height is None else height),
+            width=int(MAGI2_RELEASED_REFINER_WIDTH if width is None else width),
             noise_index=int(evaluation.magi2_refiner_noise_value),
             scheduler=resolved_scheduler,
         )
@@ -459,7 +745,9 @@ class Magi2Refiner:
             self._data_proxy = Magi2RefinerDataProxy(
                 config.evaluation_config.magi2_refiner_data_proxy_config
             )
+        attach_refiner_mlp_chunking(self._transformer)
         attach_refiner_attention_backend(self._transformer, backend)
+        attach_refiner_attention_chunking(self._transformer)
         self._place(device=device, residency=residency)
 
     def _place(self, *, device: str, residency: Any | None) -> None:
@@ -539,6 +827,9 @@ class Magi2Refiner:
     def release(self) -> None:
         """Drop the refiner off the compute device and free its VRAM."""
         self._release_hooks()
+        manager = self._block_swap_manager
+        if manager is not None:
+            manager.release_device()
         self._block_swap_manager = None
         if self._transformer is not None:
             self._transformer.to(device=torch.device("cpu"))
@@ -551,6 +842,15 @@ class Magi2Refiner:
 # --------------------------------------------------------------------------- #
 # Refine policy loop (family-owned; model access via provider hooks only)
 # --------------------------------------------------------------------------- #
+def _release_cuda_workspace(device: torch.device) -> None:
+    """Make completed asynchronous work reclaimable at a memory boundary."""
+
+    if device.type != "cuda":
+        return
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+
+
 def run_refine(
     *,
     pipeline: Any,
@@ -588,25 +888,35 @@ def run_refine(
             f"{tuple(base_latent.shape)}."
         )
     compute_device = torch.device(device)
-    generator = torch.Generator(device=compute_device)
-    generator.manual_seed(int(seed))
+    generator_factory = getattr(pipeline, "refiner_noise_generator", None)
+    if callable(generator_factory):
+        generator = generator_factory(seed=int(seed), device=compute_device)
+    else:
+        generator = torch.Generator(device=compute_device)
+        generator.manual_seed(int(seed))
 
     # The preview latent is complete, so its sparse-MoE transformer leaves the
     # device before the refiner's weights are allocated.
     pipeline.release_base_transformer()
 
-    # Text conditioning is produced before the refiner is resident so the Qwen3.5
-    # encoder and the refiner never share the device.
-    pipeline.load_text_encoder(device=str(compute_device))
-    try:
-        context = torch.as_tensor(
-            pipeline.encode_prompt(prompt, device=str(compute_device))
-        )
-        context_null = torch.as_tensor(
-            pipeline.encode_prompt(negative_prompt or "", device=str(compute_device))
-        )
-    finally:
-        pipeline.offload_text_encoder()
+    # An adjacent preview already encoded these exact prompts. Consume its
+    # detached pair when available; a resumed refiner-only call falls back to a
+    # fresh encode before the refiner becomes resident.
+    take_context = getattr(pipeline, "take_refiner_context", None)
+    cached_context = take_context() if callable(take_context) else None
+    if cached_context is None:
+        pipeline.load_text_encoder(device=str(compute_device))
+        try:
+            context = torch.as_tensor(
+                pipeline.encode_prompt(prompt, device=str(compute_device))
+            )
+            context_null = torch.as_tensor(
+                pipeline.encode_prompt(negative_prompt or "", device=str(compute_device))
+            )
+        finally:
+            pipeline.offload_text_encoder()
+    else:
+        context, context_null = cached_context
     context = _as_batched_context(context, compute_device)
     context_null = _as_batched_context(context_null, compute_device)
 
@@ -651,8 +961,12 @@ def run_refine(
                     velocity = pipeline.refiner_forward(latents, context_null)
                 else:
                     v_cond = pipeline.refiner_forward(latents, context)
+                    # The forward is asynchronous, so synchronize before
+                    # returning its cached allocator segments for reuse.
+                    _release_cuda_workspace(compute_device)
                     v_uncond = pipeline.refiner_forward(latents, context_null)
                     velocity = v_uncond + scale * (v_cond - v_uncond)
+                    del v_cond, v_uncond
                 # Upstream expands the guidance scale over the frame axis so a
                 # per-frame schedule can lower it on the leading frames. The
                 # released refiner profile leaves that schedule off, so the
@@ -661,6 +975,8 @@ def run_refine(
                 latents = scheduler.step(
                     velocity, timestep, latents, return_dict=False
                 )[0]
+                del velocity
+                _release_cuda_workspace(compute_device)
     finally:
         refiner.release()
     refined = latents.squeeze(0) if latents.ndim == 5 else latents
@@ -681,6 +997,9 @@ def _as_batched_context(context: torch.Tensor, device: torch.device) -> torch.Te
 
 
 __all__ = [
+    "MAGI2_RELEASED_REFINER_HEIGHT",
+    "MAGI2_RELEASED_REFINER_WIDTH",
+    "MAGI2_REFINER_MLP_CHUNK_TOKENS",
     "MAGI2_REFINER_OUTPUT_FPS",
     "MAGI2_REFINER_SIGMA_TABLE_SIZE",
     "MAGI2_REFINER_SOLVER",
@@ -688,6 +1007,8 @@ __all__ = [
     "MAGI2_REFINER_VAE_TEMPORAL_STRIDE",
     "Magi2RefineSettings",
     "Magi2Refiner",
+    "attach_refiner_attention_chunking",
+    "attach_refiner_mlp_chunking",
     "magi2_refiner_decoded_frames",
     "magi2_refiner_latent_frames",
     "magi2_refiner_renoise",

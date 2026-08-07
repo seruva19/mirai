@@ -344,6 +344,8 @@ class InferenceConfig:
     expert_feature_cache_drift_threshold: float = 0.05
     expert_feature_cache_max_reuse_span: int = 2
     expert_feature_cache_slots: int = 2
+    # Bound routed-expert activation workspace without changing routing.
+    moe_token_chunk_size: int = 0
     # Inference-entrypoint frozen-weight block residency. 0 keeps the denoiser
     # fully resident; above 0 it requires memory.weight_residency_strategy.
     blocks_to_swap: int = 0
@@ -731,6 +733,7 @@ class TrainingConfig:
                 "expert_feature_cache_drift_threshold",
                 "expert_feature_cache_max_reuse_span",
                 "expert_feature_cache_slots",
+                "moe_token_chunk_size",
                 "blocks_to_swap",
                 "block_swap_mode",
             },
@@ -738,6 +741,11 @@ class TrainingConfig:
         inference_blocks_to_swap = int(inference_table.get("blocks_to_swap", 0))
         if inference_blocks_to_swap < 0:
             raise ConfigError("inference.blocks_to_swap must be >= 0.")
+        inference_moe_token_chunk_size = int(
+            inference_table.get("moe_token_chunk_size", 0)
+        )
+        if inference_moe_token_chunk_size < 0:
+            raise ConfigError("inference.moe_token_chunk_size must be >= 0.")
         inference_block_swap_mode = str(
             inference_table.get("block_swap_mode", "sync")
         ).strip().lower()
@@ -834,6 +842,12 @@ class TrainingConfig:
                     "inference.expert_feature_cache requires "
                     "memory.moe_kernel_backend='grouped'; got "
                     f"'{configured_kernel_backend}'."
+                )
+            if inference_moe_token_chunk_size > 0:
+                raise ConfigError(
+                    "inference.moe_token_chunk_size is incompatible with "
+                    "inference.expert_feature_cache because branch caching owns "
+                    "the complete routed-slot layout."
                 )
         model_params_table = _expect_table("model.params", model_table.get("params", {}))
         model_params_allowed = {
@@ -3324,6 +3338,7 @@ class TrainingConfig:
                     expert_feature_cache_policy.max_reuse_span
                 ),
                 expert_feature_cache_slots=expert_feature_cache_policy.slots,
+                moe_token_chunk_size=inference_moe_token_chunk_size,
                 blocks_to_swap=inference_blocks_to_swap,
                 block_swap_mode=inference_block_swap_mode,
             ),

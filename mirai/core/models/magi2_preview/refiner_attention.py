@@ -35,16 +35,14 @@ reference:
 knobs of the CUDA kernel. They select how the kernel visits the ranges, not
 which key each query attends to, so this path ignores them.
 
-Mask construction. The union is expressed as a lookup rather than as a loop.
-Splitting the query axis at every ``q_ranges`` boundary yields elementary
-segments, each of which every row either fully covers or is disjoint from, so a
-segment's allowed key set is fixed. Marking ``+1`` at ``k_start`` and ``-1`` at
-``k_end`` per covering row and taking the running sum gives, per segment, a
-boolean row over the key axis that is true exactly on the union — overlapping
-ranges raise the count above one and change nothing else. ``mask_mod`` is then
-two tensor indexings: segment of the query position, then key position in that
-segment's row. The construction costs ``O(segments * key_tokens)`` and segments
-are bounded by ``2 * N - 1``.
+Mask construction. Splitting the query axis at every ``q_ranges`` boundary
+yields elementary segments, each of which every row either fully covers or is
+disjoint from, so a segment's allowed key set is fixed. A boundary-event sweep
+tracks the active key ranges and stores their merged union as a short interval
+list per segment. The released profile normally needs two intervals: the local
+video window and the dense conditioning tail. This compact representation is
+important at 1080p: expanding every range across every query segment creates
+billions of intermediate indices even though the resulting union is sparse.
 
 Tensor semantics: ``query`` is ``[tokens, heads_q, head_dim]`` and ``key`` /
 ``value`` are ``[key_tokens, heads_kv, head_dim]``, unbatched, as the vendored
@@ -59,7 +57,8 @@ MagiAttention's ``flex_flash_attn_func``
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
@@ -127,15 +126,29 @@ def validate_refiner_flex_support(device: torch.device | None = None) -> None:
 class Magi2RangeUnionMask:
     """Per-query-segment key membership of a paired range list.
 
-    ``allowed`` carries one boolean row per elementary query segment plus a
-    final all-false row, which is the segment index assigned to any query
-    position no ``q_range`` covers. ``segment_of`` maps a query position to its
-    row, so membership is one lookup per ``(query, key)`` pair.
+    ``interval_starts`` / ``interval_ends`` carry the disjoint key-range union
+    for each elementary query segment plus a final empty row. ``segment_of``
+    maps a query position to its row, so membership checks only the compact
+    interval slots instead of indexing a dense ``segments * key_tokens`` table.
     """
 
-    allowed: torch.Tensor
+    interval_starts: torch.Tensor
+    interval_ends: torch.Tensor
     segment_of: torch.Tensor
     segment_has_keys: torch.Tensor
+    boundaries: torch.Tensor
+    key_tokens: int
+
+    @property
+    def allowed(self) -> torch.Tensor:
+        """Materialize membership for diagnostics and small contract tests."""
+        keys = torch.arange(
+            int(self.key_tokens), device=self.interval_starts.device
+        ).view(1, 1, -1)
+        return (
+            (self.interval_starts.unsqueeze(-1) <= keys)
+            & (keys < self.interval_ends.unsqueeze(-1))
+        ).any(dim=1)
 
     @property
     def query_has_keys(self) -> torch.Tensor:
@@ -143,8 +156,10 @@ class Magi2RangeUnionMask:
         return self.segment_has_keys[self.segment_of]
 
     def mask_mod(self) -> Callable[..., torch.Tensor]:
-        allowed = self.allowed
+        interval_starts = self.interval_starts
+        interval_ends = self.interval_ends
         segment_of = self.segment_of
+        slots = int(interval_starts.shape[1])
 
         def range_union_mask(
             batch: torch.Tensor,
@@ -152,9 +167,78 @@ class Magi2RangeUnionMask:
             query_index: torch.Tensor,
             key_index: torch.Tensor,
         ) -> torch.Tensor:
-            return allowed[segment_of[query_index], key_index]
+            segment = segment_of[query_index]
+            allowed = torch.zeros_like(query_index, dtype=torch.bool)
+            # A fixed Python loop is unrolled while FlexAttention traces the
+            # score modifier; released masks keep this slot count very small.
+            for slot in range(slots):
+                starts = interval_starts[:, slot]
+                ends = interval_ends[:, slot]
+                allowed = allowed | (
+                    (starts[segment] <= key_index) & (key_index < ends[segment])
+                )
+            return allowed
 
         return range_union_mask
+
+    def block_mask(self, *, query_tokens: int, block_size: int = 128) -> Any:
+        """Build FlexAttention's sparse block metadata without a dense Q*K mask."""
+        from torch.nn.attention.flex_attention import BlockMask
+
+        query_tokens = int(query_tokens)
+        key_tokens = int(self.key_tokens)
+        block_size = int(block_size)
+        query_blocks = math.ceil(query_tokens / block_size)
+        key_blocks_by_query: list[set[int]] = [set() for _ in range(query_blocks)]
+        boundaries = [int(value) for value in self.boundaries.detach().cpu().tolist()]
+        starts = self.interval_starts.detach().cpu().tolist()
+        ends = self.interval_ends.detach().cpu().tolist()
+        for segment, (query_start, query_end) in enumerate(
+            zip(boundaries[:-1], boundaries[1:], strict=True)
+        ):
+            if query_start >= query_end:
+                continue
+            first_query_block = query_start // block_size
+            last_query_block = (query_end - 1) // block_size
+            key_blocks: set[int] = set()
+            for key_start, key_end in zip(
+                starts[segment], ends[segment], strict=True
+            ):
+                if key_start >= key_end:
+                    continue
+                key_blocks.update(
+                    range(key_start // block_size, (key_end - 1) // block_size + 1)
+                )
+            for query_block in range(first_query_block, last_query_block + 1):
+                key_blocks_by_query[query_block].update(key_blocks)
+
+        # BlockMask.from_kv_blocks uses the padded width as the total key-block
+        # domain while transposing the sparse rows, so retain that full block
+        # width even though only ``counts`` entries in each row are meaningful.
+        max_key_blocks = max(math.ceil(key_tokens / block_size), 1)
+        counts = torch.tensor(
+            [len(indices) for indices in key_blocks_by_query],
+            dtype=torch.int32,
+            device=self.segment_of.device,
+        ).view(1, 1, query_blocks)
+        indices = torch.zeros(
+            (1, 1, query_blocks, max_key_blocks),
+            dtype=torch.int32,
+            device=self.segment_of.device,
+        )
+        for query_block, key_blocks in enumerate(key_blocks_by_query):
+            ordered = sorted(key_blocks)
+            if ordered:
+                indices[0, 0, query_block, : len(ordered)] = torch.tensor(
+                    ordered, dtype=torch.int32, device=self.segment_of.device
+                )
+        return BlockMask.from_kv_blocks(
+            counts,
+            indices,
+            BLOCK_SIZE=block_size,
+            mask_mod=self.mask_mod(),
+            seq_lengths=(query_tokens, key_tokens),
+        )
 
 
 def _validated_ranges(
@@ -208,37 +292,61 @@ def build_range_union_mask(
     q, k = _validated_ranges(
         q_ranges, k_ranges, query_tokens=int(query_tokens), key_tokens=int(key_tokens)
     )
-    boundaries = torch.unique(q.reshape(-1))
+    boundaries = torch.unique(q.reshape(-1), sorted=True)
     segments = max(int(boundaries.numel()) - 1, 0)
 
-    # One extra row, kept all-false, is the segment a query position outside
-    # every q_range is mapped to.
-    allowed = torch.zeros(
-        (segments + 1, int(key_tokens)), dtype=torch.bool, device=device
+    # Build boundary events on CPU. Range metadata is small relative to video
+    # activations, and the event sweep avoids materializing one entry per
+    # (range, covered-segment) pair on CUDA.
+    boundary_values = [int(value) for value in boundaries.detach().cpu().tolist()]
+    boundary_index = {value: index for index, value in enumerate(boundary_values)}
+    starts: list[list[tuple[int, int]]] = [[] for _ in boundary_values]
+    ends: list[list[tuple[int, int]]] = [[] for _ in boundary_values]
+    for q_pair, k_pair in zip(
+        q.detach().cpu().tolist(), k.detach().cpu().tolist(), strict=True
+    ):
+        q_start, q_end = (int(q_pair[0]), int(q_pair[1]))
+        k_start, k_end = (int(k_pair[0]), int(k_pair[1]))
+        if q_start == q_end or k_start == k_end:
+            continue
+        interval = (k_start, k_end)
+        starts[boundary_index[q_start]].append(interval)
+        ends[boundary_index[q_end]].append(interval)
+
+    active: dict[tuple[int, int], int] = {}
+    segment_intervals: list[list[tuple[int, int]]] = []
+    for index in range(segments):
+        for interval in ends[index]:
+            remaining = active[interval] - 1
+            if remaining:
+                active[interval] = remaining
+            else:
+                del active[interval]
+        for interval in starts[index]:
+            active[interval] = active.get(interval, 0) + 1
+
+        merged: list[tuple[int, int]] = []
+        for k_start, k_end in sorted(active):
+            if merged and k_start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], k_end))
+            else:
+                merged.append((k_start, k_end))
+        segment_intervals.append(merged)
+
+    slots = max((len(intervals) for intervals in segment_intervals), default=0)
+    # Keep one always-false slot so mask_mod has a uniform, non-empty axis even
+    # when every query range is empty.
+    slots = max(slots, 1)
+    padded_starts = [[int(key_tokens)] * slots for _ in range(segments + 1)]
+    padded_ends = [[int(key_tokens)] * slots for _ in range(segments + 1)]
+    for segment, intervals in enumerate(segment_intervals):
+        for slot, (k_start, k_end) in enumerate(intervals):
+            padded_starts[segment][slot] = k_start
+            padded_ends[segment][slot] = k_end
+    interval_starts = torch.tensor(
+        padded_starts, dtype=torch.int64, device=device
     )
-    if segments > 0:
-        segment_start = boundaries[:-1]
-        segment_end = boundaries[1:]
-        # Segments are elementary, so a row either covers one entirely or not
-        # at all; containment of the segment bounds is therefore exact.
-        covers = (q[:, 0].unsqueeze(1) <= segment_start.unsqueeze(0)) & (
-            segment_end.unsqueeze(0) <= q[:, 1].unsqueeze(1)
-        )
-        rows, covered_segments = covers.nonzero(as_tuple=True)
-        if int(rows.numel()) > 0:
-            # Running sum of range openings minus closings: positive exactly on
-            # the union, so a key reachable from several rows is counted once.
-            crossings = torch.zeros(
-                (segments, int(key_tokens) + 1), dtype=torch.int32, device=device
-            )
-            unit = torch.ones(int(rows.numel()), dtype=torch.int32, device=device)
-            crossings.index_put_(
-                (covered_segments, k[rows, 0]), unit, accumulate=True
-            )
-            crossings.index_put_(
-                (covered_segments, k[rows, 1]), -unit, accumulate=True
-            )
-            allowed[:segments] = crossings.cumsum(dim=1)[:, : int(key_tokens)] > 0
+    interval_ends = torch.tensor(padded_ends, dtype=torch.int64, device=device)
 
     positions = torch.arange(int(query_tokens), device=device)
     # ``right=True`` yields the index i with boundaries[i-1] <= pos < boundaries[i],
@@ -250,9 +358,12 @@ def build_range_union_mask(
         outside, torch.full_like(segment_of, segments), segment_of
     )
     return Magi2RangeUnionMask(
-        allowed=allowed,
+        interval_starts=interval_starts,
+        interval_ends=interval_ends,
         segment_of=segment_of,
-        segment_has_keys=allowed.any(dim=1),
+        segment_has_keys=(interval_starts < interval_ends).any(dim=1),
+        boundaries=boundaries,
+        key_tokens=int(key_tokens),
     )
 
 
@@ -293,6 +404,8 @@ def flex_range_attention(
     *,
     compile_kernel: bool | None = None,
     compile_block_mask: bool | None = None,
+    range_mask: Magi2RangeUnionMask | None = None,
+    block_mask: Any | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FlexAttention equivalent of MagiAttention's ``flex_flash_attn_func``.
 
@@ -328,9 +441,15 @@ def flex_range_attention(
     query_tokens = int(query.shape[0])
     key_tokens = int(key.shape[0])
     _validate_attn_type_map(attn_type_map, ranges=int(q_ranges.shape[0]))
-    mask = build_range_union_mask(
-        q_ranges, k_ranges, query_tokens=query_tokens, key_tokens=key_tokens
-    )
+    mask = range_mask
+    if mask is None:
+        mask = build_range_union_mask(
+            q_ranges, k_ranges, query_tokens=query_tokens, key_tokens=key_tokens
+        )
+    elif int(mask.segment_of.numel()) != query_tokens or int(mask.key_tokens) != key_tokens:
+        raise Magi2RefinerAttentionUnsupported(
+            "Cached MAGI-2 range mask geometry does not match the attention input."
+        )
     if max_seqlen_q is not None and int(max_seqlen_q) > 0:
         longest = int((q_ranges[:, 1] - q_ranges[:, 0]).max()) if q_ranges.numel() else 0
         if longest > int(max_seqlen_q):
@@ -347,17 +466,10 @@ def flex_range_attention(
     if compile_block_mask is None:
         compile_block_mask = device.type == "cuda"
 
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    block_mask = create_block_mask(
-        mask.mask_mod(),
-        None,
-        None,
-        query_tokens,
-        key_tokens,
-        device=str(device),
-        _compile=bool(compile_block_mask),
-    )
+    # Construct sparse block metadata directly without evaluating a dense Q*K
+    # boolean matrix.
+    if block_mask is None:
+        block_mask = mask.block_mask(query_tokens=query_tokens)
     flex = flex_attention_function(compiled=bool(compile_kernel))
     attended, log_sum_exp = flex(
         query.transpose(0, 1).unsqueeze(0),
@@ -381,18 +493,81 @@ def flex_range_attention(
     return out.to(query.dtype), lse
 
 
-@dataclass(frozen=True)
+@torch.compiler.disable
+def _resolve_cached_range_mask(
+    backend: "Magi2RefinerFlexAttentionBackend",
+    q_ranges: torch.Tensor,
+    k_ranges: torch.Tensor,
+    *,
+    query_tokens: int,
+    key_tokens: int,
+) -> tuple[Magi2RangeUnionMask, Any]:
+    """Reuse immutable geometry across refiner layers and denoise steps."""
+    if (
+        backend._cached_q_source is q_ranges
+        and backend._cached_k_source is k_ranges
+        and backend._cached_query_tokens == int(query_tokens)
+        and backend._cached_key_tokens == int(key_tokens)
+    ):
+        assert backend._cached_range_mask is not None
+        assert backend._cached_block_mask is not None
+        return backend._cached_range_mask, backend._cached_block_mask
+    q_cpu = q_ranges.detach().to(device="cpu", dtype=torch.int64)
+    k_cpu = k_ranges.detach().to(device="cpu", dtype=torch.int64)
+    cache_matches = (
+        backend._cached_q_ranges is not None
+        and backend._cached_k_ranges is not None
+        and backend._cached_query_tokens == int(query_tokens)
+        and backend._cached_key_tokens == int(key_tokens)
+        and torch.equal(backend._cached_q_ranges, q_cpu)
+        and torch.equal(backend._cached_k_ranges, k_cpu)
+    )
+    if cache_matches:
+        assert backend._cached_range_mask is not None
+        assert backend._cached_block_mask is not None
+        return backend._cached_range_mask, backend._cached_block_mask
+
+    mask = build_range_union_mask(
+        q_cpu.to(device=q_ranges.device),
+        k_cpu.to(device=k_ranges.device),
+        query_tokens=int(query_tokens),
+        key_tokens=int(key_tokens),
+    )
+    block_mask = mask.block_mask(query_tokens=int(query_tokens))
+    object.__setattr__(backend, "_cached_q_ranges", q_cpu.clone())
+    object.__setattr__(backend, "_cached_k_ranges", k_cpu.clone())
+    object.__setattr__(backend, "_cached_q_source", q_ranges)
+    object.__setattr__(backend, "_cached_k_source", k_ranges)
+    object.__setattr__(backend, "_cached_query_tokens", int(query_tokens))
+    object.__setattr__(backend, "_cached_key_tokens", int(key_tokens))
+    object.__setattr__(backend, "_cached_range_mask", mask)
+    object.__setattr__(backend, "_cached_block_mask", block_mask)
+    return mask, block_mask
+
+
+@dataclass
 class Magi2RefinerFlexAttentionBackend:
     """Execution seam bound to every vendored refiner ``Attention`` module.
 
-    ``compile_kernel`` and ``compile_block_mask`` default to the device
-    decision: CUDA execution compiles, because only the compiled lowering is
-    fused, while CPU execution stays eager so reference verification runs
-    without an inductor toolchain.
+    ``compile_kernel`` defaults to the device decision: CUDA execution compiles,
+    because only the compiled lowering is fused, while CPU execution stays
+    eager so reference verification runs without an inductor toolchain.
+    ``compile_block_mask`` remains an accepted compatibility field; compact
+    block metadata is now constructed directly and has no dense mask to compile.
     """
 
     compile_kernel: bool | None = None
     compile_block_mask: bool | None = None
+    _cached_q_ranges: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _cached_k_ranges: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _cached_q_source: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _cached_k_source: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _cached_query_tokens: int = field(default=-1, init=False, repr=False)
+    _cached_key_tokens: int = field(default=-1, init=False, repr=False)
+    _cached_range_mask: Magi2RangeUnionMask | None = field(
+        default=None, init=False, repr=False
+    )
+    _cached_block_mask: Any | None = field(default=None, init=False, repr=False)
 
     def execute(
         self,
@@ -405,6 +580,13 @@ class Magi2RefinerFlexAttentionBackend:
         attn_type_map: torch.Tensor | None,
         max_seqlen_q: int | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        range_mask, block_mask = _resolve_cached_range_mask(
+            self,
+            q_ranges,
+            k_ranges,
+            query_tokens=int(query.shape[0]),
+            key_tokens=int(key.shape[0]),
+        )
         return flex_range_attention(
             query,
             key,
@@ -415,7 +597,31 @@ class Magi2RefinerFlexAttentionBackend:
             max_seqlen_q,
             compile_kernel=self.compile_kernel,
             compile_block_mask=self.compile_block_mask,
+            range_mask=range_mask,
+            block_mask=block_mask,
         )
+
+
+def _magi_attention_hopper_kernel_available() -> bool:
+    """Whether the authors' single-GPU flex kernel can serve ``auto``.
+
+    The kernel is Hopper-specific. Import reachability is checked lazily by the
+    compatibility layer, including its functional-module fallback for installs
+    that omit the distributed communication extension.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+    except (AssertionError, RuntimeError):
+        return False
+    if major < 9:
+        return False
+    from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
+        magi_attention_flex_flash_attn_func,
+    )
+
+    return magi_attention_flex_flash_attn_func() is not None
 
 
 def resolve_magi2_refiner_attention(
@@ -425,8 +631,10 @@ def resolve_magi2_refiner_attention(
 
     Precedence under ``auto``: a registered ``torch.ops.magi2`` operator wins,
     because a real MagiCompiler install owns its graph boundary and its dispatch
-    semantics; with the namespace empty this native path is selected.
-    ``native_flex`` selects it unconditionally and ``vendor_eager`` never does.
+    semantics. Without one, the authors' single-GPU Hopper kernel wins when it
+    imports; only then does Mirai use its portable FlexAttention path.
+    ``native_flex`` selects the portable path unconditionally and
+    ``vendor_eager`` never binds it.
     """
     from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
         missing_magi2_custom_ops,
@@ -436,6 +644,8 @@ def resolve_magi2_refiner_attention(
     if name == "vendor_eager":
         return None
     if name == "auto" and not missing_magi2_custom_ops((MAGI2_REFINER_FLEX_OP,)):
+        return None
+    if name == "auto" and _magi_attention_hopper_kernel_available():
         return None
     return Magi2RefinerFlexAttentionBackend()
 

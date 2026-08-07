@@ -424,14 +424,12 @@ Inference uses the same native denoiser and the same block-residency path as
 training, so the preview transformer runs on one GPU with host-resident block
 streaming. The declared inference task is `text_to_video`.
 
-MAGI-2 declares no `ModelFamilyProvider.generation_defaults()`, so
-`scripts/infer.py` keeps its family-agnostic fallbacks (20 steps, CFG 5.0,
-Euler) and never substitutes a negative prompt on the family's behalf. The
-family's own unconditional stays where it already was: the native pipeline
-substitutes the vendored `NEGATIVE_PROMPT` inside `encode_prompt` when the
-negative prompt is empty and `evaluation_config.use_negative_prompt` is set.
-That condition is family runtime state a provider capability cannot observe, so
-the substitution has exactly one owner and the CLI does not duplicate it.
+MAGI-2 declares its released preview profile through
+`ModelFamilyProvider.generation_defaults()`: 896x512, 249 frames, 100 Flow-UniPC
+steps, CFG 5.0, and the vendored released negative prompt. Explicit CLI values
+still win. The native encoder retains the same negative-prompt fallback as a
+backstop for direct family callers, but an ordinary CLI run resolves the value
+before entering the pipeline and reports it in the result payload.
 
 Use [`configs/magi2_preview/inference_offload.toml`](../configs/magi2_preview/inference_offload.toml)
 with `scripts/infer.py`:
@@ -439,8 +437,6 @@ with `scripts/infer.py`:
 ```bash
 python scripts/infer.py \
   --config configs/magi2_preview/inference_offload.toml \
-  --scheduler unipc \
-  --frames 121 \
   --prompt "..." \
   --out outputs/clip.mp4
 ```
@@ -452,8 +448,10 @@ nor the VAE resident. Denoiser activation size is set by `--height`, `--width`,
 and `--frames`, which no config key controls, so on a 32 GiB device the request
 is part of the profile — prefer a smaller spatial size and a latent length near
 the floor of the generation envelope, and treat 832x480 at latent `T` 32 as a
-large request rather than a default. `--refine` adds a second model load and a
-second denoise; enable it only once the preview run's peak is known.
+large request rather than a default. The released 1920x1088 refiner target is
+not a 32 GiB profile; use an explicit smaller `--refiner-height` /
+`--refiner-width` there. `--refine` adds a second model load and a second
+denoise; enable it only once the preview run's peak is known.
 
 The example keeps `inference.keep_text_encoder_resident` and
 `inference.keep_vae_resident` at `false`, so text encoding, denoising, and VAE
@@ -500,18 +498,20 @@ count: the file carries exactly what the VAE decoded.
 
 The bounds apply to generation only — training forwards accept any
 representable latent length, and `dataset.frame_buckets` is unaffected.
-`scripts/infer.py` defaults `--frames` to 17, which this family rejects as
-below the floor; pass a length inside the envelope. `logging.sample_frame_count`
-must also fall inside it for a training run that emits previews; the shipped
-example sets 121 for a cheap mid-length preview.
+`scripts/infer.py` resolves this family's unset `--frames` to the released 249;
+its generic 17-frame fallback applies only to families that declare no value.
+`logging.sample_frame_count` must also fall inside the envelope for a training
+run that emits previews; the shipped example sets 121 for a cheap mid-length
+preview.
 
 The native sampler owns its own CFG execution and its own schedule, so both
 requested policies are checked rather than applied. Every denoise step packs
 the conditional and unconditional branches into one single-device `B=2`
 forward, which is why the shipped example sets `inference.cfg_mode = "batched"`
-and passes `--scheduler unipc`: `sequential` and any other solver name are
-rejected instead of being silently ignored. A training run that emits previews
-sets `logging.sample_solver = "unipc"` for the same reason.
+and the family declares `unipc` as its default solver: `sequential` and any
+other solver name are rejected instead of being silently ignored. A training
+run that emits previews sets `logging.sample_solver = "unipc"` for the same
+reason.
 
 Prompt-to-video output requires the official Qwen3.5 text encoder and the
 TurboVAE decoder from the same snapshot; both are validated before use and a
@@ -533,8 +533,7 @@ What it does, in order:
    load-bearing: it pins preview frame `k` to refined frame `2k`, so the
    inserted frames are true midpoints rather than a half-frame shift of the
    whole trajectory. `H'`/`W'` come from the refiner target resolution, which
-   defaults to the preview resolution — the default refinement is purely
-   temporal.
+   defaults to the released 1920x1088 delivery grid.
 2. **Re-noise.** The resampled latent is corrupted once, variance-preserving, at
    a fixed index into a zero-terminal-SNR `sqrt(alphas_cumprod)` table:
    `x * sigma + n * sqrt(1 - sigma^2)`. `sigma` is the *signal* coefficient, so
@@ -567,16 +566,46 @@ its own layers under the same policy. No latency or peak-memory figures are
 claimed here; they are published only after the GPU validation contract records
 them.
 
+Keep preview and refinement as separate process stages when compiler workspaces
+remain process-resident across model teardown. The preview latent is the exact
+stage boundary, so restarting for the refiner neither crops nor re-encodes the
+video latent.
+
+The TurboVAE decoder chunks the temporal axis and offloads decoded chunks, but
+does not spatially tile its internal activations. Mirai therefore bounds the
+temporal-window volume deterministically from the latent geometry: the released
+7/7 schedule remains unchanged for the 896x512 preview grid, while the complete
+1920x1088 refined latent uses 2/2. This decodes the full 68x120 latent; it does
+not crop or rescale it.
+Set `family_params.vae_decode_chunk_size` to a positive integer to override the
+automatic schedule on a device with a different memory envelope. Latent
+downsampling after refinement remains diagnostic only and visibly softens the
+image.
+
 Enable it with `--refine`:
 
 ```bash
 python scripts/infer.py \
   --config configs/magi2_preview/inference_offload.toml \
-  --scheduler unipc \
-  --frames 249 \
   --refine \
   --prompt "..." \
   --out outputs/clip.mp4
+```
+
+For the memory-bounded two-process path, preserve both deliverables:
+
+```bash
+python scripts/infer.py \
+  --config configs/magi2_preview/inference_offload.toml \
+  --prompt "..." \
+  --out outputs/preview.mp4
+
+python scripts/infer.py \
+  --config configs/magi2_preview/inference_offload.toml \
+  --decode-latent outputs/preview.pt \
+  --refine \
+  --prompt "..." \
+  --out outputs/refined.mp4
 ```
 
 `--refine` alone runs the released refinement profile. Every refiner flag
@@ -589,7 +618,7 @@ applied.
 | `--refiner-steps` | The released refiner step count. |
 | `--refiner-cfg` | The released refiner guidance scale. |
 | `--refiner-shift` | The released refiner flow shift, falling back to the preview `shift`. |
-| `--refiner-height` / `--refiner-width` | The preview `--height` / `--width`, making the refinement purely temporal. Both must be multiples of 16, the refiner VAE spatial stride. |
+| `--refiner-height` / `--refiner-width` | The released 1088 / 1920 delivery target. Both must be multiples of 16, the refiner VAE spatial stride. |
 | `--refiner-scheduler` | `unipc`; any other solver is rejected, as on the preview path. |
 | `--refiner-t-thresh`, `--refiner-sigma-tail-steps` | Not implemented by this family and **rejected** if stated. They describe a rectified-flow tail re-entry; MAGI-2 re-noises once at a table index instead. Change it through the refiner profile. |
 
@@ -611,12 +640,19 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   Diffusers is imported nowhere in loading or in a forward pass.
 - **Native MAGI-2 refiner staging** — Optional default-off second stage that
   resamples the preview latent in time, re-noises it once, and short-denoises it
-  through the released refiner checkpoint, producing a full-rate clip.
+  through the released refiner checkpoint, producing a full-rate clip. The
+  single-GPU path chunks independent attention-projection, rotary, and MLP token
+  rows, replacing the release's eight-rank context-parallel split without
+  changing their per-row operations.
 - **Native MAGI-2 refiner window attention** — The refiner's local-attention
-  layers run their paired query/key ranges as one PyTorch FlexAttention mask, so
-  the stage needs neither the MagiAttention CUDA extension nor MagiCompiler. A
-  registered `torch.ops.magi2` operator still takes precedence when the released
-  runtime is installed. [(FlexAttention)](https://pytorch.org/blog/flexattention/)
+  layers prefer the authors' single-GPU MagiAttention kernel on Hopper, including
+  installs that omit its distributed communication extension. A registered
+  `torch.ops.magi2` operator still takes precedence. When neither is available,
+  Mirai runs the paired query/key ranges as one PyTorch FlexAttention mask, so
+  MagiCompiler is not required. That portable fallback sweeps query boundaries
+  into compact key-interval unions and constructs sparse block metadata directly;
+  it never materializes the released 1080p query-by-key mask.
+  [(FlexAttention)](https://pytorch.org/blog/flexattention/)
 - **Grouped MAGI-2 expert execution** — Optional grouped-GEMM execution of the
   multi-head routed experts during training, selected by
   `memory.moe_kernel_backend="grouped"`, with the vendored per-expert loop
@@ -650,7 +686,9 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.family_params.config_path` | Override for the vendored architecture JSON; empty resolves to the shipped `magi2_preview.json`. |
 | `model.params.family_params.refiner_config_path` | Override for the vendored refiner profile JSON; empty resolves to the shipped `magi2_refiner.json`. The profile states the refiner architecture, its step count, guidance scale, flow shift, VAE stride and the zero-terminal-SNR index the stage re-noises at, so changing the refinement means pointing this at a different profile. Only read when `--refine` is requested. |
 | `model.params.family_params.refiner_subfolder` | Snapshot subdirectory holding the refiner shards; defaults to `refiner`. Must be relative to the snapshot root and must not traverse upwards. |
-| `model.params.family_params.refiner_attention_backend` | `auto`, `native_flex`, or `vendor_eager`, selecting how the refiner's local-attention layers evaluate their paired query/key ranges. `auto` yields to a registered `torch.ops.magi2.flex_flash_attn_func` operator when MagiCompiler published one and otherwise binds Mirai's native FlexAttention range-union path. `native_flex` binds the native path even when the operator exists. `vendor_eager` never binds it, leaving the vendored dispatch, which needs either MagiCompiler and MagiAttention or a FlashAttention-2 install. The native path implements the union of every key range paired with a query position under one softmax; the vendored eager fallback merges per-range partial softmaxes by their log-sum-exps and therefore double-counts keys reachable through more than one range. Only read when `--refine` is requested. |
+| `model.params.family_params.refiner_attention_backend` | `auto`, `native_flex`, or `vendor_eager`, selecting how the refiner's local-attention layers evaluate their paired query/key ranges. `auto` uses, in order, a registered `torch.ops.magi2.flex_flash_attn_func` operator, the authors' importable single-GPU MagiAttention kernel on Hopper, then Mirai's portable FlexAttention range-union path. `native_flex` always binds the portable path. `vendor_eager` leaves the vendored dispatch unchanged, which needs either MagiAttention or a FlashAttention-2 install. Both accelerated paths and the portable path implement the union of every key range paired with a query position under one softmax; only the final FlashAttention-2 correction fallback merges per-range partial softmaxes and can double-count keys reachable through more than one range. Only read when `--refine` is requested. |
+| `model.params.family_params.refiner_block_swap_mode` | `sync` (default) or `async`. This is independent of `inference.block_swap_mode`: `sync` keeps only the current streamed refiner layer resident, while `async` also prefetches the next layer. Only read when `--refine` is requested. |
+| `model.params.family_params.vae_decode_chunk_size` | Temporal Turbo VAE window size. `0` (default) selects a deterministic geometry-bounded schedule: released 7/7 for preview and 2/2 for the full 1920×1088 refined latent. A positive integer forces that size and changes decoder workspace residency. This never crops or rescales the latent. |
 | `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, and it takes part in attention and MoE routing. The training forward redraws it on every call from a family-owned generator seeded from `training.seed`, so a step is reproducible under its seed and the track length never perturbs the process RNG stream; native sampling draws it once per generation from the generation generator. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
 | `model.params.moe_routing_health` | Arms the family's routing-collapse tap. MAGI-2 emits no router statistic without it, so this is the only way `emits_router_metrics` becomes true and the only routing signal an `attn_router` run has. Default off; when off no tap is attached and no diagnostic key appears. |
 | `memory.frozen_weight_quantization` | `none` or `nf4`. `nf4` packs only the three routed expert tensors of each MoE layer and requires bitsandbytes; every other format is rejected. |

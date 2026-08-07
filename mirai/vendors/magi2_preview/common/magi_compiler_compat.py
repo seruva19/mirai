@@ -72,11 +72,23 @@ def magi_attention_flex_flash_attn_func() -> Callable[..., object] | None:
     """
     if importlib.util.find_spec("magi_attention") is None:
         return None
-    try:
-        from magi_attention.api import flex_flash_attn_func
-    except Exception:
-        return None
-    return flex_flash_attn_func
+    # Released source trees normally export the entry point from ``api``. Some
+    # single-GPU installs omit the distributed ``magi_attn_comm`` extension,
+    # which makes that convenience module fail even though the functional CUDA
+    # kernel is installed and callable. Resolve the public path first, then the
+    # implementation module that does not require distributed communication.
+    for module_name in (
+        "magi_attention.api",
+        "magi_attention.functional.flex_flash_attn",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+            flex_flash_attn_func = getattr(module, "flex_flash_attn_func")
+        except Exception:
+            continue
+        if callable(flex_flash_attn_func):
+            return flex_flash_attn_func
+    return None
 
 try:
     from magi_compiler import magi_compile

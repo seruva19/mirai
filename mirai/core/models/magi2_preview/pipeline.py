@@ -7,7 +7,7 @@ imports remain lazy so the rest of Mirai is usable without them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -38,6 +38,7 @@ from mirai.core.models.magi2_preview.refiner_attention import (
 )
 from mirai.core.models.native_video import NativeVideoPipeline, VideoLatentLayout
 from mirai.core.models.providers import (
+    FamilyGenerationDefaults,
     ModelFamilyProvider,
     NativeCacheEncoderConfig,
     register_model_family_provider,
@@ -69,6 +70,15 @@ MAGI2_GRADIENT_CHECKPOINTING_ON = frozenset({"standard", "true", "1"})
 # unconditional branches in one B=2 forward.
 MAGI2_NATIVE_SOLVER = "unipc"
 MAGI2_NATIVE_CFG_MODE = "batched"
+MAGI2_RELEASED_PREVIEW_WIDTH = 896
+MAGI2_RELEASED_PREVIEW_HEIGHT = 512
+MAGI2_RELEASED_FRAMES = 249
+MAGI2_RELEASED_PREVIEW_STEPS = 100
+MAGI2_RELEASED_PREVIEW_CFG_SCALE = 5.0
+# A Turbo VAE middle window carries two context latents in addition to its
+# configured step. Bound that complete window from the latent geometry while
+# preserving the released 7/7 schedule for the preview grid and smaller inputs.
+MAGI2_VAE_MAX_WINDOW_VOLUME = 32_640
 
 # The audio placeholder is drawn from a family-owned stream rather than from the
 # latent-noise stream the training loop seeds, so the two draws stay independent
@@ -114,6 +124,42 @@ def _magi2_decoded_frames(latent_frames: int) -> int:
     return 4 * (int(latent_frames) - 1) + 1
 
 
+def resolve_magi2_vae_decode_chunk_size(
+    *,
+    latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    released_chunk_size: int,
+    requested_chunk_size: int = 0,
+) -> int:
+    """Choose a deterministic temporal window that bounds decoder activations.
+
+    The vendored decoder adds one context latent on each side of a middle
+    window.  Its peak is therefore governed by ``H * W * (step + 2)`` rather
+    than by decoded output size.  An explicit positive request wins; zero keeps
+    the released window where it fits and shrinks only large spatial grids.
+    """
+
+    frames = int(latent_frames)
+    height = int(latent_height)
+    width = int(latent_width)
+    released = int(released_chunk_size)
+    requested = int(requested_chunk_size)
+    if frames < 1 or height < 1 or width < 1:
+        raise ValueError("MAGI-2 VAE latent dimensions must all be >= 1.")
+    if released < 1:
+        raise ValueError("MAGI-2 released VAE chunk size must be >= 1.")
+    if requested < 0:
+        raise ValueError("MAGI-2 requested VAE chunk size must be >= 0.")
+    if requested > 0:
+        return requested
+    safe_step = max(
+        1,
+        MAGI2_VAE_MAX_WINDOW_VOLUME // (height * width) - 2,
+    )
+    return min(released, safe_step)
+
+
 MAGI2_TARGET_PRESETS: dict[str, tuple[str, ...]] = {
     "attn_only": (".attention.linear_qkv", ".attention.linear_proj"),
     "attn_router": (
@@ -153,6 +199,8 @@ class Magi2RuntimeOptions:
     refiner_config_path: str = ""
     refiner_subfolder: str = MAGI2_REFINER_SUBFOLDER
     refiner_attention_backend: str = MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT
+    refiner_block_swap_mode: str = "sync"
+    vae_decode_chunk_size: int = 0
 
 
 @dataclass(frozen=True)
@@ -209,6 +257,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         )
         self._expert_stores: dict[str, Magi2Nf4ExpertStore] = {}
         self._moe_optimization_policy = MoEOptimizationPolicy()
+        self._moe_token_chunk_policy: Any | None = None
         # Armed only by inference.expert_feature_cache; None keeps the MoE seam
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
@@ -233,6 +282,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             refiner_attention_backend=normalize_refiner_attention_backend(
                 family.get("refiner_attention_backend")
             ),
+            refiner_block_swap_mode=str(
+                family.get("refiner_block_swap_mode", "sync") or "sync"
+            ).strip().lower(),
+            vae_decode_chunk_size=int(family.get("vae_decode_chunk_size", 0) or 0),
         )
         self.runtime_config, self.transformer, self.data_proxy = self._build_model()
         # Routing telemetry is opt-in: with the gate off no observer, tracker, or
@@ -251,8 +304,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._lora_scale = 1.0
         self._text_encoder: Any | None = None
         self._vae: nn.Module | None = None
+        self._last_vae_decode_chunk_size = 0
         self._inference_device = "cpu"
         self._audio_noise_generator = self._build_audio_noise_generator(seed)
+        self._refiner_generator_state: torch.Tensor | None = None
+        self._refiner_context_pair: tuple[torch.Tensor, torch.Tensor] | None = None
         # Refiner state stays absent until a refinement request is validated.
         self._refiner: Any | None = None
         self._refine_settings: Magi2RefineSettings | None = None
@@ -265,6 +321,24 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         generator.manual_seed(
             int(0 if seed is None else seed) + MAGI2_AUDIO_NOISE_SEED_OFFSET
         )
+        return generator
+
+    def refiner_noise_generator(
+        self, *, seed: int, device: torch.device
+    ) -> torch.Generator:
+        """Continue the release pipeline's per-sample RNG stream.
+
+        SandAI draws preview video noise, preview audio noise, and refiner noise
+        from one CUDA generator in that order. The generic inference loop owns
+        the generator, so the family snapshots its state after the preview draws
+        and restores it here. Direct refiner calls without a preceding preview
+        retain their deterministic seed fallback.
+        """
+        generator = torch.Generator(device=device)
+        if self._refiner_generator_state is None:
+            generator.manual_seed(int(seed))
+        else:
+            generator.set_state(self._refiner_generator_state)
         return generator
 
     @classmethod
@@ -493,7 +567,25 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise RuntimeError("load_vae() must be called before decode_latents_native().")
         value = torch.stack([torch.as_tensor(item) for item in latents], dim=0)
         device = next(self._vae.parameters()).device
-        decoded = self._vae.decode(value.to(device=device, dtype=torch.bfloat16), output_offload=True)
+        released_first = int(self._vae.first_chunk_size)
+        released_step = int(self._vae.step_size)
+        chunk_size = resolve_magi2_vae_decode_chunk_size(
+            latent_frames=int(value.shape[-3]),
+            latent_height=int(value.shape[-2]),
+            latent_width=int(value.shape[-1]),
+            released_chunk_size=min(released_first, released_step),
+            requested_chunk_size=int(self.options.vae_decode_chunk_size),
+        )
+        self._last_vae_decode_chunk_size = chunk_size
+        self._vae.first_chunk_size = chunk_size
+        self._vae.step_size = chunk_size
+        try:
+            decoded = self._vae.decode(
+                value.to(device=device, dtype=torch.bfloat16), output_offload=True
+            )
+        finally:
+            self._vae.first_chunk_size = released_first
+            self._vae.step_size = released_step
         if isinstance(decoded, list):
             decoded = torch.cat(decoded, dim=0)
         frames = decoded[0].detach().float().mul(0.5).add(0.5).clamp(0.0, 1.0)
@@ -594,6 +686,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._moe_optimization_policy = policy
         self._attach_moe_execution()
 
+    def configure_moe_token_chunking(self, policy: Any) -> None:
+        """Apply a bounded token schedule to grouped expert execution."""
+
+        self._moe_token_chunk_policy = (
+            policy if int(getattr(policy, "token_chunk_size", 0)) > 0 else None
+        )
+        self._attach_moe_execution()
+
     def configure_expert_feature_cache(self, cache: Any) -> None:
         """Arm (or clear) cross-timestep expert-branch reuse on the MoE seam."""
         self._expert_feature_cache = cache if getattr(cache, "enabled", False) else None
@@ -617,6 +717,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
         quantized = self.has_quantized_frozen_weights()
         policy = self._moe_optimization_policy
+        token_chunk_size = int(
+            getattr(getattr(self, "_moe_token_chunk_policy", None), "token_chunk_size", 0)
+        )
         plan = resolve_magi2_moe_execution(policy, quantized_experts=quantized)
         if plan is not None:
             validate_grouped_moe_backend_support(
@@ -626,9 +729,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             backend = None
         elif quantized:
             self._bind_quantized_expert_runtime_policy()
-            backend = Magi2QuantizedGroupedMoEBackend(plan)
+            backend = Magi2QuantizedGroupedMoEBackend(
+                plan, token_chunk_size=token_chunk_size
+            )
         else:
-            backend = Magi2GroupedMoEBackend(plan)
+            backend = Magi2GroupedMoEBackend(plan, token_chunk_size=token_chunk_size)
         cache = getattr(self, "_expert_feature_cache", None)
         if cache is not None and getattr(cache, "enabled", False):
             from mirai.core.moe.runtime.expert_feature_cache import (
@@ -1156,6 +1261,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             dtype=torch.float32,
             generator=generator,
         )
+        self._refiner_generator_state = generator.get_state().detach().cpu().clone()
         video_scheduler = FlowUniPCMultistepScheduler()
         audio_scheduler = FlowUniPCMultistepScheduler()
         shift = float(self.runtime_config.evaluation_config.shift)
@@ -1210,6 +1316,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 cfg_config=cfg,
             )
         )
+        self._refiner_context_pair = (
+            context.detach().to(device="cpu"),
+            context_null.detach().to(device="cpu"),
+        )
         return sampled_video[0]
 
     # -- refiner stage -----------------------------------------------------
@@ -1233,8 +1343,25 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return bool(self._refiner_assets().has_weights())
 
     def refiner_residency_request(self) -> Any:
-        """The block-residency policy the refiner stage should stream under."""
-        return self._residency_request
+        """Resolve the refiner's stage-specific block-transfer schedule."""
+
+        request = self._residency_request
+        if request is None:
+            return None
+        mode = str(getattr(self.options, "refiner_block_swap_mode", "sync"))
+        return replace(request, mode=mode)
+
+    def discard_refiner_context(self) -> None:
+        """Drop prompt embeddings retained only for the adjacent refiner stage."""
+
+        self._refiner_context_pair = None
+
+    def take_refiner_context(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Consume preview prompt embeddings so refinement need not re-encode."""
+
+        pair = self._refiner_context_pair
+        self._refiner_context_pair = None
+        return pair
 
     def load_refiner(self, *, device: str) -> None:
         self._refiner_assets().load(
@@ -1252,8 +1379,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         current sampling session; the owning session restores its placement
         before the next generation.
         """
+        for handle in self._block_hook_handles:
+            handle.remove()
+        self._block_hook_handles.clear()
         if self._block_swap_manager is not None:
-            self._block_swap_manager.finish_backward()
+            self._block_swap_manager.release_device()
         self.transformer.to(device=torch.device("cpu"))
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1460,6 +1590,8 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "refiner_config_path",
         "refiner_subfolder",
         "refiner_attention_backend",
+        "refiner_block_swap_mode",
+        "vae_decode_chunk_size",
     }
 
     def __init__(self, model_type: str = "magi2-preview") -> None:
@@ -1488,6 +1620,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             "refiner_config_path",
             "refiner_subfolder",
             "refiner_attention_backend",
+            "refiner_block_swap_mode",
         ):
             value = params.get(name)
             if value is not None and not isinstance(value, str):
@@ -1498,6 +1631,24 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
                 normalize_refiner_attention_backend(attention)
             except Magi2RefinerAttentionUnsupported as exc:
                 errors.append(str(exc))
+        vae_chunk = params.get("vae_decode_chunk_size")
+        if vae_chunk is not None and (
+            isinstance(vae_chunk, bool)
+            or not isinstance(vae_chunk, int)
+            or int(vae_chunk) < 0
+        ):
+            errors.append(
+                "MAGI-2 family_params.vae_decode_chunk_size must be an integer >= 0."
+            )
+        swap_mode = params.get("refiner_block_swap_mode")
+        if isinstance(swap_mode, str) and swap_mode.strip().lower() not in {
+            "sync",
+            "async",
+        }:
+            errors.append(
+                "MAGI-2 family_params.refiner_block_swap_mode must be "
+                "'sync' or 'async'."
+            )
         subfolder = params.get("refiner_subfolder")
         # Both flavours are tested because the rule is about the value, not
         # about the host the config happens to be validated on.
@@ -1512,6 +1663,21 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
                 "upwards."
             )
         return errors
+
+    def generation_defaults(self) -> FamilyGenerationDefaults:
+        from mirai.vendors.magi2_preview.pipeline.inference_engine import (
+            NEGATIVE_PROMPT,
+        )
+
+        return FamilyGenerationDefaults(
+            negative_prompt=NEGATIVE_PROMPT,
+            steps=MAGI2_RELEASED_PREVIEW_STEPS,
+            cfg_scale=MAGI2_RELEASED_PREVIEW_CFG_SCALE,
+            scheduler=MAGI2_NATIVE_SOLVER,
+            width=MAGI2_RELEASED_PREVIEW_WIDTH,
+            height=MAGI2_RELEASED_PREVIEW_HEIGHT,
+            frames=MAGI2_RELEASED_FRAMES,
+        )
 
     def validate_native_backend_availability(self, cfg: Any) -> list[str]:
         root = Path(str(cfg.model.path)).expanduser()

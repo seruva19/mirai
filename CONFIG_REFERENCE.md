@@ -1034,6 +1034,14 @@ Keeps native VAE weights on their compute device across repeated `InferenceSessi
 
 `>= 1`. Cache entries held per MoE layer. Sequential classifier-free guidance visits each layer twice per timestep along two unrelated trajectories, so the default of `2` keeps them in separate entries; `1` halves cache residency and makes those visits evict each other ([`expert_feature_cache.py`](mirai/core/moe/runtime/expert_feature_cache.py)).
 
+### `moe_token_chunk_size`
+
+- **Type:** int
+- **Default:** `0`
+- **Allowed / range:** `>= 0`
+
+Maximum number of tokens whose routed expert branches are evaluated at once during inference. `0` preserves the unchunked path. A positive value computes routing once for the complete layer input, then executes and combines contiguous token ranges independently, bounding the large gate/up/hidden activation workspace without changing selected experts or weights. It requires a model family that implements the sparse-MoE token-chunk capability and is incompatible with `inference.expert_feature_cache`, whose cache owns the complete routed-slot layout ([`token_chunking.py`](mirai/core/moe/runtime/token_chunking.py), family grouped-MoE backend).
+
 ### `blocks_to_swap`
 
 - **Type:** int

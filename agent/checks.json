@@ -256,7 +256,7 @@
       "name": "residency",
       "paths": ["mirai/core/training/residency/", "mirai/core/models/compressed_weights/packed/", "scripts/agent/probe_moe_runtime.py"],
       "commands": [
-        "python -m pytest mirai/core/training/residency/contracts/block_swap.py mirai/core/training/residency/contracts/h2d_ring.py mirai/core/training/residency/contracts/device_residency.py mirai/core/training/residency/contracts/pinned_host_budget.py mirai/core/models/compressed_weights/packed/contracts/residency.py -q"
+        "python -m pytest tests/test_block_swap_release.py mirai/core/training/residency/contracts/block_swap.py mirai/core/training/residency/contracts/h2d_ring.py mirai/core/training/residency/contracts/device_residency.py mirai/core/training/residency/contracts/pinned_host_budget.py mirai/core/models/compressed_weights/packed/contracts/residency.py -q"
       ],
       "invariants": [
         "host and device ownership never overlap unexpectedly",

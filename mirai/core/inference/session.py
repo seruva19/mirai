@@ -384,6 +384,7 @@ class InferenceSession:
             vae_override=keep_vae_resident,
         )
         session._arm_expert_feature_cache()
+        session._arm_moe_token_chunking()
         if component_residency.text_encoder:
             session._make_text_encoder_resident()
         if component_residency.vae:
@@ -420,6 +421,18 @@ class InferenceSession:
         )
         self.pipeline.configure_expert_feature_cache(cache)
         self._expert_feature_cache = cache
+
+    def _arm_moe_token_chunking(self) -> None:
+        """Bound inference-time routed-expert workspace when configured."""
+
+        size = int(getattr(self.cfg.inference, "moe_token_chunk_size", 0))
+        if size <= 0:
+            return
+        from mirai.core.moe.runtime.token_chunking import MoETokenChunkPolicy
+
+        self.pipeline.configure_moe_token_chunking(
+            MoETokenChunkPolicy(token_chunk_size=size)
+        )
 
     # -- resident-weight seams ---------------------------------------------
     # These opt-in flags leave the pipeline unchanged when disabled. When
@@ -549,6 +562,11 @@ class InferenceSession:
         """
         output_fps = resolve_output_fps(pipeline=self.pipeline, requested=fps)
         decode_latent_path = str(decode_latent or "").strip()
+        discard_refiner_context = getattr(
+            self.pipeline, "discard_refiner_context", None
+        )
+        if callable(discard_refiner_context):
+            discard_refiner_context()
         if not decode_latent_path:
             self._ensure_base_placement()
             if self._residency_strategy not in {"", "disabled"}:
@@ -621,7 +639,7 @@ class InferenceSession:
 
         # Refine pre-flight (fail fast BEFORE the expensive base denoise). Only
         # runs when --refine is set; the default path is untouched.
-        if refine and not decode_latent_path:
+        if refine:
             refine = self._validate_refine_request(
                 refine,
                 frames=effective_frames,
@@ -702,7 +720,7 @@ class InferenceSession:
                 timings["denoise_s"] = _sync_perf_counter() - _denoise_t0
             torch.save(pred.detach().cpu(), out_path.with_suffix(".pt"))
         refined = False
-        if refine and ran_denoise_loop and not decode_latent_path:
+        if refine and ran_denoise_loop:
             device = self._compute_device
             dtype = self._compute_dtype if device.type == "cuda" else None
             _refine_t0 = _sync_perf_counter() if timings is not None else 0.0

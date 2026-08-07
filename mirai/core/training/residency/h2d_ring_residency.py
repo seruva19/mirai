@@ -296,3 +296,17 @@ class FlatRingResidencyPool:
         unit._device_tensors.clear()
         unit._slot_index = None
         unit._device = None
+
+    def release_device(self) -> None:
+        """Drop every device binding and the reusable CUDA slot allocation.
+
+        ``offload`` releases a block's ownership of a slot but deliberately
+        keeps the ring itself allocated for the next block.  A pipeline-stage
+        transition has no next block, so retaining those slots would keep the
+        old stage's peak transfer window alive beside the next model.
+        """
+
+        for unit in self.units:
+            self.offload(unit)
+        self._slots.clear()
+        self._target = None

@@ -130,6 +130,8 @@ class BlockSwapManager:
         return bounded_pin_budget_bytes(available, floor, cap_bytes)
 
     def bind(self, units: list[tuple[int, Any]], *, device: Any) -> None:
+        if self._device is not None or self._units or self._flat_ring is not None:
+            self.release_device()
         for handle in self._backward_hooks:
             handle.remove()
         self._backward_hooks.clear()
@@ -231,6 +233,42 @@ class BlockSwapManager:
         # transfer; its event is the only thing that will order the next
         # forward behind that transfer, so it survives the phase turn.
         self._backward_active = False
+
+    def release_device(self) -> None:
+        """End the current binding and release all device-side residency state.
+
+        This is stronger than ``finish_backward``: phase pins and permanently
+        resident blocks are useful across training steps, but must not survive
+        a model-stage transition.  The manager's immutable configuration and
+        residency plan remain intact so a later ``bind`` can restore the stage.
+        """
+
+        device = self._device
+        if (
+            torch is not None
+            and device is not None
+            and getattr(device, "type", None) == "cuda"
+            and torch.cuda.is_available()
+        ):
+            # Both the consumer and transfer streams may still reference a
+            # streamed tensor.  Stage transitions are rare, so a device-wide
+            # barrier is preferable to retaining allocator-owned references.
+            torch.cuda.synchronize(device)
+        for handle in self._backward_hooks:
+            handle.remove()
+        self._backward_hooks.clear()
+        for unit in self._units.values():
+            unit.offload()
+        if self._flat_ring is not None:
+            self._flat_ring.release_device()
+        self._prefetch_q.clear()
+        self._prefetch_events.clear()
+        self._units.clear()
+        self._flat_ring = None
+        self._transfer_stream = None
+        self._device = None
+        self._backward_active = False
+        self.events.clear()
 
     def _discard_prefetch_event(self, idx: int) -> None:
         """Drop the in-flight H2D record for a block that is leaving the device.

@@ -21,6 +21,9 @@ from mirai.core.models.providers import resolve_family_generation_defaults
 GENERIC_STEPS = 20
 GENERIC_CFG_SCALE = 5.0
 GENERIC_SCHEDULER = "euler"
+GENERIC_WIDTH = 832
+GENERIC_HEIGHT = 480
+GENERIC_FRAMES = 17
 
 # These module-level seams let callers supply placement behavior to the
 # load-once InferenceSession without coupling the session to this CLI.
@@ -99,14 +102,24 @@ def parse_args() -> argparse.Namespace:
         help="Merge adapter into model for inference.",
     )
     p.add_argument("--out", default="./outputs/infer_output.pt", help="Output path (.pt or .mp4)")
-    p.add_argument("--width", type=int, default=832, help="Output width")
-    p.add_argument("--height", type=int, default=480, help="Output height")
+    p.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help=f"Preview width (unset: the model family's declared value, or {GENERIC_WIDTH}).",
+    )
+    p.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help=f"Preview height (unset: the model family's declared value, or {GENERIC_HEIGHT}).",
+    )
     p.add_argument(
         "--frames",
         type=int,
-        default=17,
-        help="Number of frames; the model family's latent layout states the "
-        "rule the count must satisfy.",
+        default=None,
+        help=f"Number of frames (unset: the model family's declared value, or "
+        f"{GENERIC_FRAMES}); the family latent layout states the valid counts.",
     )
     p.add_argument(
         "--steps",
@@ -226,8 +239,9 @@ def parse_args() -> argparse.Namespace:
         "--decode-latent",
         default="",
         help=(
-            "Decode an existing latent .pt (the latent dump of a previous run) "
-            "to video, skipping the denoise loop."
+            "Use an existing latent .pt (the latent dump of a previous run), "
+            "skipping the base denoise loop. Combine with --refine to resume "
+            "the refiner stage, or omit --refine to decode it directly."
         ),
     )
     p.add_argument(
@@ -390,6 +404,9 @@ def main() -> int:
         scheduler = family_defaults.resolve_scheduler(
             args.scheduler, fallback=GENERIC_SCHEDULER
         )
+        width = family_defaults.resolve_width(args.width, fallback=GENERIC_WIDTH)
+        height = family_defaults.resolve_height(args.height, fallback=GENERIC_HEIGHT)
+        frames = family_defaults.resolve_frames(args.frames, fallback=GENERIC_FRAMES)
         if refine_request is not None:
             refine_request["scheduler"] = str(args.refiner_scheduler or scheduler)
         routing_params = session.cfg.model.params
@@ -414,9 +431,9 @@ def main() -> int:
             seed=int(args.seed),
             steps=steps,
             cfg_scale=cfg_scale,
-            frames=int(args.frames),
-            height=int(args.height),
-            width=int(args.width),
+            frames=frames,
+            height=height,
+            width=width,
             out_path=args.out,
             fps=None if args.fps is None else float(args.fps),
             scheduler=scheduler,
@@ -450,9 +467,9 @@ def main() -> int:
                     "seed": int(args.seed),
                     "prompt": str(payload["prompt"]),
                     "negative_prompt": str(payload["negative_prompt"]),
-                    "frames": int(args.frames),
-                    "height": int(args.height),
-                    "width": int(args.width),
+                    "frames": frames,
+                    "height": height,
+                    "width": width,
                 },
             )
             print(f"[routing-trace] {routing_trace_summary}", file=sys.stderr)

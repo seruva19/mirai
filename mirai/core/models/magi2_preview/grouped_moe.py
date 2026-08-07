@@ -293,8 +293,13 @@ class Magi2GroupedMoEBackend:
 
     name = "grouped"
 
-    def __init__(self, plan: Magi2GroupedMoEPlan) -> None:
+    def __init__(
+        self, plan: Magi2GroupedMoEPlan, *, token_chunk_size: int = 0
+    ) -> None:
+        if int(token_chunk_size) < 0:
+            raise ValueError("MAGI-2 MoE token chunk size must be >= 0.")
         self.plan = plan
+        self.token_chunk_size = int(token_chunk_size)
         self._resolved: dict[str, tuple[str, str]] = {}
         self._alignment: tuple[str, ...] | None = None
 
@@ -452,6 +457,34 @@ class Magi2GroupedMoEBackend:
         topk_probs: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
+        tokens = int(x_heads.shape[0])
+        chunk_size = self.token_chunk_size
+        if chunk_size <= 0 or tokens <= chunk_size:
+            return self._execute_routed_chunk(
+                module, x_heads, topk_probs, topk_indices
+            )
+        outputs: list[torch.Tensor] = []
+        for start in range(0, tokens, chunk_size):
+            stop = min(start + chunk_size, tokens)
+            outputs.append(
+                self._execute_routed_chunk(
+                    module,
+                    x_heads[start:stop],
+                    topk_probs[:, start:stop],
+                    topk_indices[:, start:stop],
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
+    def _execute_routed_chunk(
+        self,
+        module: Any,
+        x_heads: torch.Tensor,
+        topk_probs: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute already-computed routes for one contiguous token range."""
+
         forward_backend, dx_backend = self._resolve(x_heads.device, module)
         device = x_heads.device
         tokens = int(x_heads.shape[0])
@@ -614,6 +647,59 @@ def run_segmented_grouped_linear(
     return torch.cat(outputs, dim=0)
 
 
+def run_segmented_grouped_expert_mlp(
+    x_sorted: torch.Tensor,
+    offsets: torch.Tensor,
+    *,
+    boundaries: list[int],
+    materialize: Callable[[str, int, int], torch.Tensor],
+    backend: str,
+    max_groups: int,
+    output_columns: int,
+) -> torch.Tensor:
+    """Evaluate one frozen SwiGLU7 expert segment end-to-end.
+
+    Segmenting each projection separately retains every gate/up result until a
+    full-row concatenate. Running gate, up, activation, and down for the same
+    group range before advancing keeps only the final narrow expert output while
+    materializing every packed weight range exactly once.
+    """
+
+    outputs: list[torch.Tensor] = []
+    for segment in grouped_mm_segments(boundaries, max_groups=max(1, int(max_groups))):
+        if segment.row_count == 0:
+            continue
+        local_offsets = (
+            offsets[segment.group_start : segment.group_stop] - segment.row_start
+        ).contiguous()
+        rows = x_sorted[segment.row_start : segment.row_stop]
+
+        weight = materialize("W_gate", segment.group_start, segment.group_stop)
+        gate = _grouped_linear(rows, weight, local_offsets, backend)
+        del weight
+        weight = materialize("W_up", segment.group_start, segment.group_stop)
+        up = _grouped_linear(rows, weight, local_offsets, backend)
+        del weight
+
+        gate = gate.float().clamp(max=7.0)
+        up = up.float().clamp(min=-7.0, max=7.0)
+        hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+        del gate, up
+
+        weight = materialize("W_down", segment.group_start, segment.group_stop)
+        outputs.append(
+            _grouped_linear(
+                hidden.to(weight.dtype), weight, local_offsets, backend
+            )
+        )
+        del hidden, weight
+    if not outputs:
+        return x_sorted.new_empty((0, int(output_columns)))
+    if len(outputs) == 1:
+        return outputs[0]
+    return torch.cat(outputs, dim=0)
+
+
 class _QuantizedGroupedExpertLinear(torch.autograd.Function):
     """Grouped expert matmul against a frozen NF4 payload.
 
@@ -739,6 +825,43 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
     ) -> torch.Tensor:
         return _QuantizedGroupedExpertLinear.apply(
             x_sorted, offsets, self._store(module), key, forward_backend, dx_backend
+        )
+
+    def branch_features(
+        self,
+        module: Any,
+        x_heads: torch.Tensor,
+        sorted_rows: torch.Tensor,
+        offsets: torch.Tensor,
+        forward_backend: str,
+        dx_backend: str,
+    ) -> torch.Tensor:
+        if torch.is_grad_enabled():
+            return super().branch_features(
+                module,
+                x_heads,
+                sorted_rows,
+                offsets,
+                forward_backend,
+                dx_backend,
+            )
+        tokens = int(x_heads.shape[0])
+        num_heads = int(x_heads.shape[1])
+        d_head = int(x_heads.shape[2])
+        x_rows = x_heads.reshape(tokens * num_heads, d_head)
+        x_sorted = x_rows.index_select(0, sorted_rows)
+        store = self._store(module)
+        boundaries = _grouped_boundaries(offsets)
+        return run_segmented_grouped_expert_mlp(
+            x_sorted,
+            offsets,
+            boundaries=boundaries,
+            materialize=lambda key, start, stop: store.materialize_segment(
+                key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
+            ),
+            backend=forward_backend,
+            max_groups=store.segment_group_span(),
+            output_columns=d_head,
         )
 
 

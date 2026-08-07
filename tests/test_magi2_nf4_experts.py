@@ -18,6 +18,7 @@ from mirai.core.models.magi2_preview.grouped_moe import (
     attach_grouped_moe_backend,
     magi2_grouped_mm_alignment_violations,
     resolve_magi2_moe_execution,
+    run_segmented_grouped_expert_mlp,
     run_segmented_grouped_linear,
 )
 from mirai.core.models.magi2_preview.pipeline import LowRankWeight, Magi2PreviewPipeline
@@ -166,6 +167,59 @@ def test_segmented_execution_visits_every_group_exactly_once() -> None:
         columns=4,
     )
     assert visited == [(0, 4), (4, 8), (8, 9)]
+
+
+def test_segmented_expert_mlp_matches_projection_wide_schedule() -> None:
+    """Fusing the three projections by group range retains the released math."""
+
+    torch.manual_seed(13)
+    groups = 7
+    rows_per_group = [3, 0, 5, 1, 0, 4, 2]
+    x_sorted, offsets, boundaries, _ = _sorted_layout(
+        groups=groups, rows_per_group=rows_per_group, columns=6, dtype=torch.float32
+    )
+    weights = {
+        "W_gate": torch.randn(groups, 6, 10),
+        "W_up": torch.randn(groups, 6, 10),
+        "W_down": torch.randn(groups, 10, 6),
+    }
+
+    def project(key: str, values: torch.Tensor) -> torch.Tensor:
+        return run_segmented_grouped_linear(
+            values,
+            offsets,
+            boundaries=boundaries,
+            materialize=lambda start, stop: weights[key][start:stop].contiguous(),
+            backend="bmm",
+            max_groups=3,
+            columns=int(weights[key].shape[-1]),
+        )
+
+    gate = project("W_gate", x_sorted).float().clamp(max=7.0)
+    up = project("W_up", x_sorted).float().clamp(min=-7.0, max=7.0)
+    hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    expected = project("W_down", hidden)
+    visits: list[tuple[str, int, int]] = []
+
+    def materialize(key: str, start: int, stop: int) -> torch.Tensor:
+        visits.append((key, start, stop))
+        return weights[key][start:stop].contiguous()
+
+    actual = run_segmented_grouped_expert_mlp(
+        x_sorted,
+        offsets,
+        boundaries=boundaries,
+        materialize=materialize,
+        backend="bmm",
+        max_groups=3,
+        output_columns=6,
+    )
+    assert torch.equal(expected, actual)
+    assert visits == [
+        (key, start, stop)
+        for start, stop in ((0, 3), (3, 6), (6, 7))
+        for key in ("W_gate", "W_up", "W_down")
+    ]
 
 
 def test_dequantized_segment_layout_satisfies_the_grouped_precondition() -> None:

@@ -119,6 +119,7 @@ def _run_reduced_moe(
     dtype: torch.dtype,
     hidden_size: int = 16,
     expert_intermediate_size: int = 12,
+    token_chunk_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     module, adapter = _build_reduced_moe(
         device=device,
@@ -128,7 +129,8 @@ def _run_reduced_moe(
     )
     if backend is not None:
         module._mirai_moe_kernel_backend = Magi2GroupedMoEBackend(
-            Magi2GroupedMoEPlan(forward_backend=backend, dx_backend=backend)
+            Magi2GroupedMoEPlan(forward_backend=backend, dx_backend=backend),
+            token_chunk_size=token_chunk_size,
         )
     torch.manual_seed(7)
     hidden = torch.randn(5, hidden_size, device=device, dtype=dtype, requires_grad=True)
@@ -165,6 +167,41 @@ def test_magi2_grouped_moe_matches_reference_loop_in_bf16_on_cpu() -> None:
         )
     assert reference[3].abs().max() > 0.0
     assert reference[4].abs().max() > 0.0
+
+
+def test_magi2_grouped_moe_token_chunks_preserve_outputs_and_gradients() -> None:
+    """Token scheduling changes workspace only, including under autograd."""
+
+    device = torch.device("cpu")
+    whole = _run_reduced_moe(
+        backend="bmm", device=device, dtype=torch.float32, token_chunk_size=0
+    )
+    chunked = _run_reduced_moe(
+        backend="bmm", device=device, dtype=torch.float32, token_chunk_size=2
+    )
+    for expected, actual in zip(whole, chunked):
+        assert torch.allclose(expected, actual, rtol=1e-5, atol=1e-6)
+
+
+def test_magi2_grouped_moe_token_chunks_route_once() -> None:
+    module, _adapter = _build_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32
+    )
+    module._mirai_moe_kernel_backend = Magi2GroupedMoEBackend(
+        Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"),
+        token_chunk_size=2,
+    )
+    route = module._route
+    calls = 0
+
+    def counted_route(x_heads):
+        nonlocal calls
+        calls += 1
+        return route(x_heads)
+
+    module._route = counted_route
+    module._forward_impl(torch.randn(5, 16))
+    assert calls == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1163,10 +1200,9 @@ def test_magi2_refiner_resolves_the_released_refinement_profile() -> None:
     )
     assert (resolved.steps, resolved.cfg_scale, resolved.shift) == (5, 2.0, 5.0)
     assert resolved.noise_index == 220
-    # An unset target resolution keeps the preview geometry, so the default
-    # refinement is purely temporal.
-    assert (resolved.height, resolved.width) == (256, 448)
-    assert refiner.latent_size(resolved) == (16, 28)
+    # An unset target resolves to the released 1080p delivery grid.
+    assert (resolved.height, resolved.width) == (1088, 1920)
+    assert refiner.latent_size(resolved) == (68, 120)
     assert resolved.as_request()["scheduler"] == "unipc"
 
     overridden = refiner.settings(
@@ -1267,8 +1303,8 @@ def test_magi2_refinement_arms_the_full_rate_output(
         "steps": 5,
         "cfg_scale": 2.0,
         "shift": 5.0,
-        "height": 256,
-        "width": 448,
+        "height": 1088,
+        "width": 1920,
         "noise_index": 220,
         "scheduler": "unipc",
     }
@@ -1279,6 +1315,142 @@ def test_magi2_refinement_arms_the_full_rate_output(
     )
     # An explicit request still wins over the armed rate.
     assert resolve_output_fps(pipeline=pipeline, requested=30.0) == 30.0
+
+
+def test_magi2_refiner_continues_the_preview_rng_stream() -> None:
+    """Refiner noise follows the release draw order instead of re-seeding."""
+    pipeline = _bare_pipeline()
+    source = torch.Generator(device="cpu")
+    source.manual_seed(42)
+    torch.randn((48, 32, 32, 56), generator=source)
+    torch.randn((1, 249, 64), generator=source)
+    pipeline._refiner_generator_state = source.get_state().clone()
+
+    expected = torch.randn((17,), generator=source)
+    resumed = pipeline.refiner_noise_generator(seed=999, device=torch.device("cpu"))
+    actual = torch.randn(expected.shape, generator=resumed)
+    assert torch.equal(actual, expected)
+
+
+def test_magi2_vae_decode_window_is_bounded_by_full_latent_geometry() -> None:
+    from mirai.core.models.magi2_preview.pipeline import (
+        resolve_magi2_vae_decode_chunk_size,
+    )
+
+    resolve = resolve_magi2_vae_decode_chunk_size
+    assert resolve(
+        latent_frames=32,
+        latent_height=32,
+        latent_width=56,
+        released_chunk_size=7,
+    ) == 7
+    assert resolve(
+        latent_frames=63,
+        latent_height=42,
+        latent_width=74,
+        released_chunk_size=7,
+    ) == 7
+    assert resolve(
+        latent_frames=63,
+        latent_height=68,
+        latent_width=120,
+        released_chunk_size=7,
+    ) == 2
+    assert resolve(
+        latent_frames=63,
+        latent_height=68,
+        latent_width=120,
+        released_chunk_size=7,
+        requested_chunk_size=7,
+    ) == 7
+
+
+def test_magi2_vae_decode_chunk_override_is_scoped_even_on_failure() -> None:
+    from mirai.core.models.magi2_preview.pipeline import Magi2RuntimeOptions
+
+    class _FailingVAE(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+            self.first_chunk_size = 7
+            self.step_size = 7
+            self.observed = None
+
+        def decode(self, value, *, output_offload):
+            self.observed = (
+                self.first_chunk_size,
+                self.step_size,
+                bool(output_offload),
+                tuple(value.shape),
+            )
+            raise RuntimeError("decode failed")
+
+    pipeline = _bare_pipeline()
+    pipeline._vae = _FailingVAE()
+    pipeline.options = Magi2RuntimeOptions(
+        config_path="", vae_decode_chunk_size=2
+    )
+    with pytest.raises(RuntimeError, match="decode failed"):
+        pipeline.decode_latents_native([torch.zeros(1, 3, 1, 1)])
+
+    assert pipeline._vae.observed == (2, 2, True, (1, 1, 3, 1, 1))
+    assert (pipeline._vae.first_chunk_size, pipeline._vae.step_size) == (7, 7)
+    assert pipeline._last_vae_decode_chunk_size == 2
+
+
+def test_magi2_release_base_transformer_ends_block_residency_binding() -> None:
+    pipeline = _bare_pipeline()
+    pipeline.transformer = torch.nn.Linear(2, 2)
+
+    class _Handle:
+        removed = False
+
+        def remove(self) -> None:
+            self.removed = True
+
+    class _Manager:
+        released = 0
+
+        def release_device(self) -> None:
+            self.released += 1
+
+    handle = _Handle()
+    manager = _Manager()
+    pipeline._block_hook_handles = [handle]
+    pipeline._block_swap_manager = manager
+
+    pipeline.release_base_transformer()
+
+    assert handle.removed is True
+    assert pipeline._block_hook_handles == []
+    assert manager.released == 1
+    assert all(parameter.device.type == "cpu" for parameter in pipeline.parameters())
+
+
+def test_magi2_refiner_release_ends_block_residency_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mirai.core.models.magi2_preview.refiner import Magi2Refiner
+
+    class _Manager:
+        released = 0
+
+        def release_device(self) -> None:
+            self.released += 1
+
+    manager = _Manager()
+    refiner = object.__new__(Magi2Refiner)
+    refiner._block_hook_handles = []
+    refiner._block_swap_manager = manager
+    refiner._transformer = None
+    refiner._data_proxy = object()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    refiner.release()
+
+    assert manager.released == 1
+    assert refiner._block_swap_manager is None
+    assert refiner._data_proxy is None
 
 
 def test_magi2_refiner_hooks_match_the_seam_the_session_consults() -> None:
@@ -1398,6 +1570,35 @@ def test_magi2_unimportable_magi_attention_does_not_select_the_magi_attention_br
         magi_attention_flex_flash_attn_func.cache_clear()
 
 
+def test_magi2_attention_probe_reaches_single_gpu_functional_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The functional kernel remains usable without the distributed API shim."""
+    import types
+
+    from mirai.vendors.magi2_preview.common import magi_compiler_compat as compat
+
+    expected = object()
+    functional = types.SimpleNamespace(flex_flash_attn_func=lambda: expected)
+
+    def import_module(name: str):
+        if name == "magi_attention.api":
+            raise ImportError("magi_attn_comm is not installed")
+        if name == "magi_attention.functional.flex_flash_attn":
+            return functional
+        raise AssertionError(name)
+
+    compat.magi_attention_flex_flash_attn_func.cache_clear()
+    try:
+        monkeypatch.setattr(
+            importlib.util, "find_spec", _find_spec_stub({"magi_attention"})
+        )
+        monkeypatch.setattr(importlib, "import_module", import_module)
+        assert compat.magi_attention_flex_flash_attn_func() is functional.flex_flash_attn_func
+    finally:
+        compat.magi_attention_flex_flash_attn_func.cache_clear()
+
+
 def test_magi2_refiner_precondition_fails_only_when_no_attention_path_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1448,8 +1649,8 @@ def test_magi2_refiner_precondition_fails_only_when_no_attention_path_exists(
     assert "magi_compiler" in message
 
 
-def test_magi2_refiner_streams_under_the_configured_residency_policy() -> None:
-    """The refiner reuses the family's block-residency policy, not its own.
+def test_magi2_refiner_uses_a_stage_specific_safe_transfer_mode() -> None:
+    """The refiner reuses residency but not the preview's unsafe prefetch mode.
 
     A run configured for block swapping must stream the refiner's layers too;
     the refiner is a different architecture but the same ``block.layers`` stack.
@@ -1457,6 +1658,7 @@ def test_magi2_refiner_streams_under_the_configured_residency_policy() -> None:
     from mirai.core.models.magi2_preview.pipeline import (
         Magi2PreviewPipeline,
         Magi2ResidencyRequest,
+        Magi2RuntimeOptions,
     )
 
     pipeline = _bare_pipeline()
@@ -1466,6 +1668,7 @@ def test_magi2_refiner_streams_under_the_configured_residency_policy() -> None:
         [torch.nn.Linear(2, 2) for _ in range(4)]
     )
     pipeline._adapter_configured = True
+    pipeline.options = Magi2RuntimeOptions(config_path="")
     assert pipeline.refiner_residency_request() is None
 
     Magi2PreviewPipeline.set_weight_residency_strategy(
@@ -1473,8 +1676,13 @@ def test_magi2_refiner_streams_under_the_configured_residency_policy() -> None:
     )
     request = pipeline.refiner_residency_request()
     assert isinstance(request, Magi2ResidencyRequest)
-    assert (request.enabled, request.blocks_to_swap, request.mode) == (True, 3, "async")
+    assert (request.enabled, request.blocks_to_swap, request.mode) == (True, 3, "sync")
     assert request.offload_dir is None
+
+    pipeline.options = Magi2RuntimeOptions(
+        config_path="", refiner_block_swap_mode="async"
+    )
+    assert pipeline.refiner_residency_request().mode == "async"
 
     Magi2PreviewPipeline.set_weight_residency_strategy(
         pipeline, strategy="disabled", blocks_to_swap=0, mode="async"
@@ -1508,12 +1716,19 @@ class _StubRefinePipeline:
         # force around the forward.
         self.projection = torch.nn.Linear(4, 4, dtype=torch.float32)
         self.observed: list[tuple[torch.dtype, torch.dtype]] = []
+        self.cached_context = None
+        self.text_loads = 0
 
     def release_base_transformer(self) -> None:
         return None
 
     def load_text_encoder(self, device: str) -> None:
-        return None
+        self.text_loads += 1
+
+    def take_refiner_context(self):
+        pair = self.cached_context
+        self.cached_context = None
+        return pair
 
     def encode_prompt(self, prompt: str, device: str) -> torch.Tensor:
         return torch.zeros(2, 8, dtype=torch.float32)
@@ -1577,6 +1792,55 @@ def test_magi2_refine_loop_leaves_the_vendored_dtype_policy_alone() -> None:
     assert pipeline.observed == [
         (torch.float32, torch.float32) for _ in pipeline.observed
     ]
+    assert pipeline.text_loads == 1
+
+
+def test_magi2_refiner_waits_before_releasing_cuda_workspace(monkeypatch) -> None:
+    from mirai.core.models.magi2_preview.refiner import _release_cuda_workspace
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device: events.append(f"sync:{device.type}")
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty"))
+    device = type("_Device", (), {"type": "cuda"})()
+
+    _release_cuda_workspace(device)
+
+    assert events == ["sync:cuda", "empty"]
+
+
+def test_magi2_refine_loop_reuses_adjacent_preview_context() -> None:
+    from mirai.core.models.magi2_preview.refiner import (
+        Magi2RefineSettings,
+        run_refine,
+    )
+
+    pipeline = _StubRefinePipeline()
+    pipeline.cached_context = (
+        torch.zeros(1, 2, 8, dtype=torch.float32),
+        torch.ones(1, 2, 8, dtype=torch.float32),
+    )
+    run_refine(
+        pipeline=pipeline,
+        refiner=_StubRefinerAssets(),
+        base_latent=torch.zeros(4, 3, 4, 4, dtype=torch.float32),
+        settings=Magi2RefineSettings(
+            steps=1,
+            cfg_scale=2.0,
+            shift=5.0,
+            height=64,
+            width=64,
+            noise_index=220,
+            scheduler="unipc",
+        ),
+        prompt="a",
+        negative_prompt="",
+        seed=0,
+        device="cpu",
+    )
+    assert pipeline.text_loads == 0
+    assert pipeline.cached_context is None
 
 
 def test_magi2_refiner_residency_staging_runs_outside_the_compiled_forward() -> None:
@@ -1663,6 +1927,10 @@ def test_magi2_provider_accepts_and_validates_refiner_family_params() -> None:
     assert provider.validate_family_params({"refiner_subfolder": "/etc"})
     assert provider.validate_family_params({"refiner_subfolder": "../elsewhere"})
     assert provider.validate_family_params({"refiner_config_path": 3})
+    assert provider.validate_family_params({"vae_decode_chunk_size": 0}) == []
+    assert provider.validate_family_params({"vae_decode_chunk_size": 2}) == []
+    assert provider.validate_family_params({"vae_decode_chunk_size": -1})
+    assert provider.validate_family_params({"vae_decode_chunk_size": True})
 
 
 _REFINER_DEFAULT_OFF_PROBE = """
