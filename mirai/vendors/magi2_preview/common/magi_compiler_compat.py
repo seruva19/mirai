@@ -52,13 +52,23 @@ MAGI2_EAGER_IMPL_DEPENDENCY = "flash_attn"
 
 @functools.lru_cache(maxsize=1)
 def magi_attention_flex_flash_attn_func() -> Callable[..., object] | None:
-    """MagiAttention's flex entry point, or ``None`` when it is not usable.
+    """MagiAttention's flex entry point, or ``None`` when it does not import.
 
     ``find_spec`` proves only that the distribution is on the path. MagiAttention
     carries CUDA extensions built for compute capability 9.0, so an install that
-    is present can still fail to import on any other architecture; importing the
-    entry point is the probe that separates the two. Resolution stays lazy
-    because the import touches CUDA.
+    is present can still fail to import on another architecture; importing the
+    entry point separates those two states. Resolution stays lazy because the
+    import touches CUDA.
+
+    What this establishes is import reachability, NOT that a call will succeed.
+    MagiAttention builds its cutlass kernels on first call, so on a machine where
+    the import succeeds and the architecture reports Hopper the vendored dispatch
+    still reaches the real kernel and can fail inside that build. Proving
+    callability would mean paying for the build, which is neither cheap nor safe
+    to do from a probe, so it is deliberately not attempted here. A path that
+    must be guaranteed to run is selected explicitly instead —
+    ``family_params.refiner_attention_backend='native_flex'`` binds the native
+    FlexAttention refiner backend, which never consults this probe.
     """
     if importlib.util.find_spec("magi_attention") is None:
         return None

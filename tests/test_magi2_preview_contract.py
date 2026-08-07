@@ -1365,16 +1365,18 @@ def test_magi2_attention_ops_resolve_to_the_vendored_eager_implementation(
         resolve_magi2_op.cache_clear()
 
 
-def test_magi2_unusable_magi_attention_does_not_select_the_magi_attention_branch(
+def test_magi2_unimportable_magi_attention_does_not_select_the_magi_attention_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An importable-but-unusable ``magi_attention`` falls through to eager math.
+    """A present-but-unimportable ``magi_attention`` falls through to eager math.
 
     MagiAttention's extensions build for compute capability 9.0 only, so the
     distribution can be on the path while its entry point does not import. A
     presence probe would send a Hopper-reporting device into a branch that then
-    fails; the usability probe must resolve to nothing so the branch is not
-    taken and the vendored eager path runs instead.
+    fails; the import probe must resolve to nothing so the branch is not taken
+    and the vendored eager path runs instead. Import reachability is all this
+    establishes: an entry point that imports can still fail in its kernel build
+    at call time, which is why a guaranteed path is selected rather than probed.
     """
     from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
         magi_attention_flex_flash_attn_func,
@@ -1478,6 +1480,178 @@ def test_magi2_refiner_streams_under_the_configured_residency_policy() -> None:
         pipeline, strategy="disabled", blocks_to_swap=0, mode="async"
     )
     assert pipeline.refiner_residency_request().enabled is False
+
+
+class _StubRefinerAssets:
+    """Stand-in for the loaded refiner: geometry only, no weights, no device."""
+
+    def __init__(self) -> None:
+        self.loaded = 0
+        self.released = 0
+
+    def latent_size(self, settings) -> tuple[int, int]:
+        return int(settings.height) // 16, int(settings.width) // 16
+
+    def load(self, *, device: str, residency) -> None:
+        self.loaded += 1
+
+    def release(self) -> None:
+        self.released += 1
+
+
+class _StubRefinePipeline:
+    """The provider hooks ``run_refine`` reaches the model through."""
+
+    def __init__(self) -> None:
+        # Constructed at float32 exactly as the vendored Adapter and PostAdapter
+        # projections are, so its output dtype reports whether an autocast is in
+        # force around the forward.
+        self.projection = torch.nn.Linear(4, 4, dtype=torch.float32)
+        self.observed: list[tuple[torch.dtype, torch.dtype]] = []
+
+    def release_base_transformer(self) -> None:
+        return None
+
+    def load_text_encoder(self, device: str) -> None:
+        return None
+
+    def encode_prompt(self, prompt: str, device: str) -> torch.Tensor:
+        return torch.zeros(2, 8, dtype=torch.float32)
+
+    def offload_text_encoder(self) -> None:
+        return None
+
+    def refiner_residency_request(self):
+        return None
+
+    def refiner_forward(self, latents, context):
+        self.observed.append(
+            (latents.dtype, self.projection(torch.zeros(1, 4)).dtype)
+        )
+        return torch.zeros_like(latents)
+
+
+def test_magi2_refine_loop_leaves_the_vendored_dtype_policy_alone() -> None:
+    """The refiner denoise runs at float32 with no autocast around it.
+
+    The vendored refiner owns its dtype policy: its ``Adapter`` and
+    ``PostAdapter`` linears are float32 and write into float32 buffers through
+    masked ``index_put_``. An outer autocast demotes the projections without
+    demoting the buffers, and the vendored ``@torch.compile`` forward rejects
+    the crossing. The loop therefore declares no compute dtype at all, and both
+    the latent it hands the model and a float32 projection evaluated inside the
+    forward stay float32.
+    """
+    import inspect
+
+    from mirai.core.models.magi2_preview.refiner import (
+        Magi2RefineSettings,
+        run_refine,
+    )
+
+    assert "dtype" not in inspect.signature(run_refine).parameters
+
+    settings = Magi2RefineSettings(
+        steps=2,
+        cfg_scale=2.0,
+        shift=5.0,
+        height=64,
+        width=64,
+        noise_index=220,
+        scheduler="unipc",
+    )
+    pipeline = _StubRefinePipeline()
+    refined = run_refine(
+        pipeline=pipeline,
+        refiner=_StubRefinerAssets(),
+        base_latent=torch.zeros(4, 3, 4, 4, dtype=torch.float32),
+        settings=settings,
+        prompt="a",
+        negative_prompt="",
+        seed=0,
+        device="cpu",
+    )
+    assert tuple(refined.shape) == (4, 5, 4, 4)
+    # Two CFG branches per step: the refiner is never packed into one B=2 forward.
+    assert len(pipeline.observed) == 2 * settings.steps
+    assert pipeline.observed == [
+        (torch.float32, torch.float32) for _ in pipeline.observed
+    ]
+
+
+def test_magi2_refiner_residency_staging_runs_outside_the_compiled_forward() -> None:
+    """Block-swap staging is a graph break, not traced state.
+
+    Staging rebinds ``Parameter.data`` host-to-device from inside the vendored
+    ``@torch.compile(dynamic=True)`` forward, which Dynamo cannot trace across
+    two devices. The hooks must therefore route through a dynamo-disabled
+    callable while still staging every block eagerly.
+    """
+    from mirai.core.models.magi2_preview.pipeline import Magi2ResidencyRequest
+    from mirai.core.models.magi2_preview.refiner import Magi2Refiner
+
+    refiner = Magi2Refiner(
+        type("_ModelConfig", (), {"path": "./models/MAGI-2-preview"})(),
+        config_path=_REFINER_CONFIG,
+    )
+    transformer = torch.nn.Module()
+    transformer.block = torch.nn.Module()
+    transformer.block.layers = torch.nn.ModuleList(
+        [torch.nn.Linear(2, 2) for _ in range(3)]
+    )
+    refiner._transformer = transformer
+
+    staged: list[tuple[str, int]] = []
+
+    class _RecordingManager:
+        def bind(self, units, *, device) -> None:
+            return None
+
+        def before_block(self, index: int) -> None:
+            staged.append(("in", int(index)))
+
+        def after_block(self, index: int) -> None:
+            staged.append(("out", int(index)))
+
+    import mirai.core.training.residency.block_swap as block_swap
+
+    saved = block_swap.BlockSwapManager
+    block_swap.BlockSwapManager = lambda **kwargs: _RecordingManager()
+    try:
+        refiner._place(
+            device="cpu",
+            residency=Magi2ResidencyRequest(
+                enabled=True,
+                blocks_to_swap=3,
+                mode="async",
+                block_residency_planner="static",
+                block_swap_prefetch_depth=1,
+                block_residency_priority="uniform",
+                block_swap_transfer_strategy="default",
+                offload_dir=None,
+            ),
+        )
+    finally:
+        block_swap.BlockSwapManager = saved
+
+    for index, layer in enumerate(transformer.block.layers):
+        layer(torch.zeros(1, 2))
+    assert staged == [
+        ("in", 0), ("out", 0), ("in", 1), ("out", 1), ("in", 2), ("out", 2)
+    ]
+
+    # ``_torchdynamo_disable`` is the marker Dynamo itself reads to decide that a
+    # call is a graph break rather than traceable state. Each hook must close
+    # over exactly one such callable: the pre-hook stages in, the post-hook out.
+    layer = transformer.block.layers[0]
+    for hooks in (layer._forward_pre_hooks, layer._forward_hooks):
+        hook = next(iter(hooks.values()))
+        disabled = [
+            cell.cell_contents
+            for cell in (hook.__closure__ or ())
+            if getattr(cell.cell_contents, "_torchdynamo_disable", False)
+        ]
+        assert len(disabled) == 1
 
 
 def test_magi2_provider_accepts_and_validates_refiner_family_params() -> None:

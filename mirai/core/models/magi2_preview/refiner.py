@@ -49,7 +49,6 @@ Attribution: SandAI MAGI-2-preview, Apache-2.0
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -503,16 +502,29 @@ class Magi2Refiner:
         )
         manager.bind(units, device=target)
         self._release_hooks()
+
+        # Staging rebinds ``Parameter.data`` between host and device from inside
+        # the vendored ``@torch.compile(dynamic=True)`` refiner forward. Dynamo
+        # cannot trace the resulting ``aten.set_`` across two devices and aborts
+        # with "Unhandled FakeTensor Device Propagation". Staging is a residency
+        # side effect that must happen eagerly whether or not the forward is
+        # compiled, so it is an explicit graph break. The disable covers the two
+        # staging calls only; the compiled forward around them is untouched.
+        from torch import _dynamo
+
+        stage_in = _dynamo.disable(lambda idx: manager.before_block(idx))
+        stage_out = _dynamo.disable(lambda idx: manager.after_block(idx))
+
         for index, layer in units:
             self._block_hook_handles.append(
                 layer.register_forward_pre_hook(
-                    lambda _module, _args, idx=index: manager.before_block(idx)
+                    lambda _module, _args, idx=index: stage_in(idx)
                 )
             )
             self._block_hook_handles.append(
                 layer.register_forward_hook(
                     lambda _module, _args, output, idx=index: (
-                        manager.after_block(idx),
+                        stage_out(idx),
                         output,
                     )[1]
                 )
@@ -549,7 +561,6 @@ def run_refine(
     negative_prompt: str,
     seed: int,
     device: str,
-    dtype: Any | None = None,
 ) -> torch.Tensor:
     """Resample, re-noise and short-denoise a preview latent into a refined one.
 
@@ -559,6 +570,17 @@ def run_refine(
     The preview transformer is released before any refiner state is allocated.
     This operation does not restore it; the owning inference session restores
     placement before a subsequent preview denoise.
+
+    This loop takes no compute dtype, because the vendored refiner owns its own
+    dtype policy and it is not a policy a caller may override. Its ``Adapter``
+    and ``PostAdapter`` projections are constructed at ``dtype=torch.float32``
+    and write into float32 buffers through masked ``index_put_``, while the
+    transformer block casts to ``config.params_dtype`` on entry and the post
+    adapter casts back on exit. An outer ``torch.amp.autocast`` demotes those
+    projections without demoting the buffers they write into, and the vendored
+    ``@torch.compile(dynamic=True)`` forward rejects the resulting dtype
+    crossing outright. Latents therefore enter float32 and no autocast wraps the
+    denoise.
     """
     if base_latent.ndim != 4:
         raise RuntimeError(
@@ -619,13 +641,7 @@ def run_refine(
             residency=pipeline.refiner_residency_request(),
         )
         scale = float(settings.cfg_scale)
-        autocast_ctx: Any = (
-            torch.amp.autocast("cuda", dtype=dtype)
-            if compute_device.type == "cuda"
-            and dtype in {torch.float16, torch.bfloat16}
-            else contextlib.nullcontext()
-        )
-        with torch.inference_mode(), autocast_ctx:
+        with torch.inference_mode():
             for timestep in scheduler.timesteps:
                 # The refiner evaluates the conditional and unconditional
                 # branches as two separate forwards. Unlike the preview sampler

@@ -8,14 +8,25 @@ conditioning packs and runs, and that the resampled latent geometry survives the
 data proxy — while the geometry and re-noise math are checked on CPU by
 ``tests/test_magi2_preview_contract.py``.
 
-The refiner also dispatches its attention through the ``torch.ops.magi2``
-operators MagiCompiler registers, which is a precondition of the probe rather
-than part of what it measures.
+Which attention path serves the run is part of what the probe reports. The
+refiner's window attention dispatches through ``torch.ops.magi2``, but a bound
+native FlexAttention backend serves that operator itself, so the probe resolves
+a backend first and then requires only the operators the reduced architecture
+still reaches. Its layers are all local, so a bound backend leaves none.
+
+``MIRAI_MAGI2_REFINER_ATTENTION_BACKEND`` selects the path, defaulting to
+``auto``. The environment is the surface here because the probe is invoked from
+``agent/checks.json`` as a fixed argv with no config file behind it, and the
+selection has to be forceable to A/B the native path against the vendored one on
+the same machine. It stays scoped to this script: nothing in the runtime reads
+it, and the shipped control surface remains
+``model.params.family_params.refiner_attention_backend``.
 """
 
 from __future__ import annotations
 
 import json
+import os
 
 import torch
 
@@ -24,6 +35,28 @@ from mirai.core.models.magi2_preview.refiner import (
     magi2_refiner_renoise,
     magi2_refiner_upsample,
 )
+from mirai.core.models.magi2_preview.refiner_attention import (
+    MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT,
+    attach_refiner_attention_backend,
+    normalize_refiner_attention_backend,
+    refiner_required_magi2_ops,
+    resolve_magi2_refiner_attention,
+    validate_refiner_flex_support,
+)
+
+
+# Probe-scoped override of the attention path, so the native and vendored paths
+# can be forced on one machine. Absent, the released default resolution applies.
+MAGI2_REFINER_ATTENTION_BACKEND_ENV = "MIRAI_MAGI2_REFINER_ATTENTION_BACKEND"
+
+
+def _requested_attention_backend() -> str:
+    return normalize_refiner_attention_backend(
+        os.environ.get(
+            MAGI2_REFINER_ATTENTION_BACKEND_ENV,
+            MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT,
+        )
+    )
 
 
 def _reduced_refiner_config():
@@ -88,7 +121,15 @@ def main() -> None:
         require_magi2_custom_ops,
     )
 
-    require_magi2_custom_ops("The MAGI-2 refine-stage probe")
+    requested_backend = _requested_attention_backend()
+    arch_config = _reduced_refiner_config()
+    backend = resolve_magi2_refiner_attention(requested_backend)
+    if backend is not None:
+        validate_refiner_flex_support(torch.device("cuda"))
+    required_ops = refiner_required_magi2_ops(arch_config, backend)
+    if required_ops:
+        require_magi2_custom_ops("The MAGI-2 refine-stage probe", required_ops)
+
     from mirai.vendors.magi2_preview.model.magi2_refiner import Transformer
     from mirai.vendors.magi2_preview.pipeline.inference_engine import EvalInput
     from mirai.vendors.magi2_preview.pipeline.refiner_data_proxy import (
@@ -97,7 +138,7 @@ def main() -> None:
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    model = Transformer(_reduced_refiner_config())
+    model = Transformer(arch_config)
     # The refiner is normally strict-loaded from released shards, so its module
     # tree allocates uninitialized storage. A probe that never reads a
     # checkpoint has to seed it before any finiteness claim is meaningful.
@@ -107,6 +148,7 @@ def main() -> None:
     model.to(device=device).eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
+    attach_refiner_attention_backend(model, backend)
 
     proxy = Magi2RefinerDataProxy(_reduced_proxy_config())
     preview_latent_frames = 3
@@ -157,6 +199,11 @@ def main() -> None:
         json.dumps(
             {
                 "status": "passed",
+                "attention_backend": requested_backend,
+                "attention_path": (
+                    "vendor_eager" if backend is None else "native_flex"
+                ),
+                "required_magi2_ops": list(required_ops),
                 "preview_latent_frames": preview_latent_frames,
                 "refined_latent_frames": expected_frames,
                 "peak_memory_bytes": int(torch.cuda.max_memory_allocated(device)),

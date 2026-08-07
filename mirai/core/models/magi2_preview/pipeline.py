@@ -1339,8 +1339,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 "validate_refinement_request() resolves the release profile."
             )
         # MAGI-2 declares text_to_video only, so a conditioned request never
-        # reaches this stage; the parameter exists to satisfy the shared contract.
-        _ = request, conditioning
+        # reaches this stage; the parameter exists to satisfy the shared
+        # contract. ``dtype`` is discarded for the same reason: the vendored
+        # refiner fixes its own dtype policy, so the stage has no compute dtype
+        # a caller may select.
+        _ = request, conditioning, dtype
         return run_refine(
             pipeline=self,
             refiner=self._refiner_assets(),
@@ -1350,7 +1353,6 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             negative_prompt=negative_prompt,
             seed=int(seed),
             device=str(device),
-            dtype=dtype,
         )
 
     def refiner_forward(self, latents: Any, context: Any) -> Any:

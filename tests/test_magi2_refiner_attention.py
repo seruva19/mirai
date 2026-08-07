@@ -497,3 +497,70 @@ def test_vendored_dispatch_uses_the_bound_backend(vendored_refiner_module) -> No
     )
     expected, _ = _dense_range_attention(query, key, value, q_ranges, k_ranges)
     torch.testing.assert_close(observed, expected, rtol=2e-2, atol=2e-2)
+
+
+# --------------------------------------------------------------------------- #
+# Refine-stage probe: which path it selects and what it then requires
+# --------------------------------------------------------------------------- #
+def _refine_probe():
+    from mirai.core.models.magi2_preview.contracts import native_refine_step
+
+    return native_refine_step
+
+
+def test_refine_probe_selects_the_native_path_and_requires_no_operator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no MagiCompiler the probe binds the native backend and needs no op.
+
+    The reduced architecture the probe builds is all-local, so once the native
+    backend is bound the flex operator is served by it and the dense operator is
+    never reached. The probe must therefore require an empty operator set rather
+    than the full tuple, which is what previously drove it into MagiAttention.
+    """
+    import mirai.vendors.magi2_preview.common.magi_compiler_compat as compat
+
+    probe = _refine_probe()
+    monkeypatch.delenv(probe.MAGI2_REFINER_ATTENTION_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(compat, "missing_magi2_custom_ops", lambda names: tuple(names))
+
+    requested = probe._requested_attention_backend()
+    assert requested == MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT
+    backend = resolve_magi2_refiner_attention(requested)
+    assert isinstance(backend, Magi2RefinerFlexAttentionBackend)
+
+    arch = probe._reduced_refiner_config()
+    assert set(arch.local_attn_layers) == set(range(arch.num_layers))
+    assert refiner_required_magi2_ops(arch, backend) == ()
+    # Without a bound backend the same architecture does reach the operator, so
+    # the empty requirement is a consequence of the binding, not of the config.
+    assert refiner_required_magi2_ops(arch, None) == ("flex_flash_attn_func",)
+
+
+@pytest.mark.parametrize(
+    "value, expected_native",
+    [("native_flex", True), ("vendor_eager", False), (" Auto ", True)],
+)
+def test_refine_probe_environment_override_selects_the_path(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected_native: bool
+) -> None:
+    """The probe-scoped override forces either path on one machine."""
+    import mirai.vendors.magi2_preview.common.magi_compiler_compat as compat
+
+    probe = _refine_probe()
+    monkeypatch.setattr(compat, "missing_magi2_custom_ops", lambda names: tuple(names))
+    monkeypatch.setenv(probe.MAGI2_REFINER_ATTENTION_BACKEND_ENV, value)
+
+    requested = probe._requested_attention_backend()
+    assert requested == value.strip().lower()
+    backend = resolve_magi2_refiner_attention(requested)
+    assert isinstance(backend, Magi2RefinerFlexAttentionBackend) is expected_native
+
+
+def test_refine_probe_rejects_an_unknown_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _refine_probe()
+    monkeypatch.setenv(probe.MAGI2_REFINER_ATTENTION_BACKEND_ENV, "magi_attention")
+    with pytest.raises(Magi2RefinerAttentionUnsupported, match="must be one of"):
+        probe._requested_attention_backend()

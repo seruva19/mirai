@@ -517,9 +517,20 @@ class AgentValidationContractTests(unittest.TestCase):
             names.add(check["name"])
             self.assertIn(check["cost"], {"fast", "extended", "gpu"})
             for command in check["commands"]:
-                contract_paths = re.findall(
-                    r"(?:tests|mirai)/[A-Za-z0-9_./-]+\.py", command
+                # A standalone probe is invoked as a module rather than as a
+                # file path: the runner executes argv without a shell, so only
+                # ``-m`` puts the repository root on sys.path and lets the probe
+                # import ``mirai`` on a checkout with no installed package. The
+                # dotted name still names exactly one probe file.
+                module = re.fullmatch(
+                    r"python -m ((?:mirai|tests)(?:\.[A-Za-z0-9_]+)+)", command
                 )
+                if module is not None:
+                    contract_paths = [module.group(1).replace(".", "/") + ".py"]
+                else:
+                    contract_paths = re.findall(
+                        r"(?:tests|mirai)/[A-Za-z0-9_./-]+\.py", command
+                    )
                 if not contract_paths:
                     non_pytest_commands.add(command)
                 for contract_path in contract_paths:
