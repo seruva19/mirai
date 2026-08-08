@@ -49,7 +49,7 @@ else:
     _moe_restore_weighted_sum_kernel = None
 
 
-def restore_tokens_triton(
+def _restore_tokens_triton_forward(
     expert_output: torch.Tensor,
     sorted_positions: torch.Tensor,
     sorted_scores: torch.Tensor,
@@ -94,3 +94,62 @@ def restore_tokens_triton(
         block_h,
     )
     return output
+
+
+class _RestoreTokensTriton(torch.autograd.Function):
+    """Autograd-complete weighted route restore around the Triton forward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        expert_output,
+        sorted_positions,
+        sorted_scores,
+        num_tokens,
+        top_k,
+    ):
+        output = _restore_tokens_triton_forward(
+            expert_output,
+            sorted_positions,
+            sorted_scores,
+            int(num_tokens),
+            int(top_k),
+        )
+        ctx.expert_dtype = expert_output.dtype
+        ctx.score_dtype = sorted_scores.dtype
+        ctx.top_k = int(top_k)
+        ctx.save_for_backward(expert_output, sorted_positions, sorted_scores)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        expert_output, sorted_positions, sorted_scores = ctx.saved_tensors
+        token_indices = torch.div(
+            sorted_positions,
+            int(ctx.top_k),
+            rounding_mode="floor",
+        )
+        gathered = grad_output.float().index_select(0, token_indices)
+        grad_expert = (gathered * sorted_scores.float().unsqueeze(1)).to(
+            dtype=ctx.expert_dtype
+        )
+        grad_scores = (gathered * expert_output.float()).sum(dim=1).to(
+            dtype=ctx.score_dtype
+        )
+        return grad_expert, None, grad_scores, None, None
+
+
+def restore_tokens_triton(
+    expert_output: torch.Tensor,
+    sorted_positions: torch.Tensor,
+    sorted_scores: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    return _RestoreTokensTriton.apply(
+        expert_output,
+        sorted_positions,
+        sorted_scores,
+        int(num_tokens),
+        int(top_k),
+    )

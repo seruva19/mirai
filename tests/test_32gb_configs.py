@@ -1,9 +1,9 @@
 """The 32 GiB hardware-profile configs state a runnable, self-consistent profile.
 
 The assertions below are the profiles' requirements, not restatements of the
-files: every example must survive the real loader and runtime validators, the
-MAGI-2 training profile must fit a 128 GiB host through load-time NF4 packing,
-and the LingBot profile must keep the compressed base fully resident.
+files: every example must survive the real loader and runtime validators, and
+both training profiles must keep their bounded host-residency plans inside a
+128 GiB machine.
 """
 
 from __future__ import annotations
@@ -123,44 +123,54 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         self.assertFalse(config.inference.keep_vae_resident)
         self.assertEqual(config.inference.cfg_mode, "batched")
 
-    def test_lingbot_profile_is_compressed_and_fully_resident(self) -> None:
-        for path in (LINGBOT_TRAIN, LINGBOT_INFER):
-            with self.subTest(config=path.name):
-                entrypoint = "train" if path is LINGBOT_TRAIN else "infer"
-                config = _resolved(path, entrypoint=entrypoint)
-                self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
-                self.assertEqual(
-                    config.memory.frozen_weight_quantization_strategy,
-                    "compressed_weights",
-                )
-                self.assertTrue(config.memory.quantize_experts_on_load)
-                self.assertEqual(
-                    config.memory.weight_residency_strategy,
-                    "disabled",
-                    "the compressed base fits the device; swapping it would buy nothing",
-                )
-                self.assertEqual(config.training.blocks_to_swap, 0)
-                self.assertEqual(config.training.block_swap_mode, "sync")
-                self.assertLessEqual(config.memory.cuda_memory_fraction, 0.95)
+    def test_lingbot_training_profile_uses_bounded_async_residency(self) -> None:
+        config = _resolved(LINGBOT_TRAIN, entrypoint="train")
+        self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
+        self.assertEqual(
+            config.memory.frozen_weight_quantization_strategy,
+            "compressed_weights",
+        )
+        self.assertTrue(config.memory.quantize_experts_on_load)
+        self.assertEqual(config.optimizer.type, "paged_adamw_8bit")
+        self.assertFalse(config.optimizer.allow_fallback)
+        self.assertEqual(config.training.gradient_checkpointing, "aggressive")
+        self.assertEqual(config.memory.weight_residency_strategy, "block_swap")
+        self.assertEqual(config.training.blocks_to_swap, 16)
+        self.assertEqual(config.training.block_swap_mode, "async")
+        self.assertEqual(config.memory.block_swap_prefetch_depth, 1)
+        self.assertEqual(config.memory.expert_dequant_chunk_size, 32)
+        self.assertLessEqual(
+            config.memory.max_pinned_host_gib
+            + config.memory.minimum_system_memory_gib,
+            PROFILE_HOST_MEMORY_GIB,
+        )
+        self.assertLessEqual(config.memory.cuda_memory_fraction, 0.95)
+
+    def test_lingbot_inference_profile_is_compressed_and_resident(self) -> None:
+        config = _resolved(LINGBOT_INFER, entrypoint="infer")
+        self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
+        self.assertEqual(
+            config.memory.frozen_weight_quantization_strategy,
+            "compressed_weights",
+        )
+        self.assertTrue(config.memory.quantize_experts_on_load)
+        self.assertEqual(config.memory.weight_residency_strategy, "disabled")
+        self.assertEqual(config.training.blocks_to_swap, 0)
+        self.assertEqual(config.training.block_swap_mode, "sync")
 
     def test_lingbot_inference_releases_auxiliary_models_between_phases(self) -> None:
         config = _resolved(LINGBOT_INFER, entrypoint="infer")
         self.assertFalse(config.inference.keep_text_encoder_resident)
         self.assertFalse(config.inference.keep_vae_resident)
 
-    def test_explicit_chunk_size_agrees_with_the_device_memory_tier(self) -> None:
-        """The named profile states the value the tier table would choose."""
+    def test_inference_chunk_size_agrees_with_the_device_memory_tier(self) -> None:
+        """The resident inference profile states the tier-table value."""
 
         tier_choice = resolve_expert_dequant_chunk_size(
             0, profile=((8, 9), PROFILE_DEVICE_MEMORY_GIB)
         )
-        for path in (LINGBOT_TRAIN, LINGBOT_INFER):
-            with self.subTest(config=path.name):
-                entrypoint = "train" if path is LINGBOT_TRAIN else "infer"
-                config = _resolved(path, entrypoint=entrypoint)
-                self.assertEqual(
-                    config.memory.expert_dequant_chunk_size, tier_choice
-                )
+        config = _resolved(LINGBOT_INFER, entrypoint="infer")
+        self.assertEqual(config.memory.expert_dequant_chunk_size, tier_choice)
 
     def test_profiles_do_not_delegate_to_the_tier_table(self) -> None:
         """A named hardware profile states its own keys.

@@ -74,7 +74,7 @@ else:
     _moe_pack_tokens_kernel = None
 
 
-def reorder_tokens_triton_pack(
+def _reorder_tokens_triton_pack_forward(
     tokens: torch.Tensor,
     top_scores: torch.Tensor,
     top_indices: torch.Tensor,
@@ -144,3 +144,67 @@ def reorder_tokens_triton_pack(
         block_h,
     )
     return permuted_tokens, counts, sorted_positions, sorted_scores, num_tokens, top_k
+
+
+class _ReorderTokensTritonPack(torch.autograd.Function):
+    """Autograd boundary for the fused route-pack kernels.
+
+    Triton writes into fresh output buffers, so invoking the kernels directly
+    disconnects both token and router-score gradients.  The backward is a
+    duplicate-safe inverse gather and score scatter over the saved route map.
+    """
+
+    @staticmethod
+    def forward(ctx, tokens, top_scores, top_indices, num_experts):
+        packed, counts, positions, scores, _, top_k = (
+            _reorder_tokens_triton_pack_forward(
+                tokens,
+                top_scores,
+                top_indices,
+                int(num_experts),
+            )
+        )
+        ctx.input_rows = int(tokens.shape[0])
+        ctx.top_k = int(top_k)
+        ctx.top_scores_shape = tuple(top_scores.shape)
+        ctx.save_for_backward(positions)
+        ctx.mark_non_differentiable(counts, positions)
+        return packed, counts, positions, scores
+
+    @staticmethod
+    def backward(ctx, grad_packed, _grad_counts, _grad_positions, grad_scores):
+        (positions,) = ctx.saved_tensors
+        token_indices = torch.div(
+            positions,
+            int(ctx.top_k),
+            rounding_mode="floor",
+        )
+        grad_tokens = None
+        if grad_packed is not None:
+            grad_tokens = grad_packed.new_zeros(
+                (int(ctx.input_rows), grad_packed.shape[-1])
+            )
+            grad_tokens.index_add_(0, token_indices, grad_packed)
+        grad_top_scores = None
+        if grad_scores is not None:
+            flat = grad_scores.new_zeros(int(ctx.input_rows) * int(ctx.top_k))
+            flat.scatter_(0, positions, grad_scores)
+            grad_top_scores = flat.reshape(ctx.top_scores_shape)
+        return grad_tokens, grad_top_scores, None, None
+
+
+def reorder_tokens_triton_pack(
+    tokens: torch.Tensor,
+    top_scores: torch.Tensor,
+    top_indices: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    num_tokens = int(tokens.shape[0])
+    top_k = int(top_indices.shape[1])
+    packed, counts, positions, scores = _ReorderTokensTritonPack.apply(
+        tokens,
+        top_scores,
+        top_indices,
+        int(num_experts),
+    )
+    return packed, counts, positions, scores, num_tokens, top_k

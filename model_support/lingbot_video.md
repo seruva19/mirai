@@ -78,15 +78,10 @@ Available examples:
   frozen base with chunked expert reconstruction. This example uses the
   bitsandbytes optimizer installed with Mirai.
 - [`train_nf4_32gb.toml`](../configs/lingbot_video/train_nf4_32gb.toml) — NF4
-  compressed frozen base kept **fully resident** on a 32 GiB device. Block
-  swapping is disabled: host-device transfer only pays for itself when the
-  weights do not fit, and the compressed base does. Unlike `train_nf4.toml`
-  this example uses the dependency-free `adamw` optimizer rather than the
-  Linux-only bitsandbytes path, so it runs unchanged on a Windows workstation.
-  On a DGX Spark (128 GiB unified) it applies unchanged: the resident
-  compressed base plus activations fit the unified pool, and
-  `memory.cuda_memory_fraction` with `memory.minimum_system_memory_gib` guard
-  the same pool from both directions.
+  training profile for 128 GiB RAM and 32 GiB VRAM. It combines bounded async
+  RAM-to-VRAM block residency, aggressive activation checkpointing, chunked
+  expert reconstruction, and the always-installed paged 8-bit optimizer. The
+  host pin ceiling leaves memory for dataset caching and checkpoint writes.
 
 Set `[model].path`, `[dataset].path`, and `[logging].output_dir`, then run:
 

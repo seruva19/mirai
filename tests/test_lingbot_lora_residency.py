@@ -49,11 +49,20 @@ from mirai.vendors.lingbot_video.transformer_lingbot_video import _block_router_
 from mirai.vendors.lingbot_video.transformer_lingbot_video import (
     _torch_grouped_mm_supported,
 )
+from mirai.vendors.lingbot_video.moe_pack_kernels import (
+    reorder_tokens_triton_pack,
+)
+from mirai.vendors.lingbot_video.moe_restore_kernels import restore_tokens_triton
 
 try:
     import torch
 except ModuleNotFoundError:  # pragma: no cover
     torch = None
+
+try:
+    import triton  # noqa: F401
+except Exception:  # pragma: no cover
+    triton = None
 
 
 @unittest.skipIf(torch is None, "torch not installed")
@@ -1844,6 +1853,65 @@ class LingBotLoRAResidencyTests(unittest.TestCase):
             torch.testing.assert_close(
                 ring_gradients[name], reference_gradients[name], rtol=0, atol=0
             )
+
+
+@unittest.skipUnless(
+    torch is not None and torch.cuda.is_available() and triton is not None,
+    "CUDA Triton required",
+)
+class LingBotMoeTritonAutogradTests(unittest.TestCase):
+    def test_pack_restore_matches_reference_forward_and_gradients(self) -> None:
+        torch.manual_seed(7)
+        device = torch.device("cuda")
+        tokens = torch.randn(11, 32, device=device, requires_grad=True)
+        logits = torch.randn(11, 3, device=device, requires_grad=True)
+        scores = logits.softmax(dim=-1)
+        indices = torch.randint(0, 7, (11, 3), device=device)
+
+        packed, counts, positions, packed_scores, rows, top_k = (
+            reorder_tokens_triton_pack(tokens, scores, indices, 7)
+        )
+        expert_output = packed.sin()
+        actual = restore_tokens_triton(
+            expert_output,
+            positions,
+            packed_scores,
+            rows,
+            top_k,
+        )
+        output_grad = torch.randn_like(actual)
+        (actual * output_grad).sum().backward()
+
+        reference_tokens = tokens.detach().clone().requires_grad_()
+        reference_logits = logits.detach().clone().requires_grad_()
+        reference_scores = reference_logits.softmax(dim=-1)
+        token_indices = torch.div(positions, top_k, rounding_mode="floor")
+        reference_expert = reference_tokens[token_indices].sin()
+        reference = torch.zeros_like(actual, dtype=torch.float32).index_add(
+            0,
+            token_indices,
+            reference_expert.float()
+            * reference_scores.flatten()[positions].float().unsqueeze(1),
+        )
+        (reference * output_grad.float()).sum().backward()
+
+        torch.testing.assert_close(actual.float(), reference, atol=2e-6, rtol=2e-6)
+        torch.testing.assert_close(
+            tokens.grad,
+            reference_tokens.grad,
+            atol=2e-6,
+            rtol=2e-6,
+        )
+        torch.testing.assert_close(
+            logits.grad,
+            reference_logits.grad,
+            atol=2e-6,
+            rtol=2e-6,
+        )
+        torch.testing.assert_close(
+            counts,
+            torch.bincount(indices.flatten(), minlength=7).to(torch.int32),
+        )
 
 
 if __name__ == "__main__":

@@ -1,21 +1,20 @@
-# LingBot Video LoRA training on a 32 GiB device.
-#
-# NF4-compressed frozen weights fit the 30B-A3B base in device memory with
-# room for LoRA state and activations, so this profile keeps the model fully
-# resident and does not swap blocks: host-device transfer is only worth its
-# cost when the weights do not fit.
+# LingBot Video LoRA training with 128 GiB RAM and 32 GiB VRAM.
 preset = "lingbot_video"
 
 [model]
 path = "./models/lingbot-video-moe-30b-a3b"
 
 [training]
+batch_size = 1
+gradient_accumulation = 2
 max_steps = 1000
 gradient_checkpointing = "aggressive"
-# No block residency: nothing streams, so the mode is inert and the swap count
-# is zero.
-block_swap_mode = "sync"
-blocks_to_swap = 0
+block_swap_mode = "async"
+blocks_to_swap = 16
+
+[optimizer]
+type = "paged_adamw_8bit"
+allow_fallback = false
 
 [adapter]
 type = "lora"
@@ -34,18 +33,15 @@ frame_buckets = [17, 33]
 frozen_weight_quantization = "nf4"
 frozen_weight_quantization_strategy = "compressed_weights"
 quantize_experts_on_load = true
-# Experts are stored compressed and reconstructed per call regardless of
-# residency, so the access policy is required even with nothing swapped.
 expert_weight_access = "chunked_dequant"
-# Transient dequantization buffer size. Eight experts per chunk is what the
-# device-memory tier table selects for a device of at most 32 GiB.
-expert_dequant_chunk_size = 8
-# The whole compressed base stays on the device.
-weight_residency_strategy = "disabled"
+expert_dequant_chunk_size = 32
+weight_residency_strategy = "block_swap"
+block_swap_prefetch_depth = 1
+max_pinned_host_gib = 16.0
 # A workstation GPU also drives the desktop; leave allocator headroom.
 cuda_memory_fraction = 0.95
 # Free-RAM guard for the host side of caching and checkpoint writes.
-minimum_system_memory_gib = 8.0
+minimum_system_memory_gib = 16.0
 
 [logging]
 output_dir = "./outputs/lingbot_lora_nf4_32gb"

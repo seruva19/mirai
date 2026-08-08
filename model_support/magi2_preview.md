@@ -614,7 +614,7 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 - **MAGI-2 Preview single-GPU adapter training** — Adapter-only optimization
   with native preview-transformer weights and gradients.
   [(repo)](https://github.com/SandAI-org/MAGI-2-preview)
-- **Trainable MAGI-2 FlexAttention** —
+- **Trainable MAGI-2 attention** —
   `model.attention_backend = "flex"` routes packed attention through a backend
   with a backward pass instead of the dense-mask reference path autograd
   otherwise selects. Document block masking keeps packed samples isolated and
