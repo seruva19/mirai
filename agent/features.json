@@ -2856,6 +2856,39 @@
       "promotion_evidence": ""
     },
     {
+      "name": "momentum_anchored_orthogonal_projection",
+      "kind": "training_policy",
+      "owner": "mirai/core/training/policies/momentum_anchor.py",
+      "check": "training_optim",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "MomentumAnchoredOrthogonalProjection"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "tests/test_optimizer_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Momentum-anchored gradient projection",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2607.00293",
+      "promotion_evidence": ""
+    },
+    {
       "name": "mxfp8_e4m3_round_up_microscaling",
       "kind": "compressed_weight",
       "owner": "mirai/core/models/compressed_weights/quantization/microscaling_quant.py",

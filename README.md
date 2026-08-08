@@ -181,6 +181,10 @@ configuration and compatibility rules are documented in
   weight space for dense and grouped-expert adapters.
   [(paper)](https://arxiv.org/abs/2407.18242)
   [(repo)](https://github.com/mrflogs/LoRA-Pro)
+- **Momentum-anchored gradient projection** — Opt-in MAOP removes a globally
+  antagonistic component from accumulated gradients using the existing FP32
+  AdamW first moment, with bounded scratch memory and resumable policy state.
+  [(paper)](https://arxiv.org/abs/2607.00293)
 - **Gauge-invariant spectral LoRA optimization (LoRA-Muon)** — Whitened
   factor momentum receives a matrix-sign update in the geometry of the
   composed low-rank weight. Dense and grouped-expert adapters use split weight

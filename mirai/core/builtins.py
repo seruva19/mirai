@@ -36,6 +36,7 @@ BUILTIN_COMPONENT_MODULES: tuple[tuple[str, str], ...] = (
     ("training_policy", "mirai.core.training.policies.prototypical_routing"),
     ("training_policy", "mirai.core.training.policies.sharp_moe"),
     ("training_policy", "mirai.core.training.policies.mixture_of_depths"),
+    ("training_policy", "mirai.core.training.policies.momentum_anchor"),
     ("training_policy", "mirai.core.training.policies.preemptive_monitoring"),
 )
 

@@ -66,7 +66,12 @@ from mirai.core.training.optim.selected_expert_muon import (
     orthogonalize_matrix_newton_schulz,
     orthogonalize_matrix_reference,
 )
+from mirai.core.training.policies.momentum_anchor import (
+    MomentumAnchoredOrthogonalProjection,
+)
 from mirai.core.training.runtime.contract import validate_training_runtime_config
+from mirai.core.training.training_policy import TrainingPolicySet
+from mirai.core.training.training_policy import validate_training_policy_configs
 
 try:
     import torch
@@ -75,6 +80,29 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 class OptimizerConfigurationTests(unittest.TestCase):
+    def test_maop_policy_is_default_off_validated_and_resumable(self) -> None:
+        self.assertNotIn(
+            "momentum_anchor",
+            TrainingPolicySet.from_config(TrainingConfig()).active_names,
+        )
+        config = TrainingConfig()
+        config.training.policy_options = {
+            "momentum_anchor": {"enabled": True, "start_after_steps": 3}
+        }
+        self.assertEqual(validate_training_policy_configs(config), [])
+        policies = TrainingPolicySet.from_config(config)
+        policy = policies._policies[0]
+        policy.applied_steps = 4
+        policy.projection_steps = 2
+        payload = policies.state_dict()
+        restored = TrainingPolicySet.from_config(config)
+        restored.load_state_dict(payload)
+        self.assertEqual(restored.state_dict(), payload)
+
+        config.optimizer.type = "paged_adamw_8bit"
+        errors = validate_training_policy_configs(config)
+        self.assertTrue(any("optimizer.type='adamw'" in error for error in errors))
+
     def test_prodigy_controls_parse_and_validate(self) -> None:
         config = TrainingConfig.from_dict(
             {
@@ -130,6 +158,37 @@ class OptimizerConfigurationTests(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "torch not installed")
 class OptimizerRuntimeTests(unittest.TestCase):
+    def test_maop_conflicting_global_gradient_is_orthogonalized(self) -> None:
+        first = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32))
+        second = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        optimizer = torch.optim.AdamW([first, second], lr=0.1)
+        optimizer.state[first]["exp_avg"] = torch.tensor([1.0, 2.0])
+        optimizer.state[second]["exp_avg"] = torch.tensor([3.0])
+        first.grad = torch.tensor([-2.0, 1.0])
+        second.grad = torch.tensor([-1.0])
+
+        result = MomentumAnchoredOrthogonalProjection(chunk_size=1).apply(optimizer)
+
+        self.assertTrue(result.projected)
+        projected = torch.cat((first.grad, second.grad))
+        anchor = torch.tensor([1.0, 2.0, 3.0])
+        self.assertAlmostEqual(float(torch.dot(projected, anchor)), 0.0, places=6)
+        expected = torch.tensor([-2.0, 1.0, -1.0]) - (-3.0 / 14.0) * anchor
+        torch.testing.assert_close(projected, expected)
+
+    def test_maop_synergistic_and_missing_anchor_paths_are_unchanged(self) -> None:
+        parameter = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32))
+        optimizer = torch.optim.AdamW([parameter], lr=0.1)
+        parameter.grad = torch.tensor([1.0, 2.0])
+        original = parameter.grad.clone()
+        projection = MomentumAnchoredOrthogonalProjection()
+        self.assertFalse(projection.apply(optimizer).projected)
+        torch.testing.assert_close(parameter.grad, original)
+
+        optimizer.state[parameter]["exp_avg"] = torch.tensor([2.0, 1.0])
+        self.assertFalse(projection.apply(optimizer).projected)
+        torch.testing.assert_close(parameter.grad, original)
+
     def test_prodigy_builder_forwards_all_typed_controls(self) -> None:
         parameter = torch.nn.Parameter(torch.ones(4))
         result = build_optimizer(

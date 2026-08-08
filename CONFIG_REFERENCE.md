@@ -1532,6 +1532,22 @@ Explicit out-of-tree training-policy plugins. Modules register factories through
 
 Plugin-owned configuration namespaces. A plugin reads only `training.policy_options.<policy_name>` and validates its own values; unknown policy names fail before training.
 
+Built-in `training.policy_options.momentum_anchor` enables Momentum-Anchored
+Orthogonal Projection (MAOP) from [Rosetta](https://arxiv.org/abs/2607.00293).
+It is default-off; set `enabled=true` with `optimizer.type="adamw"`,
+`optimizer.stochastic_rounding=false`, and
+`training.optimizer_cpu_offload=false`. At each optimizer boundary, after
+gradient accumulation and before global norm clipping, a negative global dot
+product between the mixed gradient and the existing FP32 AdamW `exp_avg` is
+removed over the complete trainable parameter vector. Parameters without an
+initialized moment are unchanged. `start_after_steps` delays intervention by a
+non-negative number of successful updates (default `0`); `epsilon` and
+`min_anchor_norm_sq` default to `1e-12`; `chunk_size` bounds temporary FP32
+work to positive element chunks (default `1048576`). Applied-step and
+projection counters are checkpointed. Quantized, paged, stochastic-rounding,
+CPU-offloaded, sparse-gradient, and multi-device optimizer states are rejected
+rather than approximating the momentum anchor.
+
 Built-in `training.policy_options.diversity_routing` is default-off. Set
 `enabled=true`, `warmup_steps` to a positive integer (default `100`), and
 `ridge` to a positive covariance regularizer (default `1e-4`).
