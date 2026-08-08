@@ -117,6 +117,10 @@ configuration and compatibility rules are documented in
   one model forward; requires at least two examples per microbatch.
   [(paper)](https://arxiv.org/abs/2506.05350)
   [(repo)](https://github.com/gstoica27/DeltaFM)
+- **Latent wavelet supervision** — Opt-in FP32 spatial Haar loss on the
+  reconstructed clean latent adds frequency-aware supervision without a VAE
+  decode. Video frames remain independent in the transform.
+  [(paper)](https://arxiv.org/abs/2604.12163)
 - **Rectified-flow timestep sampling** — Deterministic uniform, logit-normal,
   and mode-shift distributions driven by checkpointed RNG state.
   [(paper)](https://arxiv.org/abs/2403.03206)

@@ -361,6 +361,7 @@ class TrainingSection:
     loss_function: str = "mse"
     objective: str = "flow_matching"
     contrastive_flow_weight: float = 0.0
+    latent_wavelet_loss_weight: float = 0.0
     loss_weighting: str = "uniform"
     min_snr_gamma: float = 5.0
     timestep_eps: float = 1e-5
@@ -977,6 +978,7 @@ class TrainingConfig:
             "loss_function",
             "objective",
             "contrastive_flow_weight",
+            "latent_wavelet_loss_weight",
             "loss_weighting",
             "min_snr_gamma",
             "timestep_eps",
@@ -2518,6 +2520,9 @@ class TrainingConfig:
             objective=str(training_table.get("objective", "flow_matching")),
             contrastive_flow_weight=float(
                 training_table.get("contrastive_flow_weight", 0.0)
+            ),
+            latent_wavelet_loss_weight=float(
+                training_table.get("latent_wavelet_loss_weight", 0.0)
             ),
             loss_weighting=str(training_table.get("loss_weighting", "uniform")),
             min_snr_gamma=float(training_table.get("min_snr_gamma", 5.0)),

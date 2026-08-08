@@ -246,6 +246,37 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
             "training.contrastive_flow_weight requires training.batch_size >= 2 "
             "because negatives are drawn within each microbatch.",
         )
+    latent_wavelet_weight = float(config.training.latent_wavelet_loss_weight)
+    _check(
+        math.isfinite(latent_wavelet_weight) and latent_wavelet_weight >= 0.0,
+        "training.latent_wavelet_loss_weight must be finite and >= 0.",
+    )
+    if latent_wavelet_weight > 0.0:
+        _check(
+            str(config.training.objective).strip().lower() == "flow_matching",
+            "training.latent_wavelet_loss_weight requires "
+            "training.objective='flow_matching'.",
+        )
+        _check(
+            str(config.training.loss_function).strip().lower() == "mse",
+            "training.latent_wavelet_loss_weight requires "
+            "training.loss_function='mse'.",
+        )
+        _check(
+            str(config.strategy.type).strip().lower() == "text_to_video",
+            "training.latent_wavelet_loss_weight currently requires "
+            "strategy.type='text_to_video'.",
+        )
+        _check(
+            contrastive_flow_weight == 0.0,
+            "training.latent_wavelet_loss_weight is incompatible with "
+            "training.contrastive_flow_weight.",
+        )
+        _check(
+            not bool(config.training.masked_loss),
+            "training.latent_wavelet_loss_weight is incompatible with "
+            "training.masked_loss.",
+        )
     _check(
         str(config.training.loss_weighting).strip().lower() in ALLOWED_LOSS_WEIGHTING,
         "training.loss_weighting must be one of: adaptive_uncertainty, "

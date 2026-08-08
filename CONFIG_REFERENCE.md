@@ -1116,6 +1116,14 @@ Training objective. `sharp_moe_trajectory` is selected only with the SharpMoE po
 
 Contrastive Flow Matching (Δ-FM): subtracts this weight times the squared distance to a uniformly sampled non-self flow target from the same microbatch. It adds no model forward, uses the checkpointed torch RNG, and reports detached positive/negative terms ([`objectives/contrastive_flow.py`](mirai/core/training/objectives/contrastive_flow.py)).
 
+### `latent_wavelet_loss_weight`
+
+- **Type:** float
+- **Default:** `0.0`
+- **Allowed / range:** `>= 0`; `0` disables; enabled requires `objective="flow_matching"`, `loss_function="mse"`, `strategy.type="text_to_video"`, disabled contrastive flow, and `masked_loss=false`
+
+Weight for single-level spatial Haar supervision on the reconstructed clean latent. The four orthonormal sub-band MSE terms are evaluated in FP32 without a VAE decode; video frames are transformed independently. This is an experimental adaptation of the high-resolution objective from [Nucleus-Image](https://arxiv.org/abs/2604.12163) ([`objectives/latent_wavelet.py`](mirai/core/training/objectives/latent_wavelet.py)).
+
 ### `loss_weighting`
 
 - **Type:** str

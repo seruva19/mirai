@@ -347,7 +347,7 @@
       ],
       "commands": [
         "python -m pytest mirai/core/training/runtime/contracts/compilation.py -q",
-        "python -m pytest mirai/core/training/objectives/contracts/sampling.py mirai/core/training/objectives/contracts/contrastive_flow.py mirai/core/training/objectives/contracts/adaptive_weighting.py mirai/core/moe/contracts/sharp_moe.py -q",
+        "python -m pytest mirai/core/training/objectives/contracts/sampling.py mirai/core/training/objectives/contracts/contrastive_flow.py mirai/core/training/objectives/contracts/adaptive_weighting.py mirai/core/training/objectives/contracts/latent_wavelet.py mirai/core/moe/contracts/sharp_moe.py -q",
         "python -m pytest mirai/core/training/calibration/contracts/router_repair.py -q",
         "python -m pytest mirai/core/training/calibration/contracts/flexmoe.py -q",
         "python -m pytest tests/test_training_runtime_policy_contract.py mirai/core/training/optim/contracts/posthoc_ema.py -q",

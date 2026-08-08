@@ -2371,6 +2371,41 @@
       "promotion_evidence": ""
     },
     {
+      "name": "latent_wavelet_supervision",
+      "kind": "generic",
+      "owner": "mirai/core/training/objectives/latent_wavelet.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "compute_latent_wavelet_loss",
+        "reconstruct_clean_rectified_flow"
+      ],
+      "config_keys": [
+        "training.latent_wavelet_loss_weight"
+      ],
+      "disabled_config": {
+        "training.latent_wavelet_loss_weight": 0.0
+      },
+      "contract_paths": [
+        "mirai/core/training/objectives/contracts/latent_wavelet.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/training/objectives/latent_wavelet.py",
+      "readme_claim": "Latent wavelet supervision",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2604.12163",
+      "promotion_evidence": ""
+    },
+    {
       "name": "learned_orthogonal_expert_quantization_rotation",
       "kind": "compressed_weight",
       "owner": "mirai/core/models/compressed_weights/quantization/learned_rotation.py",

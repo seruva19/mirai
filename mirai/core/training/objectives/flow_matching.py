@@ -18,6 +18,10 @@ from mirai.core.training.objectives.contrastive_flow import (
     compute_contrastive_flow_loss,
 )
 from mirai.core.training.objectives.flow_loss import compute_flow_matching_loss
+from mirai.core.training.objectives.latent_wavelet import (
+    compute_latent_wavelet_loss,
+    reconstruct_clean_rectified_flow,
+)
 
 
 @register_objective("flow_matching")
@@ -110,6 +114,7 @@ class FlowMatchingObjective(TrainingObjective):
             ),
             weight=weight,
         )
+        per_sample_loss = result.per_sample_loss
         diagnostics = {}
         if result.negative_distance is not None:
             diagnostics = {
@@ -119,8 +124,36 @@ class FlowMatchingObjective(TrainingObjective):
                 ),
                 "contrastive_flow_weight": weight,
             }
+        wavelet_weight = float(
+            getattr(config.training, "latent_wavelet_loss_weight", 0.0)
+        )
+        if wavelet_weight > 0.0:
+            predicted_clean = reconstruct_clean_rectified_flow(
+                prediction=prediction,
+                noisy_latents=inputs.noisy_latents,
+                sigmas=inputs.timestep,
+            )
+            wavelet = compute_latent_wavelet_loss(
+                predicted_clean=predicted_clean,
+                clean_latents=inputs.clean_latents,
+            )
+            per_sample_loss = (
+                per_sample_loss + wavelet_weight * wavelet.per_sample_loss
+            )
+            diagnostics.update(
+                {
+                    "latent_wavelet_loss": wavelet.per_sample_loss.detach().mean(),
+                    "latent_wavelet_low_frequency_loss": (
+                        wavelet.low_frequency_loss.detach().mean()
+                    ),
+                    "latent_wavelet_high_frequency_loss": (
+                        wavelet.high_frequency_loss.detach().mean()
+                    ),
+                    "latent_wavelet_loss_weight": wavelet_weight,
+                }
+            )
         return ObjectiveLossTerms(
-            per_sample_loss=result.per_sample_loss,
+            per_sample_loss=per_sample_loss,
             diagnostics=diagnostics,
         )
 
