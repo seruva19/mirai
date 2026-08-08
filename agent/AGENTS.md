@@ -110,6 +110,51 @@ lease is free.
 
 ## Extension protocol
 
+### Feature admission gate
+
+Evaluate a proposed technique before implementation. A paper's use of MoE, a
+working reference implementation, or mathematical novelty is not sufficient
+reason to add it. Record one of four decisions:
+
+- `reject`: no concrete Mirai workflow, duplicates an existing mechanism, or
+  its expected value does not justify its runtime and maintenance cost;
+- `experimental`: a concrete workflow and technically sound integration exist,
+  but Mirai-specific quality or efficiency evidence is still missing;
+- `admitted`: behavioral contracts, persistence, compatibility, and measured
+  resource cost pass, and a representative Mirai A/B evaluation supports the
+  intended use;
+- `promoted`: the feature is eligible for recommended defaults or performance
+  claims under the evidence requirements below.
+
+An admission review must answer all of the following:
+
+1. Which released Mirai training or inference workflow benefits, and what
+   observable failure or limitation does the technique address?
+2. Is the mechanism intrinsically generic, native-MoE-specific, or
+   model-family-specific? Classify by required architecture, not by the paper's
+   title, evaluation model, or current provider coverage. A mechanism remains
+   generic when another provider could implement the same contract without
+   native experts or routers.
+3. Does an existing owner or feature already provide materially equivalent
+   behavior?
+4. What new configuration, runtime state, checkpoint lineage, incompatibility,
+   and migration obligations does it create?
+5. What are the measured latency, peak VRAM, peak host RAM, and persistent-state
+   costs on the smallest representative probe?
+6. Is the implementation and long-term validation burden proportional to the
+   expected benefit?
+7. Which reference-parity, output, loss, input-gradient, trainable-gradient,
+   save/load, disabled-path, and provider-integration checks establish
+   correctness?
+8. Which representative Mirai baseline/candidate evaluation could falsify the
+   claimed quality or efficiency benefit?
+
+Only `experimental`, `admitted`, and `promoted` features may enter the public
+tree. Experimental features must be explicit, default-off, described without
+quality or efficiency claims, and have a named evaluation path. Correctness
+tests alone never advance a feature beyond `experimental`. If no practical
+evaluation can be named, reject the feature instead of implementing it.
+
 `agent/features.json` is the machine-readable feature inventory and
 `mirai/core/features.py` owns its typed contract. Before adding behavior, run
 `python scripts/agent/feature.py inspect`; attach the implementation to an existing
