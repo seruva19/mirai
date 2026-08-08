@@ -1,12 +1,9 @@
 """The 32 GiB hardware-profile configs state a runnable, self-consistent profile.
 
-These examples exist because the shipped offload/NF4 examples target hosts that
-a 32 GiB workstation does not have. The assertions below are the profile's
-requirements, not restatements of the files: every example must survive the real
-loader and the real runtime-contract validators, the MAGI-2 profile's host-memory
-keys must leave the BF16 checkpoint room on a 256 GiB machine, and the LingBot
-profile must keep the compressed base fully resident rather than swapping blocks
-it does not need to swap.
+The assertions below are the profiles' requirements, not restatements of the
+files: every example must survive the real loader and runtime validators, the
+MAGI-2 training profile must fit a 128 GiB host through load-time NF4 packing,
+and the LingBot profile must keep the compressed base fully resident.
 """
 
 from __future__ import annotations
@@ -40,10 +37,8 @@ _TRAIN_CONFIGS = (MAGI2_TRAIN, LINGBOT_TRAIN)
 _INFER_CONFIGS = (MAGI2_INFER, LINGBOT_INFER)
 _ALL_CONFIGS = _TRAIN_CONFIGS + _INFER_CONFIGS
 
-# The profile's declared host: 256 GiB of system RAM.
-PROFILE_HOST_MEMORY_GIB = 256.0
-# The MAGI-2 Preview BF16 checkpoint the host has to hold while blocks stream.
-MAGI2_BF16_CHECKPOINT_GIB = 228.0
+PROFILE_HOST_MEMORY_GIB = 128.0
+MAGI2_PACKED_LOAD_PEAK_GIB = 68.0
 # The profile's declared device: 32 GiB of VRAM.
 PROFILE_DEVICE_MEMORY_GIB = 32.0
 
@@ -74,54 +69,52 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
                 config = _resolved(path, entrypoint="train")
                 validate_training_runtime_config(config)
 
-    def test_magi2_profile_streams_every_block_synchronously(self) -> None:
-        for path in (MAGI2_TRAIN, MAGI2_INFER):
-            with self.subTest(config=path.name):
-                entrypoint = "train" if path is MAGI2_TRAIN else "infer"
-                config = _resolved(path, entrypoint=entrypoint)
-                self.assertEqual(config.memory.weight_residency_strategy, "block_swap")
-                self.assertGreaterEqual(
-                    config.training.blocks_to_swap,
-                    int(Magi2ModelConfig().num_layers),
-                    "the 32 GiB profile cannot keep any preview block resident",
-                )
-                self.assertEqual(
-                    config.training.block_swap_mode,
-                    "sync",
-                    "async swapping keeps a second block and a transfer buffer live",
-                )
+    def test_magi2_training_profile_packs_experts_with_bounded_prefetch(self) -> None:
+        config = _resolved(MAGI2_TRAIN, entrypoint="train")
+        self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
+        self.assertEqual(
+            config.memory.frozen_weight_quantization_strategy,
+            "compressed_weights",
+        )
+        self.assertTrue(config.memory.quantize_experts_on_load)
+        self.assertEqual(config.memory.weight_residency_strategy, "block_swap")
+        self.assertGreater(config.training.blocks_to_swap, 0)
+        self.assertLess(
+            config.training.blocks_to_swap,
+            int(Magi2ModelConfig().num_layers),
+        )
+        self.assertEqual(config.training.block_swap_mode, "async")
+        self.assertEqual(config.memory.block_swap_prefetch_depth, 1)
 
-    def test_magi2_host_memory_keys_fit_a_256_gib_machine(self) -> None:
-        headroom_gib = PROFILE_HOST_MEMORY_GIB - MAGI2_BF16_CHECKPOINT_GIB
-        for path in (MAGI2_TRAIN, MAGI2_INFER):
-            with self.subTest(config=path.name):
-                entrypoint = "train" if path is MAGI2_TRAIN else "infer"
-                memory = _resolved(path, entrypoint=entrypoint).memory
-                # minimum_system_memory_gib is a floor on FREE host RAM, so a
-                # value near the machine's total aborts the run on contact.
-                self.assertGreater(memory.minimum_system_memory_gib, 0.0)
-                self.assertLess(
-                    memory.minimum_system_memory_gib,
-                    headroom_gib,
-                    "the free-RAM guard must be reachable once the checkpoint is host-resident",
-                )
-                # Pinned budget is min(free - guard, ceiling); both together
-                # have to stay inside what the checkpoint leaves behind.
-                self.assertLessEqual(
-                    memory.minimum_system_memory_gib + memory.max_pinned_host_gib,
-                    headroom_gib,
-                )
+    def test_magi2_inference_profile_streams_every_block_synchronously(self) -> None:
+        config = _resolved(MAGI2_INFER, entrypoint="infer")
+        self.assertEqual(config.memory.weight_residency_strategy, "block_swap")
+        self.assertGreaterEqual(
+            config.training.blocks_to_swap,
+            int(Magi2ModelConfig().num_layers),
+        )
+        self.assertEqual(config.training.block_swap_mode, "sync")
+
+    def test_magi2_training_host_memory_keys_fit_a_128_gib_machine(self) -> None:
+        memory = _resolved(MAGI2_TRAIN, entrypoint="train").memory
+        self.assertGreater(memory.minimum_system_memory_gib, 0.0)
+        self.assertLessEqual(
+            MAGI2_PACKED_LOAD_PEAK_GIB
+            + memory.minimum_system_memory_gib
+            + memory.max_pinned_host_gib,
+            PROFILE_HOST_MEMORY_GIB,
+        )
 
     def test_magi2_training_shape_stays_inside_the_profile_budget(self) -> None:
         config = _resolved(MAGI2_TRAIN, entrypoint="train")
         self.assertEqual(config.training.batch_size, 1)
         self.assertEqual(config.training.gradient_checkpointing, "standard")
         self.assertEqual(config.adapter.type, "lora")
-        self.assertEqual(config.adapter.target_preset, "attn_only")
+        self.assertEqual(config.adapter.target_preset, "attn_router")
         for frames in config.dataset.frame_buckets:
             # The native cache path trims video to 8n + 1 frames.
             self.assertEqual((int(frames) - 1) % 8, 0)
-            self.assertLessEqual(int(frames), 25)
+            self.assertLessEqual(int(frames), 17)
         self.assertEqual(config.dataset.bucket_resolutions, ["256x448"])
 
     def test_magi2_inference_never_co_resides_auxiliary_models(self) -> None:

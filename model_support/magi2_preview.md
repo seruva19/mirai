@@ -293,26 +293,16 @@ python scripts/train.py \
 ```
 
 [`configs/magi2_preview/train_offload_32gb.toml`](../configs/magi2_preview/train_offload_32gb.toml)
-is the same offload preset stated for a 32 GiB device on a 256 GiB host: batch
-size 1 (the preset leaves the schema default 2), all 40 preview blocks swapped
-synchronously, `attn_only` LoRA rank 8, a single 25-frame 256x448 bucket, and
-host-memory keys sized for a machine whose RAM the BF16 checkpoint nearly
-fills. `memory.minimum_system_memory_gib` is a floor on *free* host RAM, not a
-statement of the profile's total requirement — a value near the machine's
-total aborts the run on contact — so the profile sets a small operating-system
-reserve and a correspondingly small `memory.max_pinned_host_gib`. This host is
-the edge of the profile: quantized frozen experts, which would remove the
-constraint, are not implemented for this family. Its fit is derived from the
-configured residency and shape, not measured; figures are published only after
-the GPU validation contract records them.
+targets a 32 GiB device with 128 GiB of system RAM. It packs routed experts as
+NF4 while reading the checkpoint, swaps 30 preview blocks with one-block
+asynchronous prefetch, uses
+batch size 1 with whole-block recomputation, and bounds the sample shape to 17
+frames at 256x448. The profile keeps a 12 GiB free-RAM floor and permits up to
+16 GiB of pinned host memory.
 
-**DGX Spark (128 GiB unified).** No separate Spark configs ship for this
-family. MAGI-2 Preview is not addressable there: the BF16 checkpoint is roughly
-228 GiB and the block-swap path requires the whole transformer to be
-host-resident while blocks stream, so a 128 GiB unified pool cannot hold it
-under any setting the schema offers — and because the pool is unified, there is
-no host budget separate from the device budget to trade against. Quantized
-frozen experts, not a config profile, are the prerequisite.
+**DGX Spark (128 GiB unified).** The 128/32 profile assumes separate host and
+device pools. A unified-memory system needs its own measured residency budget;
+the same totals do not establish that fit.
 
 Adapters are LoRA only: `adapter.type` must be `lora`, and `adapter.rank` must
 be positive. The packed-weight LoRA parametrization is shape-preserving and
