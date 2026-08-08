@@ -622,7 +622,22 @@ class SelectiveActivationOffloadStagingTests(unittest.TestCase):
         self.assertIsNot(packed, source)
         restored = SelectiveActivationOffload.unpack(packed)
         torch.testing.assert_close(restored, source, rtol=0, atol=0)
+        self.assertEqual(offload.diagnostics()["offloaded_tensors"], 1)
         self.assertEqual(offload.reserved_bytes, 0)
+
+    @unittest.skipUnless(
+        torch is not None and torch.cuda.is_available(),
+        "device-to-host offload requires an available accelerator",
+    )
+    def test_pageable_round_trip_counts_the_offloaded_tensor(self) -> None:
+        offload = SelectiveActivationOffload(
+            min_bytes=0, max_bytes=1 << 30, pin_memory=False
+        )
+        source = torch.randn(64, 64, device="cuda")
+        packed = offload.pack(source)
+        restored = SelectiveActivationOffload.unpack(packed)
+        torch.testing.assert_close(restored, source, rtol=0, atol=0)
+        self.assertEqual(offload.diagnostics()["offloaded_tensors"], 1)
 
     @unittest.skipUnless(
         torch is not None and torch.cuda.is_available(),

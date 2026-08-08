@@ -657,6 +657,7 @@ class SelectiveActivationOffload:
                 # ordering is observable and no event is needed.
                 host = self._acquire_host_buffer(tensor)
                 host.copy_(tensor.detach())
+                self._offloaded_tensors += 1
                 return _OffloadedTensor(host, tensor.device, nbytes, self)
             copy_stream = self._copy_stream(tensor.device)
             copy_stream.wait_stream(torch.cuda.current_stream(tensor.device))
@@ -669,6 +670,7 @@ class SelectiveActivationOffload:
             tensor.record_stream(copy_stream)
             staged = torch.cuda.Event()
             staged.record(copy_stream)
+            self._offloaded_tensors += 1
             return _OffloadedTensor(host, tensor.device, nbytes, self, staged)
         except Exception:
             if host is not None:
