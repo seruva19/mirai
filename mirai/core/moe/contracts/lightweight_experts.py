@@ -283,6 +283,13 @@ def test_disabled_router_path_is_object_identical() -> None:
         topk_group=None,
         route_scale=1.0,
     )
+    with torch.no_grad():
+        router.weight.copy_(
+            torch.tensor(
+                [[0.25, -0.5, 0.75], [-0.75, 0.5, -0.25]],
+                dtype=router.weight.dtype,
+            )
+        )
     router.eval()
     tokens = torch.randn(4, 3)
     before = router(tokens)
