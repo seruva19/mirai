@@ -294,11 +294,11 @@ python scripts/train.py \
 
 [`configs/magi2_preview/train_offload_32gb.toml`](../configs/magi2_preview/train_offload_32gb.toml)
 targets a 32 GiB device with 128 GiB of system RAM. It packs routed experts as
-NF4 while reading the checkpoint, swaps 30 preview blocks with one-block
-asynchronous prefetch, uses
+NF4 while reading the checkpoint, swaps 31 preview blocks with one-block
+asynchronous prefetch, dequantizes 384 flattened expert groups per segment, uses
 batch size 1 with whole-block recomputation, and bounds the sample shape to 17
 frames at 256x448. The profile keeps a 12 GiB free-RAM floor and permits up to
-16 GiB of pinned host memory.
+48 GiB of pinned host memory.
 
 **DGX Spark (128 GiB unified).** The 128/32 profile assumes separate host and
 device pools. A unified-memory system needs its own measured residency budget;
@@ -614,6 +614,13 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 - **MAGI-2 Preview single-GPU adapter training** — Adapter-only optimization
   with native preview-transformer weights and gradients.
   [(repo)](https://github.com/SandAI-org/MAGI-2-preview)
+- **Trainable MAGI-2 FlexAttention** —
+  `model.attention_backend = "flex"` routes packed attention through a backend
+  with a backward pass instead of the dense-mask reference path autograd
+  otherwise selects. Document block masking keeps packed samples isolated and
+  per-head attention sinks retain their reference semantics, including sink
+  parameter gradients.
+  [(FlexAttention)](https://pytorch.org/blog/flexattention/)
 - **Host-resident MAGI-2 block streaming** — Frozen transformer blocks move to
   the execution device only for their forward/backward window.
 - **Native MAGI-2 inference** — The provider uses the same native denoiser and
