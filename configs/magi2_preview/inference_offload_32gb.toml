@@ -42,7 +42,6 @@ weight_residency_strategy = "block_swap"
 block_swap_prefetch_depth = 1
 minimum_system_memory_gib = 12.0
 max_pinned_host_gib = 48.0
-cuda_memory_fraction = 0.40
 
 [logging]
 output_dir = "./outputs/magi2_preview_inference_32gb"

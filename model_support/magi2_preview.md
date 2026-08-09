@@ -319,7 +319,7 @@ python scripts/train.py \
 
 [`configs/magi2_preview/train_offload_32gb.toml`](../configs/magi2_preview/train_offload_32gb.toml)
 targets a 32 GiB device with 128 GiB of system RAM. It packs routed experts as
-NF4 while reading the checkpoint, uses sink-aware FlexAttention, swaps 32
+NF4 while reading the checkpoint, uses sink-aware FlexAttention, swaps 31
 preview blocks with one-block
 asynchronous prefetch, dequantizes 512 flattened expert groups per segment, and
 rematerializes complete packed expert segments in backward instead of retaining
@@ -340,9 +340,11 @@ startup.
 | Cache workload | Memory policy | Step time | Peak allocated VRAM | Peak process RSS |
 |---|---|---:|---:|---:|
 | 256x448x17 | 31 swapped blocks, 384-group dequantization | 3.80 s median | 29,421 MiB | 69.84 GiB |
-| 512x512x33 (`[48, 9, 32, 32]` latent) | FlexAttention, 32 swapped blocks, 512-group dequantization, segmented expert rematerialization, fused Triton SwiGLU7, 40% CUDA cap | 9.26 s late-step median | 28,990 MiB | 69.49 GiB |
+| 512x512x33 (`[48, 9, 32, 32]` latent) | FlexAttention, 31 swapped blocks, 512-group dequantization, segmented expert rematerialization, fused Triton SwiGLU7, 40% cap on an 80 GiB device | 7.88 s late-step median | 30,679 MiB | 69.88 GiB |
 
-The 512x512x33 measurement is the median of steps 2 through 6. Block transfers,
+The 512x512x33 measurement is the median of steps 2 through 6. The 40% cap was
+used only to reproduce a 32 GiB allocation ceiling on the measured 80 GiB GPU;
+the public 32 GiB config retains the full-device default. Block transfers,
 NF4 dequantization, and backward rematerialization account for work that is not
 represented by the model's 6B active-parameter count.
 

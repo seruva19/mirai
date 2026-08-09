@@ -87,7 +87,7 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.training.block_swap_mode, "async")
         self.assertEqual(config.memory.block_swap_prefetch_depth, 1)
-        self.assertEqual(config.training.blocks_to_swap, 32)
+        self.assertEqual(config.training.blocks_to_swap, 31)
         self.assertFalse(config.training.activation_cpu_offload)
         self.assertEqual(config.memory.expert_dequant_chunk_size, 512)
         self.assertEqual(config.memory.moe_expert_autograd, "segmented_recompute")
@@ -135,7 +135,7 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         self.assertEqual(config.inference.block_swap_mode, "sync")
         self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
         self.assertEqual(config.memory.moe_activation_backend, "triton")
-        self.assertLessEqual(config.memory.cuda_memory_fraction, 0.40)
+        self.assertEqual(config.memory.cuda_memory_fraction, 1.0)
 
     def test_lingbot_training_profile_uses_bounded_async_residency(self) -> None:
         config = _resolved(LINGBOT_TRAIN, entrypoint="train")

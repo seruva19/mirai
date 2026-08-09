@@ -8,7 +8,7 @@ hash_snapshot_contents = false
 
 [training]
 batch_size = 1
-blocks_to_swap = 32
+blocks_to_swap = 31
 block_swap_mode = "async"
 gradient_checkpointing = "standard"
 moe_token_chunk_size = 0
