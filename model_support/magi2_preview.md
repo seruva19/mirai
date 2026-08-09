@@ -270,11 +270,11 @@ than an additional one.
 
 ### Policy keys
 
-With packed experts the family consumes three more shared MoE policy keys than
+With packed experts the family consumes four more shared MoE policy keys than
 it does with native BF16 experts — `memory.expert_weight_access`,
-`memory.expert_dequant_chunk_size`, and `memory.quantize_experts_on_load`. All
-three are rejected while the experts are BF16, because nothing consumes them
-there. The exhaustive rejection of every remaining policy field is unchanged: a
+`memory.expert_dequant_chunk_size`, `memory.quantize_experts_on_load`, and
+`memory.moe_expert_autograd`. All four are rejected while the experts are BF16,
+because nothing consumes them there. The exhaustive rejection of every remaining policy field is unchanged: a
 non-default value fails closed with the key named.
 
 ## Training
@@ -294,11 +294,38 @@ python scripts/train.py \
 
 [`configs/magi2_preview/train_offload_32gb.toml`](../configs/magi2_preview/train_offload_32gb.toml)
 targets a 32 GiB device with 128 GiB of system RAM. It packs routed experts as
-NF4 while reading the checkpoint, swaps 31 preview blocks with one-block
-asynchronous prefetch, dequantizes 384 flattened expert groups per segment, uses
-batch size 1 with whole-block recomputation, and bounds the sample shape to 17
-frames at 256x448. The profile keeps a 12 GiB free-RAM floor and permits up to
-48 GiB of pinned host memory.
+NF4 while reading the checkpoint, swaps 33 preview blocks with one-block
+asynchronous prefetch, dequantizes 384 flattened expert groups per segment, and
+rematerializes complete packed expert segments in backward instead of retaining
+their wide gate/up graph. It uses batch size 1 with whole-block recomputation
+and targets 33 frames at 512x512. Selective activation offload is capped at 48
+GiB, and the profile keeps a 12 GiB free-RAM floor while permitting up to 48
+GiB of pinned host memory. Every choice is an explicit TOML value; the trainer
+does not select a profile from detected RAM, VRAM, GPU model, or sample
+dimensions.
+
+## Optimization
+
+Single-H100 training measurements use batch size 1, rank-16 `attn_router` LoRA,
+BF16 compute, NF4 packed routed experts, whole-block recomputation, and one
+CUDA device. Step time is synchronized wall time and excludes checkpoint
+startup.
+
+| Cache workload | Memory policy | Step time | Peak allocated VRAM | Peak process RSS |
+|---|---|---:|---:|---:|
+| 256x448x17 | 31 swapped blocks, 384-group dequantization | 3.80 s median | 29,421 MiB | 69.84 GiB |
+| 512x512x33 (`[48, 9, 32, 32]` latent) | 33 swapped blocks, selective activation offload, segmented expert rematerialization, 40% CUDA cap | 55.89, 43.66, 366.73, 31.45 s | 31,115.7 MiB | 78.59 GiB |
+
+The 512x512x33 series establishes the 32 GiB VRAM and 128 GiB RAM fit. Its four
+step times are reported individually because the 366.73-second sample makes the
+series too short for a stable throughput estimate.
+
+The same 512x512x33 workload takes about 11 seconds per step with approximately
+61 GiB of available VRAM. Constraining it to 32 GiB currently gives a
+non-outlier median of 43.66 seconds per step, about 4x slower. The difference is
+the cost of block residency transfers, activation offload, NF4 dequantization,
+and backward rematerialization; the model's 6B active-parameter count does not
+include those data-movement and recomputation costs.
 
 **DGX Spark (128 GiB unified).** The 128/32 profile assumes separate host and
 device pools. A unified-memory system needs its own measured residency budget;

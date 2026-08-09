@@ -337,6 +337,7 @@ class ConfigTests(unittest.TestCase):
             quantize_experts_on_load = true
             router_quantization = "disabled"
             moe_kernel_backend = "megablocks"
+            moe_expert_autograd = "segmented_recompute"
             cuda_memory_fraction = 0.85
             minimum_system_memory_gib = 12.0
             trainable_parameter_offload = true
@@ -352,6 +353,7 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(cfg.memory.quantize_experts_on_load)
         self.assertEqual(cfg.memory.router_quantization, "disabled")
         self.assertEqual(cfg.memory.moe_kernel_backend, "megablocks")
+        self.assertEqual(cfg.memory.moe_expert_autograd, "segmented_recompute")
         self.assertEqual(cfg.memory.cuda_memory_fraction, 0.85)
         self.assertEqual(cfg.memory.minimum_system_memory_gib, 12.0)
         self.assertTrue(cfg.memory.trainable_parameter_offload)

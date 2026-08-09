@@ -730,7 +730,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         elif quantized:
             self._bind_quantized_expert_runtime_policy()
             backend = Magi2QuantizedGroupedMoEBackend(
-                plan, token_chunk_size=token_chunk_size
+                plan,
+                token_chunk_size=token_chunk_size,
+                expert_autograd=str(
+                    getattr(policy, "moe_expert_autograd", "standard")
+                ),
             )
         else:
             backend = Magi2GroupedMoEBackend(plan, token_chunk_size=token_chunk_size)

@@ -2656,13 +2656,15 @@
         "memory.frozen_weight_quantization",
         "memory.quantize_experts_on_load",
         "memory.expert_weight_access",
-        "memory.expert_dequant_chunk_size"
+        "memory.expert_dequant_chunk_size",
+        "memory.moe_expert_autograd"
       ],
       "disabled_config": {
         "memory.frozen_weight_quantization": "none",
         "memory.quantize_experts_on_load": false,
         "memory.expert_weight_access": "auto",
-        "memory.expert_dequant_chunk_size": 0
+        "memory.expert_dequant_chunk_size": 0,
+        "memory.moe_expert_autograd": "standard"
       },
       "contract_paths": [
         "tests/test_magi2_nf4_experts.py"

@@ -6,9 +6,15 @@ path = "./models/MAGI-2-preview"
 
 [training]
 batch_size = 1
-blocks_to_swap = 31
+blocks_to_swap = 33
 block_swap_mode = "async"
 gradient_checkpointing = "standard"
+moe_token_chunk_size = 0
+activation_cpu_offload = true
+activation_cpu_offload_min_mib = 8
+activation_cpu_offload_max_gib = 48.0
+activation_cpu_offload_pin_memory = false
+activation_cpu_offload_view_replay = false
 
 [adapter]
 type = "lora"
@@ -21,8 +27,8 @@ path = "./data/videos"
 auto_preprocess_cache = true
 preprocess_raw_media_to_pt = true
 enable_bucketing = true
-frame_buckets = [17]
-bucket_resolutions = ["256x448"]
+frame_buckets = [33]
+bucket_resolutions = ["512x512"]
 
 [memory]
 frozen_weight_quantization = "nf4"
@@ -33,6 +39,7 @@ expert_weight_access = "chunked_dequant"
 expert_dequant_chunk_size = 384
 weight_residency_strategy = "block_swap"
 block_swap_prefetch_depth = 1
+moe_expert_autograd = "segmented_recompute"
 minimum_system_memory_gib = 12.0
 max_pinned_host_gib = 48.0
 
@@ -40,4 +47,4 @@ max_pinned_host_gib = 48.0
 output_dir = "./outputs/magi2_preview_lora_32gb"
 save_every_n_steps = 100
 sample_solver = "unipc"
-sample_frame_count = 57
+sample_frame_count = 33

@@ -138,20 +138,14 @@ def magi2_grouped_mm_alignment_violations(
             columns=int(w_gate.shape[-1]),
             element_size=int(w_gate.element_size()),
         ),
-        grouped_mm_operand(
-            w_gate.transpose(-2, -1), label="W_gate dX transposed weight view"
-        ),
-        grouped_mm_operand(
-            w_up.transpose(-2, -1), label="W_up dX transposed weight view"
-        ),
+        grouped_mm_operand(w_gate.transpose(-2, -1), label="W_gate dX transposed weight view"),
+        grouped_mm_operand(w_up.transpose(-2, -1), label="W_up dX transposed weight view"),
         grouped_mm_row_operand(
             label="grad_output dX rows for W_down",
             columns=int(w_down.shape[-1]),
             element_size=int(w_down.element_size()),
         ),
-        grouped_mm_operand(
-            w_down.transpose(-2, -1), label="W_down dX transposed weight view"
-        ),
+        grouped_mm_operand(w_down.transpose(-2, -1), label="W_down dX transposed weight view"),
     ]
     return grouped_mm_stride_violations(operands)
 
@@ -190,9 +184,7 @@ def select_grouped_backends(
             resolved.append("torch_grouped" if usable else "bmm")
             continue
         if requested == "torch_grouped" and alignment_violations:
-            raise Magi2GroupedMoEPolicyError(
-                _alignment_rejection(role, alignment_violations)
-            )
+            raise Magi2GroupedMoEPolicyError(_alignment_rejection(role, alignment_violations))
         result = probe(requested)
         if not result.available:
             raise RuntimeError(
@@ -282,10 +274,86 @@ class _GroupedExpertLinear(torch.autograd.Function):
         weight, offsets = ctx.saved_tensors
         grad_x = None
         if ctx.needs_input_grad[0]:
-            grad_x = _grouped_linear_dx(
-                grad_output, weight, offsets, ctx.dx_backend
-            )
+            grad_x = _grouped_linear_dx(grad_output, weight, offsets, ctx.dx_backend)
         return grad_x, None, None, None, None
+
+
+_SWIGLU7_ROW_CHUNK = 4096
+
+
+def _memory_bounded_swiglu7(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    gate_rows = gate.reshape(-1, int(gate.shape[-1]))
+    up_rows = up.reshape_as(gate_rows)
+    output = torch.empty(gate.shape, dtype=output_dtype, device=gate.device)
+    output_rows = output.reshape_as(gate_rows)
+    for start in range(0, int(gate_rows.shape[0]), _SWIGLU7_ROW_CHUNK):
+        stop = min(start + _SWIGLU7_ROW_CHUNK, int(gate_rows.shape[0]))
+        gate_fp32 = gate_rows[start:stop].float().clamp_(max=7.0)
+        up_fp32 = up_rows[start:stop].float().clamp_(min=-7.0, max=7.0)
+        hidden = gate_fp32 * torch.sigmoid(1.702 * gate_fp32)
+        hidden.mul_(up_fp32.add_(1.0))
+        output_rows[start:stop].copy_(hidden)
+    return output
+
+
+def _memory_bounded_swiglu7_backward(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    grad_output: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    grad_gate = torch.empty_like(gate)
+    grad_up = torch.empty_like(up)
+    gate_rows = gate.reshape(-1, int(gate.shape[-1]))
+    up_rows = up.reshape_as(gate_rows)
+    grad_output_rows = grad_output.reshape_as(gate_rows)
+    grad_gate_rows = grad_gate.reshape_as(gate_rows)
+    grad_up_rows = grad_up.reshape_as(up_rows)
+    for start in range(0, int(gate_rows.shape[0]), _SWIGLU7_ROW_CHUNK):
+        stop = min(start + _SWIGLU7_ROW_CHUNK, int(gate_rows.shape[0]))
+        raw_gate = gate_rows[start:stop].float()
+        raw_up = up_rows[start:stop].float()
+        gate_fp32 = raw_gate.clamp(max=7.0)
+        up_fp32 = raw_up.clamp(min=-7.0, max=7.0)
+        sigmoid = torch.sigmoid(1.702 * gate_fp32)
+        activated_gate = gate_fp32 * sigmoid
+        grad_hidden = grad_output_rows[start:stop].float()
+        gate_derivative = sigmoid + (1.702 * gate_fp32 * sigmoid * (1.0 - sigmoid))
+        gate_derivative.mul_(raw_gate <= 7.0)
+        grad_gate_rows[start:stop].copy_(grad_hidden * gate_derivative * (up_fp32 + 1.0))
+        up_derivative = (raw_up >= -7.0) & (raw_up <= 7.0)
+        grad_up_rows[start:stop].copy_(grad_hidden * activated_gate * up_derivative)
+    return grad_gate, grad_up
+
+
+class _MemoryBoundedSwiGlu7(torch.autograd.Function):
+    """Evaluate MAGI-2's FP32 SwiGLU7 ladder without full-size FP32 copies."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if gate.shape != up.shape:
+            raise ValueError("MAGI-2 SwiGLU7 gate/up shapes must match.")
+        ctx.save_for_backward(gate, up)
+        return _memory_bounded_swiglu7(gate, up, output_dtype=output_dtype)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+        gate, up = ctx.saved_tensors
+        grad_gate, grad_up = _memory_bounded_swiglu7_backward(gate, up, grad_output)
+        if not ctx.needs_input_grad[0]:
+            grad_gate = None
+        if not ctx.needs_input_grad[1]:
+            grad_up = None
+        return grad_gate, grad_up, None
 
 
 class Magi2GroupedMoEBackend:
@@ -293,9 +361,7 @@ class Magi2GroupedMoEBackend:
 
     name = "grouped"
 
-    def __init__(
-        self, plan: Magi2GroupedMoEPlan, *, token_chunk_size: int = 0
-    ) -> None:
+    def __init__(self, plan: Magi2GroupedMoEPlan, *, token_chunk_size: int = 0) -> None:
         if int(token_chunk_size) < 0:
             raise ValueError("MAGI-2 MoE token chunk size must be >= 0.")
         self.plan = plan
@@ -341,9 +407,7 @@ class Magi2GroupedMoEBackend:
             ("dx", self.plan.dx_backend),
         ):
             if requested == "torch_grouped":
-                raise Magi2GroupedMoEPolicyError(
-                    _alignment_rejection(role, violations)
-                )
+                raise Magi2GroupedMoEPolicyError(_alignment_rejection(role, violations))
 
     def _resolve(self, device: torch.device, module: Any = None) -> tuple[str, str]:
         if module is not None and self._alignment is None:
@@ -409,9 +473,7 @@ class Magi2GroupedMoEBackend:
             x_heads=x_heads,
             topk_probs=topk_probs,
             flat_experts=(topk_indices + head_axis * num_experts).reshape(-1),
-            rows=(token_axis * num_heads + head_axis)
-            .expand_as(topk_indices)
-            .reshape(-1),
+            rows=(token_axis * num_heads + head_axis).expand_as(topk_indices).reshape(-1),
             groups=num_heads * num_experts,
             forward_backend=forward_backend,
             dx_backend=dx_backend,
@@ -432,19 +494,17 @@ class Magi2GroupedMoEBackend:
         d_head = int(x_heads.shape[2])
         x_rows = x_heads.reshape(tokens * num_heads, d_head)
         x_sorted = x_rows.index_select(0, sorted_rows)
-        gate = self.project(
-            module, "W_gate", x_sorted, offsets, forward_backend, dx_backend
+        gate = self.project(module, "W_gate", x_sorted, offsets, forward_backend, dx_backend)
+        up = self.project(module, "W_up", x_sorted, offsets, forward_backend, dx_backend)
+        hidden = _MemoryBoundedSwiGlu7.apply(
+            gate,
+            up,
+            self.expert_weight_dtype(module, "W_down"),
         )
-        up = self.project(
-            module, "W_up", x_sorted, offsets, forward_backend, dx_backend
-        )
-        gate = gate.float().clamp(max=7.0)
-        up = up.float().clamp(min=-7.0, max=7.0)
-        hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
         return self.project(
             module,
             "W_down",
-            hidden.to(self.expert_weight_dtype(module, "W_down")),
+            hidden,
             offsets,
             forward_backend,
             dx_backend,
@@ -460,9 +520,7 @@ class Magi2GroupedMoEBackend:
         tokens = int(x_heads.shape[0])
         chunk_size = self.token_chunk_size
         if chunk_size <= 0 or tokens <= chunk_size:
-            return self._execute_routed_chunk(
-                module, x_heads, topk_probs, topk_indices
-            )
+            return self._execute_routed_chunk(module, x_heads, topk_probs, topk_indices)
         outputs: list[torch.Tensor] = []
         for start in range(0, tokens, chunk_size):
             stop = min(start + chunk_size, tokens)
@@ -544,13 +602,9 @@ class Magi2ExpertBranchPlan:
         return self.flat_experts
 
     def _grouped_offsets(self, experts: torch.Tensor) -> torch.Tensor:
-        return (
-            torch.bincount(experts, minlength=self.groups).cumsum(0).to(torch.int32)
-        )
+        return torch.bincount(experts, minlength=self.groups).cumsum(0).to(torch.int32)
 
-    def compute_branch_features(
-        self, slot_mask: torch.Tensor | None
-    ) -> torch.Tensor:
+    def compute_branch_features(self, slot_mask: torch.Tensor | None) -> torch.Tensor:
         """Expert output of the selected routed slots, canonical order.
 
         Rows outside ``slot_mask`` are zero. A masked subset is sorted and
@@ -576,9 +630,7 @@ class Magi2ExpertBranchPlan:
             self.dx_backend,
         )
         target = order if selected is None else selected.index_select(0, order)
-        canonical = computed.new_zeros(
-            (int(self.flat_experts.numel()), int(computed.shape[-1]))
-        )
+        canonical = computed.new_zeros((int(self.flat_experts.numel()), int(computed.shape[-1])))
         return canonical.index_copy(0, target, computed)
 
     def combine_branch_features(self, features: torch.Tensor) -> torch.Tensor:
@@ -687,11 +739,7 @@ def run_segmented_grouped_expert_mlp(
         del gate, up
 
         weight = materialize("W_down", segment.group_start, segment.group_stop)
-        outputs.append(
-            _grouped_linear(
-                hidden.to(weight.dtype), weight, local_offsets, backend
-            )
-        )
+        outputs.append(_grouped_linear(hidden.to(weight.dtype), weight, local_offsets, backend))
         del hidden, weight
     if not outputs:
         return x_sorted.new_empty((0, int(output_columns)))
@@ -767,6 +815,92 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         return grad_x, None, None, None, None, None
 
 
+class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
+    """Rematerialize one NF4 expert segment at a time in forward and backward."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        x_sorted: torch.Tensor,
+        offsets: torch.Tensor,
+        store: Magi2Nf4ExpertStore,
+        forward_backend: str,
+        dx_backend: str,
+    ) -> torch.Tensor:
+        boundaries = _grouped_boundaries(offsets)
+        output = run_segmented_grouped_expert_mlp(
+            x_sorted,
+            offsets,
+            boundaries=boundaries,
+            materialize=lambda key, start, stop: store.materialize_segment(
+                key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
+            ),
+            backend=forward_backend,
+            max_groups=store.segment_group_span(),
+            output_columns=int(x_sorted.shape[-1]),
+        )
+        ctx.save_for_backward(x_sorted, offsets)
+        ctx.store = store
+        ctx.forward_backend = forward_backend
+        ctx.dx_backend = dx_backend
+        ctx.boundaries = boundaries
+        ctx.segment_span = store.segment_group_span()
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+        x_sorted, offsets = ctx.saved_tensors
+        grad_segments: list[torch.Tensor] = []
+        store = ctx.store
+        for segment in grouped_mm_segments(
+            ctx.boundaries, max_groups=max(1, int(ctx.segment_span))
+        ):
+            if segment.row_count == 0:
+                continue
+            local_offsets = (
+                offsets[segment.group_start : segment.group_stop] - segment.row_start
+            ).contiguous()
+            rows = x_sorted[segment.row_start : segment.row_stop]
+            grad_rows = grad_output[segment.row_start : segment.row_stop]
+
+            w_gate = store.materialize_segment(
+                "W_gate",
+                segment.group_start,
+                segment.group_stop,
+                dtype=rows.dtype,
+                device=rows.device,
+            )
+            gate = _grouped_linear(rows, w_gate, local_offsets, ctx.forward_backend)
+            w_up = store.materialize_segment(
+                "W_up",
+                segment.group_start,
+                segment.group_stop,
+                dtype=rows.dtype,
+                device=rows.device,
+            )
+            up = _grouped_linear(rows, w_up, local_offsets, ctx.forward_backend)
+            w_down = store.materialize_segment(
+                "W_down",
+                segment.group_start,
+                segment.group_stop,
+                dtype=rows.dtype,
+                device=rows.device,
+            )
+            grad_hidden = _grouped_linear_dx(grad_rows, w_down, local_offsets, ctx.dx_backend)
+            grad_gate, grad_up = _memory_bounded_swiglu7_backward(gate, up, grad_hidden)
+            grad_x = _grouped_linear_dx(grad_gate, w_gate, local_offsets, ctx.dx_backend)
+            grad_x.add_(_grouped_linear_dx(grad_up, w_up, local_offsets, ctx.dx_backend))
+            grad_segments.append(grad_x)
+            del w_gate, w_up, w_down, gate, up, grad_hidden, grad_gate, grad_up
+        if not grad_segments:
+            grad_input = torch.empty_like(x_sorted)
+        elif len(grad_segments) == 1:
+            grad_input = grad_segments[0]
+        else:
+            grad_input = torch.cat(grad_segments, dim=0)
+        return grad_input, None, None, None, None
+
+
 class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
     """Grouped execution over NF4-packed MAGI-2 routed experts.
 
@@ -778,6 +912,16 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
     """
 
     name = "grouped_nf4"
+
+    def __init__(
+        self,
+        plan: Magi2GroupedMoEPlan,
+        *,
+        token_chunk_size: int = 0,
+        expert_autograd: str = "standard",
+    ) -> None:
+        super().__init__(plan, token_chunk_size=token_chunk_size)
+        self.expert_autograd = str(expert_autograd)
 
     @staticmethod
     def _store(module: Any) -> Magi2Nf4ExpertStore:
@@ -836,7 +980,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         forward_backend: str,
         dx_backend: str,
     ) -> torch.Tensor:
-        if torch.is_grad_enabled():
+        if torch.is_grad_enabled() and self.expert_autograd == "standard":
             return super().branch_features(
                 module,
                 x_heads,
@@ -851,6 +995,10 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         x_rows = x_heads.reshape(tokens * num_heads, d_head)
         x_sorted = x_rows.index_select(0, sorted_rows)
         store = self._store(module)
+        if torch.is_grad_enabled():
+            return _SegmentedQuantizedExpertMlp.apply(
+                x_sorted, offsets, store, forward_backend, dx_backend
+            )
         boundaries = _grouped_boundaries(offsets)
         return run_segmented_grouped_expert_mlp(
             x_sorted,
@@ -886,6 +1034,7 @@ _QUANTIZED_CONSUMED_POLICY_FIELDS = _CONSUMED_POLICY_FIELDS | frozenset(
         "expert_weight_access",
         "expert_dequant_chunk_size",
         "quantize_experts_on_load",
+        "moe_expert_autograd",
     }
 )
 
@@ -917,8 +1066,7 @@ _POLICY_FIELD_NOTES: dict[str, str] = {
         "memory.frozen_weight_quantization='nf4'."
     ),
     "quantize_experts_on_load": (
-        "On-load expert quantization requires "
-        "memory.frozen_weight_quantization='nf4'."
+        "On-load expert quantization requires memory.frozen_weight_quantization='nf4'."
     ),
     "expert_device_cache_gib": (
         "Packed MAGI-2 experts are layer-resident state moved by the block "
@@ -928,8 +1076,7 @@ _POLICY_FIELD_NOTES: dict[str, str] = {
         "device-resident."
     ),
     "device_residency_budget_gib": (
-        "This family has no independent expert-residency owner to account "
-        "against a shared ceiling."
+        "This family has no independent expert-residency owner to account against a shared ceiling."
     ),
     "moe_dispatch": "This family owns its routed dispatch.",
     "moe_dispatch_preprocess": "This family owns its routed dispatch.",
@@ -940,20 +1087,14 @@ _POLICY_FIELD_NOTES: dict[str, str] = {
 }
 
 
-def _reject_unconsumed_policy_fields(
-    policy: Any, *, quantized_experts: bool = False
-) -> None:
+def _reject_unconsumed_policy_fields(policy: Any, *, quantized_experts: bool = False) -> None:
     """Raise for any policy field MAGI-2 neither consumes nor leaves at default.
 
     The consumed set is a function of the storage format: three fields acquire a
     consumer only once the routed experts are packed, and stay rejected while
     the family runs native BF16 experts.
     """
-    consumed = (
-        _QUANTIZED_CONSUMED_POLICY_FIELDS
-        if quantized_experts
-        else _CONSUMED_POLICY_FIELDS
-    )
+    consumed = _QUANTIZED_CONSUMED_POLICY_FIELDS if quantized_experts else _CONSUMED_POLICY_FIELDS
     defaults = MoEOptimizationPolicy()
     for field in fields(MoEOptimizationPolicy):
         if field.name in consumed:
@@ -1003,9 +1144,7 @@ def resolve_magi2_moe_execution(
     if kernel_backend in _DEFAULT_KERNEL_BACKENDS and not quantized_experts:
         return None
     main = normalize_moe_gemm_backend(getattr(policy, "moe_gemm_backend", "auto"))
-    forward = normalize_moe_gemm_role_backend(
-        getattr(policy, "moe_gemm_backend_forward", "")
-    )
+    forward = normalize_moe_gemm_role_backend(getattr(policy, "moe_gemm_backend_forward", ""))
     dx = normalize_moe_gemm_role_backend(getattr(policy, "moe_gemm_backend_dx", ""))
     return Magi2GroupedMoEPlan(
         forward_backend=forward or main,
@@ -1049,9 +1188,7 @@ def validate_grouped_moe_backend_support(
             )
 
 
-def attach_grouped_moe_backend(
-    transformer: Any, backend: Magi2GroupedMoEBackend | None
-) -> int:
+def attach_grouped_moe_backend(transformer: Any, backend: Magi2GroupedMoEBackend | None) -> int:
     """Bind (or clear) the grouped execution seam on every vendored MoE module."""
     from mirai.vendors.magi2_preview.model.magi2_preview import CoreMultiHeadMoE
 

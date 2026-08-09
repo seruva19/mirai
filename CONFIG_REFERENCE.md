@@ -3198,6 +3198,19 @@ Input-gradient backend selection; `deepgemm_fp8` is rejected.
 
 Adapter-gradient backend selection; `deepgemm_fp8` is rejected.
 
+### `moe_expert_autograd`
+
+- **Type:** str
+- **Default:** `"standard"`
+- **Allowed / range:** `standard`, `segmented_recompute`
+
+Autograd schedule for frozen routed-expert MLPs. `standard` preserves the
+projection-by-projection graph. `segmented_recompute` keeps only the sorted
+expert input and rematerializes each packed expert segment during backward,
+bounding gate/up activation residency at the cost of extra projection work.
+Support is provider-owned; MAGI-2 implements it for NF4-packed grouped experts
+and rejects it for dense experts.
+
 ### `moe_batched_dequant`
 
 - **Type:** bool

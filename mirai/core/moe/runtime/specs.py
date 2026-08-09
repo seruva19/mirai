@@ -50,6 +50,7 @@ ROUTER_QUANTIZATION_POLICIES = {"disabled", "int8_per_channel"}
 
 PACKED_STATE_PRELOAD_MODES = ("off", "ram", "pinned")
 PACKED_STREAM_BACKENDS = ("staged", "gds")
+MOE_EXPERT_AUTOGRAD_MODES = ("standard", "segmented_recompute")
 
 @dataclass(frozen=True)
 class ExpertTensorSpec:
@@ -253,6 +254,7 @@ class MoEOptimizationPolicy:
     moe_batched_dequant: bool = True
     moe_pair_dequant: bool = True
     moe_batched_gather: bool = False
+    moe_expert_autograd: str = "standard"
     packed_shard_size_mb: int = 2048
     int8_workspace_mb: int = 0
 
@@ -280,6 +282,13 @@ class MoEOptimizationPolicy:
         workspace_mb = int(self.int8_workspace_mb)
         stream_cache_gib = float(self.packed_stream_cache_gib)
         stream_prefetch_depth = int(self.packed_stream_prefetch_depth)
+        expert_autograd = str(self.moe_expert_autograd).strip().lower()
+        if expert_autograd not in MOE_EXPERT_AUTOGRAD_MODES:
+            raise ValueError(
+                "memory.moe_expert_autograd must be one of: "
+                + ", ".join(MOE_EXPERT_AUTOGRAD_MODES)
+                + "."
+            )
         if access == "chunked_dequant" and chunk <= 0:
             raise ValueError(
                 "memory.expert_dequant_chunk_size must be > 0 when "
@@ -350,6 +359,7 @@ class MoEOptimizationPolicy:
         object.__setattr__(self, "moe_batched_dequant", bool(self.moe_batched_dequant))
         object.__setattr__(self, "moe_pair_dequant", bool(self.moe_pair_dequant))
         object.__setattr__(self, "moe_batched_gather", bool(self.moe_batched_gather))
+        object.__setattr__(self, "moe_expert_autograd", expert_autograd)
         object.__setattr__(self, "packed_shard_size_mb", shard_mb)
         object.__setattr__(self, "int8_workspace_mb", workspace_mb)
 
@@ -395,6 +405,7 @@ class MoEOptimizationPolicy:
             moe_batched_dequant=bool(getattr(memory, "moe_batched_dequant", True)),
             moe_pair_dequant=bool(getattr(memory, "moe_pair_dequant", True)),
             moe_batched_gather=bool(getattr(memory, "moe_batched_gather", False)),
+            moe_expert_autograd=getattr(memory, "moe_expert_autograd", "standard"),
             packed_shard_size_mb=int(getattr(memory, "packed_shard_size_mb", 2048)),
             int8_workspace_mb=int(getattr(memory, "int8_workspace_mb", 0)),
         )

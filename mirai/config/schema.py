@@ -663,6 +663,7 @@ class MemoryConfig:
     moe_batched_dequant: bool = True
     moe_pair_dequant: bool = True
     moe_batched_gather: bool = False
+    moe_expert_autograd: str = "standard"
     packed_shard_size_mb: int = 2048
     int8_workspace_mb: int = 0
     # Block-residency planning over the block-swap ring (all default = current
@@ -1299,6 +1300,7 @@ class TrainingConfig:
             "moe_batched_dequant",
             "moe_pair_dequant",
             "moe_batched_gather",
+            "moe_expert_autograd",
             "packed_shard_size_mb",
             "int8_workspace_mb",
             "block_residency_planner",
@@ -3199,6 +3201,9 @@ class TrainingConfig:
             moe_pair_dequant=bool(memory_table.get("moe_pair_dequant", True)),
             moe_batched_gather=bool(
                 memory_table.get("moe_batched_gather", False)
+            ),
+            moe_expert_autograd=str(
+                memory_table.get("moe_expert_autograd", "standard")
             ),
             packed_shard_size_mb=int(
                 memory_table.get("packed_shard_size_mb", 2048)
