@@ -195,6 +195,7 @@ class GroupedLinearBase(nn.Module):
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        self._mirai_lora_executor = None
         self.in_features = in_features
         self.out_features = out_features
         self.num_experts = num_experts
@@ -218,6 +219,10 @@ class GroupedLinearBase(nn.Module):
         m_splits: Optional[list[int]] = None,
         gather_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self._mirai_lora_executor is not None:
+            return self._mirai_lora_executor(
+                self, input, cu_seqlens, m_splits, gather_ids
+            )
         weight = self.weight.view(self.num_experts, self.out_features, self.in_features)
         bias = (
             self.bias.view(self.num_experts, self.out_features)
@@ -2612,6 +2617,7 @@ class CoreMultiHeadMoE(nn.Module):
         # Optional grouped expert-execution seam injected by the Mirai pipeline;
         # None keeps the reference torch/flash paths below.
         self._mirai_moe_kernel_backend = None
+        self._mirai_router_lora_executor = None
         self.config = config
         self.num_heads = config.num_heads
         self.num_experts = config.num_experts
@@ -2700,8 +2706,11 @@ class CoreMultiHeadMoE(nn.Module):
 
     def _route(self, x_heads: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_heads = x_heads.size(1)
-        gate = self.gate.view(num_heads, self.num_experts, self.d_head).float()
-        router_logits = torch.einsum("shd,hed->hse", x_heads.float(), gate)
+        if self._mirai_router_lora_executor is None:
+            gate = self.gate.view(num_heads, self.num_experts, self.d_head).float()
+            router_logits = torch.einsum("shd,hed->hse", x_heads.float(), gate)
+        else:
+            router_logits = self._mirai_router_lora_executor(self, x_heads)
         expert_bias = self.router.expert_bias.view(num_heads, self.num_experts)
         topk_probs, topk_indices = _mh_moe_compute_topk(
             router_logits=router_logits,

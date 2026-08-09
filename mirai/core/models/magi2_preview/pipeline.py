@@ -912,6 +912,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     unsafe=False,
                 )
                 module.parametrizations[tensor_name].original.requires_grad_(False)
+                from mirai.core.models.magi2_preview.lora_execution import (
+                    attach_magi2_lora_executor,
+                )
+
+                attach_magi2_lora_executor(module, tensor_name)
                 matched.append(full_name)
         if not matched:
             raise ValueError(f"MAGI-2 LoRA preset '{preset}' matched no parameters.")

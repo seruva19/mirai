@@ -26,6 +26,10 @@ from mirai.core.models.magi2_preview.grouped_moe import (
 )
 from mirai.core.moe.runtime.gemm import BackendProbe, grouped_mm_op
 from mirai.core.models.magi2_preview.pipeline import LowRankWeight
+from mirai.core.models.magi2_preview.lora_execution import (
+    attach_magi2_lora_executor,
+    execute_router_lora,
+)
 from mirai.core.models.native_video import resolve_output_fps
 from mirai.core.models.providers import (
     NativeCacheEncoderConfig,
@@ -65,6 +69,98 @@ def test_magi2_low_rank_weight_preserves_default_and_gradients() -> None:
     assert adapter.lora_b.grad is not None
     assert torch.isfinite(adapter.lora_a.grad).all()
     assert torch.isfinite(adapter.lora_b.grad).all()
+
+
+def test_magi2_grouped_linear_lora_executes_without_dense_delta() -> None:
+    from mirai.vendors.magi2_preview.model.magi2_preview import GroupedLinearBase
+
+    torch.manual_seed(41)
+    module = GroupedLinearBase(
+        in_features=7,
+        out_features=5,
+        num_experts=3,
+        bias=False,
+        dtype=torch.float32,
+    )
+    module.weight.data.normal_()
+    module.weight.requires_grad_(False)
+    parametrize.register_parametrization(
+        module,
+        "weight",
+        LowRankWeight(tuple(module.weight.shape), rank=3, alpha=6.0),
+    )
+    module.parametrizations.weight.original.requires_grad_(False)
+    adapter = module.parametrizations.weight[0]
+    adapter.lora_b.data.normal_()
+    splits = [3, 0, 4]
+    reference_input = torch.randn(7, 7, requires_grad=True)
+    actual_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference = module(reference_input, m_splits=splits)
+    reference.square().mean().backward()
+    reference_grads = (
+        reference_input.grad.detach().clone(),
+        adapter.lora_a.grad.detach().clone(),
+        adapter.lora_b.grad.detach().clone(),
+    )
+    adapter.lora_a.grad = None
+    adapter.lora_b.grad = None
+    attach_magi2_lora_executor(module, "weight")
+
+    def reject_materialization(_base: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("activation-space LoRA must not materialize B @ A")
+
+    adapter.forward = reject_materialization
+    actual = module(actual_input, m_splits=splits)
+    actual.square().mean().backward()
+    actual_grads = (
+        actual_input.grad,
+        adapter.lora_a.grad,
+        adapter.lora_b.grad,
+    )
+
+    torch.testing.assert_close(actual, reference)
+    for expected, observed in zip(reference_grads, actual_grads, strict=True):
+        torch.testing.assert_close(observed, expected)
+    state_keys = set(module.state_dict())
+    assert "parametrizations.weight.0.lora_a" in state_keys
+    assert "parametrizations.weight.0.lora_b" in state_keys
+
+
+def test_magi2_router_lora_executes_without_dense_delta() -> None:
+    module, adapter = _build_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32
+    )
+    torch.manual_seed(43)
+    reference_input = torch.randn(6, 2, 8, requires_grad=True)
+    actual_input = reference_input.detach().clone().requires_grad_(True)
+    gate = module.gate.view(2, 4, 8).float()
+    reference = torch.einsum("shd,hed->hse", reference_input.float(), gate)
+    reference.square().mean().backward()
+    reference_grads = (
+        reference_input.grad.detach().clone(),
+        adapter.lora_a.grad.detach().clone(),
+        adapter.lora_b.grad.detach().clone(),
+    )
+    adapter.lora_a.grad = None
+    adapter.lora_b.grad = None
+    attach_magi2_lora_executor(module, "gate")
+
+    def reject_materialization(_base: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("activation-space router LoRA must not materialize B @ A")
+
+    adapter.forward = reject_materialization
+    actual = execute_router_lora(module, actual_input)
+    actual.square().mean().backward()
+    actual_grads = (
+        actual_input.grad,
+        adapter.lora_a.grad,
+        adapter.lora_b.grad,
+    )
+
+    torch.testing.assert_close(actual, reference)
+    for expected, observed in zip(reference_grads, actual_grads, strict=True):
+        torch.testing.assert_close(observed, expected)
 
 
 def _build_reduced_moe(
