@@ -223,6 +223,7 @@ class InferenceSession:
         self._compute_dtype = compute_dtype
         self._residency_strategy = str(residency_strategy)
         self._base_placement_dirty = False
+        self._stage_text_encoder_before_denoiser = False
         # Armed by from_config only when inference.expert_feature_cache is on;
         # None means no cache object exists anywhere in the run.
         self._expert_feature_cache: Any = None
@@ -299,6 +300,19 @@ class InferenceSession:
         inference_mode = resolve_inference_mode(trainer.pipeline)
         compute_device = _device_fn()
         compute_dtype = _dtype_fn(cfg)
+        stage_text_encoder = bool(
+            cfg.inference.stage_text_encoder_before_denoiser
+        )
+        if stage_text_encoder and bool(cfg.inference.keep_text_encoder_resident):
+            raise ValueError(
+                "inference.stage_text_encoder_before_denoiser=true is incompatible "
+                "with inference.keep_text_encoder_resident=true."
+            )
+        if stage_text_encoder and str(compile_mode or "").strip():
+            raise ValueError(
+                "inference.stage_text_encoder_before_denoiser=true is currently "
+                "incompatible with --compile-mode."
+            )
         # Weight residency is a property of the run, not of the trainer that
         # built the pipeline: the trainer resolves it from the training keys,
         # which an inference config leaves at their defaults. Opting in through
@@ -314,7 +328,7 @@ class InferenceSession:
             if inference_residency_strategy is not None
             else str(getattr(trainer, "weight_residency_strategy", "disabled"))
         )
-        if place_on_device:
+        if place_on_device and not stage_text_encoder:
             # Same placement contract as training: without it the denoiser
             # stays in host RAM and the denoise loop silently runs on CPU
             # (hours instead of minutes for a real MoE family). CPU-only
@@ -376,6 +390,11 @@ class InferenceSession:
             compute_device=compute_device,
             compute_dtype=compute_dtype,
             residency_strategy=residency_strategy,
+        )
+        session._stage_text_encoder_before_denoiser = stage_text_encoder
+        session._base_placement_dirty = bool(stage_text_encoder and place_on_device)
+        trainer.pipeline.set_text_encoder_weight_quantization(
+            str(cfg.inference.text_encoder_weight_quantization)
         )
         component_residency = resolve_inference_component_residency(
             config_text_encoder=bool(cfg.inference.keep_text_encoder_resident),
@@ -567,7 +586,9 @@ class InferenceSession:
         )
         if callable(discard_refiner_context):
             discard_refiner_context()
-        if not decode_latent_path:
+        if not decode_latent_path and not getattr(
+            self, "_stage_text_encoder_before_denoiser", False
+        ):
             self._ensure_base_placement()
             if self._residency_strategy not in {"", "disabled"}:
                 # A swapped run has no training step boundary, so the residency
@@ -666,6 +687,35 @@ class InferenceSession:
         video_written = False
         media_written = False
         media_path: Path | None = None
+        encoded_context = None
+        if (
+            getattr(self, "_stage_text_encoder_before_denoiser", False)
+            and use_native
+            and not decode_latent_path
+        ):
+            _conditioning_t0 = _sync_perf_counter() if timings is not None else 0.0
+            if task_key != TEXT_TO_VIDEO:
+                raise ValueError(
+                    "inference.stage_text_encoder_before_denoiser currently supports "
+                    "text_to_video inference only."
+                )
+            self.pipeline.release_base_transformer()
+            self._base_placement_dirty = True
+            self.pipeline.load_text_encoder(device=str(self._compute_device))
+            try:
+                encoded_context = (
+                    self.pipeline.encode_prompt(prompt, device=str(self._compute_device)),
+                    self.pipeline.encode_prompt(
+                        str(negative_prompt or ""), device=str(self._compute_device)
+                    ),
+                )
+            finally:
+                self.pipeline.offload_text_encoder()
+            self._ensure_base_placement()
+            if self._residency_strategy not in {"", "disabled"}:
+                self.pipeline.flush_runtime_offloads()
+            if timings is not None:
+                timings["conditioning_s"] = _sync_perf_counter() - _conditioning_t0
         if decode_latent_path:
             pred = torch.load(decode_latent_path, map_location="cpu", weights_only=True)
             if not isinstance(pred, torch.Tensor):
@@ -700,6 +750,7 @@ class InferenceSession:
                     cfg_mode=cfg_mode_key,
                     forward_fn=self._forward_fn,
                     conditioning=conditioning,
+                    encoded_context=encoded_context,
                 )
             else:
                 if task_key != TEXT_TO_VIDEO:

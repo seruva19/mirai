@@ -338,6 +338,8 @@ class InferenceConfig:
     prompt_rewriter: str = "none"
     cfg_mode: str = "sequential"
     keep_text_encoder_resident: bool = False
+    stage_text_encoder_before_denoiser: bool = False
+    text_encoder_weight_quantization: str = "none"
     keep_vae_resident: bool = False
     # Cross-timestep expert-branch feature reuse (default-off, lossy). See
     # mirai/core/moe/runtime/expert_feature_cache.py.
@@ -733,6 +735,8 @@ class TrainingConfig:
                 "prompt_rewriter",
                 "cfg_mode",
                 "keep_text_encoder_resident",
+                "stage_text_encoder_before_denoiser",
+                "text_encoder_weight_quantization",
                 "keep_vae_resident",
                 "expert_feature_cache",
                 "expert_feature_cache_drift_threshold",
@@ -744,6 +748,32 @@ class TrainingConfig:
             },
         )
         inference_blocks_to_swap = int(inference_table.get("blocks_to_swap", 0))
+        inference_text_encoder_quantization = str(
+            inference_table.get("text_encoder_weight_quantization", "none")
+        ).strip().lower()
+        if inference_text_encoder_quantization not in {"none", "int8", "nf4"}:
+            raise ConfigError(
+                "inference.text_encoder_weight_quantization must be 'none', "
+                f"'int8', or 'nf4'; got '{inference_text_encoder_quantization}'."
+            )
+        if (
+            inference_text_encoder_quantization != "none"
+            and not bool(
+                inference_table.get("stage_text_encoder_before_denoiser", False)
+            )
+        ):
+            raise ConfigError(
+                "inference.text_encoder_weight_quantization requires "
+                "inference.stage_text_encoder_before_denoiser=true."
+            )
+        if (
+            bool(inference_table.get("stage_text_encoder_before_denoiser", False))
+            and bool(inference_table.get("keep_text_encoder_resident", False))
+        ):
+            raise ConfigError(
+                "inference.stage_text_encoder_before_denoiser=true is incompatible "
+                "with inference.keep_text_encoder_resident=true."
+            )
         if inference_blocks_to_swap < 0:
             raise ConfigError("inference.blocks_to_swap must be >= 0.")
         inference_moe_token_chunk_size = int(
@@ -3346,6 +3376,12 @@ class TrainingConfig:
                 cfg_mode=cfg_mode,
                 keep_text_encoder_resident=bool(
                     inference_table.get("keep_text_encoder_resident", False)
+                ),
+                stage_text_encoder_before_denoiser=bool(
+                    inference_table.get("stage_text_encoder_before_denoiser", False)
+                ),
+                text_encoder_weight_quantization=(
+                    inference_text_encoder_quantization
                 ),
                 keep_vae_resident=bool(
                     inference_table.get("keep_vae_resident", False)

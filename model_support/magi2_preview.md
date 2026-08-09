@@ -478,21 +478,23 @@ python scripts/infer.py \
 ```
 
 [`configs/magi2_preview/inference_offload_32gb.toml`](../configs/magi2_preview/inference_offload_32gb.toml)
-selects the most conservative residency and occupancy the schema offers for
-this family: all 40 blocks swapped synchronously, and neither the text encoder
-nor the VAE resident. Denoiser activation size is set by `--height`, `--width`,
-and `--frames`, which no config key controls, so on a 32 GiB device the request
-is part of the profile — prefer a smaller spatial size and a latent length near
-the floor of the generation envelope, and treat 832x480 at latent `T` 32 as a
-large request rather than a default. The released 1920x1088 refiner target is
-not a 32 GiB profile; use an explicit smaller `--refiner-height` /
-`--refiner-width` there. `--refine` adds a second model load and a second
-denoise; enable it only once the preview run's peak is known.
+streams all 48 preview blocks synchronously, uses NF4 routed experts and fused
+Triton SwiGLU7, and stages the INT8 Qwen3.5 text encoder before denoiser
+placement. At 512x512x57 with five denoise steps, the fused profile measured
+38.49 seconds in the denoise loop and 16,745 MiB peak allocated VRAM with NF4
+text conditioning. The otherwise identical bounded torch activation path took
+94.59 seconds. INT8 text conditioning raises the measured staging peak to
+26,368 MiB; its embedding cosine against BF16 was 0.99922 on the documented
+warm-cabin prompt (NF4: 0.99253). Text-encoder quantization is explicitly lossy.
+
+The released 1920x1088 refiner target is not a 32 GiB profile: its current
+packed-token preparation exceeds that budget before the first transformer
+layer. Use a smaller explicit `--refiner-height` / `--refiner-width` on this
+device class.
 
 The example keeps `inference.keep_text_encoder_resident` and
-`inference.keep_vae_resident` at `false`, so text encoding, denoising, and VAE
-decoding occupy the execution device sequentially. Set either to `true` to
-trade VRAM for reload time across repeated session generations.
+`inference.keep_vae_resident` at `false`. Sequential text staging is
+incompatible with keeping that encoder resident.
 
 ### Generation length and output frame rate
 

@@ -97,10 +97,10 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         config = _resolved(MAGI2_INFER, entrypoint="infer")
         self.assertEqual(config.memory.weight_residency_strategy, "block_swap")
         self.assertGreaterEqual(
-            config.training.blocks_to_swap,
+            config.inference.blocks_to_swap,
             int(Magi2ModelConfig().num_layers),
         )
-        self.assertEqual(config.training.block_swap_mode, "sync")
+        self.assertEqual(config.inference.block_swap_mode, "sync")
 
     def test_magi2_training_host_memory_keys_fit_a_128_gib_machine(self) -> None:
         memory = _resolved(MAGI2_TRAIN, entrypoint="train").memory
@@ -129,6 +129,13 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         self.assertFalse(config.inference.keep_text_encoder_resident)
         self.assertFalse(config.inference.keep_vae_resident)
         self.assertEqual(config.inference.cfg_mode, "batched")
+        self.assertTrue(config.inference.stage_text_encoder_before_denoiser)
+        self.assertEqual(config.inference.text_encoder_weight_quantization, "int8")
+        self.assertEqual(config.inference.blocks_to_swap, 48)
+        self.assertEqual(config.inference.block_swap_mode, "sync")
+        self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
+        self.assertEqual(config.memory.moe_activation_backend, "triton")
+        self.assertLessEqual(config.memory.cuda_memory_fraction, 0.40)
 
     def test_lingbot_training_profile_uses_bounded_async_residency(self) -> None:
         config = _resolved(LINGBOT_TRAIN, entrypoint="train")

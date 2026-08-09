@@ -4255,6 +4255,43 @@
       "promotion_evidence": ""
     },
     {
+      "name": "sequential_text_encoder_staging",
+      "kind": "inference",
+      "owner": "mirai/core/inference/session.py",
+      "check": "inference",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation",
+        "native_execution"
+      ],
+      "symbols": [
+        "InferenceSession"
+      ],
+      "config_keys": [
+        "inference.stage_text_encoder_before_denoiser",
+        "inference.text_encoder_weight_quantization"
+      ],
+      "disabled_config": {
+        "inference.stage_text_encoder_before_denoiser": false,
+        "inference.text_encoder_weight_quantization": "none"
+      },
+      "contract_paths": [
+        "tests/test_inference_session.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/inference/session.py",
+      "readme_claim": "Sequential text-encoder staging",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2208.07339; https://arxiv.org/abs/2305.14314",
+      "promotion_evidence": ""
+    },
+    {
       "name": "similarity_preserving_router_balancing",
       "kind": "training_policy",
       "owner": "mirai/core/moe/adaptation/simbal.py",

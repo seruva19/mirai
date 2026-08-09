@@ -187,6 +187,7 @@ def run_native_denoise_loop(
     cfg_mode: str | None = None,
     forward_fn: Any = None,
     conditioning: Any | None = None,
+    encoded_context: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, list[dict[str, float]]]:
     """Real denoise loop using native T5 encoding and flow matching solver.
 
@@ -257,25 +258,28 @@ def run_native_denoise_loop(
 
     # Encode prompts via the native text encoder. Different families may return
     # different tensor/list shapes, so normalise to a single (1, S, D) tensor.
-    pipeline.load_text_encoder(device="cpu")
-    encode_conditioned = getattr(pipeline, "encode_conditioned_prompt", None)
-    encode = (
-        (
-            lambda text: encode_conditioned(
-                text,
-                prepared=prepared,
-                device=str(device),
+    if encoded_context is None:
+        pipeline.load_text_encoder(device="cpu")
+        encode_conditioned = getattr(pipeline, "encode_conditioned_prompt", None)
+        encode = (
+            (
+                lambda text: encode_conditioned(
+                    text,
+                    prepared=prepared,
+                    device=str(device),
+                )
             )
+            if callable(encode_conditioned)
+            else (lambda text: pipeline.encode_prompt(text, device=str(device)))
         )
-        if callable(encode_conditioned)
-        else (lambda text: pipeline.encode_prompt(text, device=str(device)))
-    )
-    context = _as_context_tensor(encode(prompt), device)
-    context_null = _as_context_tensor(
-        encode(negative_prompt or ""),
-        device,
-    )
-    pipeline.offload_text_encoder()
+        try:
+            context = _as_context_tensor(encode(prompt), device)
+            context_null = _as_context_tensor(encode(negative_prompt or ""), device)
+        finally:
+            pipeline.offload_text_encoder()
+    else:
+        context = _as_context_tensor(encoded_context[0], device)
+        context_null = _as_context_tensor(encoded_context[1], device)
 
     # Generate initial noise
     noise = torch.randn(target_shape, dtype=torch.float32, device=device, generator=g)

@@ -18,6 +18,8 @@ refiner_attention_backend = "auto"
 [inference]
 task = "text_to_video"
 cfg_mode = "batched"
+stage_text_encoder_before_denoiser = true
+text_encoder_weight_quantization = "nf4"
 keep_text_encoder_resident = false
 keep_vae_resident = false
 
@@ -28,6 +30,7 @@ quantize_experts_on_load = true
 moe_kernel_backend = "grouped"
 expert_weight_access = "chunked_dequant"
 expert_dequant_chunk_size = 256
+moe_activation_backend = "triton"
 weight_residency_strategy = "block_swap"
 block_swap_prefetch_depth = 1
 minimum_system_memory_gib = 12.0

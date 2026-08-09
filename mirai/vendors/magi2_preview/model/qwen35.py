@@ -228,10 +228,12 @@ class Qwen35TextEncoder:
         precision: torch.dtype = torch.bfloat16,
         max_length: int = 7000,
         skip_layer: int = 0,
+        weight_quantization: str = "none",
     ):
         self.device = device
         self.max_length = max_length
         self.skip_layer = skip_layer
+        self.weight_quantization = str(weight_quantization).strip().lower()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
 
         cjk_split = pre_tokenizers.Split(
@@ -247,14 +249,54 @@ class Qwen35TextEncoder:
 
         from transformers import Qwen3_5TextModel
 
-        self.text_model = Qwen3_5TextModel.from_pretrained(
-            model_path, torch_dtype=precision
-        )
-        self.to(device)
+        load_kwargs = {"torch_dtype": precision}
+        if self.weight_quantization in {"int8", "nf4"}:
+            from transformers import BitsAndBytesConfig
+
+            # bitsandbytes LLM.int8 and QLoRA NF4 weight-only loading:
+            # https://arxiv.org/abs/2208.07339
+            # https://arxiv.org/abs/2305.14314
+            quantization_config = (
+                BitsAndBytesConfig(load_in_8bit=True)
+                if self.weight_quantization == "int8"
+                else BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=precision,
+                )
+            )
+            load_kwargs.update(
+                quantization_config=quantization_config,
+                device_map={"": str(device)},
+            )
+        elif self.weight_quantization != "none":
+            raise ValueError(
+                "Qwen3.5 text encoder weight quantization must be 'none', "
+                f"'int8', or 'nf4'; got '{weight_quantization}'."
+            )
+        self.text_model = Qwen3_5TextModel.from_pretrained(model_path, **load_kwargs)
+        if self.weight_quantization == "none":
+            self.to(device)
+        else:
+            self.device = str(device)
         self.text_model.eval()
         self.text_model.requires_grad_(False)
 
     def to(self, device: str | torch.device):
+        if self.weight_quantization != "none":
+            current = next(self.text_model.parameters()).device
+            target = torch.device(device)
+            same_device = target == current or (
+                target.type == current.type and target.index is None
+            )
+            if not same_device:
+                raise RuntimeError(
+                    "Quantized Qwen3.5 text-encoder weights cannot be moved after "
+                    "loading; release and reload the encoder on the target device."
+                )
+            self.device = str(device)
+            return self
         self.text_model.to(device)
         self.device = str(device)
         return self
@@ -334,5 +376,3 @@ class Qwen35TextEncoder:
         if self.skip_layer == 0:
             return outputs.last_hidden_state
         return outputs.hidden_states[-(self.skip_layer + 1)]
-
-

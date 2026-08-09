@@ -257,6 +257,47 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(cfg.inference.moe_token_chunk_size, 8192)
 
+    def test_inference_sequential_component_staging_parses_and_validates(self) -> None:
+        path = self._write(
+            """
+            [inference]
+            stage_text_encoder_before_denoiser = true
+            """
+        )
+        cfg = load_config(path)
+        self.assertTrue(cfg.inference.stage_text_encoder_before_denoiser)
+
+        incompatible = self._write(
+            """
+            [inference]
+            stage_text_encoder_before_denoiser = true
+            keep_text_encoder_resident = true
+            """
+        )
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            load_config(incompatible)
+
+        quantized = self._write(
+            """
+            [inference]
+            stage_text_encoder_before_denoiser = true
+            text_encoder_weight_quantization = "nf4"
+            """
+        )
+        self.assertEqual(
+            load_config(quantized).inference.text_encoder_weight_quantization,
+            "nf4",
+        )
+
+        missing_staging = self._write(
+            """
+            [inference]
+            text_encoder_weight_quantization = "nf4"
+            """
+        )
+        with self.assertRaisesRegex(ValueError, "requires"):
+            load_config(missing_staging)
+
     def test_inference_moe_token_chunking_rejects_negative_size(self) -> None:
         path = self._write(
             """

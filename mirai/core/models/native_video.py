@@ -125,6 +125,14 @@ class NativeVideoPipeline(BasePipeline):
             f"{type(self).__name__} does not implement native text encoder loading."
         )
 
+    def set_text_encoder_weight_quantization(self, mode: str) -> None:
+        key = str(mode).strip().lower()
+        if key != "none":
+            raise ValueError(
+                f"{type(self).__name__} does not implement text-encoder "
+                f"weight quantization '{mode}'."
+            )
+
     def encode_prompt(self, prompt: str, *, device: str) -> Any:
         _ = prompt, device
         raise NotImplementedError(
@@ -171,6 +179,19 @@ class NativeVideoPipeline(BasePipeline):
         raise NotImplementedError(
             f"{type(self).__name__} does not implement native text encoder offload."
         )
+
+    def release_base_transformer(self) -> None:
+        """Release denoiser device residency before another large component runs."""
+        model = self.get_training_model()
+        if model is not None:
+            model.to(device="cpu")
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ModuleNotFoundError:  # pragma: no cover
+            pass
 
     def load_vae(self, *, device: str) -> None:
         _ = device

@@ -80,6 +80,9 @@ configuration and compatibility rules are documented in
 ### Generic
 
 - **Dataset bucketing** — Resolution and frame buckets.
+- **Sequential text-encoder staging** — Inference can encode prompts before
+  placing the denoiser, with optional INT8 or NF4 encoder weights, so the two
+  components do not need to occupy VRAM concurrently.
 - **Regional graph compilation** — Opt-in `torch.compile` targets repeated
   provider-declared transformer blocks, validates configurable token-shape
   buckets, supplies soft dynamic-shape hints, and reports compiled regions and

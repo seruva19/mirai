@@ -249,7 +249,8 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "If set, write a per-phase timings JSON "
-            '{"load_s","denoise_s","decode_s","peak_vram_mb"} to this path. '
+            '{"load_s","conditioning_s","denoise_s","decode_s",'
+            '"refine_s","peak_vram_mb"} to this path. '
             "Consumed by inference/bench.py."
         ),
     )
@@ -341,6 +342,7 @@ def main() -> int:
     # Per-phase wall times (seconds). Left at 0.0 for phases a given run skips
     # (e.g. decode_latent skips the denoise phase).
     load_s = 0.0
+    conditioning_s = 0.0
     denoise_s = 0.0
     decode_s = 0.0
     refine_s = 0.0
@@ -449,6 +451,7 @@ def main() -> int:
             denoising_strength=args.denoising_strength,
         )
         if collect_timings and timings_box is not None:
+            conditioning_s = float(timings_box.get("conditioning_s", 0.0))
             denoise_s = float(timings_box.get("denoise_s", 0.0))
             decode_s = float(timings_box.get("decode_s", 0.0))
             refine_s = float(timings_box.get("refine_s", 0.0))
@@ -483,6 +486,7 @@ def main() -> int:
                 json.dumps(
                     {
                         "load_s": load_s,
+                        "conditioning_s": conditioning_s,
                         "denoise_s": denoise_s,
                         "decode_s": decode_s,
                         "refine_s": refine_s,

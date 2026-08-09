@@ -1014,6 +1014,32 @@ Strategy-owned options; must be a table and unknown keys fail. `text_to_video` a
 
 Keeps native text-encoder weights on their compute device across repeated `InferenceSession.generate()` calls. Increases VRAM use; the CLI BooleanOptional override is `--keep-text-encoder-resident` ([`session.py`](mirai/core/inference/session.py)).
 
+### `stage_text_encoder_before_denoiser`
+
+- **Type:** bool
+- **Default:** `False`
+
+Encodes T2V prompts on the compute device before placing the denoiser, then
+offloads the text encoder and places the denoiser once for the complete sampling
+loop. This bounds peak accelerator residency when the two components cannot
+co-reside. It requires a native pipeline, is incompatible with
+`keep_text_encoder_resident=true` and `--compile-mode`, and does not alter the
+encoded conditioning ([`session.py`](mirai/core/inference/session.py)).
+
+### `text_encoder_weight_quantization`
+
+- **Type:** str
+- **Default:** `"none"`
+- **Allowed:** `none`, `int8`, `nf4`
+
+Optional weight-only INT8 or NF4 storage for a native text encoder whose
+provider implements it. The encoder is released after producing FP32
+conditioning, so the denoiser does not inherit its storage type. Both
+quantized modes are explicit lossy inference policies and require
+`stage_text_encoder_before_denoiser=true`; the
+unquantized encoder remains the reference path ([`native_video.py`](mirai/core/models/native_video.py),
+provider-owned text encoder).
+
 ### `keep_vae_resident`
 
 - **Type:** bool

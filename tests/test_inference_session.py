@@ -474,6 +474,33 @@ class InferenceSessionEquivalenceTests(unittest.TestCase):
             lat_on = torch.load(tmpdir / "on.pt", map_location="cpu", weights_only=True)
             self.assertTrue(torch.equal(lat_off, lat_on))
 
+    def test_sequential_text_staging_preserves_latent(self) -> None:
+        from mirai.core.inference.session import InferenceSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            baseline_cfg = tmpdir / "baseline.toml"
+            _write_config(baseline_cfg)
+            staged_cfg = tmpdir / "staged.toml"
+            staged_cfg.write_text(
+                baseline_cfg.read_text(encoding="utf-8")
+                + "\n[inference]\nstage_text_encoder_before_denoiser = true\n",
+                encoding="utf-8",
+            )
+            baseline = InferenceSession.from_config(str(baseline_cfg))
+            baseline.generate(prompt="p", out_path=tmpdir / "baseline.mp4", **_RUN_KW)
+            baseline._stage_text_encoder_before_denoiser = True
+            baseline._base_placement_dirty = True
+            baseline.pipeline.release_base_transformer()
+            baseline.generate(prompt="p", out_path=tmpdir / "staged.mp4", **_RUN_KW)
+            lat_baseline = torch.load(
+                tmpdir / "baseline.pt", map_location="cpu", weights_only=True
+            )
+            lat_staged = torch.load(
+                tmpdir / "staged.pt", map_location="cpu", weights_only=True
+            )
+            self.assertTrue(torch.equal(lat_baseline, lat_staged))
+
     def test_merge_request_is_applied_before_reporting_success(self) -> None:
         from mirai.core.inference.session import InferenceSession
 

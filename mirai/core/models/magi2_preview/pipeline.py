@@ -306,6 +306,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._compute_autocast_dtype = torch.bfloat16
         self._lora_scale = 1.0
         self._text_encoder: Any | None = None
+        self._text_encoder_weight_quantization = "none"
         self._vae: nn.Module | None = None
         self._last_vae_decode_chunk_size = 0
         self._inference_device = "cpu"
@@ -547,7 +548,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     f"MAGI-2 text encoder assets are missing at {path}."
                 )
             self._text_encoder = Qwen35TextEncoder(
-                str(path), device=device, precision=torch.bfloat16
+                str(path),
+                device=device,
+                precision=torch.bfloat16,
+                weight_quantization=self._text_encoder_weight_quantization,
             )
         else:
             self._text_encoder.to(device)
@@ -567,9 +571,26 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
     def offload_text_encoder(self) -> None:
         if self._text_encoder is not None:
-            self._text_encoder.to("cpu")
+            if self._text_encoder_weight_quantization == "none":
+                self._text_encoder.to("cpu")
+            else:
+                self._text_encoder = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def set_text_encoder_weight_quantization(self, mode: str) -> None:
+        key = str(mode).strip().lower()
+        if key not in {"none", "int8", "nf4"}:
+            raise ValueError(
+                "MAGI-2 text-encoder weight quantization must be 'none', "
+                f"'int8', or 'nf4'; got '{mode}'."
+            )
+        if self._text_encoder is not None and key != self._text_encoder_weight_quantization:
+            raise RuntimeError(
+                "Text-encoder weight quantization cannot change while the encoder "
+                "is loaded."
+            )
+        self._text_encoder_weight_quantization = key
 
     def load_vae(self, *, device: str) -> None:
         if self._vae is not None:
