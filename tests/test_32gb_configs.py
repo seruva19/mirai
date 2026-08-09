@@ -90,6 +90,8 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         self.assertEqual(config.training.blocks_to_swap, 32)
         self.assertFalse(config.training.activation_cpu_offload)
         self.assertEqual(config.memory.expert_dequant_chunk_size, 512)
+        self.assertEqual(config.memory.moe_expert_autograd, "segmented_recompute")
+        self.assertEqual(config.memory.moe_activation_backend, "triton")
 
     def test_magi2_inference_profile_streams_every_block_synchronously(self) -> None:
         config = _resolved(MAGI2_INFER, entrypoint="infer")

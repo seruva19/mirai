@@ -12,6 +12,8 @@ from mirai.core.models.magi2_preview.grouped_moe import (
     _CONSUMED_POLICY_FIELDS,
     _MemoryBoundedSwiGlu7,
     _QUANTIZED_CONSUMED_POLICY_FIELDS,
+    _memory_bounded_swiglu7,
+    _memory_bounded_swiglu7_backward,
     Magi2GroupedMoEBackend,
     Magi2GroupedMoEPlan,
     Magi2GroupedMoEPolicyError,
@@ -34,6 +36,10 @@ from mirai.core.models.magi2_preview.quantized_experts import (
     install_magi2_nf4_expert_stores,
     magi2_expert_store,
     quantize_magi2_experts_in_place,
+)
+from mirai.core.models.magi2_preview.triton_swiglu import (
+    triton_swiglu7,
+    triton_swiglu7_backward,
 )
 from mirai.core.moe.runtime.gemm import grouped_mm_stride_violations, grouped_mm_operand
 from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
@@ -77,6 +83,24 @@ def test_memory_bounded_swiglu7_matches_reference_output_and_gradients() -> None
     assert torch.equal(actual, expected)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
         assert torch.allclose(actual_grad, expected_grad, atol=0.0625, rtol=0.01)
+
+
+@pytest.mark.skipif(not _CUDA, reason="requires CUDA")
+def test_triton_swiglu7_matches_reference_output_and_gradients() -> None:
+    pytest.importorskip("triton")
+    torch.manual_seed(19)
+    gate = (torch.randn(4101, 32, device="cuda") * 4.0).to(torch.bfloat16)
+    up = (torch.randn_like(gate) * 4.0).to(torch.bfloat16)
+    grad_output = torch.randn_like(gate)
+
+    expected = _memory_bounded_swiglu7(gate, up, output_dtype=torch.bfloat16)
+    actual = triton_swiglu7(gate, up, output_dtype=torch.bfloat16)
+    expected_grads = _memory_bounded_swiglu7_backward(gate, up, grad_output)
+    actual_grads = triton_swiglu7_backward(gate, up, grad_output)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=2e-2, atol=2e-2)
 
 
 def _sorted_layout(*, groups: int, rows_per_group: list[int], columns: int, dtype: torch.dtype):
@@ -339,6 +363,19 @@ def test_segmented_expert_autograd_is_explicit_and_packed_only() -> None:
     )
     with pytest.raises(ValueError, match="moe_expert_autograd"):
         MoEOptimizationPolicy(moe_expert_autograd="automatic")
+
+
+def test_moe_activation_backend_is_explicit() -> None:
+    policy = MoEOptimizationPolicy(
+        kernel_backend="grouped",
+        moe_activation_backend="triton",
+    )
+    assert resolve_magi2_moe_execution(policy) == Magi2GroupedMoEPlan(
+        forward_backend="auto",
+        dx_backend="auto",
+    )
+    with pytest.raises(ValueError, match="moe_activation_backend"):
+        MoEOptimizationPolicy(moe_activation_backend="automatic")
 
 
 def test_packed_experts_leave_no_reference_loop_to_fall_back_to() -> None:

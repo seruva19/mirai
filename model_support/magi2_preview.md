@@ -298,6 +298,10 @@ it does with native BF16 experts — `memory.expert_weight_access`,
 because nothing consumes them there. The exhaustive rejection of every remaining policy field is unchanged: a
 non-default value fails closed with the key named.
 
+`memory.moe_activation_backend` applies to both dense and NF4 grouped experts.
+`torch` uses the bounded reference implementation; `triton` fuses the family's
+exact FP32 SwiGLU7 forward and backward pointwise operations on CUDA.
+
 ## Training
 
 Use [`configs/magi2_preview/train_offload.toml`](../configs/magi2_preview/train_offload.toml),
@@ -336,7 +340,7 @@ startup.
 | Cache workload | Memory policy | Step time | Peak allocated VRAM | Peak process RSS |
 |---|---|---:|---:|---:|
 | 256x448x17 | 31 swapped blocks, 384-group dequantization | 3.80 s median | 29,421 MiB | 69.84 GiB |
-| 512x512x33 (`[48, 9, 32, 32]` latent) | FlexAttention, 32 swapped blocks, 512-group dequantization, segmented expert rematerialization, 40% CUDA cap | 10.49 s late-step median | 29,103 MiB | 70.21 GiB |
+| 512x512x33 (`[48, 9, 32, 32]` latent) | FlexAttention, 32 swapped blocks, 512-group dequantization, segmented expert rematerialization, fused Triton SwiGLU7, 40% CUDA cap | 9.26 s late-step median | 28,990 MiB | 69.49 GiB |
 
 The 512x512x33 measurement is the median of steps 2 through 6. Block transfers,
 NF4 dequantization, and backward rematerialization account for work that is not
@@ -724,6 +728,7 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `memory.frozen_weight_quantization` | `none` or `nf4`. `nf4` packs only the three routed expert tensors of each MoE layer and requires bitsandbytes; every other format is rejected. |
 | `memory.expert_weight_access` | `auto`, `disabled`, and `full_dequant` dequantize the whole group axis per call; `chunked_dequant` dequantizes `memory.expert_dequant_chunk_size` groups at a time. `active_dequant` and `fused_kernel` are rejected — the flattened head-major axis carries one weight slice per `(head, expert)` pair, not a per-routed-expert operand. Any non-default value requires `frozen_weight_quantization = "nf4"`. |
 | `memory.expert_dequant_chunk_size` | Groups per dequantization on the flattened `head * num_experts + expert` axis, not experts of one head. Required to be positive with `chunked_dequant`. |
+| `memory.moe_activation_backend` | `torch` or `triton`. `triton` fuses the exact FP32 SwiGLU7 clamp, sigmoid, and backward operations and requires CUDA plus Triton. |
 | `memory.quantize_experts_on_load` | Packs each routed expert tensor as its shard is read, so the released BF16 expert stack is never held whole. Requires `frozen_weight_quantization = "nf4"`. |
 | `memory.moe_kernel_backend` | `auto`, `torch`, or `grouped`. With NF4 experts `torch` is rejected: the vendored per-expert reference loop reads dense expert tensors that packed storage replaces. |
 | `adapter.type` | `lora` only. |

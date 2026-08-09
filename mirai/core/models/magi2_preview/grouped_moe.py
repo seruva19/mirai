@@ -330,6 +330,36 @@ def _memory_bounded_swiglu7_backward(
     return grad_gate, grad_up
 
 
+def _swiglu7_forward(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    output_dtype: torch.dtype,
+    backend: str,
+) -> torch.Tensor:
+    if backend == "triton":
+        from mirai.core.models.magi2_preview.triton_swiglu import triton_swiglu7
+
+        return triton_swiglu7(gate, up, output_dtype=output_dtype)
+    return _memory_bounded_swiglu7(gate, up, output_dtype=output_dtype)
+
+
+def _swiglu7_backward(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    grad_output: torch.Tensor,
+    *,
+    backend: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if backend == "triton":
+        from mirai.core.models.magi2_preview.triton_swiglu import (
+            triton_swiglu7_backward,
+        )
+
+        return triton_swiglu7_backward(gate, up, grad_output)
+    return _memory_bounded_swiglu7_backward(gate, up, grad_output)
+
+
 class _MemoryBoundedSwiGlu7(torch.autograd.Function):
     """Evaluate MAGI-2's FP32 SwiGLU7 ladder without full-size FP32 copies."""
 
@@ -356,16 +386,61 @@ class _MemoryBoundedSwiGlu7(torch.autograd.Function):
         return grad_gate, grad_up, None
 
 
+class _ConfiguredSwiGlu7(torch.autograd.Function):
+    """Dispatch the exact SwiGLU7 contract through the configured backend."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        output_dtype: torch.dtype,
+        backend: str,
+    ) -> torch.Tensor:
+        if gate.shape != up.shape:
+            raise ValueError("MAGI-2 SwiGLU7 gate/up shapes must match.")
+        ctx.save_for_backward(gate, up)
+        ctx.backend = str(backend)
+        return _swiglu7_forward(
+            gate,
+            up,
+            output_dtype=output_dtype,
+            backend=ctx.backend,
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+        gate, up = ctx.saved_tensors
+        grad_gate, grad_up = _swiglu7_backward(
+            gate,
+            up,
+            grad_output,
+            backend=ctx.backend,
+        )
+        if not ctx.needs_input_grad[0]:
+            grad_gate = None
+        if not ctx.needs_input_grad[1]:
+            grad_up = None
+        return grad_gate, grad_up, None, None
+
+
 class Magi2GroupedMoEBackend:
     """Grouped execution seam attached to vendored ``CoreMultiHeadMoE`` layers."""
 
     name = "grouped"
 
-    def __init__(self, plan: Magi2GroupedMoEPlan, *, token_chunk_size: int = 0) -> None:
+    def __init__(
+        self,
+        plan: Magi2GroupedMoEPlan,
+        *,
+        token_chunk_size: int = 0,
+        activation_backend: str = "torch",
+    ) -> None:
         if int(token_chunk_size) < 0:
             raise ValueError("MAGI-2 MoE token chunk size must be >= 0.")
         self.plan = plan
         self.token_chunk_size = int(token_chunk_size)
+        self.activation_backend = str(activation_backend)
         self._resolved: dict[str, tuple[str, str]] = {}
         self._alignment: tuple[str, ...] | None = None
 
@@ -496,10 +571,11 @@ class Magi2GroupedMoEBackend:
         x_sorted = x_rows.index_select(0, sorted_rows)
         gate = self.project(module, "W_gate", x_sorted, offsets, forward_backend, dx_backend)
         up = self.project(module, "W_up", x_sorted, offsets, forward_backend, dx_backend)
-        hidden = _MemoryBoundedSwiGlu7.apply(
+        hidden = _ConfiguredSwiGlu7.apply(
             gate,
             up,
             self.expert_weight_dtype(module, "W_down"),
+            self.activation_backend,
         )
         return self.project(
             module,
@@ -708,6 +784,7 @@ def run_segmented_grouped_expert_mlp(
     backend: str,
     max_groups: int,
     output_columns: int,
+    activation_backend: str = "torch",
 ) -> torch.Tensor:
     """Evaluate one frozen SwiGLU7 expert segment end-to-end.
 
@@ -733,9 +810,12 @@ def run_segmented_grouped_expert_mlp(
         up = _grouped_linear(rows, weight, local_offsets, backend)
         del weight
 
-        gate = gate.float().clamp(max=7.0)
-        up = up.float().clamp(min=-7.0, max=7.0)
-        hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+        hidden = _swiglu7_forward(
+            gate,
+            up,
+            output_dtype=rows.dtype,
+            backend=activation_backend,
+        )
         del gate, up
 
         weight = materialize("W_down", segment.group_start, segment.group_stop)
@@ -826,6 +906,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         store: Magi2Nf4ExpertStore,
         forward_backend: str,
         dx_backend: str,
+        activation_backend: str,
     ) -> torch.Tensor:
         boundaries = _grouped_boundaries(offsets)
         output = run_segmented_grouped_expert_mlp(
@@ -838,11 +919,13 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
             backend=forward_backend,
             max_groups=store.segment_group_span(),
             output_columns=int(x_sorted.shape[-1]),
+            activation_backend=str(activation_backend),
         )
         ctx.save_for_backward(x_sorted, offsets)
         ctx.store = store
         ctx.forward_backend = forward_backend
         ctx.dx_backend = dx_backend
+        ctx.activation_backend = str(activation_backend)
         ctx.boundaries = boundaries
         ctx.segment_span = store.segment_group_span()
         return output
@@ -887,7 +970,12 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
                 device=rows.device,
             )
             grad_hidden = _grouped_linear_dx(grad_rows, w_down, local_offsets, ctx.dx_backend)
-            grad_gate, grad_up = _memory_bounded_swiglu7_backward(gate, up, grad_hidden)
+            grad_gate, grad_up = _swiglu7_backward(
+                gate,
+                up,
+                grad_hidden,
+                backend=ctx.activation_backend,
+            )
             grad_x = _grouped_linear_dx(grad_gate, w_gate, local_offsets, ctx.dx_backend)
             grad_x.add_(_grouped_linear_dx(grad_up, w_up, local_offsets, ctx.dx_backend))
             grad_segments.append(grad_x)
@@ -898,7 +986,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
             grad_input = grad_segments[0]
         else:
             grad_input = torch.cat(grad_segments, dim=0)
-        return grad_input, None, None, None, None
+        return grad_input, None, None, None, None, None
 
 
 class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
@@ -919,8 +1007,13 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         *,
         token_chunk_size: int = 0,
         expert_autograd: str = "standard",
+        activation_backend: str = "torch",
     ) -> None:
-        super().__init__(plan, token_chunk_size=token_chunk_size)
+        super().__init__(
+            plan,
+            token_chunk_size=token_chunk_size,
+            activation_backend=activation_backend,
+        )
         self.expert_autograd = str(expert_autograd)
 
     @staticmethod
@@ -997,7 +1090,12 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         store = self._store(module)
         if torch.is_grad_enabled():
             return _SegmentedQuantizedExpertMlp.apply(
-                x_sorted, offsets, store, forward_backend, dx_backend
+                x_sorted,
+                offsets,
+                store,
+                forward_backend,
+                dx_backend,
+                self.activation_backend,
             )
         boundaries = _grouped_boundaries(offsets)
         return run_segmented_grouped_expert_mlp(
@@ -1010,6 +1108,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             backend=forward_backend,
             max_groups=store.segment_group_span(),
             output_columns=d_head,
+            activation_backend=self.activation_backend,
         )
 
 
@@ -1022,6 +1121,7 @@ _CONSUMED_POLICY_FIELDS = frozenset(
         "moe_gemm_backend",
         "moe_gemm_backend_forward",
         "moe_gemm_backend_dx",
+        "moe_activation_backend",
     }
 )
 

@@ -786,8 +786,7 @@
       "reference_path": "mirai/core/inference/conditioning.py",
       "readme_claim": "Conditioned inference",
       "readme_claims": [
-        "Native T2I and TI2V conditioning",
-        "V2V schedule-strength conditioning"
+        "Native T2I and TI2V conditioning"
       ],
       "provenance": "https://github.com/Robbyant/lingbot-video",
       "promotion_evidence": ""
@@ -2481,9 +2480,7 @@
         "Strict snapshot validation",
         "Structured prompt alignment",
         "Native text encoder and VAE",
-        "Native refiner staging",
-        "Router runtime integration",
-        "Compressed routed experts"
+        "Native refiner staging"
       ],
       "provenance": "",
       "promotion_evidence": ""
@@ -2615,11 +2612,13 @@
       ],
       "config_keys": [
         "memory.moe_kernel_backend",
-        "memory.moe_gemm_backend"
+        "memory.moe_gemm_backend",
+        "memory.moe_activation_backend"
       ],
       "disabled_config": {
         "memory.moe_kernel_backend": "auto",
-        "memory.moe_gemm_backend": "auto"
+        "memory.moe_gemm_backend": "auto",
+        "memory.moe_activation_backend": "torch"
       },
       "contract_paths": [
         "tests/test_magi2_preview_contract.py"

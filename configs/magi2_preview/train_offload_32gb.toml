@@ -38,6 +38,7 @@ expert_dequant_chunk_size = 512
 weight_residency_strategy = "block_swap"
 block_swap_prefetch_depth = 1
 moe_expert_autograd = "segmented_recompute"
+moe_activation_backend = "triton"
 minimum_system_memory_gib = 12.0
 max_pinned_host_gib = 48.0
 

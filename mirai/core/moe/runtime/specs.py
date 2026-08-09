@@ -51,6 +51,7 @@ ROUTER_QUANTIZATION_POLICIES = {"disabled", "int8_per_channel"}
 PACKED_STATE_PRELOAD_MODES = ("off", "ram", "pinned")
 PACKED_STREAM_BACKENDS = ("staged", "gds")
 MOE_EXPERT_AUTOGRAD_MODES = ("standard", "segmented_recompute")
+MOE_ACTIVATION_BACKENDS = ("torch", "triton")
 
 @dataclass(frozen=True)
 class ExpertTensorSpec:
@@ -255,6 +256,7 @@ class MoEOptimizationPolicy:
     moe_pair_dequant: bool = True
     moe_batched_gather: bool = False
     moe_expert_autograd: str = "standard"
+    moe_activation_backend: str = "torch"
     packed_shard_size_mb: int = 2048
     int8_workspace_mb: int = 0
 
@@ -287,6 +289,13 @@ class MoEOptimizationPolicy:
             raise ValueError(
                 "memory.moe_expert_autograd must be one of: "
                 + ", ".join(MOE_EXPERT_AUTOGRAD_MODES)
+                + "."
+            )
+        activation_backend = str(self.moe_activation_backend).strip().lower()
+        if activation_backend not in MOE_ACTIVATION_BACKENDS:
+            raise ValueError(
+                "memory.moe_activation_backend must be one of: "
+                + ", ".join(MOE_ACTIVATION_BACKENDS)
                 + "."
             )
         if access == "chunked_dequant" and chunk <= 0:
@@ -360,6 +369,7 @@ class MoEOptimizationPolicy:
         object.__setattr__(self, "moe_pair_dequant", bool(self.moe_pair_dequant))
         object.__setattr__(self, "moe_batched_gather", bool(self.moe_batched_gather))
         object.__setattr__(self, "moe_expert_autograd", expert_autograd)
+        object.__setattr__(self, "moe_activation_backend", activation_backend)
         object.__setattr__(self, "packed_shard_size_mb", shard_mb)
         object.__setattr__(self, "int8_workspace_mb", workspace_mb)
 
@@ -406,6 +416,7 @@ class MoEOptimizationPolicy:
             moe_pair_dequant=bool(getattr(memory, "moe_pair_dequant", True)),
             moe_batched_gather=bool(getattr(memory, "moe_batched_gather", False)),
             moe_expert_autograd=getattr(memory, "moe_expert_autograd", "standard"),
+            moe_activation_backend=getattr(memory, "moe_activation_backend", "torch"),
             packed_shard_size_mb=int(getattr(memory, "packed_shard_size_mb", 2048)),
             int8_workspace_mb=int(getattr(memory, "int8_workspace_mb", 0)),
         )
@@ -419,6 +430,7 @@ class MoEOptimizationPolicy:
             or self.router_quantization != "disabled"
             or bool(self.router_quantization_calibration_path)
             or self.kernel_backend not in {"", "auto", "torch"}
+            or self.moe_activation_backend != "torch"
         )
 
 

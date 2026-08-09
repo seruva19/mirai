@@ -82,7 +82,8 @@ sets (on top of the family defaults file):
 - `[memory]`: frozen_weight_quantization,
   frozen_weight_quantization_strategy, weight_residency_strategy,
   expert_weight_access, expert_dequant_chunk_size, quantize_experts_on_load,
-  router_quantization, moe_kernel_backend
+  router_quantization, moe_kernel_backend, moe_expert_autograd,
+  moe_activation_backend
 
 Model-family preset inventories and their family-specific behavior belong in
 the corresponding model-support reference.
@@ -3224,6 +3225,18 @@ expert input and rematerializes each packed expert segment during backward,
 bounding gate/up activation residency at the cost of extra projection work.
 Support is provider-owned; MAGI-2 implements it for NF4-packed grouped experts
 and rejects it for dense experts.
+
+### `moe_activation_backend`
+
+- **Type:** str
+- **Default:** `"torch"`
+- **Allowed / range:** `torch`, `triton`
+
+Provider-owned routed-expert activation backend. `torch` is the portable
+reference path. `triton` requires CUDA and an installed Triton runtime; a
+provider must implement its exact activation forward and input gradients or
+reject the value. MAGI-2 implements fused FP32 SwiGLU7 clamping, sigmoid, and
+backward kernels without retaining extra FP32 activation state.
 
 ### `moe_batched_dequant`
 

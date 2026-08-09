@@ -775,9 +775,18 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 expert_autograd=str(
                     getattr(policy, "moe_expert_autograd", "standard")
                 ),
+                activation_backend=str(
+                    getattr(policy, "moe_activation_backend", "torch")
+                ),
             )
         else:
-            backend = Magi2GroupedMoEBackend(plan, token_chunk_size=token_chunk_size)
+            backend = Magi2GroupedMoEBackend(
+                plan,
+                token_chunk_size=token_chunk_size,
+                activation_backend=str(
+                    getattr(policy, "moe_activation_backend", "torch")
+                ),
+            )
         cache = getattr(self, "_expert_feature_cache", None)
         if cache is not None and getattr(cache, "enabled", False):
             from mirai.core.moe.runtime.expert_feature_cache import (
