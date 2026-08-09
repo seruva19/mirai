@@ -67,7 +67,7 @@ sets (on top of the family defaults file):
 
 ### `defaults/moe.toml` (shared MoE-video defaults, loaded before a family preset)
 
-- `[model]`: type, path, dtype, attention_backend
+- `[model]`: type, path, dtype, attention_backend, hash_snapshot_contents
 - `[model.params]`: variant, flow_shift, vae_chunk_size, strict_native_assets,
   num_experts, experts_per_token, shared_experts, hidden_size, num_layers,
   attention_heads, latent_channels, patch_size, expert_capacity_factor,
@@ -145,6 +145,20 @@ isolated, and MAGI-2 additionally reproduces its per-head attention sinks on
 that path ([`flex_attention.py`](mirai/core/models/magi2_preview/flex_attention.py)).
 Explicit backends accept maskless attention only and fail rather than silently
 falling back.
+
+### `hash_snapshot_contents`
+
+- **Type:** bool
+- **Default:** `false`
+
+Controls model-root lineage fingerprinting. `false` hashes the relative path,
+byte size, and nanosecond modification time of each file without reading model
+payload bytes. `true` reads every file and records a full content SHA-256 tree.
+A validated `registration.json` or `download_manifest.json` remains the
+preferred constant-time identity in either mode. Dataset, cache, and config
+lineage retain their existing content-hash behavior; this key affects only
+`model.path` ([`lineage.py`](mirai/core/lineage.py),
+[`session_context.py`](mirai/core/training/lifecycle/session_context.py)).
 
 ### `provider_module`
 

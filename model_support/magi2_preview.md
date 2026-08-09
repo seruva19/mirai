@@ -338,12 +338,18 @@ startup.
 | 256x448x17 | 31 swapped blocks, 384-group dequantization | 3.80 s median | 29,421 MiB | 69.84 GiB |
 | 512x512x33 (`[48, 9, 32, 32]` latent) | FlexAttention, 32 swapped blocks, 512-group dequantization, segmented expert rematerialization, 40% CUDA cap | 10.49 s late-step median | 29,103 MiB | 70.21 GiB |
 
-The 512x512x33 measurement is the median of steps 2 through 6. The same workload
-on the vendored attention path, without the 32 GiB CUDA cap, measured 11.02
-s/step and 61,359 MiB peak allocated VRAM. That is a different attention
-backend, so it is a reference measurement rather than an isolated memory-policy
-A/B. Block transfers, NF4 dequantization, and backward rematerialization account
-for work that is not represented by the model's 6B active-parameter count.
+The 512x512x33 measurement is the median of steps 2 through 6. Block transfers,
+NF4 dequantization, and backward rematerialization account for work that is not
+represented by the model's 6B active-parameter count.
+
+With a direct packed-expert artifact and
+`model.hash_snapshot_contents = false`, model construction through device
+residency measured 57.49 seconds on the 512x512x33 probe: 8.20 seconds to build
+and restore the pipeline, 2.98 seconds to inject the adapter, and 46.32 seconds
+to stage block residency. The complete one-step process, including the first
+FlexAttention compile/forward/backward and final checkpoint output, took 98.38
+seconds. Setting the flag to `true` restores a full bytewise hash of the model
+tree before training.
 
 **DGX Spark (128 GiB unified).** The 128/32 profile assumes separate host and
 device pools. A unified-memory system needs its own measured residency budget;

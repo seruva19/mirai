@@ -50,9 +50,14 @@ from `CONFIG_REFERENCE.md` instead of supplying them.
    contract. Stable orchestration depends on contracts, not implementations.
 8. Comments explain constraints, tensor semantics, or provenance only. They do
    not contain development history, agent names, roadmap notes, or benchmarks.
-9. README lists only implemented behavior. Every public config key is described
-   in `CONFIG_REFERENCE.md`.
-10. Multi-GPU functionality is outside the current supported release surface.
+9. Public documentation describes only the current supported state and
+   reproducible evidence. It does not narrate development chronology, rejected
+   attempts, prior defaults, session decisions, or implementation history.
+   User-facing compatibility and migration requirements are stated as current
+   contracts without recounting how they were developed.
+10. README lists only implemented behavior. Every public config key is described
+    in `CONFIG_REFERENCE.md`.
+11. Multi-GPU functionality is outside the current supported release surface.
 
 ## Change routing
 

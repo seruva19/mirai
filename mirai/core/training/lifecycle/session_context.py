@@ -46,7 +46,12 @@ def build_session_artifact_context(
     output_root = output_plan.output_root
     dataset_snapshot = snapshot_descriptor_for_path(config.dataset.path)
     cache_snapshot = snapshot_descriptor_for_path(config.dataset.cache_path)
-    model_root_snapshot = snapshot_descriptor_for_path(config.model.path)
+    model_root_snapshot = snapshot_descriptor_for_path(
+        config.model.path,
+        hash_contents=bool(
+            getattr(config.model, "hash_snapshot_contents", False)
+        ),
+    )
     model_component = normalize_snapshot_component(
         getattr(config.model.params, "denoiser_subfolder", "transformer") or "transformer"
     )

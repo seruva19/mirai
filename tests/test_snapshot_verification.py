@@ -7,12 +7,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from mirai.core.lineage import snapshot_descriptor_for_path
 from mirai.core.moe.artifacts.manifest import write_download_manifest
 from mirai.core.moe.artifacts.verification import verify_downloaded_snapshot
 from scripts.download import _snapshot_file_inventory
 
 
 class SnapshotVerificationTests(unittest.TestCase):
+    def test_model_tree_metadata_fingerprint_avoids_content_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / "model.safetensors"
+            payload.write_bytes(b"weights")
+
+            fast = snapshot_descriptor_for_path(root, hash_contents=False)
+            strict = snapshot_descriptor_for_path(root, hash_contents=True)
+
+            self.assertTrue(fast.snapshot_id.startswith("tree-metadata-sha256:"))
+            self.assertEqual(fast.source_kind, "tree-metadata")
+            self.assertTrue(strict.snapshot_id.startswith("tree-sha256:"))
+            self.assertEqual(strict.source_kind, "tree")
+
     def test_download_inventory_excludes_local_cache_and_prior_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

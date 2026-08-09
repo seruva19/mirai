@@ -320,6 +320,7 @@ class ModelConfig:
     path: str = "./models/lingbot_video"
     dtype: str = "bf16"
     attention_backend: str = "auto"
+    hash_snapshot_contents: bool = False
     provider_module: str = ""
     params: ModelParams = field(default_factory=ModelParams)
 
@@ -716,6 +717,7 @@ class TrainingConfig:
             "path",
             "dtype",
             "attention_backend",
+            "hash_snapshot_contents",
             "provider_module",
             "params",
         }
@@ -1346,6 +1348,9 @@ class TrainingConfig:
             path=model_path,
             dtype=_validate_model_dtype(model_table.get("dtype", "bf16")),
             attention_backend=str(model_table.get("attention_backend", "auto")),
+            hash_snapshot_contents=bool(
+                model_table.get("hash_snapshot_contents", False)
+            ),
             provider_module=provider_module,
             params=ModelParams(
                 variant=str(

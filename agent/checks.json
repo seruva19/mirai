@@ -11,6 +11,7 @@
     {"path": "conftest.py", "checks": ["agent_validation", "static"]},
     {"path": "tests/test_config.py", "checks": ["agent_validation", "config", "static"]},
     {"path": "mirai/config/schema.py", "checks": ["config", "static"]},
+    {"path": "mirai/core/lineage.py", "checks": ["static", "training_lifecycle"]},
     {"path": "mirai/core/moe/routing/subset.py", "checks": ["moe_routing", "static"]},
     {"path": "mirai/core/moe/runtime/specs.py", "checks": ["compressed_weights", "moe_routing", "static"]},
     {"path": "mirai/core/moe/routing/chain_of_experts.py", "checks": ["moe_routing", "static"]},
@@ -325,6 +326,7 @@
     {
       "name": "training_lifecycle",
       "paths": [
+        "mirai/core/lineage.py",
         "mirai/core/training/",
         "mirai/core/moe/calibration/imatrix.py",
         "mirai/core/dataset/",

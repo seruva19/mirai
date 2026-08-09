@@ -262,8 +262,7 @@ to the caption body the encoder consumes
 
 `dataset.caption_format = "lingbot_json"` runs the same resolution at
 cache-encode time, so a LoRA trains on the conditioning it is later prompted
-with. Captions cached before this contract resolve to different text and their
-cache fingerprints will not match.
+with. The cache fingerprint binds the resolved conditioning text.
 
 #### Caption schema
 
@@ -314,10 +313,9 @@ rewriter, which Mirai does not ship. Mirai does not invent
 
 The family declares its negative prompt, denoise steps, CFG scale, and solver
 through the provider capability `ModelFamilyProvider.generation_defaults()`, so
-the generic `scripts/infer.py` applies them too — driving it directly no longer
-runs classifier-free guidance against an empty unconditional. The negative
-prompt text lives at `mirai/core/models/lingbot_video/default_negative_prompt.json`,
-read only by the provider.
+the generic `scripts/infer.py` applies them. The negative prompt text lives at
+`mirai/core/models/lingbot_video/default_negative_prompt.json`, read only by the
+provider.
 
 `--negative-prompt`, `--steps`, `--cfg-scale`, and `--scheduler` distinguish
 *omitted* from *explicitly set* in both entrypoints. Omitted takes the declared

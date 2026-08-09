@@ -40,6 +40,7 @@ def snapshot_descriptor_for_path(
     path: str | Path,
     *,
     manifest_candidates: tuple[str, ...] = ("registration.json", "download_manifest.json"),
+    hash_contents: bool = True,
 ) -> SnapshotDescriptor:
     resolved = Path(path).resolve()
     if not resolved.exists():
@@ -72,12 +73,21 @@ def snapshot_descriptor_for_path(
         rel = file_path.relative_to(resolved).as_posix()
         h.update(rel.encode("utf-8"))
         h.update(b"\0")
-        h.update(sha256_file(file_path).encode("ascii"))
+        if hash_contents:
+            identity = sha256_file(file_path)
+        else:
+            stat = file_path.stat()
+            identity = f"{int(stat.st_size)}:{int(stat.st_mtime_ns)}"
+        h.update(identity.encode("ascii"))
         h.update(b"\0")
     return SnapshotDescriptor(
-        snapshot_id=f"tree-sha256:{h.hexdigest()}",
+        snapshot_id=(
+            f"tree-sha256:{h.hexdigest()}"
+            if hash_contents
+            else f"tree-metadata-sha256:{h.hexdigest()}"
+        ),
         resolved_path=resolved.as_posix(),
-        source_kind="tree",
+        source_kind="tree" if hash_contents else "tree-metadata",
         source_manifest_path="",
     )
 

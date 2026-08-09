@@ -12,9 +12,8 @@
 </p>
 
 > [!NOTE]
-> **Preview release.** Mirai is under active development. Interfaces and
-> checkpoint formats may change, and defects may remain. Validate training and
-> inference artifacts before production use.
+> **Preview release.** Validate training and inference artifacts before
+> production use.
 
 ## Install
 

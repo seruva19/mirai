@@ -4,6 +4,7 @@ preset = "magi2_preview_offload"
 [model]
 path = "./models/MAGI-2-preview"
 attention_backend = "flex"
+hash_snapshot_contents = false
 
 [training]
 batch_size = 1

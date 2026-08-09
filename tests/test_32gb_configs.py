@@ -72,6 +72,7 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
     def test_magi2_training_profile_packs_experts_with_bounded_prefetch(self) -> None:
         config = _resolved(MAGI2_TRAIN, entrypoint="train")
         self.assertEqual(config.model.attention_backend, "flex")
+        self.assertFalse(config.model.hash_snapshot_contents)
         self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
         self.assertEqual(
             config.memory.frozen_weight_quantization_strategy,
