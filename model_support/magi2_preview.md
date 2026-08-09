@@ -76,8 +76,8 @@ package.
 ## Download
 
 `scripts/download.py` does not carry a MAGI-2 variant. Fetch the official
-snapshot from the release yourself and point `model.path` at the snapshot root,
-which must contain:
+[`sand-ai/MAGI-2-preview`](https://huggingface.co/sand-ai/MAGI-2-preview)
+snapshot and point `model.path` at its root, which must contain:
 
 - `preview/` with `model.safetensors.index.json` and its shards — validated
   before execution. `model.path` may also point directly at `preview/`.
@@ -137,7 +137,7 @@ alongside the 384 GiB system reserve, so this preset targets a
 large-host / single-GPU machine rather than a workstation. Lower
 `training.blocks_to_swap` only if the resident remainder fits in device memory.
 
-## Grouped MoE execution
+## Grouped MAGI-2 expert execution
 
 Training executes the multi-head routed experts through the vendored per-expert
 reference loop by default (`memory.moe_kernel_backend` at `auto` or `torch`).
@@ -187,7 +187,7 @@ so `inference.expert_feature_cache` — cross-timestep expert-branch reuse durin
 sampling — requires `memory.moe_kernel_backend = "grouped"`. Its knobs are
 described in [`CONFIG_REFERENCE.md`](../CONFIG_REFERENCE.md).
 
-## NF4 routed experts
+## NF4-packed MAGI-2 routed experts
 
 `memory.frozen_weight_quantization = "nf4"` stores the routed expert stack in
 NF4 instead of BF16. Exactly three tensors per MoE layer are packed —
@@ -315,13 +315,14 @@ python scripts/train.py \
 
 [`configs/magi2_preview/train_offload_32gb.toml`](../configs/magi2_preview/train_offload_32gb.toml)
 targets a 32 GiB device with 128 GiB of system RAM. It packs routed experts as
-NF4 while reading the checkpoint, swaps 33 preview blocks with one-block
-asynchronous prefetch, dequantizes 384 flattened expert groups per segment, and
+NF4 while reading the checkpoint, uses sink-aware FlexAttention, swaps 32
+preview blocks with one-block
+asynchronous prefetch, dequantizes 512 flattened expert groups per segment, and
 rematerializes complete packed expert segments in backward instead of retaining
 their wide gate/up graph. It uses batch size 1 with whole-block recomputation
-and targets 33 frames at 512x512. Selective activation offload is capped at 48
-GiB, and the profile keeps a 12 GiB free-RAM floor while permitting up to 48
-GiB of pinned host memory. Every choice is an explicit TOML value; the trainer
+and targets 33 frames at 512x512 without activation offload. The profile keeps
+a 12 GiB free-RAM floor while permitting up to 48 GiB of pinned host memory.
+Every choice is an explicit TOML value; the trainer
 does not select a profile from detected RAM, VRAM, GPU model, or sample
 dimensions.
 
@@ -335,18 +336,14 @@ startup.
 | Cache workload | Memory policy | Step time | Peak allocated VRAM | Peak process RSS |
 |---|---|---:|---:|---:|
 | 256x448x17 | 31 swapped blocks, 384-group dequantization | 3.80 s median | 29,421 MiB | 69.84 GiB |
-| 512x512x33 (`[48, 9, 32, 32]` latent) | 33 swapped blocks, selective activation offload, segmented expert rematerialization, 40% CUDA cap | 55.89, 43.66, 366.73, 31.45 s | 31,115.7 MiB | 78.59 GiB |
+| 512x512x33 (`[48, 9, 32, 32]` latent) | FlexAttention, 32 swapped blocks, 512-group dequantization, segmented expert rematerialization, 40% CUDA cap | 10.49 s late-step median | 29,103 MiB | 70.21 GiB |
 
-The 512x512x33 series establishes the 32 GiB VRAM and 128 GiB RAM fit. Its four
-step times are reported individually because the 366.73-second sample makes the
-series too short for a stable throughput estimate.
-
-The same 512x512x33 workload takes about 11 seconds per step with approximately
-61 GiB of available VRAM. Constraining it to 32 GiB currently gives a
-non-outlier median of 43.66 seconds per step, about 4x slower. The difference is
-the cost of block residency transfers, activation offload, NF4 dequantization,
-and backward rematerialization; the model's 6B active-parameter count does not
-include those data-movement and recomputation costs.
+The 512x512x33 measurement is the median of steps 2 through 6. The same workload
+on the vendored attention path, without the 32 GiB CUDA cap, measured 11.02
+s/step and 61,359 MiB peak allocated VRAM. That is a different attention
+backend, so it is a reference measurement rather than an isolated memory-policy
+A/B. Block transfers, NF4 dequantization, and backward rematerialization account
+for work that is not represented by the model's 6B active-parameter count.
 
 **DGX Spark (128 GiB unified).** The 128/32 profile assumes separate host and
 device pools. A unified-memory system needs its own measured residency budget;
@@ -372,7 +369,7 @@ pressure of its own. Routing becomes observable only through the opt-in
 telemetry below, which the family declares by reporting
 `emits_router_metrics = true` when — and only when — that gate is set.
 
-### Routing-collapse telemetry
+### MAGI-2 routing-collapse telemetry
 
 `model.params.moe_routing_health = true` (default `false`) arms detached
 per-step routing diagnostics for this family
@@ -446,25 +443,6 @@ python scripts/train.py \
   --config configs/magi2_preview/train_offload.toml \
   --resume <checkpoint-path>
 ```
-
-## Optimization
-
-The measured 128 GiB RAM / 32 GiB VRAM training profile is
-[`train_offload_32gb.toml`](../configs/magi2_preview/train_offload_32gb.toml).
-Its relevant settings are NF4 expert packing on load, 31 asynchronously swapped
-blocks with one-block prefetch, 384-group expert dequantization chunks, standard
-whole-block checkpointing, and activation-space evaluation of the frozen base
-plus LoRA update. The last mechanism is automatic for compatible native MAGI-2
-projections; it has no separate configuration key.
-
-| measured workload | training rate | peak process VRAM | peak host RSS |
-|---|---:|---:|---:|
-| Batch 1, rank-16 `attn_router` LoRA, 17 frames at 256x448; late-step median on one H100 80 GB using the 32 GiB residency profile | 3.80 s/step | 29,421 MiB | 69.84 GiB |
-
-The memory result establishes headroom under the profile's 32 GiB device and
-128 GiB host ceilings for this workload. The timing is H100-specific; it is not
-a throughput claim for a consumer 32 GiB GPU. Startup checkpoint conversion is
-outside the per-step measurement.
 
 ## Inference
 
@@ -681,6 +659,15 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 - **MAGI-2 Preview single-GPU adapter training** — Adapter-only optimization
   with native preview-transformer weights and gradients.
   [(repo)](https://github.com/SandAI-org/MAGI-2-preview)
+- **Host-resident MAGI-2 block streaming** — Frozen preview-transformer blocks
+  use the configured residency policy while adapter tensors remain on device.
+- **Grouped MAGI-2 expert execution** — The family-owned grouped seam evaluates
+  the preview transformer's flattened head/expert axis without a dense
+  per-expert Python loop.
+- **NF4-packed MAGI-2 routed experts** — Routed expert stores can be restored
+  from a versioned packed artifact and dequantized in bounded segments.
+- **MAGI-2 routing-collapse telemetry** — Optional detached observations report
+  per-layer/head expert-use health during training.
 - **Trainable MAGI-2 attention** —
   `model.attention_backend = "flex"` routes packed attention through a backend
   with a backward pass instead of the dense-mask reference path autograd

@@ -71,6 +71,7 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
 
     def test_magi2_training_profile_packs_experts_with_bounded_prefetch(self) -> None:
         config = _resolved(MAGI2_TRAIN, entrypoint="train")
+        self.assertEqual(config.model.attention_backend, "flex")
         self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
         self.assertEqual(
             config.memory.frozen_weight_quantization_strategy,
@@ -85,6 +86,9 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.training.block_swap_mode, "async")
         self.assertEqual(config.memory.block_swap_prefetch_depth, 1)
+        self.assertEqual(config.training.blocks_to_swap, 32)
+        self.assertFalse(config.training.activation_cpu_offload)
+        self.assertEqual(config.memory.expert_dequant_chunk_size, 512)
 
     def test_magi2_inference_profile_streams_every_block_synchronously(self) -> None:
         config = _resolved(MAGI2_INFER, entrypoint="infer")
@@ -114,8 +118,8 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         for frames in config.dataset.frame_buckets:
             # The native cache path trims video to 8n + 1 frames.
             self.assertEqual((int(frames) - 1) % 8, 0)
-            self.assertLessEqual(int(frames), 17)
-        self.assertEqual(config.dataset.bucket_resolutions, ["256x448"])
+            self.assertEqual(int(frames), 33)
+        self.assertEqual(config.dataset.bucket_resolutions, ["512x512"])
 
     def test_magi2_inference_never_co_resides_auxiliary_models(self) -> None:
         config = _resolved(MAGI2_INFER, entrypoint="infer")

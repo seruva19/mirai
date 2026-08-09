@@ -6,7 +6,9 @@ dependency.
 
 ## Download
 
-Download the public snapshot without a token:
+Download the public
+[`robbyant/lingbot-video-moe-30b-a3b`](https://huggingface.co/robbyant/lingbot-video-moe-30b-a3b)
+snapshot without a token:
 
 ```bash
 python scripts/download.py \

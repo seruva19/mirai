@@ -3,18 +3,15 @@ preset = "magi2_preview_offload"
 
 [model]
 path = "./models/MAGI-2-preview"
+attention_backend = "flex"
 
 [training]
 batch_size = 1
-blocks_to_swap = 33
+blocks_to_swap = 32
 block_swap_mode = "async"
 gradient_checkpointing = "standard"
 moe_token_chunk_size = 0
-activation_cpu_offload = true
-activation_cpu_offload_min_mib = 8
-activation_cpu_offload_max_gib = 48.0
-activation_cpu_offload_pin_memory = false
-activation_cpu_offload_view_replay = false
+activation_cpu_offload = false
 
 [adapter]
 type = "lora"
@@ -36,7 +33,7 @@ frozen_weight_quantization_strategy = "compressed_weights"
 quantize_experts_on_load = true
 moe_kernel_backend = "grouped"
 expert_weight_access = "chunked_dequant"
-expert_dequant_chunk_size = 384
+expert_dequant_chunk_size = 512
 weight_residency_strategy = "block_swap"
 block_swap_prefetch_depth = 1
 moe_expert_autograd = "segmented_recompute"
