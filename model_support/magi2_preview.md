@@ -210,8 +210,8 @@ parameters held. Applied to a `114B-A6B` release whose roughly 228 GB is
 overwhelmingly routed experts, that is the difference between a host that must
 hold the whole BF16 stack and one that does not, and between a swapped block
 carrying its full BF16 expert triple and one carrying the packed payload. No
-throughput claim is attached: dequantization is additional work per forward and
-per backward, and this repository has published no latency measurement for it.
+throughput claim is implied by the storage ratio: dequantization remains
+additional work per forward and per backward.
 
 ### Load path
 
@@ -221,6 +221,27 @@ removed from the vendored layers before any shard is opened, the remaining
 checkpoint keys load normally, and each routed tensor is then read from its
 safetensors shard, packed, and released before the next one is read. Peak host
 cost is one dense expert tensor rather than the expert stack.
+
+For repeated runs, export the already-quantized stores once and set
+`memory.frozen_weight_packed_state_path` to the resulting directory. The
+provider-owned schema stores a versioned manifest and one NF4 safetensors shard
+per routed-expert layer. Restore checks model variant, denoiser subfolder,
+topology, group count, block size, shapes, dtypes, and the complete buffer
+inventory. Layer shards are copied and unmapped one at a time, so direct restore
+does not retain a second file-backed copy of the 53 GB payload.
+
+```bash
+python scripts/tools/export_compressed_weights_packed_state.py \
+  --config configs/magi2_preview/train_offload_32gb.toml \
+  --output /path/to/magi2-preview-nf4
+```
+
+On the measured 17-frame 256x448 workload, direct restore reached the first
+training step in 330 seconds, with 29,563 MiB peak process VRAM, 69.42 GiB peak
+host RSS, and a 3.67 s/step late median over the five-step probe. Artifact
+creation is a one-time operation; it took 210 seconds and produced
+56,084,859,648 packed bytes in the measured environment. These measurements
+describe that workload and hardware rather than a universal throughput claim.
 
 Without that key the family still packs the experts, but only after the released
 BF16 checkpoint has been fully loaded, so the host must have been able to hold it

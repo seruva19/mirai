@@ -578,13 +578,13 @@ def test_magi2_provider_declares_moe_kernel_backend_capability() -> None:
     pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
     capabilities = pipeline.get_memory_feature_capabilities()
     assert capabilities.moe_kernel_backend
-    # Packed routed experts add the expert-storage controls; the router keeps
-    # its released FP32 projection and there is no packed-state artifact path.
+    # Packed routed experts add the expert-storage and direct-restore controls;
+    # the router keeps its released FP32 projection.
     assert capabilities.quantized_frozen_weights
     assert capabilities.expert_tensor_specs
     assert capabilities.expert_weight_access_policy
     assert capabilities.quantize_experts_on_load
-    assert not capabilities.packed_frozen_weight_state
+    assert capabilities.packed_frozen_weight_state
     assert not capabilities.router_quantization_policy
     assert not capabilities.trainable_parameter_offload
 

@@ -171,23 +171,28 @@ def export_compressed_weights_packed_state_from_config(
         raise ValueError(
             f"model.type='{config.model.type}' does not expose a training model for export."
         )
-    saved_path = save_compressed_weights_packed_state(
-        output_path,
-        training_model,
-        storage_alignment_bytes=(
-            GDS_STORAGE_ALIGNMENT_BYTES
-            if config.memory.packed_stream_backend == "gds" else 0
+    artifact_metadata = {
+        "model_type": str(config.model.type),
+        "model_variant": str(config.model.params.variant),
+        "denoiser_subfolder": str(
+            getattr(config.model.params, "denoiser_subfolder", "transformer") or "transformer"
         ),
-        metadata={
-            "model_type": str(config.model.type),
-            "model_variant": str(config.model.params.variant),
-            "denoiser_subfolder": str(
-                getattr(config.model.params, "denoiser_subfolder", "transformer") or "transformer"
-            ),
-            "strategy": "compressed_weights",
-            "quant_format": scheme,
-        },
+        "strategy": "compressed_weights",
+        "quant_format": scheme,
+    }
+    saved_path = pipeline.save_packed_frozen_weight_state(
+        output_path, metadata=artifact_metadata
     )
+    if saved_path is None:
+        saved_path = save_compressed_weights_packed_state(
+            output_path,
+            training_model,
+            storage_alignment_bytes=(
+                GDS_STORAGE_ALIGNMENT_BYTES
+                if config.memory.packed_stream_backend == "gds" else 0
+            ),
+            metadata=artifact_metadata,
+        )
     report = pipeline.get_quantized_frozen_weight_report() or {}
     return {
         "status": "ok",

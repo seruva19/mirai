@@ -573,6 +573,16 @@ class BasePipeline(ABC):
         """Return whether frozen weights are stored in quantized form."""
         return False
 
+    def save_packed_frozen_weight_state(
+        self,
+        path: Any,
+        *,
+        metadata: dict[str, str] | None = None,
+    ) -> Any | None:
+        """Persist a provider-owned packed artifact, or defer to the generic saver."""
+        _ = path, metadata
+        return None
+
     def set_compute_autocast_dtype(self, dtype: Any) -> None:
         """Record the intended mixed-precision compute dtype for forward passes."""
         self._compute_autocast_dtype = dtype

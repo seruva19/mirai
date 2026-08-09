@@ -23,6 +23,10 @@ from mirai.core.models.magi2_preview.grouped_moe import (
     run_segmented_grouped_linear,
 )
 from mirai.core.models.magi2_preview.pipeline import LowRankWeight, Magi2PreviewPipeline
+from mirai.core.models.magi2_preview.packed_experts import (
+    load_magi2_nf4_packed_state,
+    save_magi2_nf4_packed_state,
+)
 from mirai.core.models.magi2_preview.quantized_experts import (
     MAGI2_ROUTED_EXPERT_TENSOR_NAMES,
     Magi2Nf4ExpertStore,
@@ -515,6 +519,51 @@ def _dense_from_store(store: Magi2Nf4ExpertStore, key: str) -> torch.Tensor:
     return store.materialize_segment(
         key, 0, groups, dtype=torch.bfloat16, device=torch.device("cuda")
     )
+
+
+@_requires_nf4
+def test_magi2_nf4_packed_state_round_trip(tmp_path) -> None:
+    source_module = _reduced_moe(
+        device=torch.device("cuda"), dtype=torch.bfloat16
+    )
+    source_container = _container(source_module)
+    source_store = quantize_magi2_experts_in_place(source_container)[
+        "mlp.moe_mlp"
+    ]
+    artifact = tmp_path / "magi2_nf4.safetensors"
+    save_magi2_nf4_packed_state(
+        artifact, source_container, metadata={"model_variant": "reduced"}
+    )
+
+    mismatch_module = _reduced_moe(
+        device=torch.device("cpu"), dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="model_variant"):
+        load_magi2_nf4_packed_state(
+            artifact,
+            _container(mismatch_module),
+            blocksize=source_store.blocksize,
+            expected_metadata={"model_variant": "another-model"},
+        )
+
+    restored_module = _reduced_moe(
+        device=torch.device("cpu"), dtype=torch.bfloat16
+    )
+    restored_container = _container(restored_module)
+    restored_store = load_magi2_nf4_packed_state(
+        artifact, restored_container, blocksize=source_store.blocksize
+    )["mlp.moe_mlp"]
+
+    assert restored_store.payload_bytes() == source_store.payload_bytes()
+    for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+        assert restored_store.expert_weight_shape(key) == source_store.expert_weight_shape(key)
+        expected = source_store.materialize_segment(
+            key, 0, source_store.num_groups, dtype=torch.bfloat16, device=torch.device("cuda")
+        )
+        actual = restored_store.materialize_segment(
+            key, 0, restored_store.num_groups, dtype=torch.bfloat16, device=torch.device("cuda")
+        )
+        assert torch.equal(actual, expected)
 
 
 @_requires_nf4

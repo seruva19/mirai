@@ -252,6 +252,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._quantize_experts_on_load = bool(
             getattr(memory_config, "quantize_experts_on_load", False)
         )
+        self._packed_expert_state_path = str(
+            getattr(memory_config, "frozen_weight_packed_state_path", "") or ""
+        ).strip()
         self._nf4_blocksize = int(
             getattr(memory_config, "quantization_block_size", MAGI2_NF4_BLOCKSIZE)
         )
@@ -366,7 +369,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         checkpoint_dir = model_path / "preview" if (model_path / "preview").is_dir() else model_path
         config.engine_config.load = str(checkpoint_dir)
         transformer = Transformer(config.arch_config, ep_size=1)
-        if self._quantizes_experts_on_load():
+        if self._quantizes_experts_on_load() or self._packed_expert_state_path:
             # Drop the dense routed-expert parameters before any shard is read.
             # ``load_magi2_model_state_dict`` reads exactly the keys the model
             # still declares, so the released expert stack never enters host
@@ -382,11 +385,33 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             state = load_magi2_model_state_dict(transformer, config.engine_config)
             transformer.load_state_dict(state, strict=True)
             del state
-            self._expert_stores = stream_quantize_magi2_experts(
-                transformer,
-                checkpoint_dir=str(checkpoint_dir),
-                blocksize=self._nf4_blocksize,
-            )
+            if self._packed_expert_state_path:
+                from mirai.core.models.magi2_preview.packed_experts import (
+                    load_magi2_nf4_packed_state,
+                )
+
+                self._expert_stores = load_magi2_nf4_packed_state(
+                    self._packed_expert_state_path,
+                    transformer,
+                    blocksize=self._nf4_blocksize,
+                    expected_metadata={
+                        "model_variant": str(self.model_config.params.variant),
+                        "denoiser_subfolder": str(
+                            getattr(
+                                self.model_config.params,
+                                "denoiser_subfolder",
+                                "transformer",
+                            )
+                            or "transformer"
+                        ),
+                    },
+                )
+            else:
+                self._expert_stores = stream_quantize_magi2_experts(
+                    transformer,
+                    checkpoint_dir=str(checkpoint_dir),
+                    blocksize=self._nf4_blocksize,
+                )
         else:
             state = load_magi2_model_state_dict(transformer, config.engine_config)
             transformer.load_state_dict(state, strict=True)
@@ -608,12 +633,27 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return MemoryFeatureCapabilities(
             block_swap=True,
             quantized_frozen_weights=True,
+            packed_frozen_weight_state=True,
             weight_residency_strategy=True,
             runtime_offload_flush=True,
             expert_tensor_specs=True,
             expert_weight_access_policy=True,
             quantize_experts_on_load=True,
             moe_kernel_backend=True,
+        )
+
+    def save_packed_frozen_weight_state(
+        self,
+        path: Any,
+        *,
+        metadata: dict[str, str] | None = None,
+    ) -> Any:
+        from mirai.core.models.magi2_preview.packed_experts import (
+            save_magi2_nf4_packed_state,
+        )
+
+        return save_magi2_nf4_packed_state(
+            path, self.transformer, metadata=metadata
         )
 
     def _quantizes_experts_on_load(self) -> bool:

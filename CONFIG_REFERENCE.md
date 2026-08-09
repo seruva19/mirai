@@ -2988,7 +2988,7 @@ Quantization implementation strategy. `compressed_weights` supports every format
 - **Default:** `""`
 - **Allowed / range:** no control chars
 
-Prebuilt packed compressed-weight state path; requires the matching `frozen_weight_quantization` value and the `packed_frozen_weight_state` capability. Artifacts use `mirai.compressed_weights.packed_state`.
+Prebuilt packed compressed-weight state path; requires the matching `frozen_weight_quantization` value and the `packed_frozen_weight_state` capability. Generic compressed experts use `mirai.compressed_weights.packed_state`; providers whose native expert layout cannot implement that tensor contract may declare their own versioned, lineage-checked artifact through the same capability. MAGI-2 Preview uses a manifest plus one NF4 safetensors shard per routed-expert layer so each input mapping can be released before the next layer is restored.
 
 ### `expert_precision_plan_path`
 

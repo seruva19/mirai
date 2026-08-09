@@ -132,6 +132,92 @@ class Magi2Nf4ExpertStore(nn.Module):
             return max(1, min(self.num_groups, int(self.expert_dequant_chunk_size)))
         return self.num_groups
 
+    @property
+    def blocksize(self) -> int:
+        """NF4 block size encoded by this store."""
+        return self._blocksize
+
+    def packed_state_descriptor(self) -> dict[str, object]:
+        """Version-independent metadata needed to restore this exact payload."""
+        if not self.is_fully_loaded() or self._meta is None:
+            raise Magi2QuantizedExpertError(
+                "MAGI-2 NF4 store must be complete before it can be persisted."
+            )
+        meta = self._meta
+        return {
+            "num_groups": self.num_groups,
+            "blocksize": self._blocksize,
+            "expert_shapes": {
+                key: list(self.expert_weight_shape(key))
+                for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+            },
+            "expert_dtypes": {
+                key: str(self.expert_weight_dtype(key)).removeprefix("torch.")
+                for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+            },
+            "nf4_meta": {
+                "blocksize": meta.blocksize,
+                "nested_blocksize": meta.nested_blocksize,
+                "nested_dtype": str(meta.nested_dtype).removeprefix("torch."),
+                "weight_dtype": str(meta.weight_dtype).removeprefix("torch."),
+            },
+            "buffers": sorted(name for name, _value in self.named_buffers(recurse=False)),
+        }
+
+    def restore_packed_state(
+        self,
+        *,
+        descriptor: dict[str, object],
+        buffers: dict[str, torch.Tensor],
+    ) -> None:
+        """Restore a validated persisted payload without dense reconstruction."""
+        if int(descriptor.get("num_groups", -1)) != self.num_groups:
+            raise Magi2QuantizedExpertError("Packed MAGI-2 store has incompatible groups.")
+        if int(descriptor.get("blocksize", -1)) != self._blocksize:
+            raise Magi2QuantizedExpertError(
+                "Packed MAGI-2 store has incompatible NF4 blocksize."
+            )
+
+        def parse_dtype(value: object) -> torch.dtype:
+            dtype = getattr(torch, str(value), None)
+            if not isinstance(dtype, torch.dtype):
+                raise Magi2QuantizedExpertError(
+                    f"Packed MAGI-2 store declares unknown dtype '{value}'."
+                )
+            return dtype
+
+        shapes = descriptor.get("expert_shapes")
+        dtypes = descriptor.get("expert_dtypes")
+        if not isinstance(shapes, dict) or not isinstance(dtypes, dict):
+            raise Magi2QuantizedExpertError(
+                "Packed MAGI-2 store has incomplete tensor metadata."
+            )
+        expected_names = set(MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
+        if set(shapes) != expected_names or set(dtypes) != expected_names:
+            raise Magi2QuantizedExpertError(
+                "Packed MAGI-2 store has incomplete expert metadata."
+            )
+        raw_meta = descriptor.get("nf4_meta")
+        if not isinstance(raw_meta, dict):
+            raise Magi2QuantizedExpertError("Packed MAGI-2 store has no NF4 metadata.")
+        self._meta = _Nf4Meta(
+            blocksize=int(raw_meta["blocksize"]),
+            nested_blocksize=int(raw_meta["nested_blocksize"]),
+            nested_dtype=parse_dtype(raw_meta["nested_dtype"]),
+            weight_dtype=parse_dtype(raw_meta["weight_dtype"]),
+        )
+        self._shapes = {
+            key: tuple(int(dim) for dim in shapes[key]) for key in expected_names
+        }
+        self._dtypes = {key: parse_dtype(dtypes[key]) for key in expected_names}
+        expected_buffers = set(descriptor.get("buffers", []))
+        if expected_buffers != set(buffers):
+            raise Magi2QuantizedExpertError(
+                "Packed MAGI-2 store buffer inventory does not match its descriptor."
+            )
+        for name, value in buffers.items():
+            self._set_buffer(name, value)
+
     # -- storage -----------------------------------------------------------
     def _set_buffer(self, name: str, value: torch.Tensor) -> None:
         if name in self._buffers:
