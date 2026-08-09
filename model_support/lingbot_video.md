@@ -149,6 +149,23 @@ text_to_video = 6
 image_to_video = 3
 ```
 
+## Optimization
+
+The measured 128 GiB RAM / 32 GiB VRAM training profile is
+[`train_nf4_32gb.toml`](../configs/lingbot_video/train_nf4_32gb.toml). It uses
+NF4 packing on load, the paged 8-bit AdamW optimizer without fallback,
+aggressive activation checkpointing, 16 asynchronously swapped blocks with
+one-block prefetch, 32-expert dequantization chunks, and a 16 GiB pinned-host
+ceiling.
+
+| measured workload | training rate | peak process VRAM | peak host RSS |
+|---|---:|---:|---:|
+| Batch 1 with accumulation 2, rank-32 `attn_router_routed_experts` LoRA, 17 frames at 256x448; late-step median on one H100 80 GB with a 30.88 GiB allocator cap | 6.16 s/step | 32,420 MiB | 28.93 GiB |
+
+This establishes the profile's measured memory envelope for the stated
+workload. The timing is H100-specific; it is not a throughput claim for a
+consumer 32 GiB GPU.
+
 ## Inference
 
 The example [`inference_bf16.toml`](../configs/lingbot_video/inference_bf16.toml)
@@ -287,29 +304,11 @@ build instead of silently entering the cache.
 
 #### Why the caption schema matters
 
-An off-schema caption is off-distribution conditioning, not a formatting
-detail. On one fixed scene and seed, holding everything but the caption
-constant, decoder activations overshoot the VAE output range by:
-
-| Caption | Decoder overshoot | Result |
-|---|---|---|
-| Bare sentence, wrapped into the minimal body | 9.09% | Posterized, over-saturated, flat silhouettes, banding, rainbow fringing |
-| Malformed caption — schema field names, wrong types | 1.94% | Still posterized |
-| Schema-valid rich caption | ~0.9% | Photorealistic |
-
-For reference, a real encoded video sits at 0.85% under the same measurement.
-Scene content stays correct in every case; what degrades is appearance. This is
-the model’s response to the caption, not a Mirai defect: the release’s own
-runner reproduces the same degradation on the same malformed caption (1.72%
-overshoot upstream against 1.94% here), and on a schema-valid caption the two
-runners are indistinguishable (mean saturation 0.3106 upstream against 0.3139
-here).
-
-The supported way to obtain a caption is the release’s two-stage LLM rewriter,
-which Mirai does not ship. Mirai does not substitute for it: it will not invent
-`prominent_elements`, `camera_info`, or action timestamps from a sentence,
-because a fabricated caption is off-distribution content carrying Mirai’s
-signature rather than the release’s.
+The caption body is model conditioning rather than presentation-only metadata,
+so changing its fields or serialization changes the encoder input. The
+supported way to obtain a complete caption is the release's two-stage LLM
+rewriter, which Mirai does not ship. Mirai does not invent
+`prominent_elements`, `camera_info`, or action timestamps from a sentence.
 
 The family declares its negative prompt, denoise steps, CFG scale, and solver
 through the provider capability `ModelFamilyProvider.generation_defaults()`, so
@@ -321,10 +320,8 @@ read only by the provider.
 `--negative-prompt`, `--steps`, `--cfg-scale`, and `--scheduler` distinguish
 *omitted* from *explicitly set* in both entrypoints. Omitted takes the declared
 family value; anything passed explicitly wins. An explicit
-`--negative-prompt ""` is honored and prints a warning naming what degrades:
-guidance then steers away from an unconditional carrying none of the family's
-quality and artifact terms, which weakens predicted structure at high sigma and
-inflates latent magnitude.
+`--negative-prompt ""` is honored and prints a warning that the family default
+has been disabled.
 
 Use `--quant nf4` for the compressed frozen-base path. Native Euler, Flow-UniPC,
 and DPM++ 2M solvers are available; refiner execution is controlled by the
@@ -367,18 +364,10 @@ defaults.
   text-plus-image video generation preserve the release’s VAE first-frame and
   Qwen3-VL visual-token semantics.
   [(repo)](https://github.com/Robbyant/lingbot-video)
-- **V2V schedule-strength conditioning** — Source-video latents enter a
-  truncated native flow schedule at a configurable noise strength.
-  [(repo)](https://github.com/modelscope/DiffSynth-Studio/pull/1545)
 - **Native refiner staging** — Base denoising can hand off latents to the
-  family-specific refinement stage with explicit solver and resolution control.
+  released family-specific refinement stage with its native solver and
+  resolution semantics.
   [(repo)](https://github.com/Robbyant/lingbot-video)
-- **Router runtime integration** — Balance objectives, dataset specialization,
-  subset schedules, iterative expert communication, distillation, and routing
-  diagnostics attach through LingBot-owned runtime hooks and shared policy
-  objects.
-- **Compressed routed experts** — Native expert modules support packed restore,
-  bounded dequantization, vectorized dispatch, and adapter gradients.
 
 ## Model-specific configuration
 

@@ -447,6 +447,25 @@ python scripts/train.py \
   --resume <checkpoint-path>
 ```
 
+## Optimization
+
+The measured 128 GiB RAM / 32 GiB VRAM training profile is
+[`train_offload_32gb.toml`](../configs/magi2_preview/train_offload_32gb.toml).
+Its relevant settings are NF4 expert packing on load, 31 asynchronously swapped
+blocks with one-block prefetch, 384-group expert dequantization chunks, standard
+whole-block checkpointing, and activation-space evaluation of the frozen base
+plus LoRA update. The last mechanism is automatic for compatible native MAGI-2
+projections; it has no separate configuration key.
+
+| measured workload | training rate | peak process VRAM | peak host RSS |
+|---|---:|---:|---:|
+| Batch 1, rank-16 `attn_router` LoRA, 17 frames at 256x448; late-step median on one H100 80 GB using the 32 GiB residency profile | 3.80 s/step | 29,421 MiB | 69.84 GiB |
+
+The memory result establishes headroom under the profile's 32 GiB device and
+128 GiB host ceilings for this workload. The timing is H100-specific; it is not
+a throughput claim for a consumer 32 GiB GPU. Startup checkpoint conversion is
+outside the per-step measurement.
+
 ## Inference
 
 Inference uses the same native denoiser and the same block-residency path as
@@ -669,8 +688,6 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   per-head attention sinks retain their reference semantics, including sink
   parameter gradients.
   [(FlexAttention)](https://pytorch.org/blog/flexattention/)
-- **Host-resident MAGI-2 block streaming** — Frozen transformer blocks move to
-  the execution device only for their forward/backward window.
 - **Native MAGI-2 inference** — The provider uses the same native denoiser and
   residency path for sampling; the denoiser is a plain `torch.nn.Module` and
   Diffusers is imported nowhere in loading or in a forward pass.
@@ -689,22 +706,6 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   into compact key-interval unions and constructs sparse block metadata directly;
   it never materializes the released 1080p query-by-key mask.
   [(FlexAttention)](https://pytorch.org/blog/flexattention/)
-- **Grouped MAGI-2 expert execution** — Optional grouped-GEMM execution of the
-  multi-head routed experts during training, selected by
-  `memory.moe_kernel_backend="grouped"`, with the vendored per-expert loop
-  retained as the reference path.
-- **NF4-packed MAGI-2 routed experts** — Optional NF4 storage for the three
-  routed expert tensors of each MoE layer, selected by
-  `memory.frozen_weight_quantization="nf4"`. With
-  `memory.quantize_experts_on_load` the expert stack is packed while the
-  checkpoint is read, so it never exists in host memory as one dense copy.
-  Grouped execution dequantizes contiguous group segments on demand and
-  re-materializes them in backward, so no dense expert weight survives in
-  autograd. [(QLoRA)](https://arxiv.org/abs/2305.14314)
-- **MAGI-2 routing-collapse telemetry** — Optional default-off per-`(layer,
-  head)` routing diagnostics for a family that publishes no router statistic of
-  its own, taken from the expert-execution seam without modifying the vendored
-  runtime. [(diagnosis)](https://arxiv.org/abs/2605.19378)
 
 ## Model-specific configuration
 
