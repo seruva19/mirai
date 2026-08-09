@@ -15,6 +15,8 @@ from torch.nn.utils import parametrize
 from mirai.config.loader import load_config
 from mirai.core.models.magi2_preview.grouped_moe import (
     _CONSUMED_POLICY_FIELDS,
+    _MemoryBoundedSwiGlu7,
+    _QUANTIZED_CONSUMED_POLICY_FIELDS,
     Magi2GroupedMoEBackend,
     Magi2GroupedMoEPlan,
     Magi2GroupedMoEPolicyError,
@@ -250,6 +252,22 @@ def test_magi2_grouped_moe_matches_reference_loop_on_cpu() -> None:
         assert torch.allclose(expected, actual, rtol=1e-5, atol=1e-6)
     assert reference[3].abs().max() > 0.0
     assert reference[4].abs().max() > 0.0
+
+
+def test_magi2_fp32_swiglu_reference_keeps_saved_operands_immutable() -> None:
+    torch.manual_seed(23)
+    gate = torch.randn(5, 7, requires_grad=True)
+    up = torch.randn(5, 7, requires_grad=True)
+    gate_before = gate.detach().clone()
+    up_before = up.detach().clone()
+
+    output = _MemoryBoundedSwiGlu7.apply(gate, up, torch.float32)
+    output.square().mean().backward()
+
+    torch.testing.assert_close(gate, gate_before, rtol=0, atol=0)
+    torch.testing.assert_close(up, up_before, rtol=0, atol=0)
+    assert gate.grad is not None and torch.isfinite(gate.grad).all()
+    assert up.grad is not None and torch.isfinite(up.grad).all()
 
 
 def test_magi2_grouped_moe_matches_reference_loop_in_bf16_on_cpu() -> None:
@@ -530,7 +548,10 @@ _NON_DEFAULT_POLICY_VALUES: dict[str, dict[str, object]] = {
 
 def test_magi2_policy_rejection_covers_every_unconsumed_field() -> None:
     declared = {field.name for field in dataclasses.fields(MoEOptimizationPolicy)}
-    assert set(_NON_DEFAULT_POLICY_VALUES) | set(_CONSUMED_POLICY_FIELDS) == declared
+    assert (
+        set(_NON_DEFAULT_POLICY_VALUES) | set(_QUANTIZED_CONSUMED_POLICY_FIELDS)
+        == declared
+    )
 
 
 @pytest.mark.parametrize("field_name", sorted(_NON_DEFAULT_POLICY_VALUES))

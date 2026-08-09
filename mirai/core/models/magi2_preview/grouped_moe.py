@@ -293,10 +293,12 @@ def _memory_bounded_swiglu7(
     output_rows = output.reshape_as(gate_rows)
     for start in range(0, int(gate_rows.shape[0]), _SWIGLU7_ROW_CHUNK):
         stop = min(start + _SWIGLU7_ROW_CHUNK, int(gate_rows.shape[0]))
-        gate_fp32 = gate_rows[start:stop].float().clamp_(max=7.0)
-        up_fp32 = up_rows[start:stop].float().clamp_(min=-7.0, max=7.0)
+        # ``Tensor.float()`` aliases an FP32 input. Keep the saved autograd
+        # operands immutable even when the reference path itself runs in FP32.
+        gate_fp32 = gate_rows[start:stop].float().clamp(max=7.0)
+        up_fp32 = up_rows[start:stop].float().clamp(min=-7.0, max=7.0)
         hidden = gate_fp32 * torch.sigmoid(1.702 * gate_fp32)
-        hidden.mul_(up_fp32.add_(1.0))
+        hidden.mul_(up_fp32 + 1.0)
         output_rows[start:stop].copy_(hidden)
     return output
 
