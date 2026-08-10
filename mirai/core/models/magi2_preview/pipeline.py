@@ -1596,7 +1596,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 ref_audio_feat_len=torch.tensor([0], device=device),
                 ref_video_feat=torch.empty_like(video),
                 ref_video_feat_len=torch.tensor([0], device=device),
-            )
+            ),
+            compact=True,
         )
         prediction = refiner.transformer(*packed)
         video_velocity, audio_velocity = refiner.data_proxy.process_output(prediction)
@@ -1607,6 +1608,58 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 "released audio-free refinement."
             )
         return video_velocity
+
+    def refiner_cfg_forward(
+        self, latents: Any, context: Any, context_null: Any
+    ) -> tuple[Any, Any]:
+        """Evaluate both CFG branches with one refiner layer-residency pass."""
+        from mirai.vendors.magi2_preview.pipeline.inference_engine import EvalInput
+
+        refiner = self._refiner_assets()
+        if not refiner.loaded:
+            raise RuntimeError("MAGI-2 refiner is not loaded; call load_refiner() first.")
+        video = torch.as_tensor(latents)
+        device = video.device
+        audio_channels = int(
+            refiner.runtime_config().magi2_refiner_arch_config.audio_in_channels
+        )
+        empty_audio = torch.zeros(1, 0, audio_channels, dtype=torch.float32, device=device)
+
+        def pack(value: Any) -> tuple[tuple[Any, Any, Any, Any, Any], Any]:
+            text = torch.as_tensor(value).to(device=device, dtype=torch.float32)
+            packed = refiner.data_proxy.process_input(
+                EvalInput(
+                    x_t=video,
+                    audio_x_t=empty_audio,
+                    audio_feat_len=torch.tensor([0], device=device),
+                    txt_feat=text,
+                    txt_feat_len=torch.tensor([int(text.shape[1])], device=device),
+                    ref_audio_feat=empty_audio,
+                    ref_audio_feat_len=torch.tensor([0], device=device),
+                    ref_video_feat=torch.empty_like(video),
+                    ref_video_feat_len=torch.tensor([0], device=device),
+                ),
+                compact=True,
+            )
+            return packed, refiner.data_proxy.output_layout()
+
+        cond_packed, cond_layout = pack(context)
+        null_packed, null_layout = pack(context_null)
+        cond_prediction, null_prediction = refiner.forward_pair(
+            cond_packed, null_packed
+        )
+        cond_video, cond_audio = refiner.data_proxy.process_output(
+            cond_prediction, layout=cond_layout
+        )
+        null_video, null_audio = refiner.data_proxy.process_output(
+            null_prediction, layout=null_layout
+        )
+        for audio_velocity in (cond_audio, null_audio):
+            if audio_velocity is not None and audio_velocity.numel() > 0:
+                raise RuntimeError(
+                    "The MAGI-2 refiner returned audio velocity for an empty audio track."
+                )
+        return cond_video, null_video
 
     def validate_config(self, config: Any) -> list[str]:
         errors: list[str] = []

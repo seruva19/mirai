@@ -1589,6 +1589,7 @@ def test_magi2_refiner_hooks_match_the_seam_the_session_consults() -> None:
         "release_refiner",
         "release_base_transformer",
         "refiner_forward",
+        "refiner_cfg_forward",
         "refiner_residency_request",
     ):
         assert callable(getattr(Magi2PreviewPipeline, name)), name
@@ -1912,6 +1913,58 @@ def test_magi2_refine_loop_leaves_the_vendored_dtype_policy_alone() -> None:
     assert pipeline.text_loads == 1
 
 
+def test_magi2_refine_loop_uses_paired_cfg_when_provider_exposes_it() -> None:
+    from mirai.core.models.magi2_preview.refiner import (
+        Magi2RefineSettings,
+        run_refine,
+    )
+
+    class _PairedPipeline(_StubRefinePipeline):
+        def __init__(self) -> None:
+            super().__init__()
+            self.paired_calls = 0
+
+        def refiner_cfg_forward(self, latents, context, context_null):
+            self.paired_calls += 1
+            self.observed.extend(
+                [
+                    (latents.dtype, self.projection(torch.zeros(1, 4)).dtype),
+                    (latents.dtype, self.projection(torch.zeros(1, 4)).dtype),
+                ]
+            )
+            return torch.zeros_like(latents), torch.zeros_like(latents)
+
+        def refiner_forward(self, latents, context):
+            raise AssertionError("paired CFG must not fall back to separate forwards")
+
+    pipeline = _PairedPipeline()
+    settings = Magi2RefineSettings(
+        steps=2,
+        cfg_scale=2.0,
+        shift=5.0,
+        height=64,
+        width=64,
+        noise_index=220,
+        scheduler="unipc",
+    )
+    run_refine(
+        pipeline=pipeline,
+        refiner=_StubRefinerAssets(),
+        base_latent=torch.zeros(4, 3, 4, 4, dtype=torch.float32),
+        settings=settings,
+        prompt="a",
+        negative_prompt="",
+        seed=0,
+        device="cpu",
+    )
+
+    assert pipeline.paired_calls == settings.steps
+    assert len(pipeline.observed) == 2 * settings.steps
+    assert pipeline.observed == [
+        (torch.float32, torch.float32) for _ in pipeline.observed
+    ]
+
+
 def test_magi2_refiner_waits_before_releasing_cuda_workspace(monkeypatch) -> None:
     from mirai.core.models.magi2_preview.refiner import _release_cuda_workspace
 
@@ -2194,6 +2247,27 @@ def test_magi2_router_bias_source_env_is_rejected() -> None:
             os.environ.pop("MAGI2_ROUTER_BIAS_SOURCE", None)
         else:
             os.environ["MAGI2_ROUTER_BIAS_SOURCE"] = previous
+
+
+def test_magi2_streaming_safetensors_load_is_strict(tmp_path) -> None:
+    from safetensors.torch import save_file
+
+    from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import (
+        load_safetensors_into_model,
+    )
+
+    model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.LayerNorm(2))
+    expected = {
+        key: torch.randn_like(value) if value.is_floating_point() else value.clone()
+        for key, value in model.state_dict().items()
+    }
+    save_file(expected, tmp_path / "model.safetensors")
+    load_safetensors_into_model(model, str(tmp_path))
+    assert all(torch.equal(model.state_dict()[key], value) for key, value in expected.items())
+
+    save_file({"0.weight": expected["0.weight"]}, tmp_path / "model.safetensors")
+    with pytest.raises(RuntimeError, match="missing keys"):
+        load_safetensors_into_model(model, str(tmp_path))
 
 
 # --- Expert-execution backend precedence ------------------------------------

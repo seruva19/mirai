@@ -110,6 +110,73 @@ class _ModalityChunkDispatcher:
         return torch.cat(groups, dim=0)
 
 
+@dataclass
+class _PreparedRefinerBranch:
+    x: torch.Tensor
+    rope: torch.Tensor
+    permute_mapping: torch.Tensor
+    inv_permute_mapping: torch.Tensor
+    varlen_handler: Any
+    local_attn_handler: Any
+    modality_dispatcher: Any
+    cp_split_sizes: list[int]
+    video_mask: torch.Tensor
+    audio_mask: torch.Tensor
+
+
+def _prepare_refiner_branch(
+    transformer: Any, packed: tuple[Any, Any, Any, Any, Any]
+) -> _PreparedRefinerBranch:
+    """Run one branch through dispatch and the input adapter."""
+    from mirai.vendors.magi2_preview.infra.distributed import psm
+    from mirai.vendors.magi2_preview.model.magi2_refiner import (
+        CompactRefinerTokens,
+        Modality,
+        ModalityDispatcher,
+        embed_compact_refiner_tokens,
+    )
+
+    x, coords_mapping, modality_mapping, varlen_handler, local_attn_handler = packed
+    if isinstance(x, CompactRefinerTokens):
+        x = embed_compact_refiner_tokens(transformer.pre_adapter, x)
+    else:
+        raise TypeError("Paired MAGI-2 refiner execution requires compact tokens.")
+    if int(psm.get_world_size("cp")) != 1:
+        raise RuntimeError(
+            "Paired MAGI-2 refiner execution supports the single-GPU release surface only."
+        )
+    modality_dispatcher = ModalityDispatcher(modality_mapping, 3)
+    permute_mapping = modality_dispatcher.permute_mapping
+    inv_permute_mapping = modality_dispatcher.inv_permute_mapping
+    video_mask = modality_mapping == Modality.VIDEO
+    audio_mask = modality_mapping == Modality.AUDIO
+    rope = transformer.pre_adapter.rope(coords_mapping)
+    x = ModalityDispatcher.permute(
+        x.to(transformer.config.params_dtype), permute_mapping
+    )
+    return _PreparedRefinerBranch(
+        x=x,
+        rope=rope,
+        permute_mapping=permute_mapping,
+        inv_permute_mapping=inv_permute_mapping,
+        varlen_handler=varlen_handler,
+        local_attn_handler=local_attn_handler,
+        modality_dispatcher=modality_dispatcher,
+        cp_split_sizes=[int(x.shape[0])],
+        video_mask=video_mask,
+        audio_mask=audio_mask,
+    )
+
+
+def _finish_refiner_branch(transformer: Any, branch: _PreparedRefinerBranch) -> torch.Tensor:
+    """Apply inverse modality order and the output adapter for one branch."""
+    from mirai.vendors.magi2_preview.model.magi2_refiner import ModalityDispatcher
+
+    value = ModalityDispatcher.inv_permute(branch.x, branch.inv_permute_mapping)
+    value = transformer.post_adapter(value, branch.video_mask, branch.audio_mask)
+    return value
+
+
 def _refiner_mlp_forward(
     module: Any, value: torch.Tensor, modality_dispatcher: Any
 ) -> torch.Tensor:
@@ -299,7 +366,6 @@ def _chunked_refiner_attention_forward(
                 )
         group_offset = group_end
     del normalized, qkv, q_chunk, k_chunk, v_chunk
-
     if module.config.use_local_attn:
         attended = flex_flash_attn_with_cp(
             q.unsqueeze(0),
@@ -543,6 +609,7 @@ class Magi2Refiner:
         self._runtime_config: Any | None = None
         self._block_swap_manager: Any | None = None
         self._block_hook_handles: list[Any] = []
+        self._paired_staging = False
 
     # -- asset location ----------------------------------------------------
     def snapshot_root(self) -> Path:
@@ -680,6 +747,44 @@ class Magi2Refiner:
             raise RuntimeError("MAGI-2 refiner is not loaded; call load() first.")
         return self._data_proxy
 
+    @torch.compiler.disable
+    def forward_pair(
+        self,
+        first: tuple[Any, Any, Any, Any, Any],
+        second: tuple[Any, Any, Any, Any, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate two CFG branches while staging each transformer layer once."""
+        transformer = self.transformer
+        branches = [
+            _prepare_refiner_branch(transformer, first),
+            _prepare_refiner_branch(transformer, second),
+        ]
+        manager = self._block_swap_manager
+        self._paired_staging = True
+        try:
+            for index, layer in enumerate(transformer.block.layers):
+                if manager is not None:
+                    manager.before_block(index)
+                for branch in branches:
+                    branch.x = layer(
+                        branch.x,
+                        branch.rope,
+                        permute_mapping=branch.permute_mapping,
+                        inv_permute_mapping=branch.inv_permute_mapping,
+                        varlen_handler=branch.varlen_handler,
+                        local_attn_handler=branch.local_attn_handler,
+                        modality_dispatcher=branch.modality_dispatcher,
+                        cp_split_sizes=branch.cp_split_sizes,
+                    )
+                if manager is not None:
+                    manager.after_block(index)
+        finally:
+            self._paired_staging = False
+        return (
+            _finish_refiner_branch(transformer, branches[0]),
+            _finish_refiner_branch(transformer, branches[1]),
+        )
+
     def load(self, *, device: str, residency: Any | None = None) -> None:
         """Build (once) and place the refiner transformer on ``device``.
 
@@ -723,7 +828,7 @@ class Magi2Refiner:
             )
         if self._transformer is None:
             from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import (
-                load_safetensors_dir,
+                load_safetensors_into_model,
             )
             from mirai.vendors.magi2_preview.model.magi2_refiner import (
                 Transformer as Magi2RefinerTransformer,
@@ -733,11 +838,11 @@ class Magi2Refiner:
             )
 
             transformer = Magi2RefinerTransformer(config.magi2_refiner_arch_config)
-            state = load_safetensors_dir(
-                str(self.checkpoint_dir()), desc="Loading MAGI-2 refiner shards"
+            load_safetensors_into_model(
+                transformer,
+                str(self.checkpoint_dir()),
+                desc="Loading MAGI-2 refiner shards",
             )
-            transformer.load_state_dict(state, strict=True)
-            del state
             transformer.eval()
             for parameter in transformer.parameters():
                 parameter.requires_grad_(False)
@@ -806,13 +911,15 @@ class Magi2Refiner:
         for index, layer in units:
             self._block_hook_handles.append(
                 layer.register_forward_pre_hook(
-                    lambda _module, _args, idx=index: stage_in(idx)
+                    lambda _module, _args, idx=index: (
+                        None if self._paired_staging else stage_in(idx)
+                    )
                 )
             )
             self._block_hook_handles.append(
                 layer.register_forward_hook(
                     lambda _module, _args, output, idx=index: (
-                        stage_out(idx),
+                        None if self._paired_staging else stage_out(idx),
                         output,
                     )[1]
                 )
@@ -960,11 +1067,17 @@ def run_refine(
                 if scale <= 0.0:
                     velocity = pipeline.refiner_forward(latents, context_null)
                 else:
-                    v_cond = pipeline.refiner_forward(latents, context)
-                    # The forward is asynchronous, so synchronize before
-                    # returning its cached allocator segments for reuse.
-                    _release_cuda_workspace(compute_device)
-                    v_uncond = pipeline.refiner_forward(latents, context_null)
+                    paired_forward = getattr(pipeline, "refiner_cfg_forward", None)
+                    if callable(paired_forward):
+                        v_cond, v_uncond = paired_forward(
+                            latents, context, context_null
+                        )
+                    else:
+                        v_cond = pipeline.refiner_forward(latents, context)
+                        # The forward is asynchronous, so synchronize before
+                        # returning its cached allocator segments for reuse.
+                        _release_cuda_workspace(compute_device)
+                        v_uncond = pipeline.refiner_forward(latents, context_null)
                     velocity = v_uncond + scale * (v_cond - v_uncond)
                     del v_cond, v_uncond
                 # Upstream expands the guidance scale over the frame axis so a

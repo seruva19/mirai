@@ -489,9 +489,11 @@ text conditioning. The otherwise identical bounded torch activation path took
 26,368 MiB; its embedding cosine against BF16 was 0.99922 on the documented
 warm-cabin prompt (NF4: 0.99253). Text-encoder quantization is explicitly lossy.
 
-The released 1920x1088 refiner target is not a 32 GiB profile: its current
-packed-token preparation exceeds that budget before the first transformer
-layer. Use a smaller explicit `--refiner-height` / `--refiner-width` on this
+The released 1920x1088 refiner target is not a 32 GiB profile. Modality inputs
+are projected before concatenation, so token preparation stays bounded, but the
+released local-attention operator still requires a 7.85 GiB output workspace
+while 19.43 GiB of live tensors are allocated on the measured full-length
+request. Use a smaller explicit `--refiner-height` / `--refiner-width` on this
 device class.
 
 The example keeps `inference.keep_text_encoder_resident` and
@@ -602,9 +604,15 @@ to a preview step. The preview transformer is released off the compute device
 before any refiner state is allocated, so the two never co-reside; refinement
 ends the current sampling session and the next generation re-places the preview
 transformer. When the run is configured for block swapping, the refiner streams
-its own layers under the same policy. No latency or peak-memory figures are
-claimed here; they are published only after the GPU validation contract records
-them.
+its own layers under the same policy. Conditional and unconditional CFG branches
+share each staged transformer layer, avoiding a second residency pass. On one
+80 GiB H100, a focused full-resolution 1920x1088 one-step probe measured
+55.33--58.94 seconds for the paired warm CFG forward, versus 71.47 seconds for
+two separate forwards. A strict-shard validation run measured 71.04 seconds,
+62,266 MiB peak allocated VRAM, and 425.71 GiB peak process RSS. The complete
+five-step refiner stage measured 324.76 seconds and 65,315 MiB peak allocated
+VRAM. These figures use the released 63x68x120 refiner latent and are specific
+to that workload and device.
 
 Keep preview and refinement as separate process stages when compiler workspaces
 remain process-resident across model teardown. The preview latent is the exact

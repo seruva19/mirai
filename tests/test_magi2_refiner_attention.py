@@ -47,6 +47,48 @@ from mirai.core.models.magi2_preview.refiner import (
 HEAD_DIM = 16
 
 
+def test_compact_refiner_tokens_match_padded_adapter_projection(
+    vendored_refiner_module,
+) -> None:
+    config = vendored_refiner_module.AdapterConfig(
+        hidden_size=24,
+        num_attention_heads=2,
+        text_in_channels=7,
+        video_in_channels=5,
+        audio_in_channels=3,
+        params_dtype=torch.float32,
+    )
+    adapter = vendored_refiner_module.Adapter(config).eval()
+    video = torch.randn(4, 5)
+    audio = torch.randn(2, 3)
+    text = torch.randn(3, 7)
+    groups = (
+        (int(vendored_refiner_module.Modality.VIDEO), video),
+        (int(vendored_refiner_module.Modality.AUDIO), audio),
+        (int(vendored_refiner_module.Modality.TEXT), text),
+    )
+    modality_mapping = torch.tensor([0] * 4 + [1] * 2 + [2] * 3)
+    padded = torch.cat(
+        [torch.nn.functional.pad(value, (0, 7 - value.shape[1])) for _, value in groups]
+    )
+    coords = torch.tensor([[0, 0, 0, 2, 2, 2, 2, 2, 2]], dtype=torch.float32).repeat(
+        padded.shape[0], 1
+    )
+    reference, _ = adapter(
+        padded,
+        coords,
+        modality_mapping == 0,
+        modality_mapping == 1,
+        modality_mapping == 2,
+    )
+
+    order = torch.tensor([8, 0, 4, 1, 5, 2, 6, 3, 7])
+    compact = vendored_refiner_module.CompactRefinerTokens(groups, order)
+    actual = vendored_refiner_module.embed_compact_refiner_tokens(adapter, compact)
+
+    assert torch.equal(actual, reference[order])
+
+
 # --------------------------------------------------------------------------- #
 # References
 # --------------------------------------------------------------------------- #

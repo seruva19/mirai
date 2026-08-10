@@ -1980,6 +1980,41 @@ class Adapter(torch.nn.Module):
         return output_x, rope
 
 
+@dataclass(frozen=True)
+class CompactRefinerTokens:
+    """Unpadded modality runs in their original packed-token order."""
+
+    groups: tuple[tuple[int, torch.Tensor], ...]
+    token_order: Optional[torch.Tensor] = None
+
+
+def embed_compact_refiner_tokens(
+    adapter: Adapter, packed: CompactRefinerTokens
+) -> torch.Tensor:
+    """Project each modality before concatenation, avoiding wide zero padding."""
+    embedders = {
+        int(Modality.VIDEO): adapter.video_embedder,
+        int(Modality.AUDIO): adapter.audio_embedder,
+        int(Modality.TEXT): adapter.text_embedder,
+    }
+    channels = {
+        int(Modality.VIDEO): int(adapter.config.video_in_channels),
+        int(Modality.AUDIO): int(adapter.config.audio_in_channels),
+        int(Modality.TEXT): int(adapter.config.text_in_channels),
+    }
+    projected = [
+        embedders[int(modality)](value[:, : channels[int(modality)]])
+        for modality, value in packed.groups
+        if int(value.shape[0]) > 0
+    ]
+    if not projected:
+        raise RuntimeError("MAGI-2 refiner input contains no tokens.")
+    output = torch.cat(projected, dim=0)
+    if packed.token_order is not None:
+        output = output[packed.token_order]
+    return output
+
+
 class TransformerLayer(torch.nn.Module):
     """
     A single transformer layer with attention, MLP, and adaptive layer normalization
@@ -2238,7 +2273,7 @@ class Transformer(torch.nn.Module):
     @torch.compile(dynamic=True, fullgraph=False)
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | CompactRefinerTokens,
         coords_mapping: torch.Tensor,
         modality_mapping: torch.Tensor,
         varlen_handler: VarlenHandler,
@@ -2254,6 +2289,9 @@ class Transformer(torch.nn.Module):
             x(torch.Tensor): Processed input features
 
         """
+        compact_input = isinstance(x, CompactRefinerTokens)
+        if compact_input:
+            x = embed_compact_refiner_tokens(self.pre_adapter, x)
         x = ulysses_scheduler().dispatch(x)
         coords_mapping = ulysses_scheduler().dispatch(coords_mapping)
         modality_mapping = ulysses_scheduler().dispatch(modality_mapping)
@@ -2269,10 +2307,14 @@ class Transformer(torch.nn.Module):
         audio_mask = modality_mapping == Modality.AUDIO
         text_mask = modality_mapping == Modality.TEXT
 
-        # Process inputs through adapter
-        x, rope = self.pre_adapter(
-            x, coords_mapping, video_mask, audio_mask, text_mask
-        )
+        # Compact inputs have already passed through the same modality-specific
+        # projections before concatenation. Only RoPE remains input-dependent.
+        if compact_input:
+            rope = self.pre_adapter.rope(coords_mapping)
+        else:
+            x, rope = self.pre_adapter(
+                x, coords_mapping, video_mask, audio_mask, text_mask
+            )
 
         # NOTE(LLZ):only convert x to params_dtype, rope stays in float32
         x = x.to(self.config.params_dtype)
@@ -2294,5 +2336,3 @@ class Transformer(torch.nn.Module):
         x_out = ulysses_scheduler().undispatch(x_out)
 
         return x_out
-
-

@@ -70,6 +70,51 @@ def load_safetensors_dir(checkpoint_dir: str, desc: str = "Loading shards") -> d
     return _load_by_shard(read_safetensors_weight_map(checkpoint_dir), reader=_read_whole, desc=desc)
 
 
+def load_safetensors_into_model(
+    model: torch.nn.Module,
+    checkpoint_dir: str,
+    desc: str = "Loading shards",
+) -> None:
+    """Strict-load one tensor at a time without retaining a second model copy."""
+    targets = model.state_dict()
+    weight_map = read_safetensors_weight_map(checkpoint_dir)
+    target_keys = set(targets)
+    checkpoint_keys = set(weight_map)
+    missing = sorted(target_keys - checkpoint_keys)
+    unexpected = sorted(checkpoint_keys - target_keys)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing keys: {missing}")
+        if unexpected:
+            details.append(f"unexpected keys: {unexpected}")
+        raise RuntimeError("Strict safetensors load failed; " + "; ".join(details))
+
+    by_shard: dict[str, list[str]] = defaultdict(list)
+    for key, path in weight_map.items():
+        by_shard[path].append(key)
+    iterator = tqdm(
+        by_shard.items(),
+        desc=desc,
+        total=len(by_shard),
+        disable=psm.get_global_rank() != 0,
+    )
+    with torch.no_grad():
+        for path, keys in iterator:
+            with safe_open(path, framework="pt") as handle:
+                for key in keys:
+                    source = handle.get_tensor(key)
+                    target = targets[key]
+                    if tuple(source.shape) != tuple(target.shape):
+                        raise RuntimeError(
+                            "Strict safetensors load failed; shape mismatch for "
+                            f"'{key}': checkpoint {tuple(source.shape)}, model "
+                            f"{tuple(target.shape)}"
+                        )
+                    target.copy_(source)
+                    del source
+
+
 def _is_ep_sharded_key(key: str) -> bool:
     return ".moe_mlp." in key and key.endswith(_EP_SHARDED_SUFFIXES)
 
@@ -183,5 +228,4 @@ def load_magi2_model_state_dict(model: torch.nn.Module, engine_config: EngineCon
         if value.dtype != target.dtype and value.is_floating_point() and target.is_floating_point():
             state_dict[key] = value.to(dtype=target.dtype)
     return _apply_router_bias_ema(state_dict)
-
 

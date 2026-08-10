@@ -26,7 +26,10 @@ from torch.nn import functional as F
 from unfoldNd import UnfoldNd
 
 from mirai.vendors.magi2_preview.common.magi2_config import Magi2RefinerDataProxyConfig
-from mirai.vendors.magi2_preview.model.magi2_refiner import calc_local_attn_ffa_handler
+from mirai.vendors.magi2_preview.model.magi2_refiner import (
+    CompactRefinerTokens,
+    calc_local_attn_ffa_handler,
+)
 
 
 class Modality(IntEnum):
@@ -503,6 +506,12 @@ class SimplePackedData:
         return torch.stack(video_x_t_list, dim=0), torch.stack(audio_x_t_list, dim=0)
 
 
+@dataclass(frozen=True)
+class RefinerOutputLayout:
+    packed_data: SimplePackedData
+    token_restore_order: Optional[torch.Tensor]
+
+
 class Magi2RefinerDataProxy:
     def __init__(self, config: Magi2RefinerDataProxyConfig):
         self.patch_size = config.patch_size
@@ -795,7 +804,7 @@ class Magi2RefinerDataProxy:
             sparse_load=bool(window_cfg.get("sparse_load", False)),
         )
 
-    def process_input(self, transported_data):
+    def process_input(self, transported_data, *, compact: bool = False):
         # init img2col module
 
         batch_size, input_video_channel, t, h, w = transported_data.x_t.shape
@@ -845,16 +854,30 @@ class Magi2RefinerDataProxy:
             max_seqlen_k=simple_packed_data.max_seqlen.to(torch.int32).cuda(),
         )
 
-        x = simple_packed_data.token_sequence
         coords_mapping = simple_packed_data.coords_mapping
         modality_mapping = simple_packed_data.modality_mapping
         token_restore_order = None
+        if compact:
+            groups = []
+            for item in simple_packed_data.items:
+                groups.extend(
+                    (
+                        (int(Modality.VIDEO), item.video_x_t),
+                        (int(Modality.AUDIO), item.audio_x_t),
+                        (int(Modality.TEXT), item.txt_feat),
+                        (int(Modality.AUDIO), item.ref_audio_feat),
+                        (int(Modality.VIDEO), item.ref_video_feat),
+                    )
+                )
+            x = CompactRefinerTokens(groups=tuple(groups))
+        else:
+            x = simple_packed_data.token_sequence
 
         if self.use_window_attn:
             assert batch_size == 1, "window attention only supports batch size 1"
             item = simple_packed_data[0]
             local_attn_handler = self._build_window_local_attn_handler(
-                item, int(simple_packed_data.total_token_num), x.device
+                item, int(simple_packed_data.total_token_num), coords_mapping.device
             )
             level = str(self.window_attn_config.get("level", "block")).lower()
             if level == "block":
@@ -885,9 +908,12 @@ class Magi2RefinerDataProxy:
                     patch_nums=patch_nums,
                     block_sizes=block_sizes,
                     valid_token_num=int(simple_packed_data.total_token_num),
-                    device=x.device,
+                    device=coords_mapping.device,
                 )
-                x = x[token_order]
+                if compact:
+                    x = CompactRefinerTokens(groups=x.groups, token_order=token_order)
+                else:
+                    x = x[token_order]
                 coords_mapping = coords_mapping[token_order]
                 modality_mapping = modality_mapping[token_order]
         elif self.frame_receptive_field != -1:
@@ -915,12 +941,17 @@ class Magi2RefinerDataProxy:
 
         return (x, coords_mapping, modality_mapping, varlen_handler, local_attn_handler)
 
-    def process_output(self, x: torch.Tensor):
-        token_restore_order = self.get_saved_data("token_restore_order")
-        if token_restore_order is not None:
-            x = x[token_restore_order]
+    def output_layout(self) -> RefinerOutputLayout:
+        """Capture the depacking state associated with the latest packed input."""
+        return RefinerOutputLayout(
+            packed_data=self.get_saved_data("simple_packed_data"),
+            token_restore_order=self.get_saved_data("token_restore_order"),
+        )
 
-        simple_packed_data: SimplePackedData = self.get_saved_data("simple_packed_data")
-        return simple_packed_data.depack_token_sequence(x)
-
-
+    def process_output(
+        self, x: torch.Tensor, *, layout: Optional[RefinerOutputLayout] = None
+    ):
+        resolved = self.output_layout() if layout is None else layout
+        if resolved.token_restore_order is not None:
+            x = x[resolved.token_restore_order]
+        return resolved.packed_data.depack_token_sequence(x)
