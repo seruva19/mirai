@@ -921,6 +921,22 @@ Offline SVD-LLM-style activation-covariance gate. With the pre-factorization sou
 
 Offline per-tensor precision-planning gate. `imatrix` arms [`scripts/tools/calibrate_expert_precision.py`](scripts/tools/calibrate_expert_precision.py): provider-owned routed expert hosts accumulate `E[x²]` separately for every physical expert's w1/w3 input and post-SwiGLU w2 input, following llama.cpp's open importance-matrix statistic. `--max-accumulator-gib` splits layers into deterministic repeated passes. Each `--formats` candidate is encoded and decoded by Mirai's real runtime representation; activation-weighted reconstruction MSE and actual packed tensor bytes feed the existing benefit-per-byte allocator at `(module, expert, projection)` granularity. `--budget-gib` is a hard ceiling. The schema-v2 JSON plan binds dataset/model/config and an exact source-weight fingerprint; this is an open adaptation of per-tensor dynamic precision, not a claim to reproduce Unsloth's unpublished Dynamic 2.0 selection algorithm. `off` installs no observers and changes no runtime behavior.
 
+### `expert_precision_router_norm_fraction`
+
+- **Type:** float
+- **Default:** `0.0`
+- **Allowed / range:** `0.0` to `1.0`
+
+Experimental expert-protection fraction from [Efficient Quantization of Mixture-of-Experts with Theoretical Generalization Guarantees](https://arxiv.org/abs/2604.06515). A positive value requires `expert_precision_calibration="imatrix"` and `expert_precision_router_norm_min_format`. Experts are ordered by ascending final router-row L2 norm, the paper's supported surrogate when initialization weights are unavailable. A lower-ranked expert is repeatedly promoted when its maximum w1 row variance is at least three times that of the immediately higher expert. The protected prefix receives the configured precision floor; measured imatrix error still allocates the remaining byte budget. Router weights join the source fingerprint. `0.0` preserves the existing allocator exactly.
+
+### `expert_precision_router_norm_min_format`
+
+- **Type:** str
+- **Default:** `""`
+- **Allowed / range:** empty or a supported expert precision candidate
+
+Minimum candidate format for the router-norm-protected expert prefix. It must be present in `calibrate_expert_precision.py --formats`; an infeasible byte budget fails rather than weakening the floor. Empty is valid only when `expert_precision_router_norm_fraction=0.0`.
+
 ### `moe_routing_health`
 
 - **Type:** bool

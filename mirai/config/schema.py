@@ -303,6 +303,8 @@ class ModelParams:
     expert_factorization_calibration: str = "off"
     # Offline routed input-square collection and per-tensor precision planning.
     expert_precision_calibration: str = "off"
+    expert_precision_router_norm_fraction: float = 0.0
+    expert_precision_router_norm_min_format: str = ""
     # Optional path to a separate text-encoder directory for sparse-MoE families
     # that distribute text assets apart from the main checkpoint.
     text_encoder_path: str = ""
@@ -1018,6 +1020,8 @@ class TrainingConfig:
             "router_quantization_calibration",
             "expert_factorization_calibration",
             "expert_precision_calibration",
+            "expert_precision_router_norm_fraction",
+            "expert_precision_router_norm_min_format",
             "text_encoder_path",
             "denoiser_subfolder",
             "family_params",
@@ -1752,6 +1756,16 @@ class TrainingConfig:
                     model_params_table.get(
                         "expert_precision_calibration",
                         "off",
+                    )
+                ),
+                expert_precision_router_norm_fraction=float(
+                    model_params_table.get(
+                        "expert_precision_router_norm_fraction", 0.0
+                    )
+                ),
+                expert_precision_router_norm_min_format=str(
+                    model_params_table.get(
+                        "expert_precision_router_norm_min_format", ""
                     )
                 ),
                 text_encoder_path=str(model_params_table.get("text_encoder_path", "")),
@@ -2565,6 +2579,45 @@ class TrainingConfig:
             raise ConfigError(
                 "model.params.expert_precision_calibration must be 'off' "
                 "(default) or 'imatrix'."
+            )
+        _router_norm_fraction = float(
+            _mp.expert_precision_router_norm_fraction
+        )
+        _router_norm_format = str(
+            _mp.expert_precision_router_norm_min_format
+        ).strip().lower()
+        if not 0.0 <= _router_norm_fraction <= 1.0:
+            raise ConfigError(
+                "model.params.expert_precision_router_norm_fraction must be "
+                "between 0 and 1."
+            )
+        if (_router_norm_fraction > 0.0) != bool(_router_norm_format):
+            raise ConfigError(
+                "Router-norm expert precision requires both a positive protected "
+                "fraction and expert_precision_router_norm_min_format."
+            )
+        if _router_norm_format and _router_norm_format not in {
+            "bf16",
+            "fp8",
+            "int8",
+            "nf4",
+            "gguf_iq4",
+            "gguf_iq3",
+            "gguf_iq2",
+            "mxfp8_e4m3",
+            "mxfp4",
+            "nvfp4",
+        }:
+            raise ConfigError(
+                "model.params.expert_precision_router_norm_min_format is unsupported."
+            )
+        if (
+            _router_norm_fraction > 0.0
+            and str(_mp.expert_precision_calibration).strip().lower() != "imatrix"
+        ):
+            raise ConfigError(
+                "Router-norm expert precision requires "
+                "model.params.expert_precision_calibration='imatrix'."
             )
         if (
             str(_mp.expert_factorization_calibration).strip().lower()

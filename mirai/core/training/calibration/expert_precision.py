@@ -18,6 +18,8 @@ from mirai.core.moe.calibration.imatrix import ExpertImportanceCalibrationTarget
 from mirai.core.moe.calibration.imatrix import ExpertImportanceEvidence
 from mirai.core.moe.calibration.precision import TensorPrecisionEvidence
 from mirai.core.moe.calibration.precision import allocate_tensor_precision
+from mirai.core.moe.calibration.precision import RouterNormExpertEvidence
+from mirai.core.moe.calibration.precision import router_norm_precision_floors
 from mirai.core.moe.calibration.router_repair import router_tensor_fingerprint
 from mirai.core.training.lifecycle.training_step_pre import (
     _build_training_batch_factory,
@@ -107,12 +109,55 @@ def _target_groups(
 
 def _source_tensors(
     targets: dict[str, ExpertImportanceCalibrationTarget],
+    *,
+    include_router: bool = False,
 ) -> dict[str, Any]:
-    return {
+    tensors = {
         f"{name}.{projection}": target.weights[projection]
         for name, target in targets.items()
         for projection in ("w1", "w2", "w3")
     }
+    if include_router:
+        tensors.update(
+            {
+                f"{name}.router": target.router_weight
+                for name, target in targets.items()
+            }
+        )
+    return tensors
+
+
+def _router_norm_evidence(
+    targets: dict[str, ExpertImportanceCalibrationTarget],
+) -> list[RouterNormExpertEvidence]:
+    rows: list[RouterNormExpertEvidence] = []
+    for name, target in targets.items():
+        if target.router_weight is None:
+            raise ValueError(
+                f"Expert precision target {name!r} has no provider-owned router weight."
+            )
+        router = torch.as_tensor(target.router_weight).detach().float()
+        w1 = torch.as_tensor(target.weights["w1"]).detach()
+        router_norms = torch.linalg.vector_norm(router, dim=1)
+        for expert_id in range(target.num_experts):
+            maximum_variance = 0.0
+            expert = w1[expert_id]
+            for row_start in range(0, int(expert.shape[0]), 1024):
+                rows_chunk = expert[row_start : row_start + 1024].float()
+                chunk_max = rows_chunk.var(dim=1, correction=0).amax()
+                maximum_variance = max(
+                    maximum_variance,
+                    float(chunk_max.item()),
+                )
+            rows.append(
+                RouterNormExpertEvidence(
+                    module_name=name,
+                    expert_id=expert_id,
+                    final_router_norm=float(router_norms[expert_id].item()),
+                    max_intra_neuron_variance=maximum_variance,
+                )
+            )
+    return rows
 
 
 def _measurement_evidence(
@@ -226,7 +271,34 @@ def run_expert_precision_calibration_session(
             session.trainer.pipeline
         )
     )
-    source_fingerprint = router_tensor_fingerprint(_source_tensors(targets))
+    protected_fraction = float(
+        getattr(
+            config.model.params,
+            "expert_precision_router_norm_fraction",
+            0.0,
+        )
+    )
+    protected_format = str(
+        getattr(
+            config.model.params,
+            "expert_precision_router_norm_min_format",
+            "",
+        )
+    ).strip().lower()
+    floors: dict[tuple[str, int], str] = {}
+    if protected_fraction > 0.0:
+        if protected_format not in formats:
+            raise ValueError(
+                "Router-norm minimum precision must be one of the measured formats."
+            )
+        floors = router_norm_precision_floors(
+            _router_norm_evidence(targets),
+            protected_fraction=protected_fraction,
+            minimum_format=protected_format,
+        )
+    source_fingerprint = router_tensor_fingerprint(
+        _source_tensors(targets, include_router=bool(floors))
+    )
     accumulator_budget_bytes = int(max_gib * (1024**3))
     groups = _target_groups(targets, budget_bytes=accumulator_budget_bytes)
 
@@ -295,6 +367,7 @@ def run_expert_precision_calibration_session(
         model_snapshot_id=str(manifest.model_snapshot_id),
         config_snapshot_id=str(manifest.config_snapshot_id),
         source_weight_fingerprint=source_fingerprint,
+        minimum_expert_formats=floors,
     )
     plan.save(output)
     modules = {
@@ -306,6 +379,11 @@ def run_expert_precision_calibration_session(
                 )
                 for projection in ("w1", "w2", "w3")
             },
+            "router_norm_protected_experts": sorted(
+                expert_id
+                for (module_name, expert_id), _format in floors.items()
+                if module_name == name
+            ),
         }
         for name, target in targets.items()
     }

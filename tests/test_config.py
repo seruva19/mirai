@@ -46,6 +46,49 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "model.dtype must be one of"):
             TrainingConfig.from_dict({"model": {"dtype": "bf61"}})
 
+    def test_router_norm_precision_policy_is_explicit_and_paired(self) -> None:
+        cfg = TrainingConfig.from_dict(
+            {
+                "model": {
+                    "params": {
+                        "expert_precision_calibration": "imatrix",
+                        "expert_precision_router_norm_fraction": 0.25,
+                        "expert_precision_router_norm_min_format": "int8",
+                    }
+                }
+            }
+        )
+        self.assertEqual(
+            cfg.model.params.expert_precision_router_norm_fraction,
+            0.25,
+        )
+        self.assertEqual(
+            cfg.model.params.expert_precision_router_norm_min_format,
+            "int8",
+        )
+        with self.assertRaisesRegex(ConfigError, "requires both"):
+            TrainingConfig.from_dict(
+                {
+                    "model": {
+                        "params": {
+                            "expert_precision_calibration": "imatrix",
+                            "expert_precision_router_norm_fraction": 0.25,
+                        }
+                    }
+                }
+            )
+        with self.assertRaisesRegex(ConfigError, "requires .*imatrix"):
+            TrainingConfig.from_dict(
+                {
+                    "model": {
+                        "params": {
+                            "expert_precision_router_norm_fraction": 0.25,
+                            "expert_precision_router_norm_min_format": "int8",
+                        }
+                    }
+                }
+            )
+
     def test_runtime_rejects_invalid_memory_policy_enums_early(self) -> None:
         cases = (
             ("weight_residency_strategy", "somewhere"),

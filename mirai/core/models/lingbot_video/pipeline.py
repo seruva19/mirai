@@ -1188,6 +1188,7 @@ class LingBotVideoModelFamilyProvider(ModelFamilyProvider):
                     key: getattr(experts, key)
                     for key in ("w1", "w2", "w3")
                 },
+                router_weight=module.router.weight,
             ).validate()
         if not targets:
             raise ValueError(

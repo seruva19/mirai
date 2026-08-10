@@ -12,11 +12,16 @@ from mirai.core.models.compressed_weights.quantization.sensitivity import (
     measure_projection_format,
 )
 from mirai.core.moe.calibration.imatrix import ExpertImportanceAccumulator
+from mirai.core.moe.calibration.imatrix import ExpertImportanceCalibrationTarget
 from mirai.core.moe.calibration.precision import ExpertPrecisionPlan
 from mirai.core.moe.calibration.precision import TensorPrecisionEvidence
 from mirai.core.moe.calibration.precision import TensorPrecisionPlan
 from mirai.core.moe.calibration.precision import allocate_tensor_precision
 from mirai.core.moe.calibration.precision import load_precision_plan
+from mirai.core.training.calibration.expert_precision import _router_norm_evidence
+from mirai.core.moe.calibration.precision import RouterNormExpertEvidence
+from mirai.core.moe.calibration.precision import rank_router_norm_experts
+from mirai.core.moe.calibration.precision import router_norm_precision_floors
 
 try:
     import torch
@@ -77,6 +82,111 @@ def test_tensor_allocator_protects_sensitive_projection_under_exact_budget() -> 
     assert formats["w1"] == ("gguf_iq3",)
     assert formats["w3"] == ("gguf_iq3",)
     assert plan.estimated_bytes == 176
+
+
+def test_router_norm_ranking_matches_norm_change_and_variance_promotion() -> None:
+    evidence = [
+        RouterNormExpertEvidence("moe.experts", 0, 2.0, 1.0, 1.0),
+        RouterNormExpertEvidence("moe.experts", 1, 3.0, 1.0, 1.0),
+        RouterNormExpertEvidence("moe.experts", 2, 4.0, 10.0, 1.0),
+    ]
+    assert rank_router_norm_experts(evidence) == {
+        "moe.experts": (2, 0, 1)
+    }
+    assert router_norm_precision_floors(
+        evidence,
+        protected_fraction=1.0 / 3.0,
+        minimum_format="int8",
+    ) == {("moe.experts", 2): "int8"}
+    crossing = [
+        RouterNormExpertEvidence("moe.experts", 0, 1.0, 1.0),
+        RouterNormExpertEvidence("moe.experts", 1, 2.0, 5.0),
+        RouterNormExpertEvidence("moe.experts", 2, 3.0, 10.0),
+    ]
+    assert rank_router_norm_experts(crossing) == {
+        "moe.experts": (1, 2, 0)
+    }
+
+
+def test_router_norm_evidence_uses_final_norm_and_maximum_row_variance() -> None:
+    class Host:
+        def set_importance_calibration_observer(self, _observer) -> None:
+            return None
+
+        def clear_importance_calibration_observer(self) -> None:
+            return None
+
+    w1 = torch.tensor(
+        [
+            [[1.0, 3.0], [2.0, 2.0]],
+            [[0.0, 4.0], [1.0, 3.0]],
+        ]
+    )
+    target = ExpertImportanceCalibrationTarget(
+        name="moe.experts",
+        host=Host(),
+        weights={"w1": w1, "w2": w1, "w3": w1},
+        router_weight=torch.tensor([[3.0, 4.0], [0.0, 2.0]]),
+    ).validate()
+    evidence = _router_norm_evidence({"moe.experts": target})
+    assert [row.final_router_norm for row in evidence] == [5.0, 2.0]
+    assert [row.max_intra_neuron_variance for row in evidence] == [1.0, 4.0]
+
+
+def test_tensor_allocator_enforces_router_norm_precision_floor() -> None:
+    rows = [
+        TensorPrecisionEvidence(
+            module_name="moe.experts",
+            expert_id=expert_id,
+            projection=projection,
+            weight_numel=64,
+            format_error={"gguf_iq2": 0.0, "int8": 0.0},
+            format_bytes={"gguf_iq2": 19, "int8": 64},
+        )
+        for expert_id in range(2)
+        for projection in ("w1", "w2", "w3")
+    ]
+    plan = allocate_tensor_precision(
+        rows,
+        budget_bytes=3 * 64 + 3 * 19,
+        allowed_formats=("gguf_iq2", "int8"),
+        dataset_snapshot_id="dataset",
+        model_snapshot_id="model",
+        config_snapshot_id="config",
+        source_weight_fingerprint="weights-and-router",
+        minimum_expert_formats={("moe.experts", 0): "int8"},
+    )
+    formats = plan.formats_for_module("moe.experts")
+    assert all(values[0] == "int8" for values in formats.values())
+    assert all(values[1] == "gguf_iq2" for values in formats.values())
+
+
+def test_empty_router_norm_floors_preserve_allocator_exactly() -> None:
+    rows = [
+        TensorPrecisionEvidence(
+            module_name="moe.experts",
+            expert_id=expert_id,
+            projection=projection,
+            weight_numel=8,
+            format_error={"gguf_iq3": 1.0, "int8": 0.0},
+            format_bytes={"gguf_iq3": 3, "int8": 8},
+        )
+        for expert_id in range(2)
+        for projection in ("w1", "w2", "w3")
+    ]
+    kwargs = dict(
+        budget_bytes=33,
+        allowed_formats=("gguf_iq3", "int8"),
+        dataset_snapshot_id="dataset",
+        model_snapshot_id="model",
+        config_snapshot_id="config",
+        source_weight_fingerprint="weights",
+    )
+    assert allocate_tensor_precision(rows, **kwargs) == allocate_tensor_precision(
+        rows,
+        minimum_expert_formats={},
+        **kwargs,
+    )
 
 
 def test_projection_measurement_uses_real_runtime_storage_and_weighted_error() -> None:

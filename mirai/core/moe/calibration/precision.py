@@ -121,6 +121,123 @@ class TensorPrecisionEvidence:
 
 
 @dataclass(frozen=True)
+class RouterNormExpertEvidence:
+    """Paper-defined expert ordering signals for one routed MoE layer."""
+
+    module_name: str
+    expert_id: int
+    final_router_norm: float
+    max_intra_neuron_variance: float
+    initial_router_norm: float | None = None
+
+    @property
+    def router_norm_change(self) -> float:
+        initial = 0.0 if self.initial_router_norm is None else float(
+            self.initial_router_norm
+        )
+        return float(self.final_router_norm) - initial
+
+    def validate(self) -> "RouterNormExpertEvidence":
+        values = (self.final_router_norm, self.max_intra_neuron_variance)
+        if self.initial_router_norm is not None:
+            values += (self.initial_router_norm,)
+        if (
+            not str(self.module_name).strip()
+            or int(self.expert_id) < 0
+            or any(not math.isfinite(float(value)) for value in values)
+            or float(self.final_router_norm) < 0.0
+            or float(self.max_intra_neuron_variance) < 0.0
+            or (
+                self.initial_router_norm is not None
+                and float(self.initial_router_norm) < 0.0
+            )
+        ):
+            raise ValueError("Router-norm precision evidence is invalid.")
+        return self
+
+
+def rank_router_norm_experts(
+    evidence: Sequence[RouterNormExpertEvidence],
+    *,
+    variance_ratio: float = 3.0,
+) -> dict[str, tuple[int, ...]]:
+    """Rank experts by arXiv:2604.06515 Equations 3-4 and Step 1.
+
+    Smaller router-norm changes rank first. A lower-ranked expert is promoted
+    while its maximum intra-neuron variance is at least ``variance_ratio`` times
+    that of the immediately higher expert. The paper uses a ratio of three.
+    """
+
+    ratio = float(variance_ratio)
+    if not math.isfinite(ratio) or ratio <= 1.0:
+        raise ValueError("Router-norm variance_ratio must be finite and greater than 1.")
+    grouped: dict[str, list[RouterNormExpertEvidence]] = {}
+    for raw in evidence:
+        row = raw.validate()
+        grouped.setdefault(str(row.module_name), []).append(row)
+    if not grouped:
+        raise ValueError("Router-norm precision evidence cannot be empty.")
+    result: dict[str, tuple[int, ...]] = {}
+    for module_name, rows in sorted(grouped.items()):
+        if sorted(row.expert_id for row in rows) != list(range(len(rows))):
+            raise ValueError(
+                f"Router-norm evidence for {module_name!r} must cover contiguous experts."
+            )
+        ordered = sorted(
+            rows,
+            key=lambda row: (row.router_norm_change, int(row.expert_id)),
+        )
+        while True:
+            promoted = False
+            for index in range(1, len(ordered)):
+                candidate = ordered[index]
+                if candidate.max_intra_neuron_variance <= 0.0:
+                    continue
+                higher_index = next(
+                    (
+                        position
+                        for position in range(index)
+                        if candidate.max_intra_neuron_variance
+                        >= ratio
+                        * ordered[position].max_intra_neuron_variance
+                    ),
+                    None,
+                )
+                if higher_index is not None:
+                    ordered.insert(higher_index, ordered.pop(index))
+                    promoted = True
+                    break
+            if not promoted:
+                break
+        result[module_name] = tuple(int(row.expert_id) for row in ordered)
+    return result
+
+
+def router_norm_precision_floors(
+    evidence: Sequence[RouterNormExpertEvidence],
+    *,
+    protected_fraction: float,
+    minimum_format: str,
+    variance_ratio: float = 3.0,
+) -> dict[tuple[str, int], str]:
+    """Return per-expert precision floors for the protected ranking prefix."""
+
+    fraction = float(protected_fraction)
+    quant_format = str(minimum_format).strip().lower()
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("Router-norm protected_fraction must be in (0, 1].")
+    if quant_format not in _FORMAT_BITS:
+        raise ValueError("Router-norm minimum_format is unsupported.")
+    ranking = rank_router_norm_experts(evidence, variance_ratio=variance_ratio)
+    floors: dict[tuple[str, int], str] = {}
+    for module_name, expert_ids in ranking.items():
+        protected = int(math.ceil(len(expert_ids) * fraction))
+        for expert_id in expert_ids[:protected]:
+            floors[(module_name, expert_id)] = quant_format
+    return floors
+
+
+@dataclass(frozen=True)
 class TensorPrecisionAssignment:
     """One schema-v2 runtime assignment."""
 
@@ -384,6 +501,7 @@ def allocate_tensor_precision(
     model_snapshot_id: str,
     config_snapshot_id: str,
     source_weight_fingerprint: str,
+    minimum_expert_formats: Mapping[tuple[str, int], str] | None = None,
 ) -> TensorPrecisionPlan:
     """Allocate exact measured packed bytes at projection granularity."""
 
@@ -401,12 +519,36 @@ def allocate_tensor_precision(
     keys = [(row.module_name, row.expert_id, row.projection) for row in rows]
     if len(keys) != len(set(keys)) or not rows:
         raise ValueError("Tensor precision evidence keys must be non-empty and unique.")
+    floors = {
+        (str(module_name), int(expert_id)): str(quant_format).strip().lower()
+        for (module_name, expert_id), quant_format in (
+            minimum_expert_formats or {}
+        ).items()
+    }
+    available_experts = {(row.module_name, row.expert_id) for row in rows}
+    if any(key not in available_experts for key in floors) or any(
+        value not in formats for value in floors.values()
+    ):
+        raise ValueError(
+            "Minimum expert formats must reference measured experts and candidates."
+        )
+
+    def _allowed_for_row(row: TensorPrecisionEvidence) -> tuple[str, ...]:
+        floor = floors.get((row.module_name, row.expert_id))
+        if floor is None:
+            return formats
+        candidates = tuple(
+            value for value in formats if _FORMAT_BITS[value] >= _FORMAT_BITS[floor]
+        )
+        if not candidates:
+            raise ValueError("Minimum expert format has no eligible candidate.")
+        return candidates
 
     def _candidate_key(row: TensorPrecisionEvidence, quant_format: str) -> tuple[int, str]:
         return int(row.format_bytes[quant_format]), str(quant_format)
 
     assignment = [
-        min(formats, key=lambda value, row=row: _candidate_key(row, value))
+        min(_allowed_for_row(row), key=lambda value, row=row: _candidate_key(row, value))
         for row in rows
     ]
     used = sum(
@@ -425,7 +567,7 @@ def allocate_tensor_precision(
             current_error = (
                 float(row.format_error[current]) * float(row.routing_frequency)
             )
-            for candidate in formats:
+            for candidate in _allowed_for_row(row):
                 extra = int(row.format_bytes[candidate]) - current_bytes
                 if extra <= 0 or used + extra > int(budget_bytes):
                     continue
@@ -493,7 +635,10 @@ __all__ = [
     "TensorPrecisionAssignment",
     "TensorPrecisionEvidence",
     "TensorPrecisionPlan",
+    "RouterNormExpertEvidence",
     "allocate_expert_precision",
     "allocate_tensor_precision",
+    "rank_router_norm_experts",
+    "router_norm_precision_floors",
     "load_precision_plan",
 ]

@@ -301,6 +301,11 @@ configuration and compatibility rules are documented in
   highest-precision stack.
   [(repo)](https://github.com/ggml-org/llama.cpp/tree/master/tools/imatrix)
   [(source)](https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs)
+- **Router-norm-protected expert precision** — Optional expert-wise precision
+  floors protect the smallest router-norm changes, with maximum intra-neuron
+  variance promotion, before measured-error allocation consumes the remaining
+  byte budget.
+  [(paper)](https://arxiv.org/abs/2604.06515)
 - **2:4 semi-structured frozen-expert execution** — Frozen projections retain
   exactly two values per contiguous group of four and use native
   semi-structured CUDA linear when supported, with dense reference math.

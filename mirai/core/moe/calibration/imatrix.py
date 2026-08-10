@@ -89,6 +89,7 @@ class ExpertImportanceCalibrationTarget:
     name: str
     host: Any
     weights: Mapping[str, Any]
+    router_weight: Any | None = None
 
     def validate(self) -> "ExpertImportanceCalibrationTarget":
         if not str(self.name).strip():
@@ -114,6 +115,14 @@ class ExpertImportanceCalibrationTarget:
             raise ValueError("Expert importance weights disagree on expert count.")
         if shapes["w1"][2] != shapes["w3"][2]:
             raise ValueError("w1 and w3 input dimensions must match.")
+        if self.router_weight is not None:
+            router_shape = tuple(
+                int(value) for value in torch.as_tensor(self.router_weight).shape
+            )
+            if router_shape != (experts, shapes["w1"][2]):
+                raise ValueError(
+                    "Expert importance router weight must have [E, hidden] shape."
+                )
         return self
 
     @property

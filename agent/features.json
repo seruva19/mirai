@@ -2375,14 +2375,19 @@
       ],
       "symbols": [
         "TensorPrecisionPlan",
-        "allocate_tensor_precision"
+        "allocate_tensor_precision",
+        "rank_router_norm_experts"
       ],
       "config_keys": [
         "model.params.expert_precision_calibration",
+        "model.params.expert_precision_router_norm_fraction",
+        "model.params.expert_precision_router_norm_min_format",
         "memory.expert_precision_plan_path"
       ],
       "disabled_config": {
         "model.params.expert_precision_calibration": "off",
+        "model.params.expert_precision_router_norm_fraction": 0.0,
+        "model.params.expert_precision_router_norm_min_format": "",
         "memory.expert_precision_plan_path": ""
       },
       "contract_paths": [
@@ -2393,8 +2398,10 @@
       "optimized": true,
       "reference_path": "mirai/core/models/compressed_weights/execution/mixed_precision.py",
       "readme_claim": "Imatrix-calibrated per-tensor mixed-precision expert storage",
-      "readme_claims": [],
-      "provenance": "https://github.com/ggml-org/llama.cpp/tree/master/tools/imatrix; https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs",
+      "readme_claims": [
+        "Router-norm-protected expert precision"
+      ],
+      "provenance": "https://github.com/ggml-org/llama.cpp/tree/master/tools/imatrix; https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs; https://arxiv.org/abs/2604.06515",
       "promotion_evidence": ""
     },
     {
