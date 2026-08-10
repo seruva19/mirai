@@ -265,6 +265,7 @@ class PublicationContractTests(unittest.TestCase):
                 "factorize_experts_shared_basis.py",
                 "estimate_moe_capacity.py",
                 "evaluate_domain_routing.py",
+                "evaluate_local_routing_cache.py",
                 "lr_find.py",
                 "plan_expert_consolidation.py",
                 "prune_experts.py",

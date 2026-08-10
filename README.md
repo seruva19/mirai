@@ -382,6 +382,14 @@ configuration and compatibility rules are documented in
   on total process VRAM.
 - **Routed-expert device cache** — A byte-bounded cache retains reconstructed
   INT8 experts while preserving explicit host/device ownership.
+- **Local-routing cache diagnostics** — An offline, lineage-bound report
+  computes Segment Cache Best Hit Rate (SCH) oracle curves from detached route
+  traces across explicit look-ahead windows and cache sizes. The oracle uses
+  future routes only to assess whether expert offloading is promising; it does
+  not alter routing or claim an online cache hit rate. Run
+  `scripts/tools/evaluate_local_routing_cache.py`.
+  [(paper)](https://arxiv.org/abs/2505.16056)
+  [(repo)](https://github.com/ljcleo/moe-lrc)
 - **Unified residency ledger** — Block resident sets, transfer windows, and the
   expert-device cache reserve bytes in one configured ledger. It rejects
   declared overcommit but does not
