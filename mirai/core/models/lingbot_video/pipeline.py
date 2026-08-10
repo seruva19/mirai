@@ -1638,6 +1638,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 "nf4",
                 "gguf_iq4",
                 "gguf_iq3",
+                "gguf_iq2",
                 "mxfp8_e4m3",
                 "mxfp4",
                 "nvfp4",
@@ -1650,7 +1651,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             }:
                 raise ValueError(
                     "LingBot-Video packed state requires frozen_weight_quantization to be "
-                    "'fp8', 'int8', 'nf4', 'gguf_iq4', 'gguf_iq3', 'mxfp8_e4m3', "
+                    "'fp8', 'int8', 'nf4', 'gguf_iq4', 'gguf_iq3', 'gguf_iq2', 'mxfp8_e4m3', "
                     "'mxfp4', or "
                     "'nvfp4' and strategy to be "
                     "compressed_weights or auto."
@@ -1754,6 +1755,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 "nf4",
                 "gguf_iq4",
                 "gguf_iq3",
+                "gguf_iq2",
                 "mxfp8_e4m3",
                 "mxfp4",
                 "nvfp4",
@@ -4491,6 +4493,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             if self._frozen_weight_quantization not in {
                 "gguf_iq4",
                 "gguf_iq3",
+                "gguf_iq2",
                 "mxfp8_e4m3",
                 "mxfp4",
                 "nvfp4",
@@ -4559,6 +4562,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             "nf4",
             "gguf_iq4",
             "gguf_iq3",
+            "gguf_iq2",
             "mxfp8_e4m3",
             "mxfp4",
             "nvfp4",
@@ -4566,7 +4570,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             raise ValueError(
                 "LingBot-Video quantized frozen weights support only "
                 "memory.frozen_weight_quantization='fp8', 'int8', 'nf4', 'gguf_iq4', "
-                "'gguf_iq3', 'mxfp8_e4m3', 'mxfp4', or 'nvfp4'."
+                "'gguf_iq3', 'gguf_iq2', 'mxfp8_e4m3', 'mxfp4', or 'nvfp4'."
             )
         quant_format = normalize_quant_format(scheme)
         strategy = normalize_compressed_weights_strategy(kwargs.pop("strategy", "auto"))

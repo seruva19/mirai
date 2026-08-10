@@ -169,7 +169,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         self._nf4_blocksize = int(nf4_blocksize)
         self._nf4_meta: _Nf4Meta | None = None
         self._nf4_shapes: dict[str, tuple[int, ...]] = {}
-        # GGUF sub-4-bit (gguf_iq4/gguf_iq3): one packed uint8 buffer per key holds
+        # GGUF sub-4-bit (gguf_iq4/gguf_iq3/gguf_iq2): one packed buffer per key holds
         # the canonical GGUF block bytes; _gguf_shapes records the dense [E,out,in].
         self._gguf_meta: _GgufMeta | None = None
         self._gguf_shapes: dict[str, tuple[int, ...]] = {}

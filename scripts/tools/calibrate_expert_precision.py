@@ -102,7 +102,7 @@ def main() -> int:
     parser.add_argument("--budget-gib", required=True, type=float)
     parser.add_argument(
         "--formats",
-        default="gguf_iq3,gguf_iq4,int8,bf16",
+        default="gguf_iq2,gguf_iq3,gguf_iq4,int8,bf16",
         help="Comma-separated candidate formats.",
     )
     parser.add_argument("--overwrite", action="store_true")

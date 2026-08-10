@@ -1,12 +1,13 @@
 """GGUF k-quant / IQ sub-4-bit dequant primitives for frozen expert weights.
 
-This is the owner seam for the ``gguf_iq4`` / ``gguf_iq3`` frozen-weight quant
+This is the owner seam for ``gguf_iq4`` / ``gguf_iq3`` / ``gguf_iq2`` quant
 formats. It parallels the NF4 path in ``quant.py`` but stores each expert as the
 canonical GGUF *packed block* byte layout (one ``uint8`` buffer per weight), so
 bytes-per-expert equal the on-wire GGUF footprint exactly:
 
   * IQ4_XS  -> 136 bytes / 256 weights = 4.25 bits/weight
   * IQ3_XXS ->  98 bytes / 256 weights = 3.0625 bits/weight
+  * IQ2_XS  ->  74 bytes / 256 weights = 2.3125 bits/weight
 
 On-the-fly dequant reconstructs bf16 for the existing GEMM (no compute-path
 change). Quantize runs offline (CPU) at export; dequant runs on any device.
@@ -17,9 +18,11 @@ The IQ dequant math + constant tables (``kvalues_iq4nl``, the IQ3_XXS grid_map /
 grid_hex, and ``ksigns_iq2xs``) are portable from the **MIT** reference
 ``gguf`` Python package (``gguf-py/gguf/quants.py``, ggml-org/llama.cpp), which is
 the pure-python mirror of the ggml ``dequantize_row_iq4_xs`` /
-``dequantize_row_iq3_xxs`` kernels. The code is ported with attribution; no
+``dequantize_row_iq3_xxs`` / ``dequantize_row_iq2_xs`` kernels. The code is
+ported with attribution; no
 GPL/AGPL code was copied. Block layouts additionally match the
-public GGUF format spec (``block_iq4_xs`` / ``block_iq3_xxs`` in ggml-common.h).
+public GGUF format spec (``block_iq4_xs`` / ``block_iq3_xxs`` /
+``block_iq2_xs`` in ggml-common.h).
 
   reference: https://github.com/ggml-org/llama.cpp  (gguf-py, MIT)
   files:     gguf-py/gguf/quants.py, ggml/src/ggml-common.h
@@ -29,7 +32,7 @@ CALIBRATION CONTRACT
 The encoders use uniform code-assignment weighting. Per-tensor precision
 calibration evaluates their decoded weights against routed input-square
 evidence and may choose a different representation for each expert projection.
-This is imatrix-weighted format selection, not a claim that IQ3_XXS code
+This is imatrix-weighted format selection, not a claim that IQ3_XXS/IQ2_XS code
 assignment itself reproduces llama.cpp's imatrix optimizer.
 """
 
@@ -45,18 +48,23 @@ except ModuleNotFoundError:  # pragma: no cover
 
 QK_K = 256  # GGUF super-block size (elements per super-block)
 
-GGUF_FORMATS = ("gguf_iq4", "gguf_iq3")
+GGUF_FORMATS = ("gguf_iq4", "gguf_iq3", "gguf_iq2")
 
 # type_size = bytes per super-block (block struct size in ggml-common.h).
 #   block_iq4_xs  = d(fp16,2) + scales_h(u16,2) + scales_l[QK_K/64=4] + qs[QK_K/2=128] = 136
 #   block_iq3_xxs = d(fp16,2) + qs[3*QK_K/8=96 -> 64 grid idx + 32 scale/sign]         = 98
-GGUF_TYPE_SIZE = {"gguf_iq4": 136, "gguf_iq3": 98}
-GGUF_BLOCK_FORMAT = {"gguf_iq4": "iq4_xs", "gguf_iq3": "iq3_xxs"}
+GGUF_TYPE_SIZE = {"gguf_iq4": 136, "gguf_iq3": 98, "gguf_iq2": 74}
+GGUF_BLOCK_FORMAT = {
+    "gguf_iq4": "iq4_xs",
+    "gguf_iq3": "iq3_xxs",
+    "gguf_iq2": "iq2_xs",
+}
 
 # Canonical published bits-per-weight (format constants, imatrix-independent).
 BITS_PER_WEIGHT = {
     "gguf_iq4": 4.25,
     "gguf_iq3": 3.0625,
+    "gguf_iq2": 2.3125,
     "nf4": 4.5,  # canonical QLoRA NF4 (4-bit codes + fp32 absmax / 64-block)
     "nf4_double_quant": 4.0 + 8.0 / 64.0 + 32.0 / (64.0 * 256.0),  # ~4.127
 }
@@ -89,6 +97,43 @@ _IQ3XXS_GRID_HEX = (
     "5270267140711272457252720073157333736073217441740075027524753076"
 )
 
+# IQ2_XS canonical 512x8 positive grid, encoded with the gguf-py compact
+# 2-bit map 0 -> 8, 1 -> 25, 2 -> 43 (MIT, ggml-org/llama.cpp).
+_IQ2XS_GRID_HEX = (
+    "00000200050008000a0011001400160019002000220025002800410044004600"
+    "49005000520055005800610064008000820085008800910094009900a0000101"
+    "04010601090110011201150118011a0121012401400142014501480151015401"
+    "6001680181018401900100020202050208021102140220024102440250025502"
+    "80028a0201040404060409041004120415041804210424044004420445044804"
+    "5104540456046004810484049004000502050505080511051405200541054405"
+    "500561058005010604061006260640064206840600080208050808080a081108"
+    "14082008250841084408500858088008a008aa08010904091009400981098909"
+    "000a200a280a960aa00a01100410061009101010121015101810211024104010"
+    "4210451048105110541060106a10811084109010001102110511081111111411"
+    "2011411144115011801194119611011204120612101240126012001402140514"
+    "0814111414142014411444144914501464148014011504151015401500161416"
+    "49160118041810181218401854188618001905196619511aa91a002002200520"
+    "08200a201120142020204120442050208020a020012104211021402148216521"
+    "002222228022a82201240424102429244024002541255225992501261a26a626"
+    "002808280a28202855288828a22868299029082a202a822a882a8a2a01400440"
+    "0640094010401240154018402140244040404240454048404a40514054406040"
+    "6540814084409040004102410541084111411441204141414441504180418541"
+    "a241014204421042124229424042004402440544084411441444194420444144"
+    "4444504480449444014504451045244540459a4500460a464446504601480448"
+    "1048404845485448624800491149444950496949044a00500250055008501150"
+    "145020502850415044505050805001510451105115514051425100524452aa52"
+    "0154045410542154405460548154a154005508558055885521566856a1560058"
+    "14584158505899581a5940594259855a0160046010604060546062608660a960"
+    "006124624a62926200641664106540654565a46501686a682569066a546a626a"
+    "00800280058008801180148020802a8041804480508080808280a880aa800181"
+    "0481068110814081518159810082208280828282a082a8820184048410841284"
+    "158440846084898400854485a58518866a860088088825885a8880888288a888"
+    "0689228a808a888a968aa88a0190049010904090569084900091229164915692"
+    "89920094059444945094589429959095929541965198a6984999159a609a00a0"
+    "02a008a00aa020a02aa0a0a051a159a1a6a100a202a208a22aa280a2a0a240a4"
+    "95a465a698a60aa820a822a828a8a0a8a8a804a984a986a928aa2aaa91aaaaaa"
+)
+
 # ggml ksigns_iq2xs (128-entry): low 7 bits = index, bit 7 = parity so the decoded
 # 8-sign pattern always has an even number of negatives. Generated deterministically
 # (verified against the Apache-2.0 reference table: [0,129,130,3,132,5,6,135,...]).
@@ -112,6 +157,21 @@ def _decode_iq3xxs_grid() -> list[list[int]]:
     return [flat[i * 4 : i * 4 + 4] for i in range(256)]
 
 
+def _decode_iq2xs_grid() -> list[list[int]]:
+    raw = bytes.fromhex(_IQ2XS_GRID_HEX)
+    values = (8, 25, 43)
+    flat: list[int] = []
+    for byte in raw:
+        for shift in (0, 2, 4, 6):
+            index = (byte >> shift) & 0x3
+            if index >= len(values):
+                raise RuntimeError("IQ2_XS grid contains an invalid code.")
+            flat.append(values[index])
+    if len(flat) != 512 * 8:
+        raise RuntimeError("IQ2_XS grid has an invalid size.")
+    return [flat[i * 8 : i * 8 + 8] for i in range(512)]
+
+
 def _table(name: str, device: "torch.device") -> "torch.Tensor":
     key = (name, str(device))
     cached = _TABLE_CACHE.get(key)
@@ -121,6 +181,8 @@ def _table(name: str, device: "torch.device") -> "torch.Tensor":
         t = torch.tensor(_KVALUES_IQ4NL, dtype=torch.float32, device=device)
     elif name == "grid":
         t = torch.tensor(_decode_iq3xxs_grid(), dtype=torch.float32, device=device)
+    elif name == "grid_iq2xs":
+        t = torch.tensor(_decode_iq2xs_grid(), dtype=torch.float32, device=device)
     elif name == "ksigns":
         t = torch.tensor(_KSIGNS_IQ2XS, dtype=torch.int64, device=device)
     else:  # pragma: no cover - defensive
@@ -133,7 +195,7 @@ def _table(name: str, device: "torch.device") -> "torch.Tensor":
 class _GgufMeta:
     """Per-tensor-invariant GGUF block metadata (parallel to _Nf4Meta)."""
 
-    block_format: str  # "iq4_xs" | "iq3_xxs"
+    block_format: str  # "iq4_xs" | "iq3_xxs" | "iq2_xs"
     blocksize: int  # QK_K (256)
     type_size: int  # bytes per super-block
     weight_dtype: str = "bfloat16"  # dtype dequant targets by default
@@ -148,6 +210,9 @@ def normalize_gguf_format(value: str | None) -> str:
         "gguf_iq3_xxs": "gguf_iq3",
         "iq3_xxs": "gguf_iq3",
         "iq3": "gguf_iq3",
+        "gguf_iq2_xs": "gguf_iq2",
+        "iq2_xs": "gguf_iq2",
+        "iq2": "gguf_iq2",
     }
     normalized = aliases.get(text, text)
     if normalized not in GGUF_FORMATS:
@@ -387,6 +452,95 @@ def dequantize_iq3_xxs(
 
 
 # --------------------------------------------------------------------------- #
+# IQ2_XS
+# --------------------------------------------------------------------------- #
+
+def quantize_iq2_xs(weight_2d: "torch.Tensor") -> "torch.Tensor":
+    """Encode canonical IQ2_XS blocks by exact legal-grid assignment.
+
+    Code assignment uses uniform element weights. Mirai's imatrix calibration
+    evaluates the decoded candidate before selecting it for any projection.
+    """
+    if weight_2d.ndim != 2:
+        raise ValueError(
+            f"quantize_iq2_xs expects a 2D tensor, got {tuple(weight_2d.shape)}."
+        )
+    device = weight_2d.device
+    x = weight_2d.reshape(-1).to(torch.float32)
+    n = gguf_num_superblocks(x.numel())
+    groups = x.reshape(n, 16, 2, 8)
+    magnitudes = groups.abs()
+    negative = groups < 0
+    odd = negative.sum(dim=-1).remainder(2).bool()
+    minimum = magnitudes.argmin(dim=-1)
+    parity_flip = torch.zeros_like(negative)
+    parity_flip.scatter_(-1, minimum.unsqueeze(-1), odd.unsqueeze(-1))
+    signs = negative ^ parity_flip
+
+    desired = magnitudes.amax(dim=(-1, -2)) / 43.0
+    max_desired = desired.amax(dim=1)
+    d = (max_desired * (4.0 / 15.5)).clamp_min(0.0)
+    d_safe = torch.where(d > 0, d, torch.ones_like(d))
+    scales = torch.round(desired * 4.0 / d_safe[:, None] - 0.5).clamp(0, 15)
+    scales = torch.where(desired > 0, scales, torch.zeros_like(scales))
+    db = d[:, None] * (0.5 + scales) * 0.25
+    db_safe = torch.where(db > 0, db, torch.ones_like(db))
+    targets = magnitudes / db_safe[:, :, None, None]
+    grid = _table("grid_iq2xs", device)
+    grid_indices = torch.empty((n, 16, 2), dtype=torch.int64, device=device)
+    for half in range(2):
+        distance = (
+            targets[:, :, half, None, :] - grid[None, None, :, :]
+        ).square().sum(dim=-1)
+        grid_indices[:, :, half] = distance.argmin(dim=-1)
+
+    bit_positions = torch.arange(7, device=device, dtype=torch.int64)
+    sign_indices = (
+        signs[..., :7].to(torch.int64) << bit_positions
+    ).sum(dim=-1)
+    packed_qs = grid_indices | (sign_indices << 9)
+    blocks = torch.zeros((n, 74), dtype=torch.uint8, device=device)
+    blocks[:, :2] = d.to(torch.float16).reshape(n, 1).contiguous().view(torch.uint8)
+    little_endian = torch.stack(
+        (packed_qs & 0xFF, (packed_qs >> 8) & 0xFF), dim=-1
+    )
+    blocks[:, 2:66] = little_endian.reshape(n, 64).to(torch.uint8)
+    packed_scales = scales[:, 0::2].to(torch.int64) | (
+        scales[:, 1::2].to(torch.int64) << 4
+    )
+    blocks[:, 66:74] = packed_scales.to(torch.uint8)
+    return blocks
+
+
+def dequantize_iq2_xs(
+    blocks: "torch.Tensor",
+    *,
+    shape: tuple[int, ...],
+    dtype: "torch.dtype",
+    device: "torch.device",
+) -> "torch.Tensor":
+    """Dequantize canonical IQ2_XS packed blocks."""
+    validate_gguf_blocks("gguf_iq2", blocks)
+    b = blocks.to(device=device)
+    n = int(b.shape[0])
+    d = b[:, :2].contiguous().view(torch.float16).float().reshape(n)
+    qs_bytes = b[:, 2:66].to(torch.int64).reshape(n, 32, 2)
+    qs = qs_bytes[..., 0] | (qs_bytes[..., 1] << 8)
+    packed_scales = b[:, 66:74].to(torch.int64)
+    scales = torch.stack(
+        (packed_scales & 0xF, (packed_scales >> 4) & 0xF), dim=-1
+    ).reshape(n, 16)
+    db = d[:, None] * (0.5 + scales.float()) * 0.25
+    grid = _table("grid_iq2xs", device)[qs & 0x1FF].reshape(n, 16, 2, 8)
+    sign_bytes = _table("ksigns", device)[qs >> 9].reshape(n, 16, 2)
+    bits = torch.arange(8, device=device, dtype=torch.int64)
+    sign_mask = (sign_bytes[..., None] >> bits) & 1
+    sign = torch.where(sign_mask == 0, 1.0, -1.0)
+    decoded = db[:, :, None, None] * grid * sign
+    return decoded.reshape(tuple(int(value) for value in shape)).to(dtype)
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch + validation
 # --------------------------------------------------------------------------- #
 
@@ -406,7 +560,9 @@ def quantize_gguf(fmt: str, weight_2d: "torch.Tensor") -> "torch.Tensor":
     fmt = normalize_gguf_format(fmt)
     if fmt == "gguf_iq4":
         return quantize_iq4_xs(weight_2d)
-    return quantize_iq3_xxs(weight_2d)
+    if fmt == "gguf_iq3":
+        return quantize_iq3_xxs(weight_2d)
+    return quantize_iq2_xs(weight_2d)
 
 
 def dequantize_gguf(
@@ -420,4 +576,6 @@ def dequantize_gguf(
     fmt = normalize_gguf_format(fmt)
     if fmt == "gguf_iq4":
         return dequantize_iq4_xs(blocks, shape=shape, dtype=dtype, device=device)
-    return dequantize_iq3_xxs(blocks, shape=shape, dtype=dtype, device=device)
+    if fmt == "gguf_iq3":
+        return dequantize_iq3_xxs(blocks, shape=shape, dtype=dtype, device=device)
+    return dequantize_iq2_xs(blocks, shape=shape, dtype=dtype, device=device)

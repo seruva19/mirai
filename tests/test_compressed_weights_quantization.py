@@ -30,6 +30,13 @@ from mirai.core.models.compressed_weights.artifact_source import (
     load_grouped_expert_source,
 )
 from mirai.core.models.compressed_weights.quantization.quant import _quantize_weight
+from mirai.core.models.compressed_weights.quantization.gguf_quant import (
+    dequantize_gguf,
+    gguf_stored_bytes,
+    normalize_gguf_format,
+    quantize_gguf,
+    validate_gguf_blocks,
+)
 from mirai.core.models.compressed_weights.quantization.learned_rotation import (
     learn_groupwise_expert_rotation,
     validate_learned_rotation_selection,
@@ -90,6 +97,57 @@ except ModuleNotFoundError:  # pragma: no cover
 
 @unittest.skipIf(torch is None, "torch not installed")
 class CompressedWeightQuantizationTests(unittest.TestCase):
+    def test_iq2_xs_canonical_layout_and_reference_decode(self) -> None:
+        self.assertEqual(gguf_stored_bytes("gguf_iq2", 256), 74)
+        self.assertEqual(normalize_gguf_format("iq2_xs"), "gguf_iq2")
+        self.assertEqual(normalize_gguf_format("gguf_iq2_xs"), "gguf_iq2")
+
+        # Canonical block with fp16 d=1, grid row zero (eight 8s), scale nibble
+        # zero, and sign index zero decodes to 1 * (0.5 / 4) * 8 = 1.
+        block = torch.zeros((1, 74), dtype=torch.uint8)
+        block[:, :2] = torch.tensor([1.0], dtype=torch.float16).view(torch.uint8)
+        decoded = dequantize_gguf(
+            "gguf_iq2",
+            block,
+            shape=(16, 16),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        torch.testing.assert_close(decoded, torch.ones_like(decoded))
+
+    def test_iq2_xs_roundtrip_is_deterministic_and_finite(self) -> None:
+        torch.manual_seed(126)
+        weight = torch.randn(16, 16)
+        first = quantize_gguf("gguf_iq2", weight)
+        second = quantize_gguf("iq2_xs", weight)
+        self.assertTrue(torch.equal(first, second))
+        self.assertEqual(tuple(first.shape), (1, 74))
+        self.assertEqual(first.dtype, torch.uint8)
+        decoded = dequantize_gguf(
+            "gguf_iq2",
+            first,
+            shape=tuple(weight.shape),
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        self.assertTrue(bool(torch.isfinite(decoded).all()))
+        self.assertLess(float((weight - decoded).square().mean()), 0.25)
+
+        zeros = torch.zeros_like(weight)
+        zero_blocks = quantize_gguf("gguf_iq2", zeros)
+        zero_decoded = dequantize_gguf(
+            "gguf_iq2",
+            zero_blocks,
+            shape=tuple(zeros.shape),
+            dtype=zeros.dtype,
+            device=zeros.device,
+        )
+        self.assertEqual(float(zero_decoded.abs().max()), 0.0)
+
+    def test_iq2_xs_rejects_malformed_blocks(self) -> None:
+        with self.assertRaisesRegex(ValueError, "74"):
+            validate_gguf_blocks("gguf_iq2", torch.zeros((1, 73), dtype=torch.uint8))
+
     def test_prepare_supports_provider_declared_two_projection_gelu_experts(self) -> None:
         spec = ExpertMLPExecutionSpec(
             projections=(
@@ -274,7 +332,7 @@ class CompressedWeightQuantizationTests(unittest.TestCase):
 
     def test_dense_compressed_linear_does_not_save_materialized_weight(self) -> None:
         torch.manual_seed(121)
-        for quant_format in ("int8", "mxfp8_e4m3"):
+        for quant_format in ("int8", "gguf_iq2", "mxfp8_e4m3"):
             with self.subTest(quant_format=quant_format):
                 module = CompressedLinear(
                     nn.Linear(32, 16, bias=True),

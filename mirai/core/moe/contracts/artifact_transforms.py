@@ -368,6 +368,7 @@ def test_drop_upcycling_expands_physical_experts_and_router_deterministically() 
         "nf4",
         "gguf_iq4",
         "gguf_iq3",
+        "gguf_iq2",
         "mxfp8_e4m3",
         "mxfp4",
         "nvfp4",

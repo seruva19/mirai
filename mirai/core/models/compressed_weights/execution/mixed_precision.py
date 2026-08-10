@@ -151,6 +151,7 @@ class MixedPrecisionGroupedExperts(nn.Module):
                 "nf4",
                 "gguf_iq4",
                 "gguf_iq3",
+                "gguf_iq2",
                 "mxfp8_e4m3",
                 "mxfp4",
                 "nvfp4",

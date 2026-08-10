@@ -737,7 +737,7 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
         if resolved_moe_kernel == "compiled_packed":
             _check(
                 str(config.memory.frozen_weight_quantization).strip().lower()
-                in {"gguf_iq4", "gguf_iq3", "mxfp8_e4m3", "mxfp4", "nvfp4"},
+                in {"gguf_iq4", "gguf_iq3", "gguf_iq2", "mxfp8_e4m3", "mxfp4", "nvfp4"},
                 "memory.moe_kernel_backend='compiled_packed' requires "
                 "GGUF or microscaling frozen weights.",
             )
@@ -807,6 +807,7 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
             "nf4",
             "gguf_iq4",
             "gguf_iq3",
+            "gguf_iq2",
             "mxfp8_e4m3",
             "mxfp4",
             "nvfp4",

@@ -443,6 +443,7 @@ def _configure_pipeline_runtime(
         "nf4",
         "gguf_iq4",
         "gguf_iq3",
+        "gguf_iq2",
         "mxfp8_e4m3",
         "mxfp4",
         "nvfp4",
@@ -450,7 +451,7 @@ def _configure_pipeline_runtime(
         raise ValueError(
             "memory.frozen_weight_packed_state_path requires "
             "memory.frozen_weight_quantization='fp8', 'int8', 'nf4', 'gguf_iq4', "
-            "'gguf_iq3', 'mxfp8_e4m3', 'mxfp4', or 'nvfp4'."
+            "'gguf_iq3', 'gguf_iq2', 'mxfp8_e4m3', 'mxfp4', or 'nvfp4'."
         )
     if frozen_weight_packed_state_path and not memory_caps.packed_frozen_weight_state:
         raise ValueError(

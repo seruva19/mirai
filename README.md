@@ -321,8 +321,9 @@ configuration and compatibility rules are documented in
   reference.
   [(repo)](https://github.com/deepseek-ai/DeepGEMM)
   [(repo)](https://github.com/deepseek-ai/DeepSeek-V3)
-- **GGUF low-bit storage** — IQ4_XS and IQ3_XXS artifacts provide compact,
-  lineage-checked storage for frozen weights.
+- **GGUF low-bit storage** — IQ4_XS, IQ3_XXS, and experimental IQ2_XS artifacts
+  provide compact, lineage-checked storage for frozen weights. IQ2_XS is a
+  calibration-selected candidate and makes no native-kernel speed claim.
   [(repo)](https://github.com/ggml-org/llama.cpp)
 - **Microscaling formats** — MXFP4 and NVFP4 reference formats expose
   block-scaled quantization experiments behind explicit configuration.

@@ -21,7 +21,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 DEFAULT_GROUP_SIZES = (256, 64, 16)
 NF4_BLOCKSIZE = 64
-# gguf_iq4/gguf_iq3 are the default-off sub-4-bit GGUF k-quant formats (owner seam
+# gguf_iq4/gguf_iq3/gguf_iq2 are default-off sub-4-bit GGUF formats (owner seam
 # in gguf_quant.py). Listed here so normalize_quant_format accepts them; storage +
 # dequant dispatch live behind explicit `_quant_format in GGUF_FORMATS` branches.
 QUANT_FORMATS = (
@@ -30,6 +30,7 @@ QUANT_FORMATS = (
     "nf4",
     "gguf_iq4",
     "gguf_iq3",
+    "gguf_iq2",
     "mxfp8_e4m3",
     "mxfp4",
     "nvfp4",
@@ -279,6 +280,8 @@ def normalize_quant_format(value: str | None) -> str:
         "iq4_xs": "gguf_iq4",
         "gguf_iq3_xxs": "gguf_iq3",
         "iq3_xxs": "gguf_iq3",
+        "gguf_iq2_xs": "gguf_iq2",
+        "iq2_xs": "gguf_iq2",
     }
     normalized = aliases.get(text, text)
     if normalized not in QUANT_FORMATS:

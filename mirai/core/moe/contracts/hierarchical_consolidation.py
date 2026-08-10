@@ -147,7 +147,7 @@ def test_hierarchical_transform_merges_then_reencodes_without_mutation() -> None
 
 @pytest.mark.parametrize(
     "quant_format",
-    ("fp8", "gguf_iq4", "gguf_iq3", "mxfp8_e4m3", "mxfp4", "nvfp4"),
+    ("fp8", "gguf_iq4", "gguf_iq3", "gguf_iq2", "mxfp8_e4m3", "mxfp4", "nvfp4"),
 )
 def test_hierarchical_transform_reencodes_portable_packed_formats(
     quant_format: str,

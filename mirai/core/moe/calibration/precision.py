@@ -19,6 +19,7 @@ _FORMAT_BITS = {
     "nvfp4": 4,
     "mxfp8_e4m3": 8,
     "gguf_iq3": 3,
+    "gguf_iq2": 2.3125,
 }
 _PROJECTIONS = ("w1", "w2", "w3")
 

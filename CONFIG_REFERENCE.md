@@ -3062,15 +3062,15 @@ Opt-in resolution from `config/defaults/hardware_tiers.toml`. `tiered` matches c
 
 - **Type:** str
 - **Default:** `"none"`
-- **Allowed / range:** `none`, `fp8`, `int8`, `nf4`, `gguf_iq4`, `gguf_iq3`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
+- **Allowed / range:** `none`, `fp8`, `int8`, `nf4`, `gguf_iq4`, `gguf_iq3`, `gguf_iq2`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
 
-Frozen-weight quant scheme ([`quantization.py`](mirai/core/models/quantization.py), compressed_weights). `fp8` is DeepSeek-style E4M3 W8A8 reference execution: 128×128 FP32 weight scales, online per-token-per-128-channel activation scales, FP32 K=128 accumulation, and high-precision input gradients; packed dense and routed-expert artifacts use separate `*_fp8`/`*_fp8_scale` roles. `nf4` requires bitsandbytes; MAGI-2 Preview implements `nf4` only, and packs exactly the three routed expert tensors of each multi-head MoE layer ([`quantized_experts.py`](mirai/core/models/magi2_preview/quantized_experts.py)). `gguf_iq4`/`gguf_iq3` provide GGUF sub-4-bit expert storage. `mxfp8_e4m3` is the distinct OCP microscaling format with 32-value E4M3 blocks and round-up UE8M0 scales (`ceil(log2(amax / 448))`). `mxfp4` implements OCP E2M1 with 32-value E8M0-scaled blocks; `nvfp4` implements E2M1 with 16-value E4M3 block scales and a tensor FP32 scale. The portable paths are default-off and make no native-kernel speed claim.
+Frozen-weight quant scheme ([`quantization.py`](mirai/core/models/quantization.py), compressed_weights). `fp8` is DeepSeek-style E4M3 W8A8 reference execution: 128×128 FP32 weight scales, online per-token-per-128-channel activation scales, FP32 K=128 accumulation, and high-precision input gradients; packed dense and routed-expert artifacts use separate `*_fp8`/`*_fp8_scale` roles. `nf4` requires bitsandbytes; MAGI-2 Preview implements `nf4` only, and packs exactly the three routed expert tensors of each multi-head MoE layer ([`quantized_experts.py`](mirai/core/models/magi2_preview/quantized_experts.py)). `gguf_iq4`/`gguf_iq3`/`gguf_iq2` provide GGUF sub-4-bit expert storage; IQ2_XS uses canonical 74-byte blocks (2.3125 bits/weight), uniform code assignment, and imatrix-weighted calibration for per-projection format selection. It does not claim to reproduce llama.cpp's imatrix encoder. `mxfp8_e4m3` is the distinct OCP microscaling format with 32-value E4M3 blocks and round-up UE8M0 scales (`ceil(log2(amax / 448))`). `mxfp4` implements OCP E2M1 with 32-value E8M0-scaled blocks; `nvfp4` implements E2M1 with 16-value E4M3 block scales and a tensor FP32 scale. The portable paths are default-off and make no native-kernel speed claim.
 
 ### `refiner_frozen_weight_quantization`
 
 - **Type:** str
 - **Default:** `""`
-- **Allowed / range:** empty, `none`, `fp8`, `int8`, `nf4`, `gguf_iq4`, `gguf_iq3`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
+- **Allowed / range:** empty, `none`, `fp8`, `int8`, `nf4`, `gguf_iq4`, `gguf_iq3`, `gguf_iq2`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
 
 Frozen-weight format for a separately loaded refiner DiT. Empty inherits
 `memory.frozen_weight_quantization`; an explicit value lets the base and refiner

@@ -51,13 +51,14 @@ def _ensure_compressed_weights_config(config: TrainingConfig) -> None:
         "nf4",
         "gguf_iq4",
         "gguf_iq3",
+        "gguf_iq2",
         "mxfp8_e4m3",
         "mxfp4",
         "nvfp4",
     }:
         raise ValueError(
             "Packed compressed_weights export requires memory.frozen_weight_quantization "
-            "to be 'none', 'int8', 'nf4', 'gguf_iq4', 'gguf_iq3', "
+            "to be 'none', 'int8', 'nf4', 'gguf_iq4', 'gguf_iq3', 'gguf_iq2', "
             "'mxfp8_e4m3', 'mxfp4', or 'nvfp4'."
         )
     if strategy in {"", "disabled", "none"}:
