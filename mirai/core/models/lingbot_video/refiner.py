@@ -318,6 +318,8 @@ class LingBotRefiner:
         self.subfolder = str(subfolder or "refiner")
         self._transformer: Any | None = None
         self._transformer_config: dict[str, Any] | None = None
+        self._block_swap_manager: Any | None = None
+        self._block_hook_handles: list[Any] = []
 
     def has_weights(self) -> bool:
         return resolve_lingbot_transformer_dir(self.model_root, subfolder=self.subfolder) is not None
@@ -342,7 +344,14 @@ class LingBotRefiner:
             raise RuntimeError("LingBot-Video refiner is not loaded; call load() first.")
         return self._transformer
 
-    def load(self, *, device: str, dtype: Any | None = None) -> None:
+    def load(
+        self,
+        *,
+        device: str,
+        dtype: Any | None = None,
+        residency: Any | None = None,
+        transformer_loader: Any | None = None,
+    ) -> None:
         """Build (once) and place the refiner transformer on ``device``.
 
         Reuses the shared transformer loader with the refiner subfolder. Built and
@@ -355,24 +364,89 @@ class LingBotRefiner:
             )
         if self._transformer is None:
             config = self.transformer_config()
-            transformer = LingBotVideoTransformer3DModel(**config)
-            load_lingbot_transformer_checkpoint(
-                transformer,
-                self.model_root,
-                strict=True,
-                subfolder=self.subfolder,
-            )
+            if callable(transformer_loader):
+                transformer = transformer_loader(
+                    config,
+                    subfolder=self.subfolder,
+                    dtype=dtype,
+                )
+            else:
+                transformer = LingBotVideoTransformer3DModel(**config)
+                load_lingbot_transformer_checkpoint(
+                    transformer,
+                    self.model_root,
+                    strict=True,
+                    subfolder=self.subfolder,
+                )
             transformer.eval()
             for param in transformer.parameters():
                 param.requires_grad_(False)
             self._transformer = transformer
-        if dtype is not None:
-            self._transformer.to(device=torch.device(device), dtype=dtype)
-        else:
-            self._transformer.to(device=torch.device(device))
+        if dtype is not None and not callable(transformer_loader):
+            self._transformer.to(dtype=dtype)
+        self._place(device=device, residency=residency)
+
+    def _place(self, *, device: str, residency: Any | None) -> None:
+        target = torch.device(device)
+        transformer = self.transformer
+        if residency is None or not bool(getattr(residency, "enabled", False)):
+            transformer.to(device=target)
+            return
+
+        from mirai.core.training.residency.block_swap import BlockSwapManager
+        from mirai.core.training.residency.tensor_residency import (
+            move_tensors_outside_modules,
+        )
+
+        units = list(enumerate(transformer.blocks))
+        blocks = [block for _index, block in units]
+        move_tensors_outside_modules(
+            transformer,
+            excluded_modules=blocks,
+            device=target,
+        )
+        manager = BlockSwapManager(
+            total_blocks=len(units),
+            blocks_to_swap=min(len(units), int(residency.blocks_to_swap)),
+            mode=str(residency.mode),
+            # In inference this flag means "evict after the forward". There is
+            # no backward pass, so keeping it false would accumulate every
+            # streamed block on the device during the first model call.
+            block_swap_backward=True,
+            block_residency_planner=str(residency.block_residency_planner),
+            block_swap_prefetch_depth=int(residency.block_swap_prefetch_depth),
+            block_residency_priority=str(residency.block_residency_priority),
+            block_swap_transfer_strategy=str(residency.block_swap_transfer_strategy),
+            disk_offload_dir=residency.offload_dir,
+        )
+        manager.bind(units, device=target)
+        self._release_hooks()
+        for index, block in units:
+            self._block_hook_handles.append(
+                block.register_forward_pre_hook(
+                    lambda _module, _args, idx=index: manager.before_block(idx)
+                )
+            )
+            self._block_hook_handles.append(
+                block.register_forward_hook(
+                    lambda _module, _args, output, idx=index: (
+                        manager.after_block(idx), output
+                    )[1]
+                )
+            )
+        self._block_swap_manager = manager
+
+    def _release_hooks(self) -> None:
+        for handle in self._block_hook_handles:
+            handle.remove()
+        self._block_hook_handles.clear()
 
     def release(self) -> None:
         """Drop the refiner off the compute device and free its VRAM."""
+        self._release_hooks()
+        if self._block_swap_manager is not None:
+            self._block_swap_manager.release_device()
+        self._block_swap_manager = None
         if self._transformer is not None:
             self._transformer.to(device=torch.device("cpu"))
             self._transformer = None
@@ -477,7 +551,12 @@ def run_refine(
 
     # Base DiT was already released above (before the VAE stage).
     try:
-        refiner.load(device=str(compute_device), dtype=dtype)
+        refiner.load(
+            device=str(compute_device),
+            dtype=dtype,
+            residency=pipeline.refiner_residency_request(),
+            transformer_loader=pipeline.load_refiner_transformer,
+        )
         # (e) TEXT-ONLY conditioning, by contract. The base pass may feed the
         # condition image to the VLM text encoder via ``encode_conditioned_prompt``;
         # the refiner deliberately does not, and re-anchors frame 0 through

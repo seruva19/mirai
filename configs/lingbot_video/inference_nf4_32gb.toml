@@ -11,6 +11,9 @@ path = "./models/lingbot-video-moe-30b-a3b"
 [model.params]
 variant = "lingbot-video-moe-30b-a3b"
 strict_native_assets = true
+moe_pad_backend = "vectorized"
+moe_reorder_backend = "triton_pack"
+moe_restore_backend = "triton"
 
 [inference]
 task = "text_to_video"
@@ -30,7 +33,7 @@ quantize_experts_on_load = true
 # Experts are reconstructed per call from compressed storage.
 expert_weight_access = "chunked_dequant"
 # Transient dequantization buffer size for a device of at most 32 GiB.
-expert_dequant_chunk_size = 8
+expert_dequant_chunk_size = 16
 # Fully resident: no block streaming.
 weight_residency_strategy = "disabled"
 # A workstation GPU also drives the desktop; leave allocator headroom.

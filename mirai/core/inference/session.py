@@ -39,6 +39,7 @@ from mirai.core.training.runtime.cli import (
     load_runtime_config,
 )
 from mirai.core.training.residency.device_placement import (
+    configure_inference_refiner_weight_residency,
     configure_inference_weight_residency,
     place_pipeline_on_device,
     resolve_compute_device,
@@ -275,6 +276,18 @@ class InferenceSession:
         emit_runtime_policy_notes(runtime_policy_notes)
         trainer = Trainer(cfg)
 
+        configure_vae_tiling = getattr(trainer.pipeline, "configure_vae_tiling", None)
+        if bool(cfg.inference.vae_tiling):
+            if not callable(configure_vae_tiling):
+                raise ValueError(
+                    f"model.type='{cfg.model.type}' does not implement inference VAE tiling."
+                )
+            configure_vae_tiling(
+                enabled=True,
+                tile_size=int(cfg.inference.vae_tile_size),
+                tile_stride=int(cfg.inference.vae_tile_stride),
+            )
+
         if checkpoint:
             ckpt = load_checkpoint(checkpoint)
             trainer.load_state_dict(ckpt.get("trainer_state", {}))
@@ -323,10 +336,18 @@ class InferenceSession:
             trainer.pipeline,
             config=cfg,
         )
+        refiner_residency_configured = configure_inference_refiner_weight_residency(
+            trainer.pipeline,
+            config=cfg,
+        )
         residency_strategy = (
             inference_residency_strategy
             if inference_residency_strategy is not None
-            else str(getattr(trainer, "weight_residency_strategy", "disabled"))
+            else (
+                "disabled"
+                if refiner_residency_configured
+                else str(getattr(trainer, "weight_residency_strategy", "disabled"))
+            )
         )
         if place_on_device and not stage_text_encoder:
             # Same placement contract as training: without it the denoiser

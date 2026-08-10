@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -324,6 +325,20 @@ LINGBOT_EXPERT_MLP_EXECUTION_SPEC = ExpertMLPExecutionSpec(
     activation="silu",
     combiner="gated_product",
 )
+
+
+@dataclass(frozen=True)
+class LingBotRefinerResidencyRequest:
+    """Inference block-residency policy reused by the separate refiner DiT."""
+
+    enabled: bool
+    blocks_to_swap: int
+    mode: str
+    block_residency_planner: str
+    block_swap_prefetch_depth: int
+    block_residency_priority: str
+    block_swap_transfer_strategy: str
+    offload_dir: str | None
 
 
 VALID_VARIANTS = {
@@ -1543,6 +1558,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         self._trainable_parameter_offload = False
         self._optimizer_compute_device = torch.device("cpu")
         self._block_swap_manager: BlockSwapManager | None = None
+        self._refiner_residency_request: LingBotRefinerResidencyRequest | None = None
         residency_budget_gib = float(
             getattr(memory_config, "device_residency_budget_gib", 0.0)
             if memory_config is not None
@@ -1565,6 +1581,17 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             str(getattr(memory_config, "frozen_weight_quantization", "none") or "none").strip().lower()
             if memory_config is not None
             else "none"
+        )
+        refiner_quantization = (
+            str(
+                getattr(memory_config, "refiner_frozen_weight_quantization", "")
+                or ""
+            ).strip().lower()
+            if memory_config is not None
+            else ""
+        )
+        self._refiner_frozen_weight_quantization = (
+            refiner_quantization or self._frozen_weight_quantization
         )
         self._nf4_blocksize = (
             int(getattr(memory_config, "quantization_block_size", NF4_BLOCKSIZE) or NF4_BLOCKSIZE)
@@ -1902,6 +1929,19 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
     def load_vae(self, *, device: str) -> None:
         self._native_inference_assets().load_vae(device=device)
 
+    def configure_vae_tiling(
+        self,
+        *,
+        enabled: bool,
+        tile_size: int,
+        tile_stride: int,
+    ) -> None:
+        self._native_inference_assets().configure_vae_tiling(
+            enabled=enabled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
+
     def decode_latents_native(self, latents: list[Any]) -> Any:
         return self._native_inference_assets().decode_latents_native(latents)
 
@@ -1931,6 +1971,82 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             )
             self._refiner = LingBotRefiner(self.model_config, subfolder=subfolder)
         return self._refiner
+
+    def load_refiner_transformer(
+        self,
+        transformer_config: dict[str, Any],
+        *,
+        subfolder: str,
+        dtype: Any | None = None,
+    ) -> LingBotVideoTransformer3DModel:
+        """Build the refiner with the same configured weight format as the base DiT."""
+
+        refiner_quantization = self._refiner_frozen_weight_quantization
+        if refiner_quantization in {"", "none"}:
+            transformer = LingBotVideoTransformer3DModel(**transformer_config)
+            load_lingbot_transformer_checkpoint(
+                transformer,
+                self.model_config.path,
+                strict=True,
+                subfolder=subfolder,
+            )
+            if dtype is not None:
+                transformer.to(dtype=dtype)
+            set_lingbot_video_runtime_options(transformer, self._runtime_options)
+            return transformer
+
+        with torch.device("meta"):
+            transformer = LingBotVideoTransformer3DModel(**transformer_config)
+        set_lingbot_video_runtime_options(transformer, self._runtime_options)
+        policy = self._moe_optimization_policy
+        quant_format = normalize_quant_format(refiner_quantization)
+        prepare_report, handlers = prepare_compressed_weights_modules_for_checkpoint_load(
+            transformer,
+            group_sizes="auto",
+            expert_weight_access=_expert_access_from_policy(policy),
+            expert_dequant_chunk_size=policy.expert_dequant_chunk_size,
+            replace_linear=True,
+            replace_grouped_experts=True,
+            quant_format=quant_format,
+            nf4_blocksize=self._nf4_blocksize,
+            expert_mlp_execution_spec=get_model_family_provider(
+                "lingbot-video"
+            ).expert_mlp_execution_spec,
+        )
+        if prepare_report.replaced_modules <= 0:
+            raise ValueError(
+                "LingBot-Video refiner quantization found no replaceable weights."
+            )
+        expected_keys = discover_lingbot_transformer_checkpoint_keys(
+            self.model_config.path,
+            subfolder=subfolder,
+        )
+        load_lingbot_transformer_checkpoint(
+            transformer,
+            self.model_config.path,
+            strict=True,
+            subfolder=subfolder,
+            expected_keys=expected_keys,
+            tensor_handlers=handlers,
+        )
+        for module_name, module in transformer.named_modules():
+            if isinstance(module, (CompressedGroupedExperts, MixedPrecisionGroupedExperts)):
+                if not module.is_fully_loaded():
+                    raise ValueError(
+                        "LingBot-Video refiner quantization did not load all expert "
+                        f"tensors for module '{module_name}'."
+                    )
+                module.set_expert_weight_access_policy(
+                    expert_weight_access=_expert_access_from_policy(policy),
+                    expert_dequant_chunk_size=policy.expert_dequant_chunk_size,
+                )
+                bind_cache = getattr(module, "bind_expert_device_cache", None)
+                if callable(bind_cache):
+                    bind_cache(
+                        self._expert_device_cache,
+                        namespace=f"refiner.{module_name}",
+                    )
+        return transformer
 
     def supports_refiner(self) -> bool:
         # The refiner is a video-only quality stage; validation fixtures have no
@@ -2012,11 +2128,50 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         return bool(self._refiner_assets().has_weights())
 
     def load_refiner(self, *, device: str, dtype: Any | None = None) -> None:
-        self._refiner_assets().load(device=device, dtype=dtype)
+        self._refiner_assets().load(
+            device=device,
+            dtype=dtype,
+            residency=self._refiner_residency_request,
+            transformer_loader=self.load_refiner_transformer,
+        )
+
+    def refiner_residency_request(self) -> LingBotRefinerResidencyRequest | None:
+        """Return the explicit inference residency policy for the refiner stage."""
+
+        return self._refiner_residency_request
+
+    def set_refiner_weight_residency_strategy(
+        self,
+        *,
+        strategy: str,
+        blocks_to_swap: int,
+        mode: str,
+        offload_dir: str | None,
+        block_swap_prefetch_depth: int,
+        block_residency_priority: str,
+        block_swap_transfer_strategy: str,
+    ) -> None:
+        """Configure residency for the separate refiner without moving the base DiT."""
+
+        enabled = (
+            str(strategy).strip().lower() not in {"", "disabled", "none", "off"}
+            and int(blocks_to_swap) > 0
+        )
+        self._refiner_residency_request = LingBotRefinerResidencyRequest(
+            enabled=enabled,
+            blocks_to_swap=max(0, int(blocks_to_swap)),
+            mode=str(mode),
+            block_residency_planner="uniform",
+            block_swap_prefetch_depth=int(block_swap_prefetch_depth),
+            block_residency_priority=str(block_residency_priority),
+            block_swap_transfer_strategy=str(block_swap_transfer_strategy),
+            offload_dir=(str(offload_dir) if offload_dir else None),
+        )
 
     def release_refiner(self) -> None:
         if self._refiner is not None:
             self._refiner.release()
+        self._expert_device_cache.clear()
 
     def release_base_transformer(self) -> None:
         """Move the base DiT off the compute device to free VRAM for the refiner.
@@ -2024,6 +2179,9 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         The refine flow calls this before ``load_refiner``. The base transformer
         remains on CPU, so refinement terminates the current denoising session.
         """
+        if self._block_swap_manager is not None:
+            self._block_swap_manager.release_device()
+        self._expert_device_cache.clear()
         self.transformer.to(device=torch.device("cpu"))
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -4835,6 +4993,20 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             "events": [],
         }
         setattr(self.transformer, "_mirai_block_swap_manager", self._block_swap_manager)
+        self._refiner_residency_request = (
+            LingBotRefinerResidencyRequest(
+                enabled=True,
+                blocks_to_swap=swap_count,
+                mode=str(mode),
+                block_residency_planner=str(block_residency_planner),
+                block_swap_prefetch_depth=int(block_swap_prefetch_depth),
+                block_residency_priority=str(block_residency_priority),
+                block_swap_transfer_strategy=str(block_swap_transfer_strategy),
+                offload_dir=(str(offload_dir) if offload_dir else None),
+            )
+            if enabled and phase is WeightResidencyExecutionMode.INFERENCE
+            else None
+        )
 
     def get_block_swap_units(self) -> list[tuple[int, Any]]:
         return [(idx, block) for idx, block in enumerate(self.transformer.blocks)]

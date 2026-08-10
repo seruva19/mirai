@@ -10,7 +10,7 @@ gradient_accumulation = 2
 max_steps = 1000
 gradient_checkpointing = "aggressive"
 block_swap_mode = "async"
-blocks_to_swap = 16
+blocks_to_swap = 20
 
 [optimizer]
 type = "paged_adamw_8bit"
@@ -37,6 +37,8 @@ expert_weight_access = "chunked_dequant"
 expert_dequant_chunk_size = 32
 weight_residency_strategy = "block_swap"
 block_swap_prefetch_depth = 1
+block_residency_planner = "phase_aware"
+block_swap_transfer_strategy = "flat_ring"
 max_pinned_host_gib = 16.0
 # A workstation GPU also drives the desktop; leave allocator headroom.
 cuda_memory_fraction = 0.95
@@ -46,3 +48,4 @@ minimum_system_memory_gib = 16.0
 [logging]
 output_dir = "./outputs/lingbot_lora_nf4_32gb"
 save_every_n_steps = 100
+sample_frame_count = 17

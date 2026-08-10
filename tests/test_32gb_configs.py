@@ -12,7 +12,6 @@ import unittest
 from pathlib import Path
 
 from mirai.config.hardware_tiers import (
-    resolve_expert_dequant_chunk_size,
     resolve_tier,
 )
 from mirai.config.loader import load_config
@@ -32,9 +31,10 @@ MAGI2_TRAIN = _CONFIGS / "magi2_preview" / "train_offload_32gb.toml"
 MAGI2_INFER = _CONFIGS / "magi2_preview" / "inference_offload_32gb.toml"
 LINGBOT_TRAIN = _CONFIGS / "lingbot_video" / "train_nf4_32gb.toml"
 LINGBOT_INFER = _CONFIGS / "lingbot_video" / "inference_nf4_32gb.toml"
+LINGBOT_REFINER = _CONFIGS / "lingbot_video" / "inference_nf4_refiner_32gb.toml"
 
 _TRAIN_CONFIGS = (MAGI2_TRAIN, LINGBOT_TRAIN)
-_INFER_CONFIGS = (MAGI2_INFER, LINGBOT_INFER)
+_INFER_CONFIGS = (MAGI2_INFER, LINGBOT_INFER, LINGBOT_REFINER)
 _ALL_CONFIGS = _TRAIN_CONFIGS + _INFER_CONFIGS
 
 PROFILE_HOST_MEMORY_GIB = 128.0
@@ -149,9 +149,11 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         self.assertFalse(config.optimizer.allow_fallback)
         self.assertEqual(config.training.gradient_checkpointing, "aggressive")
         self.assertEqual(config.memory.weight_residency_strategy, "block_swap")
-        self.assertEqual(config.training.blocks_to_swap, 16)
+        self.assertEqual(config.training.blocks_to_swap, 20)
         self.assertEqual(config.training.block_swap_mode, "async")
         self.assertEqual(config.memory.block_swap_prefetch_depth, 1)
+        self.assertEqual(config.memory.block_residency_planner, "phase_aware")
+        self.assertEqual(config.memory.block_swap_transfer_strategy, "flat_ring")
         self.assertEqual(config.memory.expert_dequant_chunk_size, 32)
         self.assertLessEqual(
             config.memory.max_pinned_host_gib
@@ -177,14 +179,23 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         self.assertFalse(config.inference.keep_text_encoder_resident)
         self.assertFalse(config.inference.keep_vae_resident)
 
-    def test_inference_chunk_size_agrees_with_the_device_memory_tier(self) -> None:
-        """The resident inference profile states the tier-table value."""
+    def test_lingbot_refiner_profile_bounds_1080p_vae_and_refiner_weights(self) -> None:
+        config = _resolved(LINGBOT_REFINER, entrypoint="infer")
+        self.assertTrue(config.inference.vae_tiling)
+        self.assertEqual(config.inference.vae_tile_size, 480)
+        self.assertEqual(config.inference.vae_tile_stride, 384)
+        self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
+        self.assertEqual(config.memory.refiner_frozen_weight_quantization, "nf4")
+        self.assertEqual(config.memory.expert_dequant_chunk_size, 16)
+        self.assertEqual(config.model.params.moe_reorder_backend, "triton_pack")
+        self.assertEqual(config.model.params.moe_restore_backend, "triton")
 
-        tier_choice = resolve_expert_dequant_chunk_size(
-            0, profile=((8, 9), PROFILE_DEVICE_MEMORY_GIB)
-        )
+    def test_lingbot_inference_uses_the_measured_chunk_and_kernel_profile(self) -> None:
         config = _resolved(LINGBOT_INFER, entrypoint="infer")
-        self.assertEqual(config.memory.expert_dequant_chunk_size, tier_choice)
+        self.assertEqual(config.memory.expert_dequant_chunk_size, 16)
+        self.assertEqual(config.model.params.moe_pad_backend, "vectorized")
+        self.assertEqual(config.model.params.moe_reorder_backend, "triton_pack")
+        self.assertEqual(config.model.params.moe_restore_backend, "triton")
 
     def test_profiles_do_not_delegate_to_the_tier_table(self) -> None:
         """A named hardware profile states its own keys.

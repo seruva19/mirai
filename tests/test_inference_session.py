@@ -104,6 +104,15 @@ class InferenceSessionEquivalenceTests(unittest.TestCase):
             def offload_text_encoder(self):
                 self.text_offloaded = True
 
+            @staticmethod
+            def refiner_residency_request():
+                return None
+
+            @staticmethod
+            def load_refiner_transformer(config, *, subfolder, dtype=None):
+                _ = config, subfolder, dtype
+                raise AssertionError("failure tests use their supplied refiner")
+
         return _Pipeline()
 
     def test_refiner_partial_load_is_released(self) -> None:
@@ -117,8 +126,10 @@ class InferenceSessionEquivalenceTests(unittest.TestCase):
                 return True
 
             @staticmethod
-            def load(*, device, dtype):
-                _ = (device, dtype)
+            def load(
+                *, device, dtype, residency=None, transformer_loader=None
+            ):
+                _ = (device, dtype, residency, transformer_loader)
                 raise RuntimeError("load failed")
 
             def release(self):
@@ -285,8 +296,10 @@ class InferenceSessionEquivalenceTests(unittest.TestCase):
                 return True
 
             @staticmethod
-            def load(*, device, dtype):
-                _ = (device, dtype)
+            def load(
+                *, device, dtype, residency=None, transformer_loader=None
+            ):
+                _ = (device, dtype, residency, transformer_loader)
 
             def release(self):
                 self.released = True
@@ -881,6 +894,45 @@ class InferenceSessionWeightResidencyTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(Exception, "weight_residency_strategy"):
                 load_config(cfg_path)
+
+    def test_refiner_only_swap_does_not_arm_the_base_residency_owner(self) -> None:
+        from mirai.core.training.residency.device_placement import (
+            configure_inference_refiner_weight_residency,
+            configure_inference_weight_residency,
+        )
+
+        calls = []
+
+        class _Pipeline:
+            def set_refiner_weight_residency_strategy(self, **kwargs):
+                calls.append(dict(kwargs))
+
+        config = SimpleNamespace(
+            model=SimpleNamespace(type="test"),
+            inference=SimpleNamespace(
+                blocks_to_swap=0,
+                block_swap_mode="sync",
+                refiner_blocks_to_swap=20,
+                refiner_block_swap_mode="async",
+            ),
+            memory=SimpleNamespace(
+                weight_residency_strategy="block_swap",
+                block_swap_prefetch_depth=1,
+                block_residency_priority="index",
+                block_swap_transfer_strategy="flat_ring",
+            ),
+            logging=SimpleNamespace(output_dir="out"),
+        )
+        self.assertIsNone(
+            configure_inference_weight_residency(_Pipeline(), config=config)
+        )
+        self.assertTrue(
+            configure_inference_refiner_weight_residency(_Pipeline(), config=config)
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["blocks_to_swap"], 20)
+        self.assertEqual(calls[0]["mode"], "async")
+        self.assertEqual(calls[0]["block_swap_transfer_strategy"], "flat_ring")
 
 
 if __name__ == "__main__":

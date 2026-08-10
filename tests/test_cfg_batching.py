@@ -53,6 +53,53 @@ class CfgBatchingContractTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             TrainingConfig.from_dict({"inference": {"cfg_mode": "parallelish"}})
 
+    def test_vae_tiling_is_explicit_and_validated(self) -> None:
+        default = TrainingConfig.from_dict({}).inference
+        self.assertFalse(default.vae_tiling)
+        configured = TrainingConfig.from_dict(
+            {
+                "inference": {
+                    "vae_tiling": True,
+                    "vae_tile_size": 480,
+                    "vae_tile_stride": 384,
+                }
+            }
+        ).inference
+        self.assertTrue(configured.vae_tiling)
+        self.assertEqual(configured.vae_tile_size, 480)
+        self.assertEqual(configured.vae_tile_stride, 384)
+        with self.assertRaisesRegex(ConfigError, "no greater"):
+            TrainingConfig.from_dict(
+                {"inference": {"vae_tile_size": 256, "vae_tile_stride": 384}}
+            )
+
+    def test_refiner_weight_format_and_residency_are_independent_overrides(self) -> None:
+        default = TrainingConfig.from_dict({})
+        self.assertEqual(default.memory.refiner_frozen_weight_quantization, "")
+        self.assertEqual(default.inference.refiner_blocks_to_swap, 0)
+        configured = TrainingConfig.from_dict(
+            {
+                "inference": {
+                    "refiner_blocks_to_swap": 20,
+                    "refiner_block_swap_mode": "async",
+                },
+                "memory": {
+                    "weight_residency_strategy": "block_swap",
+                    "refiner_frozen_weight_quantization": "fp8",
+                },
+            }
+        )
+        self.assertEqual(
+            configured.memory.refiner_frozen_weight_quantization, "fp8"
+        )
+        self.assertEqual(configured.inference.blocks_to_swap, 0)
+        self.assertEqual(configured.inference.refiner_blocks_to_swap, 20)
+        self.assertEqual(configured.inference.refiner_block_swap_mode, "async")
+        with self.assertRaisesRegex(ConfigError, "refiner_blocks_to_swap"):
+            TrainingConfig.from_dict(
+                {"inference": {"refiner_blocks_to_swap": -1}}
+            )
+
     def test_bf16_resident_inference_preset_is_explicit(self) -> None:
         cfg = load_config("mirai/config/presets/lingbot_video_inference_bf16.toml")
         self.assertEqual(cfg.model.dtype, "bf16")

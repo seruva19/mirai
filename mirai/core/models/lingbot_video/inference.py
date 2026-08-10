@@ -234,6 +234,9 @@ class LingBotVideoNativeInference:
             dtype=resolve_text_encoder_dtype(str(getattr(model_config, "dtype", "bf16"))),
         )
         self.vae_chunk_size = max(1, int(getattr(params, "vae_chunk_size", 16)))
+        self.vae_tiling = False
+        self.vae_tile_size = 256
+        self.vae_tile_stride = 192
         self._vae: Any | None = None
 
     # -- text encoder ------------------------------------------------------
@@ -256,7 +259,32 @@ class LingBotVideoNativeInference:
     def load_vae(self, *, device: str) -> None:
         if self._vae is None:
             self._vae = load_lingbot_native_vae(self.model_root)
+        if self.vae_tiling:
+            self._vae.enable_tiling(
+                tile_sample_min_height=self.vae_tile_size,
+                tile_sample_min_width=self.vae_tile_size,
+                tile_sample_stride_height=self.vae_tile_stride,
+                tile_sample_stride_width=self.vae_tile_stride,
+            )
         self._vae.to(device=torch.device(device))
+
+    def configure_vae_tiling(
+        self,
+        *,
+        enabled: bool,
+        tile_size: int,
+        tile_stride: int,
+    ) -> None:
+        self.vae_tiling = bool(enabled)
+        self.vae_tile_size = int(tile_size)
+        self.vae_tile_stride = int(tile_stride)
+        if self._vae is not None and self.vae_tiling:
+            self._vae.enable_tiling(
+                tile_sample_min_height=self.vae_tile_size,
+                tile_sample_min_width=self.vae_tile_size,
+                tile_sample_stride_height=self.vae_tile_stride,
+                tile_sample_stride_width=self.vae_tile_stride,
+            )
 
     def offload_vae(self) -> None:
         if self._vae is not None:
@@ -363,9 +391,12 @@ class LingBotVideoNativeInference:
                 device=device, dtype=dtype
             )
             with torch.no_grad():
-                decoded = causal_chunked_decode(
-                    vae, vae_latent, chunk_size=self.vae_chunk_size
-                )
+                if self.vae_tiling:
+                    decoded = vae.decode(vae_latent).sample.detach().to("cpu")
+                else:
+                    decoded = causal_chunked_decode(
+                        vae, vae_latent, chunk_size=self.vae_chunk_size
+                    )
             # [1,3,T,H,W] pixels in [-1,1] -> [T,3,H,W] in [0,1]
             frames = decoded[0].permute(1, 0, 2, 3).contiguous().float()
             frames = frames.add(1.0).mul_(0.5).clamp_(0.0, 1.0)

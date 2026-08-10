@@ -216,6 +216,33 @@ class LingBotNativeVaeDecodeTests(unittest.TestCase):
         reference_frames = reference[0].permute(1, 0, 2, 3).add(1.0).mul(0.5).clamp(0.0, 1.0)
         self.assertTrue(torch.allclose(frames_whole, reference_frames, atol=1e-6, rtol=0.0))
 
+    def test_tiled_decode_uses_the_configured_native_vae_path(self) -> None:
+        vae = _tiny_vae()
+        torch.manual_seed(13)
+        dit_latent = torch.randn(4, 3, 8, 8)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            vae, "enable_tiling", wraps=vae.enable_tiling
+        ) as enable_tiling, patch(
+            "mirai.core.models.lingbot_video.inference.causal_chunked_decode",
+            side_effect=AssertionError("tiled decode must not bypass VAE tiling"),
+        ):
+            inference = self._inference_with_vae(tmp, vae, vae_chunk_size=1)
+            inference.configure_vae_tiling(
+                enabled=True,
+                tile_size=8,
+                tile_stride=6,
+            )
+            frames = inference.decode_latents_native([dit_latent])
+
+        enable_tiling.assert_called_once_with(
+            tile_sample_min_height=8,
+            tile_sample_min_width=8,
+            tile_sample_stride_height=6,
+            tile_sample_stride_width=6,
+        )
+        self.assertEqual(int(frames.shape[0]), 5)
+        self.assertEqual(int(frames.shape[1]), 3)
+
     def test_decode_output_shape_and_range_contract(self) -> None:
         vae = _tiny_vae()
         torch.manual_seed(11)

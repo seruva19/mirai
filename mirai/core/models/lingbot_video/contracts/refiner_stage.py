@@ -29,6 +29,7 @@ from mirai.core.inference.conditioning import (  # noqa: E402
     PreparedInferenceConditioning,
 )
 from mirai.core.models.lingbot_video.refiner import (  # noqa: E402
+    LingBotRefiner,
     MAX_REFINER_SIGMA_TAIL_STEPS,
     compute_refiner_sigmas,
     resolve_refiner_conditioning,
@@ -110,6 +111,98 @@ def test_refiner_request_rejects_out_of_range_schedule_parameters() -> None:
         )
     with pytest.raises(RuntimeError, match="steps must be >= 1"):
         resolve_refiner_request({**base, "steps": 0}, scheduler="euler")
+
+
+def test_refiner_residency_streams_and_evicts_each_forward_block(monkeypatch) -> None:
+    class _RecordingManager:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.events = []
+            self.released = False
+
+        def bind(self, units, *, device) -> None:
+            self.units = list(units)
+            self.device = device
+
+        def before_block(self, index) -> None:
+            self.events.append(("before", index))
+
+        def after_block(self, index) -> None:
+            self.events.append(("after", index))
+
+        def release_device(self) -> None:
+            self.released = True
+
+    managers = []
+
+    def _manager_factory(**kwargs):
+        manager = _RecordingManager(**kwargs)
+        managers.append(manager)
+        return manager
+
+    import mirai.core.training.residency.block_swap as block_swap
+
+    monkeypatch.setattr(block_swap, "BlockSwapManager", _manager_factory)
+    refiner = LingBotRefiner.__new__(LingBotRefiner)
+    refiner._transformer = torch.nn.Module()
+    refiner._transformer.blocks = torch.nn.ModuleList(
+        [torch.nn.Linear(2, 2) for _ in range(2)]
+    )
+    refiner._block_swap_manager = None
+    refiner._block_hook_handles = []
+
+    class _Residency:
+        enabled = True
+        blocks_to_swap = 2
+        mode = "async"
+        block_residency_planner = "phase_aware"
+        block_swap_prefetch_depth = 1
+        block_residency_priority = "uniform"
+        block_swap_transfer_strategy = "flat_ring"
+        offload_dir = None
+
+    refiner._place(device="cpu", residency=_Residency())
+    manager = managers[0]
+    assert manager.kwargs["block_swap_backward"] is True
+    assert manager.kwargs["block_swap_transfer_strategy"] == "flat_ring"
+    refiner.transformer.blocks[0](torch.ones(1, 2))
+    assert manager.events == [("before", 0), ("after", 0)]
+    refiner.release()
+    assert manager.released is True
+
+
+def test_compressed_refiner_loader_preserves_float32_scale_metadata() -> None:
+    class _PackedTransformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("weight_codes", torch.ones(2, dtype=torch.uint8))
+            self.register_buffer("weight_scale", torch.ones(2, dtype=torch.float32))
+
+    seen = {}
+
+    def _loader(config, *, subfolder, dtype=None):
+        seen.update(config=config, subfolder=subfolder, dtype=dtype)
+        return _PackedTransformer()
+
+    refiner = LingBotRefiner.__new__(LingBotRefiner)
+    refiner.subfolder = "refiner"
+    refiner._transformer = None
+    refiner._transformer_config = {"hidden_size": 2}
+    refiner._block_swap_manager = None
+    refiner._block_hook_handles = []
+    refiner.has_weights = lambda: True
+    refiner.load(
+        device="cpu",
+        dtype=torch.bfloat16,
+        transformer_loader=_loader,
+    )
+    assert seen == {
+        "config": {"hidden_size": 2},
+        "subfolder": "refiner",
+        "dtype": torch.bfloat16,
+    }
+    assert refiner.transformer.weight_codes.dtype is torch.uint8
+    assert refiner.transformer.weight_scale.dtype is torch.float32
 
 
 class _RefinerPipeline:
@@ -194,6 +287,17 @@ class _RefinerPipeline:
         # absent re-pin cannot pass by accident.
         return torch.ones_like(torch.as_tensor(latents))
 
+    @staticmethod
+    def refiner_residency_request():
+        return None
+
+    @staticmethod
+    def load_refiner_transformer(config, *, subfolder, dtype=None):
+        raise AssertionError(
+            "the contract refiner must already be loaded: "
+            f"{config!r}, {subfolder!r}, {dtype!r}"
+        )
+
 
 class _LoadedRefiner:
     def __init__(self) -> None:
@@ -203,8 +307,15 @@ class _LoadedRefiner:
     def has_weights() -> bool:
         return True
 
-    def load(self, *, device, dtype=None) -> None:
-        _ = device, dtype
+    def load(
+        self,
+        *,
+        device,
+        dtype=None,
+        residency=None,
+        transformer_loader=None,
+    ) -> None:
+        _ = device, dtype, residency, transformer_loader
 
     def release(self) -> None:
         self.released = True

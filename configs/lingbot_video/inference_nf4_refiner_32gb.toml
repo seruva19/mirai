@@ -1,0 +1,37 @@
+# LingBot Video base inference and 1080p refinement on 32 GiB VRAM.
+preset = "lingbot_video_inference_bf16"
+
+[model]
+path = "./models/lingbot-video-moe-30b-a3b"
+
+[model.params]
+variant = "lingbot-video-moe-30b-a3b"
+strict_native_assets = true
+moe_pad_backend = "vectorized"
+moe_reorder_backend = "triton_pack"
+moe_restore_backend = "triton"
+
+[inference]
+task = "text_to_video"
+denoising_strength = 1.0
+cfg_mode = "batched"
+prompt_rewriter = "lingbot_json"
+keep_text_encoder_resident = false
+keep_vae_resident = false
+vae_tiling = true
+vae_tile_size = 480
+vae_tile_stride = 384
+
+[memory]
+frozen_weight_quantization = "nf4"
+refiner_frozen_weight_quantization = "nf4"
+frozen_weight_quantization_strategy = "compressed_weights"
+quantize_experts_on_load = true
+expert_weight_access = "chunked_dequant"
+expert_dequant_chunk_size = 16
+weight_residency_strategy = "disabled"
+cuda_memory_fraction = 0.95
+minimum_system_memory_gib = 8.0
+
+[logging]
+output_dir = "./outputs/lingbot_inference_nf4_refiner_32gb"

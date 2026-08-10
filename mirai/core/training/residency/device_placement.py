@@ -170,6 +170,55 @@ def configure_inference_weight_residency(pipeline: Any, *, config: Any) -> str |
     return request.strategy
 
 
+def configure_inference_refiner_weight_residency(
+    pipeline: Any,
+    *,
+    config: Any,
+) -> bool:
+    """Apply an explicit residency override to a separate refiner denoiser."""
+
+    blocks_to_swap = int(
+        getattr(config.inference, "refiner_blocks_to_swap", 0)
+    )
+    if blocks_to_swap <= 0:
+        return False
+    strategy = str(
+        getattr(config.memory, "weight_residency_strategy", "disabled")
+    ).strip().lower()
+    if strategy in {"", "auto"}:
+        strategy = "block_swap"
+    if strategy not in _OFFLOADED_STRATEGIES:
+        raise ValueError(
+            "inference.refiner_blocks_to_swap > 0 requires "
+            "memory.weight_residency_strategy='block_swap' or 'stream_disk'."
+        )
+    configure = getattr(pipeline, "set_refiner_weight_residency_strategy", None)
+    if not callable(configure):
+        raise ValueError(
+            f"model.type='{config.model.type}' does not implement separate refiner "
+            "weight residency."
+        )
+    configure(
+        strategy=strategy,
+        blocks_to_swap=blocks_to_swap,
+        mode=str(
+            getattr(config.inference, "refiner_block_swap_mode", "sync")
+        ).strip().lower(),
+        offload_dir=str(getattr(config.logging, "output_dir", ""))
+        + "/refiner_weight_stream",
+        block_swap_prefetch_depth=int(
+            getattr(config.memory, "block_swap_prefetch_depth", 1)
+        ),
+        block_residency_priority=str(
+            getattr(config.memory, "block_residency_priority", "index")
+        ),
+        block_swap_transfer_strategy=str(
+            getattr(config.memory, "block_swap_transfer_strategy", "per_tensor")
+        ),
+    )
+    return True
+
+
 def resolve_compute_dtype(config: Any) -> "torch.dtype":
     if torch is None:  # pragma: no cover
         raise RuntimeError("torch is required to resolve compute dtype.")

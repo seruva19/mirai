@@ -341,6 +341,9 @@ class InferenceConfig:
     stage_text_encoder_before_denoiser: bool = False
     text_encoder_weight_quantization: str = "none"
     keep_vae_resident: bool = False
+    vae_tiling: bool = False
+    vae_tile_size: int = 256
+    vae_tile_stride: int = 192
     # Cross-timestep expert-branch feature reuse (default-off, lossy). See
     # mirai/core/moe/runtime/expert_feature_cache.py.
     expert_feature_cache: str = "off"
@@ -353,6 +356,9 @@ class InferenceConfig:
     # fully resident; above 0 it requires memory.weight_residency_strategy.
     blocks_to_swap: int = 0
     block_swap_mode: str = "sync"
+    # Optional refiner-only override. 0 inherits the denoiser residency request.
+    refiner_blocks_to_swap: int = 0
+    refiner_block_swap_mode: str = "sync"
 
 
 @dataclass
@@ -617,6 +623,8 @@ class MemoryConfig:
     hardware_policy: str = "disabled"
     frozen_weight_quantization: str = "none"
     frozen_weight_quantization_strategy: str = "disabled"
+    # Empty inherits frozen_weight_quantization for a separate refiner DiT.
+    refiner_frozen_weight_quantization: str = ""
     frozen_weight_packed_state_path: str = ""
     expert_precision_plan_path: str = ""
     expert_structured_sparsity: str = "disabled"
@@ -738,6 +746,9 @@ class TrainingConfig:
                 "stage_text_encoder_before_denoiser",
                 "text_encoder_weight_quantization",
                 "keep_vae_resident",
+                "vae_tiling",
+                "vae_tile_size",
+                "vae_tile_stride",
                 "expert_feature_cache",
                 "expert_feature_cache_drift_threshold",
                 "expert_feature_cache_max_reuse_span",
@@ -745,9 +756,14 @@ class TrainingConfig:
                 "moe_token_chunk_size",
                 "blocks_to_swap",
                 "block_swap_mode",
+                "refiner_blocks_to_swap",
+                "refiner_block_swap_mode",
             },
         )
         inference_blocks_to_swap = int(inference_table.get("blocks_to_swap", 0))
+        inference_refiner_blocks_to_swap = int(
+            inference_table.get("refiner_blocks_to_swap", 0)
+        )
         inference_text_encoder_quantization = str(
             inference_table.get("text_encoder_weight_quantization", "none")
         ).strip().lower()
@@ -776,6 +792,17 @@ class TrainingConfig:
             )
         if inference_blocks_to_swap < 0:
             raise ConfigError("inference.blocks_to_swap must be >= 0.")
+        if inference_refiner_blocks_to_swap < 0:
+            raise ConfigError("inference.refiner_blocks_to_swap must be >= 0.")
+        inference_vae_tile_size = int(inference_table.get("vae_tile_size", 256))
+        inference_vae_tile_stride = int(inference_table.get("vae_tile_stride", 192))
+        if inference_vae_tile_size <= 0:
+            raise ConfigError("inference.vae_tile_size must be > 0.")
+        if not 0 < inference_vae_tile_stride <= inference_vae_tile_size:
+            raise ConfigError(
+                "inference.vae_tile_stride must be > 0 and no greater than "
+                "inference.vae_tile_size."
+            )
         inference_moe_token_chunk_size = int(
             inference_table.get("moe_token_chunk_size", 0)
         )
@@ -789,7 +816,15 @@ class TrainingConfig:
                 "inference.block_swap_mode must be 'sync' or 'async'; "
                 f"got '{inference_block_swap_mode}'."
             )
-        if inference_blocks_to_swap > 0:
+        inference_refiner_block_swap_mode = str(
+            inference_table.get("refiner_block_swap_mode", "sync")
+        ).strip().lower()
+        if inference_refiner_block_swap_mode not in {"sync", "async"}:
+            raise ConfigError(
+                "inference.refiner_block_swap_mode must be 'sync' or 'async'; "
+                f"got '{inference_refiner_block_swap_mode}'."
+            )
+        if inference_blocks_to_swap > 0 or inference_refiner_blocks_to_swap > 0:
             configured_residency_strategy = (
                 str(
                     _expect_table("memory", payload.get("memory", {})).get(
@@ -806,7 +841,7 @@ class TrainingConfig:
                 "stream_disk",
             }:
                 raise ConfigError(
-                    "inference.blocks_to_swap > 0 requires "
+                    "inference block swapping requires "
                     "memory.weight_residency_strategy='block_swap' or "
                     f"'stream_disk'; got '{configured_residency_strategy}'."
                 )
@@ -1303,6 +1338,7 @@ class TrainingConfig:
             "hardware_policy",
             "frozen_weight_quantization",
             "frozen_weight_quantization_strategy",
+            "refiner_frozen_weight_quantization",
             "frozen_weight_packed_state_path",
             "expert_precision_plan_path",
             "expert_structured_sparsity",
@@ -3162,6 +3198,15 @@ class TrainingConfig:
                 + ", ".join(sorted(v for v in _fwq_allowed if v))
                 + f"; got {_fwq_raw!r}."
             )
+        _refiner_fwq_raw = str(
+            memory_table.get("refiner_frozen_weight_quantization", "")
+        ).strip().lower()
+        if _refiner_fwq_raw not in _fwq_allowed:
+            raise ValueError(
+                "memory.refiner_frozen_weight_quantization must be empty or one of: "
+                + ", ".join(sorted(v for v in _fwq_allowed if v))
+                + f"; got {_refiner_fwq_raw!r}."
+            )
         _fwq_strategy = str(
             memory_table.get("frozen_weight_quantization_strategy", "disabled")
         ).strip().lower()
@@ -3169,6 +3214,7 @@ class TrainingConfig:
             hardware_policy=str(memory_table.get("hardware_policy", "disabled")),
             frozen_weight_quantization=_fwq_raw,
             frozen_weight_quantization_strategy=_fwq_strategy,
+            refiner_frozen_weight_quantization=_refiner_fwq_raw,
             frozen_weight_packed_state_path=frozen_weight_packed_state_path,
             expert_precision_plan_path=expert_precision_plan_path,
             expert_structured_sparsity=str(
@@ -3386,6 +3432,9 @@ class TrainingConfig:
                 keep_vae_resident=bool(
                     inference_table.get("keep_vae_resident", False)
                 ),
+                vae_tiling=bool(inference_table.get("vae_tiling", False)),
+                vae_tile_size=inference_vae_tile_size,
+                vae_tile_stride=inference_vae_tile_stride,
                 expert_feature_cache=expert_feature_cache_policy.mode,
                 expert_feature_cache_drift_threshold=(
                     expert_feature_cache_policy.drift_threshold
@@ -3397,6 +3446,8 @@ class TrainingConfig:
                 moe_token_chunk_size=inference_moe_token_chunk_size,
                 blocks_to_swap=inference_blocks_to_swap,
                 block_swap_mode=inference_block_swap_mode,
+                refiner_blocks_to_swap=inference_refiner_blocks_to_swap,
+                refiner_block_swap_mode=inference_refiner_block_swap_mode,
             ),
             training=training,
             optimizer=optimizer,

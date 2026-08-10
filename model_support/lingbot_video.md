@@ -156,13 +156,14 @@ image_to_video = 3
 The measured 128 GiB RAM / 32 GiB VRAM training profile is
 [`train_nf4_32gb.toml`](../configs/lingbot_video/train_nf4_32gb.toml). It uses
 NF4 packing on load, the paged 8-bit AdamW optimizer without fallback,
-aggressive activation checkpointing, 16 asynchronously swapped blocks with
-one-block prefetch, 32-expert dequantization chunks, and a 16 GiB pinned-host
-ceiling.
+aggressive activation checkpointing, 20 asynchronously swapped blocks with
+one-block prefetch, phase-aware residency planning, flat-ring transfers,
+32-expert dequantization chunks, and a 16 GiB pinned-host ceiling.
 
 | measured workload | training rate | peak process VRAM | peak host RSS |
 |---|---:|---:|---:|
 | Batch 1 with accumulation 2, rank-32 `attn_router_routed_experts` LoRA, 17 frames at 256x448; late-step median on one H100 80 GB with a 30.88 GiB allocator cap | 6.16 s/step | 32,420 MiB | 28.93 GiB |
+| Batch 1 with accumulation 2, rank-32 `attn_router_routed_experts` LoRA, 33-frame cached samples dominated by 384x688; steps 2–6 median on one H100 80 GB with a 30.88 GiB allocator cap | 11.35 s/step | 29,631 MiB | 29.63 GiB |
 
 This establishes the profile's measured memory envelope for the stated
 workload. The timing is H100-specific; it is not a throughput claim for a
@@ -179,6 +180,22 @@ is the same generation path on a 32 GiB device: NF4 compressed weights, no
 block swapping, and the text encoder and VAE released between phases instead of
 kept resident. Set either `keep_*_resident` back to `true` only when the
 measured peak leaves room for it.
+
+The 1080p refiner can use provider-native VAE tiling to bound encode and decode
+activation memory. Configure it with the generic `inference.vae_tiling`,
+`vae_tile_size`, and `vae_tile_stride` keys. Tiling remains disabled by default.
+
+[`inference_nf4_refiner_32gb.toml`](../configs/lingbot_video/inference_nf4_refiner_32gb.toml)
+is the measured 32 GiB base-plus-refiner profile. It applies NF4 on load to both
+DiTs, uses bounded expert dequantization and Triton token packing/restoration,
+and tiles the high-resolution VAE stages.
+
+| measured workload | wall time | base denoise | refine | decode | peak process VRAM | peak host RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| 480x832x17 base at 25 steps, 1920x1088x17 refiner at 8 steps; one H100 80 GB with a 30.88 GiB allocator cap | 367.19 s | 68.31 s | 239.72 s | 6.32 s | 23,973 MiB | 49.13 GiB |
+
+The complete output was decoded and visually checked. Timing is a single H100
+measurement for the stated profile, not expected consumer-GPU throughput.
 
 Prompts use the release’s structured JSON caption format, described under
 [Prompt and negative-prompt contract](#prompt-and-negative-prompt-contract).

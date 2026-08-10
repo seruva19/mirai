@@ -1047,6 +1047,34 @@ provider-owned text encoder).
 
 Keeps native VAE weights on their compute device across repeated `InferenceSession.generate()` calls. Increases VRAM use; the CLI BooleanOptional override is `--keep-vae-resident` ([`session.py`](mirai/core/inference/session.py)).
 
+### `vae_tiling`
+
+- **Type:** bool
+- **Default:** `False`
+
+Enables provider-native spatial VAE tiling for inference encode and decode. This
+bounds peak activation memory for high-resolution refinement at the cost of
+additional overlapping tile work. The selected model-family provider must
+implement the VAE-tiling hook; unsupported providers fail explicitly
+([`session.py`](mirai/core/inference/session.py), provider-owned VAE runtime).
+
+### `vae_tile_size`
+
+- **Type:** int
+- **Default:** `256`
+
+Spatial sample-space height and width of each VAE tile. Must be greater than zero.
+It is consumed only when `vae_tiling=true`.
+
+### `vae_tile_stride`
+
+- **Type:** int
+- **Default:** `192`
+
+Spatial sample-space height and width between adjacent VAE tiles. Must be greater
+than zero and no greater than `vae_tile_size`; the difference controls overlap.
+It is consumed only when `vae_tiling=true`.
+
 ### `expert_feature_cache`
 
 - **Type:** str
@@ -1098,6 +1126,29 @@ Denoiser blocks streamed from host RAM during sampling, clamped to the block cou
 - **Allowed / range:** `sync`, `async`
 
 Transfer scheduling for `inference.blocks_to_swap`. `sync` copies each block in on the compute stream immediately before its forward; `async` issues `memory.block_swap_prefetch_depth` blocks ahead on a dedicated transfer stream so a copy overlaps the preceding block's compute, at the cost of holding the in-flight blocks on the device. Inert while `inference.blocks_to_swap = 0` ([`block_swap.py`](mirai/core/training/residency/block_swap.py)).
+
+### `refiner_blocks_to_swap`
+
+- **Type:** int
+- **Default:** `0`
+- **Allowed / range:** `>= 0`
+
+Optional block residency for a provider-owned, separately loaded refiner DiT.
+At `0`, the refiner inherits the denoiser residency request. Above `0`, only the
+refiner is streamed; `inference.blocks_to_swap=0` may keep the base denoiser
+resident. Requires `memory.weight_residency_strategy='block_swap'` or
+`'stream_disk'` and a provider that implements separate refiner residency
+([`device_placement.py`](mirai/core/training/residency/device_placement.py)).
+
+### `refiner_block_swap_mode`
+
+- **Type:** str
+- **Default:** `sync`
+- **Allowed / range:** `sync`, `async`
+
+Transfer scheduling for `inference.refiner_blocks_to_swap`. It has the same
+synchronous/asynchronous semantics as `inference.block_swap_mode` and is inert
+while the refiner-specific block count is zero.
 
 ## `[training]` — TrainingSection
 
@@ -3014,6 +3065,20 @@ Opt-in resolution from `config/defaults/hardware_tiers.toml`. `tiered` matches c
 - **Allowed / range:** `none`, `fp8`, `int8`, `nf4`, `gguf_iq4`, `gguf_iq3`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
 
 Frozen-weight quant scheme ([`quantization.py`](mirai/core/models/quantization.py), compressed_weights). `fp8` is DeepSeek-style E4M3 W8A8 reference execution: 128×128 FP32 weight scales, online per-token-per-128-channel activation scales, FP32 K=128 accumulation, and high-precision input gradients; packed dense and routed-expert artifacts use separate `*_fp8`/`*_fp8_scale` roles. `nf4` requires bitsandbytes; MAGI-2 Preview implements `nf4` only, and packs exactly the three routed expert tensors of each multi-head MoE layer ([`quantized_experts.py`](mirai/core/models/magi2_preview/quantized_experts.py)). `gguf_iq4`/`gguf_iq3` provide GGUF sub-4-bit expert storage. `mxfp8_e4m3` is the distinct OCP microscaling format with 32-value E4M3 blocks and round-up UE8M0 scales (`ceil(log2(amax / 448))`). `mxfp4` implements OCP E2M1 with 32-value E8M0-scaled blocks; `nvfp4` implements E2M1 with 16-value E4M3 block scales and a tensor FP32 scale. The portable paths are default-off and make no native-kernel speed claim.
+
+### `refiner_frozen_weight_quantization`
+
+- **Type:** str
+- **Default:** `""`
+- **Allowed / range:** empty, `none`, `fp8`, `int8`, `nf4`, `gguf_iq4`, `gguf_iq3`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
+
+Frozen-weight format for a separately loaded refiner DiT. Empty inherits
+`memory.frozen_weight_quantization`; an explicit value lets the base and refiner
+use different storage formats. The provider must support compressed on-load
+construction for its refiner. Packed integer codes and FP32 scale metadata retain
+their storage dtypes when the model compute dtype is applied
+([`pipeline.py`](mirai/core/models/lingbot_video/pipeline.py),
+[`refiner.py`](mirai/core/models/lingbot_video/refiner.py)).
 
 ### `frozen_weight_quantization_strategy`
 
