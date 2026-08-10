@@ -2405,6 +2405,48 @@
       "promotion_evidence": ""
     },
     {
+      "name": "alphaq_spectral_precision_calibration",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/moe/calibration/alphaq.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "pl_alpha_hill",
+        "alpha_importance_weights",
+        "spectral_projection_evidence"
+      ],
+      "config_keys": [
+        "model.params.expert_precision_calibration",
+        "model.params.expert_precision_alphaq_gamma",
+        "memory.expert_precision_plan_path"
+      ],
+      "disabled_config": {
+        "model.params.expert_precision_calibration": "off",
+        "model.params.expert_precision_alphaq_gamma": 0.0,
+        "memory.expert_precision_plan_path": ""
+      },
+      "contract_paths": [
+        "mirai/core/training/calibration/contracts/expert_precision.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "mirai/core/moe/calibration/precision.py",
+      "readme_claim": "Calibration-free spectral expert precision",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2606.04980; https://github.com/Superone77/AlphaQ",
+      "promotion_evidence": ""
+    },
+    {
       "name": "latent_wavelet_supervision",
       "kind": "generic",
       "owner": "mirai/core/training/objectives/latent_wavelet.py",

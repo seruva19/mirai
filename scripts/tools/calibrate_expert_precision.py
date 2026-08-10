@@ -36,6 +36,7 @@ def calibrate_expert_precision(
     max_accumulator_gib: float,
     budget_gib: float,
     allowed_formats: tuple[str, ...],
+    spectral_gamma: float | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Run an isolated leased calibration session and write a schema-v2 plan."""
@@ -48,13 +49,15 @@ def calibrate_expert_precision(
             "Pass --overwrite to replace it."
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    enforce_dataset_compliance(
-        dataset_path=config.dataset.path,
-        compliance_enabled=config.compliance.enabled,
-        usage_mode=config.dataset.usage_mode,
-        require_provenance=config.compliance.require_provenance,
-        require_rights_attestation=config.compliance.require_rights_attestation,
-    )
+    mode = str(config.model.params.expert_precision_calibration).strip().lower()
+    if mode == "imatrix":
+        enforce_dataset_compliance(
+            dataset_path=config.dataset.path,
+            compliance_enabled=config.compliance.enabled,
+            usage_mode=config.dataset.usage_mode,
+            require_provenance=config.compliance.require_provenance,
+            require_rights_attestation=config.compliance.require_rights_attestation,
+        )
     budget_bytes = int(float(budget_gib) * (1024**3))
     if budget_bytes <= 0:
         raise ValueError("--budget-gib must be positive.")
@@ -81,6 +84,11 @@ def calibrate_expert_precision(
                     max_accumulator_gib=float(max_accumulator_gib),
                     budget_bytes=budget_bytes,
                     allowed_formats=allowed_formats,
+                    spectral_gamma=(
+                        float(config.model.params.expert_precision_alphaq_gamma)
+                        if spectral_gamma is None
+                        else float(spectral_gamma)
+                    ),
                     overwrite=bool(overwrite),
                 ).to_dict()
         finally:
@@ -97,9 +105,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--steps", required=True, type=int)
+    parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--max-accumulator-gib", type=float, default=1.0)
     parser.add_argument("--budget-gib", required=True, type=float)
+    parser.add_argument(
+        "--spectral-gamma",
+        type=float,
+        default=None,
+        help="Override AlphaQ importance curvature; zero selects the data-free default.",
+    )
     parser.add_argument(
         "--formats",
         default="gguf_iq2,gguf_iq3,gguf_iq4,int8,bf16",
@@ -108,9 +122,7 @@ def main() -> int:
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     formats = tuple(
-        value.strip().lower()
-        for value in str(args.formats).split(",")
-        if value.strip()
+        value.strip().lower() for value in str(args.formats).split(",") if value.strip()
     )
     register_builtin_components()
     config, _notes = load_runtime_config(
@@ -125,6 +137,7 @@ def main() -> int:
         max_accumulator_gib=args.max_accumulator_gib,
         budget_gib=args.budget_gib,
         allowed_formats=formats,
+        spectral_gamma=args.spectral_gamma,
         overwrite=args.overwrite,
     )
     print(json.dumps(report, indent=2, sort_keys=True))

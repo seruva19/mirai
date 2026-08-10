@@ -917,9 +917,17 @@ Offline SVD-LLM-style activation-covariance gate. With the pre-factorization sou
 
 - **Type:** str
 - **Default:** `"off"`
-- **Allowed / range:** `off`, `imatrix`; collection requires floating experts and empty packed-state/precision-plan paths
+- **Allowed / range:** `off`, `imatrix`, `alphaq`; planning requires floating experts and empty packed-state/precision-plan paths
 
-Offline per-tensor precision-planning gate. `imatrix` arms [`scripts/tools/calibrate_expert_precision.py`](scripts/tools/calibrate_expert_precision.py): provider-owned routed expert hosts accumulate `E[x²]` separately for every physical expert's w1/w3 input and post-SwiGLU w2 input, following llama.cpp's open importance-matrix statistic. `--max-accumulator-gib` splits layers into deterministic repeated passes. Each `--formats` candidate is encoded and decoded by Mirai's real runtime representation; activation-weighted reconstruction MSE and actual packed tensor bytes feed the existing benefit-per-byte allocator at `(module, expert, projection)` granularity. `--budget-gib` is a hard ceiling. The schema-v2 JSON plan binds dataset/model/config and an exact source-weight fingerprint; this is an open adaptation of per-tensor dynamic precision, not a claim to reproduce Unsloth's unpublished Dynamic 2.0 selection algorithm. `off` installs no observers and changes no runtime behavior.
+Offline per-tensor precision-planning gate. `imatrix` arms [`scripts/tools/calibrate_expert_precision.py`](scripts/tools/calibrate_expert_precision.py): provider-owned routed expert hosts accumulate `E[x²]` separately for every physical expert's w1/w3 input and post-SwiGLU w2 input, following llama.cpp's open importance-matrix statistic. `--max-accumulator-gib` splits layers into deterministic repeated passes. `alphaq` is an experimental, calibration-free alternative inspired by [AlphaQ](https://arxiv.org/abs/2606.04980): deterministic 256×256 fixed-aspect weight blocks estimate projection-wise PL_Alpha_Hill, and smaller exponents increase the cost of quantization error. Mirai measures its actual packed-format distortion and uses its existing benefit-per-byte allocator, rather than claiming parity with AlphaQ's GPTQ noise surrogate or MILP solver. Each `--formats` candidate is encoded and decoded by Mirai's real runtime representation; `--budget-gib` is a hard ceiling. The schema-v2 JSON plan binds dataset/model/config and an exact source-weight fingerprint. `off` installs no observers and changes no runtime behavior.
+
+### `expert_precision_alphaq_gamma`
+
+- **Type:** float
+- **Default:** `0.0`
+- **Allowed / range:** finite and non-negative
+
+Curvature of the AlphaQ-inspired importance weight `(median(alpha) / alpha)^gamma`. `0.0` selects AlphaQ's data-free default `alpha_min * (alpha_max - alpha_min) / variance(alpha)`, with `1.0` used for a degenerate equal-alpha distribution. Positive values select an explicit curvature. It is ignored unless `expert_precision_calibration="alphaq"`; the CLI can override it with `--spectral-gamma`.
 
 ### `expert_precision_router_norm_fraction`
 

@@ -306,6 +306,13 @@ configuration and compatibility rules are documented in
   variance promotion, before measured-error allocation consumes the remaining
   byte budget.
   [(paper)](https://arxiv.org/abs/2604.06515)
+- **Calibration-free spectral expert precision** — An experimental AlphaQ-inspired
+  planner uses projection-wise heavy-tailed weight spectra when representative
+  calibration data is unavailable, then measures Mirai's real packed formats
+  under the existing global byte ceiling. This is a clean-room adaptation, not
+  parity with AlphaQ's GPTQ/MILP pipeline.
+  [(paper)](https://arxiv.org/abs/2606.04980)
+  [(repo)](https://github.com/Superone77/AlphaQ)
 - **2:4 semi-structured frozen-expert execution** — Frozen projections retain
   exactly two values per contiguous group of four and use native
   semi-structured CUDA linear when supported, with dense reference math.

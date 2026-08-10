@@ -303,6 +303,7 @@ class ModelParams:
     expert_factorization_calibration: str = "off"
     # Offline routed input-square collection and per-tensor precision planning.
     expert_precision_calibration: str = "off"
+    expert_precision_alphaq_gamma: float = 0.0
     expert_precision_router_norm_fraction: float = 0.0
     expert_precision_router_norm_min_format: str = ""
     # Optional path to a separate text-encoder directory for sparse-MoE families
@@ -1758,6 +1759,9 @@ class TrainingConfig:
                         "off",
                     )
                 ),
+                expert_precision_alphaq_gamma=float(
+                    model_params_table.get("expert_precision_alphaq_gamma", 0.0)
+                ),
                 expert_precision_router_norm_fraction=float(
                     model_params_table.get(
                         "expert_precision_router_norm_fraction", 0.0
@@ -2575,10 +2579,18 @@ class TrainingConfig:
         if str(_mp.expert_precision_calibration).strip().lower() not in {
             "off",
             "imatrix",
+            "alphaq",
         }:
             raise ConfigError(
                 "model.params.expert_precision_calibration must be 'off' "
-                "(default) or 'imatrix'."
+                "(default), 'imatrix', or 'alphaq'."
+            )
+        if not math.isfinite(float(_mp.expert_precision_alphaq_gamma)) or float(
+            _mp.expert_precision_alphaq_gamma
+        ) < 0.0:
+            raise ConfigError(
+                "model.params.expert_precision_alphaq_gamma must be finite and "
+                "non-negative."
             )
         _router_norm_fraction = float(
             _mp.expert_precision_router_norm_fraction
@@ -2613,11 +2625,12 @@ class TrainingConfig:
             )
         if (
             _router_norm_fraction > 0.0
-            and str(_mp.expert_precision_calibration).strip().lower() != "imatrix"
+            and str(_mp.expert_precision_calibration).strip().lower()
+            not in {"imatrix", "alphaq"}
         ):
             raise ConfigError(
                 "Router-norm expert precision requires "
-                "model.params.expert_precision_calibration='imatrix'."
+                "model.params.expert_precision_calibration='imatrix' or 'alphaq'."
             )
         if (
             str(_mp.expert_factorization_calibration).strip().lower()

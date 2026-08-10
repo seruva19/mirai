@@ -13,6 +13,8 @@ from mirai.core.models.compressed_weights.quantization.sensitivity import (
 )
 from mirai.core.moe.calibration.imatrix import ExpertImportanceAccumulator
 from mirai.core.moe.calibration.imatrix import ExpertImportanceCalibrationTarget
+from mirai.core.moe.calibration.alphaq import alpha_importance_weights
+from mirai.core.moe.calibration.alphaq import pl_alpha_hill
 from mirai.core.moe.calibration.precision import ExpertPrecisionPlan
 from mirai.core.moe.calibration.precision import TensorPrecisionEvidence
 from mirai.core.moe.calibration.precision import TensorPrecisionPlan
@@ -55,6 +57,29 @@ def test_importance_accumulator_separates_experts_and_projection_inputs() -> Non
     )
 
 
+def test_alphaq_importance_matches_paper_equation_and_orders_heavy_tail() -> None:
+    weights, gamma = alpha_importance_weights((2.0, 3.0, 4.0), gamma=2.0)
+    assert gamma == 2.0
+    assert weights == (2.25, 1.0, 0.5625)
+    assert weights[0] > weights[1] > weights[2]
+
+
+def test_alphaq_data_free_gamma_matches_paper_default() -> None:
+    weights, gamma = alpha_importance_weights((2.0, 3.0, 4.0), gamma=0.0)
+    expected = 2.0 * (4.0 - 2.0) / (2.0 / 3.0)
+    assert abs(gamma - expected) < 1e-12
+    assert weights[0] > weights[1] > weights[2]
+
+
+def test_alphaq_fixed_aspect_hill_estimator_is_deterministic() -> None:
+    singular_values = torch.logspace(0.0, 2.0, 32)
+    weight = torch.diag(singular_values)
+    first = pl_alpha_hill(weight, block_size=32, histogram_bins=8)
+    second = pl_alpha_hill(weight, block_size=32, histogram_bins=8)
+    assert first == second
+    assert first > 1.0
+
+
 def test_tensor_allocator_protects_sensitive_projection_under_exact_budget() -> None:
     rows = []
     for projection, low_error in (("w1", 1.0), ("w2", 20.0), ("w3", 1.0)):
@@ -90,9 +115,7 @@ def test_router_norm_ranking_matches_norm_change_and_variance_promotion() -> Non
         RouterNormExpertEvidence("moe.experts", 1, 3.0, 1.0, 1.0),
         RouterNormExpertEvidence("moe.experts", 2, 4.0, 10.0, 1.0),
     ]
-    assert rank_router_norm_experts(evidence) == {
-        "moe.experts": (2, 0, 1)
-    }
+    assert rank_router_norm_experts(evidence) == {"moe.experts": (2, 0, 1)}
     assert router_norm_precision_floors(
         evidence,
         protected_fraction=1.0 / 3.0,
@@ -103,9 +126,7 @@ def test_router_norm_ranking_matches_norm_change_and_variance_promotion() -> Non
         RouterNormExpertEvidence("moe.experts", 1, 2.0, 5.0),
         RouterNormExpertEvidence("moe.experts", 2, 3.0, 10.0),
     ]
-    assert rank_router_norm_experts(crossing) == {
-        "moe.experts": (1, 2, 0)
-    }
+    assert rank_router_norm_experts(crossing) == {"moe.experts": (1, 2, 0)}
 
 
 def test_router_norm_evidence_uses_final_norm_and_maximum_row_variance() -> None:
