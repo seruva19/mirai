@@ -660,6 +660,15 @@ configuration and compatibility rules are documented in
 - **Auxiliary-loss-free balancing** — Online router bias updates correct load
   imbalance without adding an auxiliary gradient objective.
   [(paper)](https://arxiv.org/abs/2412.19437)
+- **Domain-labelled routing testbed** — An offline, lineage-bound evaluator
+  compares observed per-layer routes with an explicit domain-to-expert reference
+  and reports assignment accuracy, regret, reference coverage, expert purity,
+  normalized mutual information, and per-domain breakdowns without changing the
+  model or training path. Run `scripts/tools/evaluate_domain_routing.py` with an
+  observations JSON (`num_experts` and per-layer `{domain, selected_experts}`
+  records), a reference JSON (`domains` mapped to expert-ID lists), and the
+  dataset/model fingerprints; the output is deterministic versioned evidence.
+  [(paper)](https://arxiv.org/abs/2604.07030)
 - **Accumulation-wide routing balance** — Expert statistics aggregate across
   the complete gradient-accumulation window rather than one microbatch,
   including models whose native auxiliary form is sequence-local.
