@@ -531,6 +531,9 @@ configuration and compatibility rules are documented in
   expert-tensor targets use explicit allocation and export contracts.
 - **Activation-space expert LoRA** — Adapter updates are fused into active
   expert execution without materializing dense expert deltas.
+  This is the pretrained-router embedded construction studied as PERFT-E.
+  [(paper)](https://aclanthology.org/2026.findings-eacl.232/)
+  [(repo)](https://github.com/liuyilun2000/PERFT)
 - **Routing-aware expert selection** — Calibration selects the experts whose
   adapter coverage best matches observed routing mass.
   [(paper)](https://arxiv.org/abs/2603.24044)

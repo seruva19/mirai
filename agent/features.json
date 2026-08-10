@@ -105,7 +105,7 @@
       "reference_path": "",
       "readme_claim": "Activation-space expert LoRA",
       "readme_claims": [],
-      "provenance": "",
+      "provenance": "https://aclanthology.org/2026.findings-eacl.232/; https://github.com/liuyilun2000/PERFT",
       "promotion_evidence": ""
     },
     {
