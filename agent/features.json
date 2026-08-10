@@ -3224,6 +3224,39 @@
       "promotion_evidence": ""
     },
     {
+      "name": "persistent_grouped_gemm_autotune_warmup",
+      "kind": "runtime_guard",
+      "owner": "mirai/core/moe/runtime/autotune_warmup.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation"
+      ],
+      "symbols": [
+        "GroupedGemmWarmupProblem",
+        "warmup_persistent_grouped_gemm"
+      ],
+      "config_keys": [
+        "memory.moe_autotune_warmup_rows"
+      ],
+      "disabled_config": {
+        "memory.moe_autotune_warmup_rows": 0
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/autotune_warmup.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/moe/runtime/autotune_warmup.py",
+      "readme_claim": "Persistent grouped-GEMM autotune warm-up",
+      "readme_claims": [],
+      "provenance": "https://github.com/woct0rdho/transformers-qwen3-moe-fused/pull/21",
+      "promotion_evidence": ""
+    },
+    {
       "name": "phi_balancing",
       "kind": "moe_policy",
       "owner": "mirai/core/moe/adaptation/phi_balance.py",
@@ -3916,6 +3949,42 @@
       "readme_claim": "Routing-aware quantization calibration",
       "readme_claims": [],
       "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routing_collapse_telemetry",
+      "kind": "monitoring",
+      "owner": "mirai/core/moe/monitoring/collapse.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "RouterLoadSignature",
+        "RoutingCollapseTracker",
+        "selection_load_signatures",
+        "router_expert_counts"
+      ],
+      "config_keys": [
+        "model.params.moe_routing_health"
+      ],
+      "disabled_config": {
+        "model.params.moe_routing_health": false
+      },
+      "contract_paths": [
+        "tests/test_routing_collapse_telemetry.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "MAGI-2 routing-collapse telemetry",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2605.19378",
       "promotion_evidence": ""
     },
     {
@@ -4889,7 +4958,7 @@
       "stateful": true,
       "optimized": false,
       "reference_path": "",
-      "readme_claim": "Train–inference routing agreement evidence",
+      "readme_claim": "Train\u2013inference routing agreement evidence",
       "readme_claims": [],
       "provenance": "https://arxiv.org/abs/2510.11370",
       "promotion_evidence": ""
@@ -5040,42 +5109,6 @@
       "readme_claim": "Weight-decomposed low-rank adaptation (DoRA)",
       "readme_claims": [],
       "provenance": "https://arxiv.org/abs/2402.09353",
-      "promotion_evidence": ""
-    },
-    {
-      "name": "routing_collapse_telemetry",
-      "kind": "monitoring",
-      "owner": "mirai/core/moe/monitoring/collapse.py",
-      "check": "moe_routing",
-      "invariants": [
-        "owner",
-        "config",
-        "default_path",
-        "resource_bound",
-        "documentation"
-      ],
-      "symbols": [
-        "RouterLoadSignature",
-        "RoutingCollapseTracker",
-        "selection_load_signatures",
-        "router_expert_counts"
-      ],
-      "config_keys": [
-        "model.params.moe_routing_health"
-      ],
-      "disabled_config": {
-        "model.params.moe_routing_health": false
-      },
-      "contract_paths": [
-        "tests/test_routing_collapse_telemetry.py"
-      ],
-      "default_off": true,
-      "stateful": false,
-      "optimized": false,
-      "reference_path": "",
-      "readme_claim": "MAGI-2 routing-collapse telemetry",
-      "readme_claims": [],
-      "provenance": "https://arxiv.org/abs/2605.19378",
       "promotion_evidence": ""
     }
   ]

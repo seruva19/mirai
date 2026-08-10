@@ -377,6 +377,19 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
         in {"host", "device", "sonic"},
         "memory.moe_dispatch_preprocess must be one of: host, device, sonic.",
     )
+    _warmup_rows = int(config.memory.moe_autotune_warmup_rows)
+    _check(
+        _warmup_rows >= 0,
+        "memory.moe_autotune_warmup_rows must be >= 0.",
+    )
+    _check(
+        _warmup_rows == 0
+        or str(config.memory.moe_dispatch).strip().lower() == "triton_persistent"
+        or str(config.memory.moe_gemm_backend).strip().lower() == "persistent",
+        "memory.moe_autotune_warmup_rows > 0 requires "
+        "memory.moe_dispatch='triton_persistent' or "
+        "memory.moe_gemm_backend='persistent'.",
+    )
     _gemm_backends = {"auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8"}
     _check(
         str(config.memory.moe_gemm_backend).strip().lower() in _gemm_backends,

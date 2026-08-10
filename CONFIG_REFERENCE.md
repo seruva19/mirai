@@ -3272,6 +3272,14 @@ MoE dispatch kernel. `triton` (padded count-aware grouped GEMM) and `triton_pers
 
 Owner of count/offset/stable-order preprocessing. `host` preserves per-chunk host assembly. `device` builds the plan with PyTorch device operations. `sonic` uses SonicMoE's fused general-routing metadata kernel and requires the optional `sonic-moe` package, Python 3.12+, PyTorch 2.7.1–2.9.1, and SM90, SM100, or SM120. Both device modes preserve the same `DispatchPlan`; explicit disk streaming should use `host` because device preprocessing includes idle experts.
 
+### `moe_autotune_warmup_rows`
+
+- **Type:** int
+- **Default:** `0`
+- **Allowed / range:** `>= 0`; positive requires `moe_dispatch="triton_persistent"` or `moe_gemm_backend="persistent"`
+
+Representative routed-row count used to populate the persistent grouped-GEMM Triton cache during trainer startup, before training activations occupy device memory. Shapes come from the model provider's typed expert tensor inventory; duplicate projection shapes tune once. `0` preserves lazy first-use autotuning and performs no allocation. Positive values allocate one synthetic expert projection at a time, synchronize after each key, and release its temporary storage before continuing. Triton's device-local cache remains the owner of persisted tuning results ([`autotune_warmup.py`](mirai/core/moe/runtime/autotune_warmup.py), [upstream PR](https://github.com/woct0rdho/transformers-qwen3-moe-fused/pull/21)).
+
 ### `moe_gemm_backend`
 
 - **Type:** str

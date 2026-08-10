@@ -399,6 +399,10 @@ configuration and compatibility rules are documented in
   [(repo)](https://github.com/triton-lang/triton)
 - **Persistent grouped GEMM** — Sorted contiguous dispatch can use a
   cache-aware persistent kernel without padding inactive rows.
+- **Persistent grouped-GEMM autotune warm-up** — An opt-in trainer-startup
+  pass tunes provider-declared projection shapes before training activations
+  occupy device memory and reuses Triton's device-local result cache.
+  [(source)](https://github.com/woct0rdho/transformers-qwen3-moe-fused/pull/21)
 - **Vendored fused MoE kernels** — Attributed native kernels provide fused
   forward and adapter-gradient paths behind capability checks.
   [(repo)](https://github.com/woct0rdho/transformers-qwen3-moe-fused)

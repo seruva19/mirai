@@ -16,6 +16,10 @@ from mirai.core.moe.runtime.specs import (
     MoEOptimizationPolicy,
     set_active_moe_optimization_policy,
 )
+from mirai.core.moe.runtime.autotune_warmup import (
+    grouped_gemm_warmup_problems,
+    warmup_persistent_grouped_gemm,
+)
 from mirai.core.training.runtime.contract import ALLOWED_ADAPTER_TYPES
 from mirai.core.training.runtime.compilation import (
     CompilationPolicy,
@@ -125,6 +129,7 @@ def initialize_trainer_runtime(*, config: TrainingConfig, pipeline: Any) -> Trai
         moe_optimization_policy=moe_optimization_policy,
         trainable_parameter_offload=trainable_parameter_offload,
     )
+    _warmup_moe_autotune(config=config, pipeline=pipeline)
     pipeline.train()
     compilation_session = prepare_training_compilation(
         pipeline=pipeline,
@@ -150,6 +155,29 @@ def initialize_trainer_runtime(*, config: TrainingConfig, pipeline: Any) -> Trai
         compile_warning=compilation_session.warning,
         compilation_session=compilation_session,
     )
+
+
+def _warmup_moe_autotune(*, config: TrainingConfig, pipeline: Any) -> None:
+    routed_rows = int(getattr(config.memory, "moe_autotune_warmup_rows", 0))
+    if routed_rows == 0:
+        return
+    if routed_rows < 0:
+        raise ValueError("memory.moe_autotune_warmup_rows must be >= 0.")
+    dispatch = str(getattr(config.memory, "moe_dispatch", "vectorized"))
+    gemm = str(getattr(config.memory, "moe_gemm_backend", "auto"))
+    if dispatch != "triton_persistent" and gemm != "persistent":
+        raise ValueError(
+            "memory.moe_autotune_warmup_rows requires "
+            "memory.moe_dispatch='triton_persistent' or "
+            "memory.moe_gemm_backend='persistent'."
+        )
+    specs = pipeline.get_expert_tensor_specs()
+    problems = grouped_gemm_warmup_problems(specs, routed_rows=routed_rows)
+    if not problems:
+        raise ValueError(
+            "MoE autotune warm-up requires provider-declared routed expert tensors."
+        )
+    warmup_persistent_grouped_gemm(problems)
 
 
 def _build_memory_feature_notes(

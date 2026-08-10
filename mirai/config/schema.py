@@ -664,6 +664,9 @@ class MemoryConfig:
     # surface; execution owners validate backend availability.
     moe_dispatch: str = "vectorized"  # vectorized|legacy|triton|triton_persistent
     moe_dispatch_preprocess: str = "host"  # host|device|sonic
+    # Zero preserves lazy first-use autotuning. Positive values tune the
+    # provider-declared persistent grouped-GEMM shapes during trainer startup.
+    moe_autotune_warmup_rows: int = 0
     # Grouped-GEMM backend registry (below moe_dispatch, moe/runtime/gemm.py): "auto"
     # (default) inherits the moe_dispatch selection; per-role
     # keys are "" = inherit the main key. See CONFIG_REFERENCE.md for full semantics.
@@ -1362,6 +1365,7 @@ class TrainingConfig:
             "packed_stream_prefetch_depth",
             "moe_dispatch",
             "moe_dispatch_preprocess",
+            "moe_autotune_warmup_rows",
             "moe_gemm_backend",
             "moe_gemm_backend_forward",
             "moe_gemm_backend_dx",
@@ -3271,6 +3275,9 @@ class TrainingConfig:
             moe_dispatch=str(memory_table.get("moe_dispatch", "vectorized")),
             moe_dispatch_preprocess=str(
                 memory_table.get("moe_dispatch_preprocess", "host")
+            ),
+            moe_autotune_warmup_rows=int(
+                memory_table.get("moe_autotune_warmup_rows", 0)
             ),
             moe_gemm_backend=str(memory_table.get("moe_gemm_backend", "auto")),
             moe_gemm_backend_forward=str(
