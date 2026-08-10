@@ -65,6 +65,20 @@ class _TinyTrainer:
     def predict_calibration_inputs(self, inputs: TrainingInputs):
         return self.pipeline.model(inputs)
 
+    def predict_objective_calibration_inputs(
+        self,
+        inputs: TrainingInputs,
+        *,
+        training: bool = False,
+    ):
+        _ = training
+        return self.pipeline.model(inputs)
+
+    def evaluate_calibration_task_loss(self, *, batch, inputs, prediction):
+        _ = batch
+        target = 1.5 * inputs.clean_latents
+        return SimpleNamespace(loss_pre_accum=(prediction - target).square().mean())
+
 
 class _TinyRouterRepairProvider(ModelFamilyProvider):
     def __init__(self) -> None:
@@ -141,6 +155,26 @@ def _write_examples(root: Path) -> list[Path]:
     return paths
 
 
+def _write_task_examples(root: Path) -> list[Path]:
+    paths = []
+    for index, values in enumerate(
+        (
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[1.0, 1.0], [-1.0, 0.5]],
+            [[0.25, -0.5], [0.75, 0.25]],
+        )
+    ):
+        inputs = _inputs(values)
+        paths.append(
+            save_router_kd_example(
+                root / f"{index}.safetensors",
+                inputs=inputs,
+                teacher_prediction=1.5 * inputs.clean_latents,
+            )
+        )
+    return paths
+
+
 def test_diffusion_router_kd_uses_final_prediction_and_detaches_teacher() -> None:
     student = torch.tensor([[1.0, 3.0]], requires_grad=True)
     teacher = torch.tensor([[0.0, 1.0]], requires_grad=True)
@@ -204,6 +238,25 @@ def test_router_kd_improves_holdout_and_changes_only_router(tmp_path: Path) -> N
             restored,
             compressed_artifact_fingerprint="sha256:" + ("b" * 64),
         )
+
+
+def test_router_task_optimizes_native_loss_with_prediction_guard(tmp_path: Path) -> None:
+    paths = _write_task_examples(tmp_path / "task-examples")
+    model = _TinyRouterStudent()
+    report = fit_router_kd_session(
+        _session(model),
+        example_paths=paths,
+        train_examples=2,
+        learning_rate=0.1,
+        gradient_accumulation=2,
+        compressed_artifact_fingerprint="sha256:" + ("d" * 64),
+        teacher_model_snapshot_id="model:teacher",
+        repair_objective="task",
+    )
+    assert report.repair_objective == "task"
+    assert report.artifact.repaired_holdout_mse < (
+        report.artifact.baseline_holdout_mse
+    )
 
 
 def test_zero_step_router_kd_is_exact_noop(tmp_path: Path) -> None:

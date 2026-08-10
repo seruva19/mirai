@@ -4,6 +4,9 @@ The original model acts as teacher. Exact teacher forward inputs and final
 predictions are streamed to temporary safetensors, then replayed through the
 compressed student. The emitted artifact contains router weights only and is
 bound to the compressed base fingerprint.
+
+``router_task`` uses GEMQ's task-loss router adaptation principle
+(arXiv:2605.23078) while retaining the held-out teacher-prediction guard.
 """
 
 from __future__ import annotations
@@ -84,10 +87,11 @@ def _require_gate(config: TrainingConfig) -> Path:
     mode = str(
         config.model.params.post_compression_router_repair
     ).strip().lower()
-    if mode != "router_kd":
+    if mode not in {"router_kd", "router_task"}:
         raise ValueError(
             "repair_router_kd.py requires "
-            "model.params.post_compression_router_repair='router_kd'."
+            "model.params.post_compression_router_repair='router_kd' or "
+            "'router_task'."
         )
     packed = Path(str(config.memory.frozen_weight_packed_state_path))
     if not packed.is_file():
@@ -118,6 +122,12 @@ def repair_router_kd(
         require_rights_attestation=config.compliance.require_rights_attestation,
     )
     packed = _require_gate(config)
+    repair_objective = (
+        "task"
+        if str(config.model.params.post_compression_router_repair).strip().lower()
+        == "router_task"
+        else "kd"
+    )
     output_path = Path(output)
     if output_path.resolve() == packed.resolve():
         raise ValueError("Router-KD output cannot overwrite the compressed base.")
@@ -152,6 +162,7 @@ def repair_router_kd(
                     teacher_session,
                     output_dir=temp_root / "examples",
                     example_count=train_steps + heldout,
+                    repair_objective=repair_objective,
                 )
                 teacher_model_snapshot_id = str(
                     teacher_session.manifest.model_snapshot_id
@@ -178,6 +189,7 @@ def repair_router_kd(
                     gradient_accumulation=int(gradient_accumulation),
                     compressed_artifact_fingerprint=compressed_fingerprint,
                     teacher_model_snapshot_id=teacher_model_snapshot_id,
+                    repair_objective=repair_objective,
                 )
                 save_router_repair_artifact(
                     output_path,

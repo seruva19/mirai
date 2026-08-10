@@ -2530,19 +2530,20 @@ class TrainingConfig:
         if str(_mp.post_compression_router_repair).strip().lower() not in {
             "off",
             "router_kd",
+            "router_task",
         }:
             raise ConfigError(
                 "model.params.post_compression_router_repair must be 'off' "
-                "(default) or 'router_kd'."
+                "(default), 'router_kd', or 'router_task'."
             )
         if (
             str(_mp.router_repair_artifact_path).strip()
             and str(_mp.post_compression_router_repair).strip().lower()
-            != "router_kd"
+            not in {"router_kd", "router_task"}
         ):
             raise ConfigError(
                 "model.params.router_repair_artifact_path requires "
-                "post_compression_router_repair='router_kd'."
+                "post_compression_router_repair='router_kd' or 'router_task'."
             )
         if str(_mp.expert_quantization_calibration).strip().lower() not in {
             "off",

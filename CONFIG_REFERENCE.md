@@ -869,15 +869,15 @@ Offline FlexMoE calibration gate for a complete schema-v1/v2/v3 expert source. `
 
 - **Type:** str
 - **Default:** `"off"`
-- **Allowed / range:** `off`, `router_kd`
+- **Allowed / range:** `off`, `router_kd`, `router_task`
 
-Offline post-compression router-repair gate. `router_kd` arms [`scripts/tools/repair_router_kd.py`](scripts/tools/repair_router_kd.py): the original model supplies final diffusion predictions for exact replay inputs, the compressed student updates only FP32-master router weights, and a held-out prediction-MSE non-regression check plus complete non-router fingerprint must pass before output. This is the continuous-output video adaptation of Router KD (arXiv:2603.02217); it intentionally does not match router logits and therefore permits different teacher/student expert counts. The gate alone changes no runtime behavior.
+Offline post-compression router-repair gate. Both modes arm [`scripts/tools/repair_router_kd.py`](scripts/tools/repair_router_kd.py): the original model supplies final diffusion predictions for exact replay inputs, the compressed student updates only FP32-master router weights, and a held-out prediction-MSE non-regression check plus complete non-router fingerprint must pass before output. `router_kd` minimizes final teacher/student prediction MSE, following the continuous-output video adaptation of Router KD (arXiv:2603.02217). Experimental `router_task` instead minimizes Mirai's native prepared video objective, following GEMQ's task-loss router adaptation (arXiv:2605.23078), while retaining the teacher-prediction guard. Neither mode matches router logits, so teacher and student expert counts may differ. The gate alone changes no runtime behavior.
 
 ### `router_repair_artifact_path`
 
 - **Type:** str
 - **Default:** `""`
-- **Allowed / range:** no control chars; requires `post_compression_router_repair="router_kd"`
+- **Allowed / range:** no control chars; requires `post_compression_router_repair="router_kd"` or `"router_task"`
 
 Optional lineage-bound router-only safetensors patch emitted by [`repair_router_kd.py`](scripts/tools/repair_router_kd.py). Loading verifies the exact compressed packed-artifact fingerprint, initial router tensor fingerprint, complete target inventory, and shapes before copying repaired weights. Empty preserves the compressed base exactly. A non-empty path also requires `memory.frozen_weight_packed_state_path` at model construction.
 

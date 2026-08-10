@@ -805,6 +805,12 @@ configuration and compatibility rules are documented in
   fingerprint must pass before a lineage-bound router-only patch is emitted;
   teacher and student expert counts may differ.
   [(paper)](https://arxiv.org/abs/2603.02217)
+- **Task-loss router adaptation after quantization** — An experimental GEMQ-style
+  alternative updates all compressed-model routers against Mirai's native video
+  objective while retaining a held-out teacher-prediction non-regression gate
+  and the same router-only artifact lineage.
+  [(paper)](https://arxiv.org/abs/2605.23078)
+  [(repo)](https://github.com/jndeng/GEMQ)
 - **Sparse expert adapter checkpoints** — Exports can contain only selected
   expert adapter rows together with the mapping required for restoration.
 

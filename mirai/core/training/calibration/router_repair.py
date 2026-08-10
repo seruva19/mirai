@@ -44,12 +44,14 @@ class RouterKDFitReport:
     non_router_fingerprint: str
     train_examples: int
     holdout_examples: int
+    repair_objective: str = "kd"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "calibration_steps": int(self.artifact.calibration_steps),
             "train_examples": int(self.train_examples),
             "holdout_examples": int(self.holdout_examples),
+            "repair_objective": self.repair_objective,
             "baseline_holdout_mse": float(self.artifact.baseline_holdout_mse),
             "repaired_holdout_mse": float(self.artifact.repaired_holdout_mse),
             "initial_router_fingerprint": (
@@ -257,11 +259,15 @@ def capture_router_kd_examples(
     *,
     output_dir: str | Path,
     example_count: int,
+    repair_objective: str = "kd",
 ) -> list[Path]:
     """Capture teacher predictions and exact replay inputs one shard at a time."""
 
     if torch is None:  # pragma: no cover
         raise RuntimeError("Router-KD capture requires torch.")
+    objective = str(repair_objective).strip().lower()
+    if objective not in {"kd", "task"}:
+        raise ValueError("Router repair objective must be 'kd' or 'task'.")
     count = int(example_count)
     if count <= 0:
         raise ValueError("Router-KD capture requires example_count > 0.")
@@ -284,11 +290,22 @@ def capture_router_kd_examples(
         paths: list[Path] = []
         with torch.no_grad():
             for step in range(count):
-                inputs = trainer.prepare_calibration_inputs(
-                    build_batch(step),
-                    training=False,
-                )
-                prediction = trainer.predict_calibration_inputs(inputs)
+                batch = build_batch(step)
+                if objective == "task":
+                    inputs = trainer.prepare_objective_calibration_inputs(
+                        batch,
+                        training=False,
+                    )
+                    prediction = trainer.predict_objective_calibration_inputs(
+                        inputs,
+                        training=False,
+                    )
+                else:
+                    inputs = trainer.prepare_calibration_inputs(
+                        batch,
+                        training=False,
+                    )
+                    prediction = trainer.predict_calibration_inputs(inputs)
                 paths.append(
                     save_router_kd_example(
                         destination / f"example-{step:06d}.safetensors",
@@ -306,6 +323,7 @@ def _evaluate_examples(
     paths: list[Path],
     *,
     device: Any,
+    repair_objective: str = "kd",
 ) -> float:
     if not paths:
         raise ValueError("Router-KD held-out evaluation requires examples.")
@@ -315,7 +333,13 @@ def _evaluate_examples(
             inputs, teacher_prediction = load_router_kd_example(path)
             inputs = _move_inputs(inputs, device)
             teacher_prediction = teacher_prediction.to(device=device)
-            student_prediction = trainer.predict_calibration_inputs(inputs)
+            if repair_objective == "task":
+                student_prediction = trainer.predict_objective_calibration_inputs(
+                    inputs,
+                    training=False,
+                )
+            else:
+                student_prediction = trainer.predict_calibration_inputs(inputs)
             total += float(
                 diffusion_router_kd_loss(
                     student_prediction,
@@ -335,11 +359,15 @@ def fit_router_kd_session(
     gradient_accumulation: int,
     compressed_artifact_fingerprint: str,
     teacher_model_snapshot_id: str,
+    repair_objective: str = "kd",
 ) -> RouterKDFitReport:
     """Fit FP32 router masters and reject held-out output regression."""
 
     if torch is None:  # pragma: no cover
         raise RuntimeError("Router-KD fitting requires torch.")
+    objective = str(repair_objective).strip().lower()
+    if objective not in {"kd", "task"}:
+        raise ValueError("Router repair objective must be 'kd' or 'task'.")
     paths = [Path(path) for path in example_paths]
     train_count = int(train_examples)
     if train_count < 0 or train_count >= len(paths):
@@ -408,6 +436,7 @@ def fit_router_kd_session(
             session.trainer,
             holdout_paths,
             device=device,
+            repair_objective=objective,
         )
         for group_start in range(0, len(train_paths), accumulation):
             group = train_paths[group_start : group_start + accumulation]
@@ -417,12 +446,23 @@ def fit_router_kd_session(
                 inputs, teacher_prediction = load_router_kd_example(path)
                 inputs = _move_inputs(inputs, device)
                 teacher_prediction = teacher_prediction.to(device=device)
-                prediction = session.trainer.predict_calibration_inputs(inputs)
-                loss = diffusion_router_kd_loss(
-                    prediction,
-                    teacher_prediction,
-                    loss_mask=inputs.loss_mask,
-                ) / float(len(group))
+                if objective == "task":
+                    prediction = session.trainer.predict_objective_calibration_inputs(
+                        inputs,
+                        training=False,
+                    )
+                    loss = session.trainer.evaluate_calibration_task_loss(
+                        batch={},
+                        inputs=inputs,
+                        prediction=prediction,
+                    ).loss_pre_accum / float(len(group))
+                else:
+                    prediction = session.trainer.predict_calibration_inputs(inputs)
+                    loss = diffusion_router_kd_loss(
+                        prediction,
+                        teacher_prediction,
+                        loss_mask=inputs.loss_mask,
+                    ) / float(len(group))
                 loss.backward()
                 session.trainer.pipeline.finish_backward_offloads()
                 for name, target in targets.items():
@@ -448,6 +488,7 @@ def fit_router_kd_session(
             session.trainer,
             holdout_paths,
             device=device,
+            repair_objective=objective,
         )
         if train_count > 0 and repaired > baseline + 1e-12:
             with torch.no_grad():
@@ -493,6 +534,7 @@ def fit_router_kd_session(
             non_router_fingerprint=non_router_after,
             train_examples=train_count,
             holdout_examples=len(holdout_paths),
+            repair_objective=objective,
         )
     finally:
         restore_trainability(model, previous_trainability)

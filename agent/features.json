@@ -3410,8 +3410,10 @@
       "optimized": false,
       "reference_path": "mirai/core/training/calibration/router_repair.py",
       "readme_claim": "Post-compression Router-KD repair",
-      "readme_claims": [],
-      "provenance": "https://arxiv.org/abs/2603.02217",
+      "readme_claims": [
+        "Task-loss router adaptation after quantization"
+      ],
+      "provenance": "https://arxiv.org/abs/2603.02217; https://arxiv.org/abs/2605.23078; https://github.com/jndeng/GEMQ",
       "promotion_evidence": ""
     },
     {
