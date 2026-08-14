@@ -34,18 +34,19 @@ import triton.language as tl
 from einops import rearrange, repeat
 try:
     from flash_attn_interface import flash_attn_3_cuda
+except (ImportError, ModuleNotFoundError):
+    flash_attn_3_cuda = None
+
+try:
     from magi_attn_extensions.fa3_interface_with_sink import (
-        FA3VarlenFuncWithSink,
         fa3_func_with_sink,
         fa3_varlen_func_with_sink,
     )
-    _HAS_MAGI2_FAST_ATTENTION = True
 except (ImportError, ModuleNotFoundError):
-    flash_attn_3_cuda = None
-    FA3VarlenFuncWithSink = None
     fa3_func_with_sink = None
     fa3_varlen_func_with_sink = None
-    _HAS_MAGI2_FAST_ATTENTION = False
+
+_HAS_MAGI2_FAST_ATTENTION = flash_attn_3_cuda is not None
 
 from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
     magi_compile,
@@ -2139,6 +2140,10 @@ def _fa3_varlen_func_with_sink_inference(
     deterministic: bool = False,
 ) -> torch.Tensor:
     if torch.is_grad_enabled():
+        if fa3_varlen_func_with_sink is None:
+            raise RuntimeError(
+                "MAGI-2 FA3 training requires the sink-aware MagiAttention extension."
+            )
         return fa3_varlen_func_with_sink(
             q,
             k,
@@ -2191,9 +2196,24 @@ def _fa3_varlen_func_with_sink_inference(
         None,  # pack_gqa
         0,  # sm_margin
     )
-    out, _ = FA3VarlenFuncWithSink.correct_out_lse_with_sink(
-        out=out, lse=softmax_lse, sink=sink, sink_layout=sink_layout
-    )
+    # The sink logits represent zero-valued tokens, so they change only the
+    # softmax denominator. Keep the correction independent of MagiAttention:
+    # the official FA3 interface already returns the LSE required here. This
+    # follows the native MAGI-2 integration in vLLM-Omni PR #5918 at
+    # commit af9d8f003525c819e95b67a827456b60d9a7876a.
+    if sink is not None and sink.numel() > 0:
+        if sink_layout != "sh":
+            raise ValueError("MAGI-2 FA3 inference supports sh-layout sinks only.")
+        old_lse = softmax_lse.float().transpose(0, 1)
+        sink_lse = torch.logsumexp(sink.float(), dim=0).unsqueeze(0)
+        if old_lse.shape[-1] != sink_lse.shape[-1]:
+            raise ValueError("MAGI-2 attention sink and FA3 head counts differ.")
+        new_lse = torch.logaddexp(old_lse, sink_lse)
+        delta = old_lse - new_lse
+        delta = torch.where(
+            torch.isfinite(delta), delta, torch.full_like(delta, -torch.inf)
+        )
+        out = out * torch.exp(delta).unsqueeze(-1).to(out.dtype)
     return out
 
 

@@ -7,6 +7,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import types
 
 import pytest
 import torch
@@ -38,6 +39,34 @@ from mirai.core.models.providers import (
     get_model_family_provider,
 )
 from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
+
+
+def test_magi2_fa3_inference_does_not_require_sink_extension(monkeypatch) -> None:
+    from mirai.vendors.magi2_preview.model import magi2_preview as model
+
+    query = torch.ones(3, 2, 4, dtype=torch.bfloat16)
+    offsets = torch.tensor([0, 3], dtype=torch.int32)
+
+    def fake_fwd(*args):
+        return query.clone(), torch.zeros(2, 3), None
+
+    monkeypatch.setattr(model, "flash_attn_3_cuda", types.SimpleNamespace(fwd=fake_fwd))
+    monkeypatch.setattr(model, "fa3_varlen_func_with_sink", None)
+    with torch.no_grad():
+        output = model._fa3_varlen_func_with_sink_inference(
+            query,
+            query,
+            query,
+            cu_seqlens_q=offsets,
+            cu_seqlens_k=offsets,
+            max_seqlen_q=3,
+            max_seqlen_k=3,
+            softcap=-1.0,
+            sink=torch.zeros(1, 2),
+            sink_layout="sh",
+        )
+
+    assert torch.equal(output, torch.full_like(query, 0.5))
 
 
 def test_magi2_provider_is_native_sparse_moe() -> None:

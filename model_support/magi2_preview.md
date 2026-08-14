@@ -479,14 +479,36 @@ python scripts/infer.py \
 ```
 
 [`configs/magi2_preview/inference_offload_32gb.toml`](../configs/magi2_preview/inference_offload_32gb.toml)
-streams all 48 preview blocks synchronously, uses NF4 routed experts and fused
-Triton SwiGLU7, and stages the INT8 Qwen3.5 text encoder before denoiser
-placement. At 512x512x57 with five denoise steps, the fused profile measured
-38.49 seconds in the denoise loop and 16,745 MiB peak allocated VRAM with NF4
-text conditioning. The otherwise identical bounded torch activation path took
-94.59 seconds. INT8 text conditioning raises the measured staging peak to
-26,368 MiB; its embedding cosine against BF16 was 0.99922 on the documented
-warm-cabin prompt (NF4: 0.99253). Text-encoder quantization is explicitly lossy.
+streams all 48 preview blocks with asynchronous prefetch, uses NF4 routed
+experts and fused Triton SwiGLU7, and stages the INT8 Qwen3.5 text encoder before
+denoiser placement. The profile is intended for one 32 GiB GPU in a machine
+with 128 GiB of system RAM.
+
+The following measurements used one H100 80 GB, PyTorch 2.9.1+cu128, and the
+same prompt and seed. Times exclude model loading and include only the denoise
+loop. The 32 GiB row used the shipped portable FlexAttention path and a 39%
+allocator cap to reproduce the target allocation ceiling; it establishes that
+the profile fits the 128/32 memory envelope, not expected throughput on a
+particular consumer GPU.
+
+For larger-memory GPUs, start from the same profile and lower
+`inference.blocks_to_swap`; the measured release-geometry H100 run used 20.
+Keep asynchronous block swap and one-block prefetch enabled. Use the smallest
+swap count that leaves room for the model's activation and kernel workspaces.
+Concretely, retain `inference.block_swap_mode = "async"`,
+`memory.weight_residency_strategy = "block_swap"`, and
+`memory.block_swap_prefetch_depth = 1`; only the model-dependent swap count
+needs tuning.
+
+| Profile | Workload | Denoise time | Time per step | Peak allocated VRAM | Peak process RSS |
+|---|---|---:|---:|---:|---:|
+| H100 resident, native FA3 | 512x512x57, 5 steps | 13.23 s | 2.65 s | 71,362 MiB | not recorded |
+| H100 20-block async streaming, native FA3 | 896x512x249, 5 steps | 74.81 s | 14.96 s | 70,141 MiB | 112.43 GiB |
+| 128/32 envelope, 48-block async streaming | 512x512x57, 5 steps | 20.82 s | 4.16 s | 26,368 MiB | 112.64 GiB |
+
+INT8 text conditioning has embedding cosine 0.99922 against BF16 on the
+documented warm-cabin prompt (NF4: 0.99253). Text-encoder quantization is
+explicitly lossy.
 
 The released 1920x1088 refiner target is not a 32 GiB profile. Modality inputs
 are projected before concatenation, so token preparation stays bounded, but the
@@ -698,7 +720,12 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   [(FlexAttention)](https://pytorch.org/blog/flexattention/)
 - **Native MAGI-2 inference** — The provider uses the same native denoiser and
   residency path for sampling; the denoiser is a plain `torch.nn.Module` and
-  Diffusers is imported nowhere in loading or in a forward pass.
+  Diffusers is imported nowhere in loading or in a forward pass. On Hopper,
+  inference uses the official FlashAttention 3 interface directly when it is
+  installed. Mirai applies the preview model's sink-logit denominator correction
+  locally, so the separate sink-aware MagiAttention extension is not required
+  for single-GPU inference. Other CUDA devices use the portable FlexAttention
+  path.
 - **Native MAGI-2 refiner staging** — Optional default-off second stage that
   resamples the preview latent in time, re-noises it once, and short-denoises it
   through the released refiner checkpoint, producing a full-rate clip. The

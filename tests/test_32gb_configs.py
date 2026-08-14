@@ -93,14 +93,14 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         self.assertEqual(config.memory.moe_expert_autograd, "segmented_recompute")
         self.assertEqual(config.memory.moe_activation_backend, "triton")
 
-    def test_magi2_inference_profile_streams_every_block_synchronously(self) -> None:
+    def test_magi2_inference_profile_streams_every_block_asynchronously(self) -> None:
         config = _resolved(MAGI2_INFER, entrypoint="infer")
         self.assertEqual(config.memory.weight_residency_strategy, "block_swap")
         self.assertGreaterEqual(
             config.inference.blocks_to_swap,
             int(Magi2ModelConfig().num_layers),
         )
-        self.assertEqual(config.inference.block_swap_mode, "sync")
+        self.assertEqual(config.inference.block_swap_mode, "async")
 
     def test_magi2_training_host_memory_keys_fit_a_128_gib_machine(self) -> None:
         memory = _resolved(MAGI2_TRAIN, entrypoint="train").memory
@@ -132,7 +132,7 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         self.assertTrue(config.inference.stage_text_encoder_before_denoiser)
         self.assertEqual(config.inference.text_encoder_weight_quantization, "int8")
         self.assertEqual(config.inference.blocks_to_swap, 48)
-        self.assertEqual(config.inference.block_swap_mode, "sync")
+        self.assertEqual(config.inference.block_swap_mode, "async")
         self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
         self.assertEqual(config.memory.moe_activation_backend, "triton")
         self.assertEqual(config.memory.cuda_memory_fraction, 1.0)

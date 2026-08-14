@@ -28,7 +28,7 @@ text_encoder_weight_quantization = "int8"
 keep_text_encoder_resident = false
 keep_vae_resident = false
 blocks_to_swap = 48
-block_swap_mode = "sync"
+block_swap_mode = "async"
 
 [memory]
 frozen_weight_quantization = "nf4"
