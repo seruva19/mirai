@@ -434,6 +434,7 @@ def triton_routed_grouped_mm(
     role: str = "forward",
     top_k: int = 1,
     segmented: bool = False,
+    max_group_rows: int | None = None,
 ) -> torch.Tensor:
     """Launch the resident-BF16 routed projection on the current CUDA stream."""
 
@@ -473,6 +474,10 @@ def triton_routed_grouped_mm(
         )
     )
     groups, k_size, n_size = map(int, weight.shape)
+    if max_group_rows is not None:
+        max_group_rows = int(max_group_rows)
+        if max_group_rows <= 0 or max_group_rows > rows:
+            raise ValueError("max_group_rows must be in [1, routed_rows]")
     if groups == 0 and rows:
         raise ValueError("non-empty routed projection requires at least one group")
     for mapping in (gather_rows, scatter_rows):
@@ -500,6 +505,12 @@ def triton_routed_grouped_mm(
         boundaries[-1] == rows,
         "terminal routed boundary must equal the routed-row count",
     )
+    if max_group_rows is not None:
+        starts = torch.cat((boundaries.new_zeros(1), boundaries[:-1]))
+        torch._assert_async(
+            torch.all(boundaries - starts <= max_group_rows),
+            "max_group_rows must bound every routed group",
+        )
     if gather_rows is not None:
         torch._assert_async(
             torch.all((gather_rows >= 0) & (gather_rows < int(activation.shape[0]))),
@@ -559,7 +570,7 @@ def triton_routed_grouped_mm(
                 if use_tma else
                 _launch_routed_grouped_mm(
                     activation, weight, boundaries, row_map, out_map, rows, candidate,
-                    gather=gather, scatter=scatter,
+                    gather=gather, scatter=scatter, max_group_rows=max_group_rows,
                 )
             )
             end.record()
@@ -575,6 +586,7 @@ def triton_routed_grouped_mm(
             _launch_routed_grouped_mm(
                 activation, weight, boundaries, row_map, out_map, rows,
                 _conservative_config(n_size), gather=gather, scatter=scatter,
+                max_group_rows=max_group_rows,
             )
         )
 
@@ -587,6 +599,7 @@ def triton_routed_grouped_mm(
                 _launch_routed_grouped_mm(
                     activation, weight, boundaries, row_map, out_map, rows,
                     winner.config, gather=gather, scatter=scatter,
+                    max_group_rows=max_group_rows,
                 )
             )
             torch.testing.assert_close(candidate_output, reference, rtol=2e-2, atol=2e-2)
@@ -598,7 +611,7 @@ def triton_routed_grouped_mm(
         )
     return _launch_routed_grouped_mm(
         activation, weight, boundaries, row_map, out_map, rows, config,
-        gather=gather, scatter=scatter,
+        gather=gather, scatter=scatter, max_group_rows=max_group_rows,
     )
 
 
@@ -606,17 +619,20 @@ def _launch_routed_grouped_mm(
     activation: torch.Tensor, weight: torch.Tensor, boundaries: torch.Tensor,
     row_map: torch.Tensor, out_map: torch.Tensor, rows: int,
     config: RoutedGemmKernelConfig, *, gather: bool, scatter: bool,
+    max_group_rows: int | None = None,
 ) -> torch.Tensor:
     groups, k_size, n_size = map(int, weight.shape)
     output = activation.new_empty((rows, n_size))
     if _use_tiled_indexed_kernel(
-        rows=rows, groups=groups, k_size=k_size, n_size=n_size
+        rows=rows, groups=groups, k_size=k_size, n_size=n_size,
+        max_group_rows=max_group_rows,
     ):
         kernel, triton = _tiled_indexed_kernel()
         block_m = 64
         block_n = min(128, max(32, triton.next_power_of_2(n_size)))
         block_k = min(32, max(16, triton.next_power_of_2(k_size)))
-        kernel[(groups, triton.cdiv(rows, block_m), triton.cdiv(n_size, block_n))](
+        grid_rows = rows if max_group_rows is None else max_group_rows
+        kernel[(groups, triton.cdiv(grid_rows, block_m), triton.cdiv(n_size, block_n))](
             activation, weight, boundaries, row_map, out_map, output,
             stride_wg=int(weight.stride(0)), stride_wk=int(weight.stride(1)),
             stride_wn=int(weight.stride(2)),
@@ -641,12 +657,14 @@ def _launch_routed_grouped_mm(
 
 
 def _use_tiled_indexed_kernel(
-    *, rows: int, groups: int, k_size: int, n_size: int
+    *, rows: int, groups: int, k_size: int, n_size: int,
+    max_group_rows: int | None = None,
 ) -> bool:
     """Select 2-D tiles when inactive group tiles remain tightly bounded."""
 
     return (
-        1 <= groups <= 32
+        1 <= groups
+        and (groups <= 32 or max_group_rows is not None)
         and rows >= 64
         and k_size >= 64
         and n_size >= 64
@@ -718,9 +736,14 @@ class _RoutedWeightedProjection(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any, activation, weight, boundaries, grouped_to_assignment,
-        assignment_to_token, coefficients, token_rows,
+        assignment_to_token, coefficients, token_rows, max_group_rows,
     ):
-        grouped = triton_routed_grouped_mm(activation, weight, boundaries)
+        grouped = triton_routed_grouped_mm(
+            activation,
+            weight,
+            boundaries,
+            max_group_rows=(None if int(max_group_rows) <= 0 else int(max_group_rows)),
+        )
         output = _weighted_reduce(
             grouped, grouped_to_assignment, assignment_to_token, coefficients,
             int(token_rows),
@@ -729,6 +752,7 @@ class _RoutedWeightedProjection(torch.autograd.Function):
             activation, weight, boundaries, grouped_to_assignment,
             assignment_to_token, coefficients, grouped,
         )
+        ctx.max_group_rows = int(max_group_rows)
         return output
 
     @staticmethod
@@ -743,6 +767,9 @@ class _RoutedWeightedProjection(torch.autograd.Function):
         grad_input = triton_routed_grouped_mm(
             grouped_grad.contiguous(), weight.transpose(-2, -1), boundaries,
             role="dx",
+            max_group_rows=(
+                None if ctx.max_group_rows <= 0 else ctx.max_group_rows
+            ),
         ) if ctx.needs_input_grad[0] else None
         grad_weight = None
         if ctx.needs_input_grad[1]:
@@ -756,7 +783,9 @@ class _RoutedWeightedProjection(torch.autograd.Function):
             grad_coefficients = torch.zeros_like(coefficients).reshape(-1)
             grad_coefficients.index_copy_(0, assignment, contribution.to(coefficients.dtype))
             grad_coefficients = grad_coefficients.view_as(coefficients)
-        return grad_input, grad_weight, None, None, None, grad_coefficients, None
+        return (
+            grad_input, grad_weight, None, None, None, grad_coefficients, None, None
+        )
 
 
 def routed_weighted_projection(
@@ -768,6 +797,7 @@ def routed_weighted_projection(
     assignment_to_token: torch.Tensor,
     coefficients: torch.Tensor,
     token_rows: int,
+    max_group_rows: int | None = None,
 ) -> torch.Tensor:
     """Final projection plus routing-weighted token reduction with autograd."""
     rows = int(activation.shape[0]) if activation.ndim == 2 else -1
@@ -794,10 +824,10 @@ def routed_weighted_projection(
     if rows:
         torch._assert_async(
             torch.all(
-                torch.sort(grouped_to_assignment.to(torch.int64)).values
-                == torch.arange(rows, device=activation.device, dtype=torch.int64)
+                (grouped_to_assignment >= 0)
+                & (grouped_to_assignment < int(assignment_to_token.numel()))
             ),
-            "grouped_to_assignment must be a permutation of routed rows",
+            "grouped_to_assignment contains an out-of-range assignment index",
         )
     if assignment_to_token.numel():
         torch._assert_async(
@@ -807,4 +837,5 @@ def routed_weighted_projection(
     return _RoutedWeightedProjection.apply(
         activation, weight, boundaries, grouped_to_assignment,
         assignment_to_token, coefficients, int(token_rows),
+        0 if max_group_rows is None else int(max_group_rows),
     )

@@ -1100,6 +1100,7 @@ def _segment_routed_projection(
     boundaries: torch.Tensor,
     *,
     gather_rows: torch.Tensor | None = None,
+    max_group_rows: int | None = None,
 ) -> torch.Tensor:
     """Run one transient dense segment through the shared routed BF16 kernel."""
     from mirai.core.moe.runtime.routed_gemm_triton import triton_routed_grouped_mm
@@ -1109,7 +1110,22 @@ def _segment_routed_projection(
         weight,
         boundaries,
         gather_rows=gather_rows,
+        max_group_rows=max_group_rows,
     )
+
+
+def _segment_max_group_rows(
+    boundaries: list[int], group_start: int, group_stop: int
+) -> int:
+    """Largest routed row count in one segment from its host-side layout."""
+
+    previous = boundaries[group_start - 1] if group_start else 0
+    maximum = 0
+    for group in range(group_start, group_stop):
+        stop = boundaries[group]
+        maximum = max(maximum, stop - previous)
+        previous = stop
+    return maximum
 
 
 class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
@@ -1134,12 +1150,16 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
             local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
+            max_group_rows = _segment_max_group_rows(
+                boundaries, segment.group_start, segment.group_stop
+            )
             w_gate = store.materialize_segment(
                 "W_gate", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=x_rows.device,
             )
             gate = _segment_routed_projection(
-                x_rows, w_gate, local_offsets, gather_rows=local_rows
+                x_rows, w_gate, local_offsets, gather_rows=local_rows,
+                max_group_rows=max_group_rows,
             )
             del w_gate
             w_up = store.materialize_segment(
@@ -1147,7 +1167,8 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                 dtype=x_rows.dtype, device=x_rows.device,
             )
             up = _segment_routed_projection(
-                x_rows, w_up, local_offsets, gather_rows=local_rows
+                x_rows, w_up, local_offsets, gather_rows=local_rows,
+                max_group_rows=max_group_rows,
             )
             del w_up
             hidden = _swiglu7_forward(
@@ -1158,7 +1179,9 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                 "W_down", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=x_rows.device,
             )
-            outputs.append(_segment_routed_projection(hidden, w_down, local_offsets))
+            outputs.append(_segment_routed_projection(
+                hidden, w_down, local_offsets, max_group_rows=max_group_rows
+            ))
             del hidden, w_down
         if not outputs:
             output = x_rows.new_empty((0, int(x_rows.shape[-1])))
@@ -1187,37 +1210,45 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
             local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
+            max_group_rows = _segment_max_group_rows(
+                ctx.boundaries, segment.group_start, segment.group_stop
+            )
             grad_rows = grad_output[segment.row_start : segment.row_stop].contiguous()
             w_gate = store.materialize_segment(
                 "W_gate", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=x_rows.device,
             )
             gate = _segment_routed_projection(
-                x_rows, w_gate, local_offsets, gather_rows=local_rows
+                x_rows, w_gate, local_offsets, gather_rows=local_rows,
+                max_group_rows=max_group_rows,
             )
             w_up = store.materialize_segment(
                 "W_up", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=x_rows.device,
             )
             up = _segment_routed_projection(
-                x_rows, w_up, local_offsets, gather_rows=local_rows
+                x_rows, w_up, local_offsets, gather_rows=local_rows,
+                max_group_rows=max_group_rows,
             )
             w_down = store.materialize_segment(
                 "W_down", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=x_rows.device,
             )
             grad_hidden = _segment_routed_projection(
-                grad_rows, w_down.transpose(-2, -1), local_offsets
+                grad_rows, w_down.transpose(-2, -1), local_offsets,
+                max_group_rows=max_group_rows,
             )
             grad_gate, grad_up = _swiglu7_backward(
                 gate, up, grad_hidden, backend=ctx.activation_backend
             )
             grad_grouped = _segment_routed_projection(
-                grad_gate.contiguous(), w_gate.transpose(-2, -1), local_offsets
+                grad_gate.contiguous(), w_gate.transpose(-2, -1), local_offsets,
+                max_group_rows=max_group_rows,
             )
             grad_grouped.add_(
                 _segment_routed_projection(
-                    grad_up.contiguous(), w_up.transpose(-2, -1), local_offsets
+                    grad_up.contiguous(), w_up.transpose(-2, -1), local_offsets,
+                    max_group_rows=max_group_rows,
                 )
             )
             grad_input.index_add_(0, local_rows.to(torch.int64), grad_grouped)
@@ -1340,12 +1371,16 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
             local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
+            max_group_rows = _segment_max_group_rows(
+                boundaries, segment.group_start, segment.group_stop
+            )
             w_gate = store.materialize_segment(
                 "W_gate", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=device,
             )
             gate = _segment_routed_projection(
-                x_rows, w_gate, local_offsets, gather_rows=local_rows
+                x_rows, w_gate, local_offsets, gather_rows=local_rows,
+                max_group_rows=max_group_rows,
             )
             del w_gate
             w_up = store.materialize_segment(
@@ -1353,7 +1388,8 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                 dtype=x_rows.dtype, device=device,
             )
             up = _segment_routed_projection(
-                x_rows, w_up, local_offsets, gather_rows=local_rows
+                x_rows, w_up, local_offsets, gather_rows=local_rows,
+                max_group_rows=max_group_rows,
             )
             del w_up
             hidden = _swiglu7_forward(
@@ -1375,6 +1411,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                     assignment_to_token=assignment_to_row,
                     coefficients=topk_probs.reshape(-1),
                     token_rows=tokens * num_heads,
+                    max_group_rows=max_group_rows,
                 )
             )
             del hidden, w_down

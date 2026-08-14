@@ -277,6 +277,37 @@ def test_weighted_entry_rejects_malformed_static_metadata() -> None:
     not torch.cuda.is_available() or os.environ.get("MIRAI_REMOTE_GPU_TESTS") != "1",
     reason="configured remote CUDA validation required",
 )
+def test_max_group_rows_hint_matches_unhinted_projection() -> None:
+    pytest.importorskip("triton")
+    from mirai.core.moe.runtime.routed_gemm_triton import triton_routed_grouped_mm
+
+    device = torch.device("cuda")
+    counts = torch.tensor([0, 17, 3, 0, 31, 1] * 64, device=device)
+    boundaries = counts.cumsum(0, dtype=torch.int32)
+    rows = int(boundaries[-1].item())
+    generator = torch.Generator(device=device).manual_seed(913)
+    activation = torch.randn(
+        rows, 73, device=device, dtype=torch.bfloat16, generator=generator
+    )
+    weight = torch.randn(
+        counts.numel(), 73, 79,
+        device=device, dtype=torch.bfloat16, generator=generator,
+    )
+    expected = triton_routed_grouped_mm(activation, weight, boundaries)
+    actual = triton_routed_grouped_mm(
+        activation, weight, boundaries, max_group_rows=31
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    with pytest.raises(ValueError, match="max_group_rows"):
+        triton_routed_grouped_mm(
+            activation, weight, boundaries, max_group_rows=0
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or os.environ.get("MIRAI_REMOTE_GPU_TESTS") != "1",
+    reason="configured remote CUDA validation required",
+)
 def test_triton_gather_and_input_gradient_parity() -> None:
     pytest.importorskip("triton")
     from mirai.core.moe.runtime.routed_gemm_triton import routed_projection
