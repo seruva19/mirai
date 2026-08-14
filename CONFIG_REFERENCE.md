@@ -3318,7 +3318,7 @@ Grouped-GEMM primitive below `moe_dispatch`. `auto` inherits dispatch selection;
 - **Default:** `""`
 - **Allowed / range:** `""` (inherit), `auto`, `bmm`, `persistent`, `torch_grouped`, `deepgemm_fp8`
 
-Forward matmul override. `deepgemm_fp8` uses stored 128×128 FP8 weights and online 1×128 activation scales; it requires `frozen_weight_quantization="fp8"`, DeepGEMM, CUDA SM90, and expert widths divisible by 128. Input gradients remain high precision.
+Forward matmul override. `deepgemm_fp8` uses stored 128×128 FP8 weights and online 1×128 activation scales; it requires `frozen_weight_quantization="fp8"`, DeepGEMM, CUDA SM90, and expert widths divisible by 128. Routed execution accepts stable unequal group boundaries, including empty groups, gathers token rows before the role-specific FP8 projection, and combines grouped output rows directly into weighted token results without an assignment-order output buffer. Input gradients remain high precision, and routing-coefficient and adapter gradients remain differentiable through the adjacent combine and adapter seams.
 
 ### `moe_gemm_backend_dx`
 
@@ -3335,6 +3335,65 @@ Input-gradient backend selection; `deepgemm_fp8` is rejected.
 - **Allowed / range:** `""` (inherit), `auto`, `bmm`, `persistent`, `torch_grouped`
 
 Adapter-gradient backend selection; `deepgemm_fp8` is rejected.
+
+### `moe_routed_gemm`
+
+- **Type:** str
+- **Default:** `"disabled"`
+- **Allowed / range:** `disabled`, `auto`, `triton`
+
+Controls the experimental routed-layout fusion contract below the role-specific
+grouped-GEMM seam. `disabled` preserves existing execution. `auto` may select a
+compatible implementation and otherwise retains the reference path; `triton`
+requires CUDA BF16 operands that are either resident or supplied as bounded,
+provider-owned materialized segments, and rejects unsupported training fusion modes
+before execution. Supported providers may fuse token gather,
+expert projection, routing-coefficient multiplication, and token reduction while
+preserving input, routing-coefficient, adapter, and trainable expert-weight
+gradients. `auto` retains the provider's existing execution path when device,
+dtype, residency, layout, or observation requirements do not pass; explicit
+`triton` fails instead. Packed storage is compatible only when its provider exposes
+fresh contiguous segment-local BF16 operands and rematerializes them in backward;
+active-expert decoding, fused decoding, swapped operands, and trainable compressed
+expert weights are rejected. Providers declare effective group axes through
+`RoutedGroupLayout`.
+
+### `moe_routed_gemm_tuning`
+
+- **Type:** str
+- **Default:** `"off"`
+- **Allowed / range:** `off`, `online`, `warmup_only`
+
+Selects shape-configuration tuning for routed grouped GEMM roles. `off` uses a
+deterministic conservative configuration and does not read or write tuning
+state. `online` benchmarks a finite candidate set on an uncached eager shape,
+checks the winner against the reference, and records it. `warmup_only` requires
+a compatible pre-populated cache and treats a miss as an error; captured
+execution requires this policy.
+
+### `moe_routed_gemm_cache_path`
+
+- **Type:** str
+- **Default:** `""`
+- **Allowed / range:** filesystem path or empty
+
+Location of the versioned routed-GEMM tuning cache. It is runtime state, is not
+embedded in model or adapter checkpoints, and is ignored when tuning is `off`.
+A corrupt automatic-mode cache is quarantined and treated as cold state.
+
+### `moe_routed_gemm_architecture`
+
+- **Type:** str
+- **Default:** `"auto"`
+- **Allowed / range:** `auto`, `indexed`, `tma_regular`
+
+Selects the routed-kernel architecture sub-capability. `indexed` uses pointer
+loads and stores for routing indirection. `tma_regular` is an explicit profiling
+path for non-indexed contiguous forward projections and requires a Hopper target
+plus descriptor-compatible shapes, strides, and alignment. Gather, scatter,
+input-gradient, and weight-gradient roles remain indexed. `auto` uses the
+indexed implementation because the regular-TMA path has no supported
+performance envelope or performance recommendation.
 
 ### `moe_expert_autograd`
 

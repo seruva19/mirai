@@ -1766,6 +1766,27 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         ):
             self._bind_expert_output_routes(top_indices, top_scores)
         kernel_backend = self._mirai_moe_kernel_backend
+        if kernel_backend is not None and bool(getattr(kernel_backend, "direct_only", False)):
+            observers = (
+                self._mirai_importance_calibration_observer,
+                self._mirai_expert_output_observer,
+                self._mirai_expert_intermediate_observer,
+            )
+            observer_active = any(
+                observer is not None
+                and (
+                    observer is self._mirai_importance_calibration_observer
+                    or bool(getattr(observer, "is_enabled", True))
+                )
+                for observer in observers
+            )
+            if observer_active:
+                if str(getattr(kernel_backend, "mode", "auto")) == "triton":
+                    raise RuntimeError(
+                        "memory.moe_routed_gemm='triton' is incompatible with "
+                        "active LingBot routed expert observers."
+                    )
+                kernel_backend = None
         if kernel_backend is not None:
             direct_output = kernel_backend.execute_direct(
                 self.experts,
@@ -1813,30 +1834,33 @@ class LingBotVideoSparseMoeBlock(nn.Module):
                         "kernel that does not expose expert intermediates."
                     )
                 return direct_output
-            routed = kernel_backend.route(
-                tokens,
-                top_scores,
-                top_indices,
-                num_experts=self.router.num_experts,
-            )
-            expert_output = kernel_backend.compute(
-                self.experts,
-                routed,
-                fallback=self._run_grouped_experts,
-            )
-            if (
-                self.training
-                and self._mirai_expert_output_observer is not None
-                and bool(self._mirai_expert_output_observer.is_enabled)
-            ):
-                sorted_positions, _, _, _, top_k = routed.restore_state
-                self._mirai_expert_output_observer.capture_sorted(
-                    expert_output,
-                    sorted_positions,
-                    num_tokens=int(tokens.shape[0]),
-                    top_k=int(top_k),
+            if bool(getattr(kernel_backend, "direct_only", False)):
+                kernel_backend = None
+            else:
+                routed = kernel_backend.route(
+                    tokens,
+                    top_scores,
+                    top_indices,
+                    num_experts=self.router.num_experts,
                 )
-            return kernel_backend.restore(expert_output, routed)
+                expert_output = kernel_backend.compute(
+                    self.experts,
+                    routed,
+                    fallback=self._run_grouped_experts,
+                )
+                if (
+                    self.training
+                    and self._mirai_expert_output_observer is not None
+                    and bool(self._mirai_expert_output_observer.is_enabled)
+                ):
+                    sorted_positions, _, _, _, top_k = routed.restore_state
+                    self._mirai_expert_output_observer.capture_sorted(
+                        expert_output,
+                        sorted_positions,
+                        num_tokens=int(tokens.shape[0]),
+                        top_k=int(top_k),
+                    )
+                return kernel_backend.restore(expert_output, routed)
         backend = _moe_expert_backend(self)
         prefers_for_loop = getattr(self.experts, "prefers_for_loop", None)
         if callable(prefers_for_loop) and bool(prefers_for_loop()):

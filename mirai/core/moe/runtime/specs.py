@@ -11,6 +11,7 @@ from mirai.core.moe.runtime.gemm import (
     normalize_moe_gemm_role_backend,
 )
 from mirai.core.moe.runtime.kernels import normalize_moe_kernel_backend
+from mirai.core.moe.runtime.routed_gemm import normalize_routed_gemm_mode
 
 
 MOE_DISPATCH_MODES = ("vectorized", "legacy", "triton", "triton_persistent")
@@ -252,6 +253,10 @@ class MoEOptimizationPolicy:
     moe_gemm_backend_forward: str = ""
     moe_gemm_backend_dx: str = ""
     moe_gemm_backend_dw: str = ""
+    moe_routed_gemm: str = "disabled"
+    moe_routed_gemm_tuning: str = "off"
+    moe_routed_gemm_cache_path: str = ""
+    moe_routed_gemm_architecture: str = "auto"
     moe_batched_dequant: bool = True
     moe_pair_dequant: bool = True
     moe_batched_gather: bool = False
@@ -277,6 +282,16 @@ class MoEOptimizationPolicy:
         gemm_forward = normalize_moe_gemm_role_backend(self.moe_gemm_backend_forward)
         gemm_dx = normalize_moe_gemm_role_backend(self.moe_gemm_backend_dx)
         gemm_dw = normalize_moe_gemm_role_backend(self.moe_gemm_backend_dw)
+        routed_gemm = normalize_routed_gemm_mode(self.moe_routed_gemm)
+        routed_tuning = str(self.moe_routed_gemm_tuning).strip().lower()
+        if routed_tuning not in {"off", "online", "warmup_only"}:
+            raise ValueError("memory.moe_routed_gemm_tuning must be one of: off, online, warmup_only.")
+        routed_cache_path = str(self.moe_routed_gemm_cache_path).strip()
+        routed_architecture = str(self.moe_routed_gemm_architecture).strip().lower()
+        if routed_architecture not in {"auto", "indexed", "tma_regular"}:
+            raise ValueError("memory.moe_routed_gemm_architecture must be one of: auto, indexed, tma_regular.")
+        if routed_tuning == "warmup_only" and not routed_cache_path:
+            raise ValueError("memory.moe_routed_gemm_tuning='warmup_only' requires memory.moe_routed_gemm_cache_path.")
         chunk = int(self.expert_dequant_chunk_size)
         device_cache_gib = float(self.expert_device_cache_gib)
         residency_budget_gib = float(self.device_residency_budget_gib)
@@ -365,6 +380,10 @@ class MoEOptimizationPolicy:
         object.__setattr__(self, "moe_gemm_backend_forward", gemm_forward)
         object.__setattr__(self, "moe_gemm_backend_dx", gemm_dx)
         object.__setattr__(self, "moe_gemm_backend_dw", gemm_dw)
+        object.__setattr__(self, "moe_routed_gemm", routed_gemm)
+        object.__setattr__(self, "moe_routed_gemm_tuning", routed_tuning)
+        object.__setattr__(self, "moe_routed_gemm_cache_path", routed_cache_path)
+        object.__setattr__(self, "moe_routed_gemm_architecture", routed_architecture)
         object.__setattr__(self, "moe_batched_dequant", bool(self.moe_batched_dequant))
         object.__setattr__(self, "moe_pair_dequant", bool(self.moe_pair_dequant))
         object.__setattr__(self, "moe_batched_gather", bool(self.moe_batched_gather))
@@ -412,6 +431,10 @@ class MoEOptimizationPolicy:
             ),
             moe_gemm_backend_dx=getattr(memory, "moe_gemm_backend_dx", ""),
             moe_gemm_backend_dw=getattr(memory, "moe_gemm_backend_dw", ""),
+            moe_routed_gemm=getattr(memory, "moe_routed_gemm", "disabled"),
+            moe_routed_gemm_tuning=getattr(memory, "moe_routed_gemm_tuning", "off"),
+            moe_routed_gemm_cache_path=getattr(memory, "moe_routed_gemm_cache_path", ""),
+            moe_routed_gemm_architecture=getattr(memory, "moe_routed_gemm_architecture", "auto"),
             moe_batched_dequant=bool(getattr(memory, "moe_batched_dequant", True)),
             moe_pair_dequant=bool(getattr(memory, "moe_pair_dequant", True)),
             moe_batched_gather=bool(getattr(memory, "moe_batched_gather", False)),

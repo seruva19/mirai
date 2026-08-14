@@ -340,6 +340,142 @@ def test_magi2_grouped_moe_matches_reference_loop_on_cuda() -> None:
         )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or os.environ.get("MIRAI_REMOTE_GPU_TESTS") != "1",
+    reason="configured remote CUDA validation required",
+)
+def test_magi2_routed_triton_provider_output_loss_and_gradient_parity() -> None:
+    """Exercise policy resolution and the complete provider-owned MoE backend.
+
+    Two heads by four experts proves the flattened effective-group mapping;
+    token chunking forces multiple production ``execute`` calls. The retained
+    top-k probabilities verify the combine gradient independently of the router
+    adapter parameters that produced them.
+    """
+
+    pytest.importorskip("triton")
+    device = torch.device("cuda")
+    hidden_size = 64
+    intermediate_size = 48
+
+    def run(routed_mode: str):
+        module, adapter = _build_reduced_moe(
+            device=device,
+            dtype=torch.bfloat16,
+            hidden_size=hidden_size,
+            expert_intermediate_size=intermediate_size,
+        )
+        policy = MoEOptimizationPolicy(
+            kernel_backend="grouped",
+            moe_gemm_backend="bmm",
+            moe_routed_gemm=routed_mode,
+        )
+        plan = resolve_magi2_moe_execution(policy)
+        assert plan is not None and plan.routed_gemm == routed_mode
+        module._mirai_moe_kernel_backend = Magi2GroupedMoEBackend(
+            plan, token_chunk_size=2
+        )
+        observed_probabilities: list[torch.Tensor] = []
+        route = module._route
+
+        def retained_route(x_heads):
+            probabilities, indices = route(x_heads)
+            probabilities.retain_grad()
+            observed_probabilities.append(probabilities)
+            return probabilities, indices
+
+        module._route = retained_route
+        torch.manual_seed(41)
+        hidden = torch.randn(
+            5, hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        output = module._forward_impl(hidden)
+        loss = output.float().square().mean()
+        loss.backward()
+        assert len(observed_probabilities) == 1
+        probabilities = observed_probabilities[0]
+        assert probabilities.grad is not None
+        return (
+            output.detach(),
+            loss.detach(),
+            hidden.grad.detach(),
+            probabilities.detach(),
+            probabilities.grad.detach(),
+            adapter.lora_a.grad.detach(),
+            adapter.lora_b.grad.detach(),
+        )
+
+    reference = run("disabled")
+    candidate = run("triton")
+    for expected, actual in zip(reference, candidate, strict=True):
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=3e-2, atol=3e-2
+        )
+    assert candidate[6].abs().max() > 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or os.environ.get("MIRAI_REMOTE_GPU_TESTS") != "1",
+    reason="configured remote CUDA validation required",
+)
+def test_magi2_routed_triton_selected_expert_step_and_save_load_parity() -> None:
+    """Train a resident expert tensor through the production provider seam."""
+    import io
+
+    pytest.importorskip("triton")
+    device = torch.device("cuda")
+
+    def run(*, routed: bool):
+        module, adapter = _build_reduced_moe(
+            device=device, dtype=torch.bfloat16,
+            hidden_size=64, expert_intermediate_size=48,
+        )
+        module.W_down.requires_grad_(True)
+        if routed:
+            policy = MoEOptimizationPolicy(
+                kernel_backend="grouped", moe_gemm_backend="bmm",
+                moe_routed_gemm="triton",
+            )
+            plan = resolve_magi2_moe_execution(policy)
+            assert plan is not None
+            module._mirai_moe_kernel_backend = Magi2GroupedMoEBackend(
+                plan, token_chunk_size=2
+            )
+        optimizer = torch.optim.SGD(
+            [module.W_down, adapter.lora_a, adapter.lora_b], lr=1e-2
+        )
+        torch.manual_seed(53)
+        hidden = torch.randn(5, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+        output = module._forward_impl(hidden)
+        loss = output.float().square().mean()
+        loss.backward()
+        observed = (
+            output.detach(), loss.detach(), hidden.grad.detach(),
+            module.W_down.grad.detach(), adapter.lora_a.grad.detach(),
+            adapter.lora_b.grad.detach(),
+        )
+        optimizer.step()
+        stepped = module.W_down.detach().clone()
+        if routed:
+            payload = io.BytesIO()
+            torch.save(module.state_dict(), payload)
+            payload.seek(0)
+            restored, _ = _build_reduced_moe(
+                device=device, dtype=torch.bfloat16,
+                hidden_size=64, expert_intermediate_size=48,
+            )
+            restored.load_state_dict(torch.load(payload, map_location=device, weights_only=True))
+            torch.testing.assert_close(restored.W_down, module.W_down, rtol=0, atol=0)
+        return observed + (stepped,)
+
+    reference = run(routed=False)
+    candidate = run(routed=True)
+    for expected, actual in zip(reference, candidate, strict=True):
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=4e-2, atol=4e-2)
+    assert candidate[3].abs().max() > 0
+    assert candidate[5].abs().max() > 0
+
+
 def _reduced_expert_weights(
     *, d_head: int, d_expert: int, dtype: torch.dtype, groups: int = 4
 ) -> dict[str, torch.Tensor]:
@@ -625,6 +761,20 @@ def test_magi2_pipeline_attaches_and_detaches_the_grouped_seam() -> None:
     pipeline.configure_moe_optimization_policy(MoEOptimizationPolicy())
     assert module._mirai_moe_kernel_backend is None
 
+    state_before = {
+        key: value.detach().clone() for key, value in module.state_dict().items()
+    }
+    hidden = torch.randn(3, int(module.num_heads * module.d_head))
+    output_before = module._forward_impl(hidden)
+    pipeline.configure_moe_optimization_policy(
+        MoEOptimizationPolicy(moe_routed_gemm="disabled")
+    )
+    assert module._mirai_moe_kernel_backend is None
+    output_after = module._forward_impl(hidden)
+    torch.testing.assert_close(output_after, output_before, rtol=0, atol=0)
+    for key, value in module.state_dict().items():
+        torch.testing.assert_close(value, state_before[key], rtol=0, atol=0)
+
     pipeline.configure_moe_optimization_policy(
         MoEOptimizationPolicy(kernel_backend="grouped", moe_gemm_backend="bmm")
     )
@@ -634,6 +784,69 @@ def test_magi2_pipeline_attaches_and_detaches_the_grouped_seam() -> None:
     pipeline.configure_moe_optimization_policy(MoEOptimizationPolicy())
     assert module._mirai_moe_kernel_backend is None
 
+
+def test_magi2_explicit_disabled_preserves_output_loss_and_gradients() -> None:
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+
+    def run(policy: MoEOptimizationPolicy):
+        module, adapter = _build_reduced_moe(
+            device=torch.device("cpu"), dtype=torch.float32
+        )
+        container = torch.nn.Module()
+        container.moe_mlp = module
+        pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.transformer = container
+        pipeline.configure_moe_optimization_policy(policy)
+        assert module._mirai_moe_kernel_backend is None
+        torch.manual_seed(812)
+        hidden = torch.randn(
+            3, int(module.num_heads * module.d_head), requires_grad=True
+        )
+        output = module._forward_impl(hidden)
+        loss = output.square().mean()
+        loss.backward()
+        return (
+            output.detach(),
+            loss.detach(),
+            hidden.grad.detach(),
+            adapter.lora_a.grad.detach(),
+            adapter.lora_b.grad.detach(),
+            {key: value.detach().clone() for key, value in module.state_dict().items()},
+        )
+
+    implicit = run(MoEOptimizationPolicy())
+    explicit = run(MoEOptimizationPolicy(moe_routed_gemm="disabled"))
+    for expected, actual in zip(implicit[:-1], explicit[:-1], strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert implicit[-1].keys() == explicit[-1].keys()
+    for key, expected in implicit[-1].items():
+        torch.testing.assert_close(explicit[-1][key], expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or os.environ.get("MIRAI_REMOTE_GPU_TESTS") != "1",
+    reason="configured remote CUDA validation required",
+)
+def test_magi2_explicit_disabled_config_allocates_no_cuda_state() -> None:
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+
+    module, _ = _build_reduced_moe(
+        device=torch.device("cuda"), dtype=torch.bfloat16
+    )
+    container = torch.nn.Module()
+    container.moe_mlp = module
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = container
+    torch.cuda.synchronize()
+    allocated_before = torch.cuda.memory_allocated()
+    pipeline.configure_moe_optimization_policy(
+        MoEOptimizationPolicy(moe_routed_gemm="disabled")
+    )
+    torch.cuda.synchronize()
+    assert module._mirai_moe_kernel_backend is None
+    assert torch.cuda.memory_allocated() == allocated_before
 
 _NATIVE_ONLY_IMPORT_PROBE = """
 import importlib

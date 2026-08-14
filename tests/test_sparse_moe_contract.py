@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +16,8 @@ from mirai.config.schema import (
 )
 from mirai.core.builtins import register_builtin_components
 from mirai.core.models.lingbot_video.pipeline import LingBotVideoPipeline
+from mirai.core.models.lingbot_video.routed_moe import LingBotRoutedTritonBackend
+from mirai.core.models.adapters.lora import LoRAExpertTensorParametrization
 from mirai.core.models.lingbot_video.router_runtime import _routing_stats
 from mirai.core.models.providers import get_model_family_provider
 from mirai.core.models.testbed import TinySparseMoEDenoiser
@@ -37,17 +40,289 @@ from mirai.core.training.trainer import Trainer
 from mirai.vendors.lingbot_video.transformer_lingbot_video import (
     LingBotVideoAttention,
     LingBotVideoRouter,
+    LingBotVideoRuntimeOptions,
     LingBotVideoSparseMoeBlock,
+    _moe_expert_backend,
+    set_lingbot_video_runtime_options,
 )
 
 try:
     import torch
+    from torch.nn.utils import parametrize
 except ModuleNotFoundError:  # pragma: no cover
     torch = None
 
 
 @unittest.skipIf(torch is None, "torch not installed")
 class SparseMoEContractTests(unittest.TestCase):
+    def test_lingbot_routed_backend_auto_falls_back_and_explicit_fails_on_cpu(self) -> None:
+        block = LingBotVideoSparseMoeBlock(
+            hidden_size=8, intermediate_size=16, num_experts=4, top_k=2,
+            moe_intermediate_size=12, score_func="softmax", norm_topk_prob=True,
+            n_group=None, topk_group=None, routed_scaling_factor=1.0,
+            n_shared_experts=0,
+        )
+        with torch.no_grad():
+            for parameter in block.parameters():
+                parameter.normal_(std=0.02)
+        tokens = torch.randn(3, 8)
+        scores = torch.softmax(torch.randn(3, 2), dim=-1)
+        indices = torch.tensor([[0, 1], [2, 3], [0, 2]])
+        block._mirai_moe_kernel_backend = LingBotRoutedTritonBackend("auto")
+        automatic = block._run_selected_experts(tokens, scores, indices)
+        block._mirai_moe_kernel_backend = None
+        reference = block._run_selected_experts(tokens, scores, indices)
+        torch.testing.assert_close(automatic, reference)
+        block._mirai_moe_kernel_backend = LingBotRoutedTritonBackend("triton")
+        with self.assertRaisesRegex(RuntimeError, "CUDA activation.*BF16"):
+            block._run_selected_experts(tokens, scores, indices)
+
+    def test_lingbot_routed_layout_preserves_zero_score_assignment_space(self) -> None:
+        block = LingBotVideoSparseMoeBlock(
+            hidden_size=8, intermediate_size=16, num_experts=4, top_k=2,
+            moe_intermediate_size=12, score_func="softmax", norm_topk_prob=True,
+            n_group=None, topk_group=None, routed_scaling_factor=1.0,
+            n_shared_experts=0,
+        )
+        with torch.no_grad():
+            for parameter in block.parameters():
+                parameter.normal_(std=0.02)
+        tokens = torch.randn(3, 8)
+        scores = torch.tensor([[1.0, 0.0], [0.3, 0.7], [0.0, 1.0]])
+        indices = torch.tensor([[0, 1], [2, 3], [0, 2]])
+        backend = LingBotRoutedTritonBackend("auto")
+        block._mirai_moe_kernel_backend = backend
+        automatic = block._run_selected_experts(tokens, scores, indices)
+        block._mirai_moe_kernel_backend = None
+        reference = block._run_selected_experts(tokens, scores, indices)
+        torch.testing.assert_close(automatic, reference)
+
+    def test_lingbot_late_observer_auto_falls_back_and_explicit_rejects(self) -> None:
+        class Observer:
+            is_enabled = True
+
+            def capture_sorted(self, *args, **kwargs):
+                pass
+
+        block = LingBotVideoSparseMoeBlock(
+            hidden_size=8, intermediate_size=16, num_experts=4, top_k=2,
+            moe_intermediate_size=12, score_func="softmax", norm_topk_prob=True,
+            n_group=None, topk_group=None, routed_scaling_factor=1.0,
+            n_shared_experts=0,
+        )
+        with torch.no_grad():
+            for parameter in block.parameters():
+                parameter.normal_(std=0.02)
+        tokens = torch.randn(3, 8)
+        scores = torch.softmax(torch.randn(3, 2), dim=-1)
+        indices = torch.tensor([[0, 1], [2, 3], [0, 2]])
+        block.set_expert_output_observer(Observer())
+        auto = LingBotRoutedTritonBackend("auto")
+        object.__setattr__(auto, "execute_direct", lambda *args: (_ for _ in ()).throw(
+            AssertionError("late observer must prevent routed kernel execution")
+        ))
+        block._mirai_moe_kernel_backend = auto
+        observed = block._run_selected_experts(tokens, scores, indices)
+        block._mirai_moe_kernel_backend = None
+        expected = block._run_selected_experts(tokens, scores, indices)
+        torch.testing.assert_close(observed, expected)
+        block._mirai_moe_kernel_backend = LingBotRoutedTritonBackend("triton")
+        with self.assertRaisesRegex(RuntimeError, "observers"):
+            block._run_selected_experts(tokens, scores, indices)
+
+    @unittest.skipUnless(
+        torch is not None
+        and torch.cuda.is_available()
+        and os.environ.get("MIRAI_REMOTE_GPU_TESTS") == "1",
+        "configured remote CUDA validation required",
+    )
+    def test_lingbot_routed_triton_full_training_and_selected_expert_parity(self) -> None:
+        def build():
+            torch.manual_seed(71)
+            block = LingBotVideoSparseMoeBlock(
+                hidden_size=17, intermediate_size=32, num_experts=5, top_k=3,
+                moe_intermediate_size=23, score_func="softmax", norm_topk_prob=True,
+                n_group=None, topk_group=None, routed_scaling_factor=1.0,
+                n_shared_experts=0,
+            ).to(device="cuda", dtype=torch.bfloat16)
+            with torch.no_grad():
+                for parameter in block.parameters():
+                    parameter.normal_(std=0.02)
+            return block
+
+        def run(*, routed):
+            block = build()
+            block.train()
+            if not routed:
+                set_lingbot_video_runtime_options(
+                    block, LingBotVideoRuntimeOptions(moe_expert_backend="loop")
+                )
+                self.assertEqual(_moe_expert_backend(block), "loop")
+            block._mirai_moe_kernel_backend = (
+                LingBotRoutedTritonBackend("triton") if routed else None
+            )
+            torch.manual_seed(72)
+            tokens = torch.randn(
+                7, 17, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            logits = torch.randn(7, 3, device="cuda", dtype=torch.float32, requires_grad=True)
+            scores = torch.softmax(logits, dim=-1).to(torch.bfloat16)
+            # Expert 4 is empty; expert 0 is deliberately dominant.
+            indices = torch.tensor(
+                [[0, 1, 2], [0, 2, 3], [0, 1, 3], [0, 2, 3],
+                 [0, 1, 2], [0, 2, 3], [0, 1, 3]], device="cuda",
+            )
+            output = block._run_selected_experts(tokens, scores, indices)
+            loss = output.float().square().mean()
+            loss.backward()
+            optimizer = torch.optim.SGD(
+                [block.experts.w1, block.experts.w2, block.experts.w3], lr=1e-2
+            )
+            observed = (
+                output.detach(), loss.detach(), tokens.grad.detach(), logits.grad.detach(),
+                block.experts.w1.grad.detach(), block.experts.w2.grad.detach(),
+                block.experts.w3.grad.detach(),
+            )
+            for tensor in observed:
+                self.assertTrue(torch.isfinite(tensor).all())
+            optimizer.step()
+            stepped = tuple(
+                value.detach().clone()
+                for value in (block.experts.w1, block.experts.w2, block.experts.w3)
+            )
+            if routed:
+                import io
+                payload = io.BytesIO()
+                torch.save(block.state_dict(), payload)
+                payload.seek(0)
+                restored = build()
+                restored.load_state_dict(
+                    torch.load(payload, map_location="cuda", weights_only=True)
+                )
+                for expected, actual in zip(stepped, (
+                    restored.experts.w1, restored.experts.w2, restored.experts.w3
+                ), strict=True):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            return observed + stepped
+
+        reference = run(routed=False)
+        candidate = run(routed=True)
+        for expected, actual in zip(reference, candidate, strict=True):
+            torch.testing.assert_close(actual.float(), expected.float(), rtol=4e-2, atol=4e-2)
+        self.assertTrue(torch.equal(candidate[4][4], torch.zeros_like(candidate[4][4])))
+
+    @unittest.skipUnless(
+        torch is not None
+        and torch.cuda.is_available()
+        and os.environ.get("MIRAI_REMOTE_GPU_TESTS") == "1",
+        "configured remote CUDA validation required",
+    )
+    def test_lingbot_routed_triton_lora_and_dora_adapter_parity(self) -> None:
+        def build(use_dora):
+            torch.manual_seed(81)
+            block = LingBotVideoSparseMoeBlock(
+                hidden_size=17, intermediate_size=32, num_experts=4, top_k=2,
+                moe_intermediate_size=23, score_func="softmax", norm_topk_prob=True,
+                n_group=None, topk_group=None, routed_scaling_factor=1.0,
+                n_shared_experts=0,
+            ).to(device="cuda", dtype=torch.bfloat16)
+            with torch.no_grad():
+                for parameter in block.parameters():
+                    parameter.normal_(std=0.02)
+            adapters = []
+            for key in ("w1", "w2", "w3"):
+                base = getattr(block.experts, key)
+                adapter = LoRAExpertTensorParametrization(
+                    adapter_name=key, shape=tuple(base.shape),
+                    layout=("expert", "out", "in"), rank=3, alpha=3.0,
+                    use_dora=use_dora, base_weight=base if use_dora else None,
+                ).to(device="cuda", dtype=torch.bfloat16)
+                if use_dora:
+                    adapter.initialize_dora_magnitude(base)
+                with torch.no_grad():
+                    adapter.lora_b.normal_(std=0.03)
+                parametrize.register_parametrization(block.experts, key, adapter)
+                block.experts.parametrizations[key].original.requires_grad_(False)
+                adapters.append(adapter)
+            return block, adapters
+
+        def run(use_dora, routed):
+            block, adapters = build(use_dora)
+            if not routed:
+                set_lingbot_video_runtime_options(
+                    block, LingBotVideoRuntimeOptions(moe_expert_backend="loop")
+                )
+                self.assertEqual(_moe_expert_backend(block), "loop")
+            block._mirai_moe_kernel_backend = (
+                LingBotRoutedTritonBackend("triton") if routed else None
+            )
+            torch.manual_seed(82)
+            tokens = torch.randn(6, 17, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            logits = torch.randn(6, 2, device="cuda", requires_grad=True)
+            scores = torch.softmax(logits, -1).to(torch.bfloat16)
+            indices = torch.tensor([[0, 1], [0, 2], [3, 0], [1, 3], [0, 2], [3, 1]], device="cuda")
+            output = block._run_selected_experts(tokens, scores, indices)
+            loss = output.float().square().mean()
+            loss.backward()
+            parameters = [parameter for adapter in adapters for parameter in adapter.parameters()]
+            observed = [output.detach(), loss.detach(), tokens.grad.detach(), logits.grad.detach()]
+            observed.extend(parameter.grad.detach() for parameter in parameters)
+            for tensor in observed:
+                self.assertTrue(torch.isfinite(tensor).all())
+            optimizer = torch.optim.AdamW(parameters, lr=1e-2)
+            optimizer.step()
+            observed.extend(parameter.detach().clone() for parameter in parameters)
+            if routed:
+                import io
+                payload = io.BytesIO()
+                torch.save(block.state_dict(), payload)
+                payload.seek(0)
+                restored, _ = build(use_dora)
+                restored.load_state_dict(torch.load(payload, map_location="cuda", weights_only=True))
+                for key, value in block.state_dict().items():
+                    torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
+            return observed
+
+        for use_dora in (False, True):
+            reference = run(use_dora, False)
+            candidate = run(use_dora, True)
+            for expected, actual in zip(reference, candidate, strict=True):
+                torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
+
+    @unittest.skipUnless(
+        torch is not None
+        and torch.cuda.is_available()
+        and os.environ.get("MIRAI_REMOTE_GPU_TESTS") == "1",
+        "configured remote CUDA validation required",
+    )
+    def test_lingbot_routed_triton_inference_token_chunk_parity(self) -> None:
+        torch.manual_seed(91)
+        block = LingBotVideoSparseMoeBlock(
+            hidden_size=17, intermediate_size=32, num_experts=4, top_k=2,
+            moe_intermediate_size=23, score_func="softmax", norm_topk_prob=True,
+            n_group=None, topk_group=None, routed_scaling_factor=1.0,
+            n_shared_experts=0,
+        ).to(device="cuda", dtype=torch.bfloat16).eval()
+        with torch.no_grad():
+            for parameter in block.parameters():
+                parameter.normal_(std=0.02)
+        block._mirai_moe_kernel_backend = LingBotRoutedTritonBackend("triton")
+        tokens = torch.randn(7, 17, device="cuda", dtype=torch.bfloat16)
+        scores = torch.softmax(torch.randn(7, 2, device="cuda"), -1).to(torch.bfloat16)
+        indices = torch.tensor([[0, 1], [2, 3], [0, 2], [1, 3], [0, 3], [1, 2], [0, 1]], device="cuda")
+        with torch.no_grad():
+            whole = block._run_selected_experts(tokens, scores, indices, drop_slots=False)
+            chunks = torch.cat([
+                block._run_selected_experts(
+                    tokens[start:start + 2], scores[start:start + 2],
+                    indices[start:start + 2], drop_slots=False,
+                )
+                for start in range(0, 7, 2)
+            ])
+        self.assertTrue(torch.isfinite(whole).all())
+        self.assertTrue(torch.isfinite(chunks).all())
+        torch.testing.assert_close(chunks.float(), whole.float(), rtol=3e-2, atol=3e-2)
+
     def _lingbot_tiny_config(self, *, strategy: StrategyConfig | None = None) -> TrainingConfig:
         return TrainingConfig(
             model=ModelConfig(

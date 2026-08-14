@@ -1,6 +1,6 @@
 """Adam-mini for directly tuned grouped-expert projection rows.
 
-This is a clean-room adaptation of the official Adam-mini v1.1.1 MLP partition
+The MLP partition follows Adam-mini v1.1.1
 (https://arxiv.org/abs/2406.16793 and
 https://github.com/zyushun/Adam-mini): each selected expert/output-neuron block
 owns one scalar second moment, while the first moment retains the projection's

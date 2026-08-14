@@ -677,6 +677,10 @@ class MemoryConfig:
     moe_gemm_backend_forward: str = ""  # inherited backend or deepgemm_fp8
     moe_gemm_backend_dx: str = ""  # ""|auto|bmm|persistent|torch_grouped
     moe_gemm_backend_dw: str = ""  # ""|auto|bmm|persistent|torch_grouped
+    moe_routed_gemm: str = "disabled"  # disabled|auto|triton
+    moe_routed_gemm_tuning: str = "off"  # off|online|warmup_only
+    moe_routed_gemm_cache_path: str = ""
+    moe_routed_gemm_architecture: str = "auto"  # auto|indexed|tma_regular
     moe_batched_dequant: bool = True
     moe_pair_dequant: bool = True
     moe_batched_gather: bool = False
@@ -1375,6 +1379,10 @@ class TrainingConfig:
             "moe_gemm_backend_forward",
             "moe_gemm_backend_dx",
             "moe_gemm_backend_dw",
+            "moe_routed_gemm",
+            "moe_routed_gemm_tuning",
+            "moe_routed_gemm_cache_path",
+            "moe_routed_gemm_architecture",
             "moe_batched_dequant",
             "moe_pair_dequant",
             "moe_batched_gather",
@@ -3353,6 +3361,16 @@ class TrainingConfig:
             ),
             moe_gemm_backend_dx=str(memory_table.get("moe_gemm_backend_dx", "")),
             moe_gemm_backend_dw=str(memory_table.get("moe_gemm_backend_dw", "")),
+            moe_routed_gemm=str(memory_table.get("moe_routed_gemm", "disabled")),
+            moe_routed_gemm_tuning=str(
+                memory_table.get("moe_routed_gemm_tuning", "off")
+            ),
+            moe_routed_gemm_cache_path=str(
+                memory_table.get("moe_routed_gemm_cache_path", "")
+            ),
+            moe_routed_gemm_architecture=str(
+                memory_table.get("moe_routed_gemm_architecture", "auto")
+            ),
             moe_batched_dequant=bool(
                 memory_table.get("moe_batched_dequant", True)
             ),

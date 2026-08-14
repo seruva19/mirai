@@ -72,7 +72,7 @@ def factorize_dense_experts(
 
     ``auto`` shares a right basis for up/gate-shaped projections and a left
     basis for down-shaped projections by choosing the smaller factor payload.
-    With ``input_covariance``, the factorization is a clean-room shared-basis
+    With ``input_covariance``, the factorization is a shared-basis
     adaptation of SVD-LLM's truncation-aware whitening
     (https://arxiv.org/abs/2403.07378): SVD is applied after multiplying each
     projection by the Cholesky factor of its routed-input covariance, and the

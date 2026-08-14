@@ -191,6 +191,7 @@ from mirai.core.moe.runtime.specs import ExpertTensorSpec
 from mirai.core.moe.runtime.specs import ExpertMLPExecutionSpec
 from mirai.core.moe.runtime.specs import ExpertProjectionRole
 from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
+from mirai.core.models.lingbot_video.routed_moe import LingBotRoutedTritonBackend
 from mirai.core.moe.runtime.specs import normalize_expert_weight_access_policy
 from mirai.core.training.runtime.compilation import (
     CompilationRegion,
@@ -4464,6 +4465,34 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                         module.enable_int8_weight()
         access = _expert_access_from_policy(policy)
         self._moe_optimization_policy = policy
+        routed_mode = str(policy.moe_routed_gemm)
+        routed_backend = None
+        if routed_mode != "disabled":
+            failures = []
+            if self._frozen_weight_quantization not in {"", "none"}:
+                failures.append("resident uncompressed BF16 experts")
+            if access not in {"auto", "disabled", "full_dequant"}:
+                failures.append("resident expert access")
+            if policy.kernel_backend not in {"auto", "torch"}:
+                failures.append("no competing MoE kernel backend")
+            observer_active = any(
+                (
+                    getattr(block.ffn, "_mirai_importance_calibration_observer", None) is not None
+                    or getattr(block.ffn, "_mirai_expert_output_observer", None) is not None
+                    or getattr(block.ffn, "_mirai_expert_intermediate_observer", None) is not None
+                )
+                for block in self.transformer.blocks
+            )
+            if observer_active:
+                failures.append("no active routed expert observers")
+            if failures and routed_mode == "triton":
+                raise ValueError(
+                    "memory.moe_routed_gemm='triton' requires "
+                    + ", ".join(failures)
+                    + "."
+                )
+            if not failures:
+                routed_backend = LingBotRoutedTritonBackend(routed_mode)
         if (
             float(policy.expert_device_cache_gib) > 0.0
             and self._frozen_weight_quantization != "int8"
@@ -4520,7 +4549,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                     "memory.moe_kernel_backend must be 'auto' or 'rotated_int8'."
                 )
             effective_kernel_backend = "rotated_int8"
-        kernel_backend = build_moe_kernel_backend(
+        kernel_backend = routed_backend or build_moe_kernel_backend(
             effective_kernel_backend,
             direct_routed=access in {"active_dequant", "chunked_dequant", "fused_kernel"},
         )

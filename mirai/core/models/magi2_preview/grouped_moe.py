@@ -66,6 +66,7 @@ from mirai.core.moe.runtime.specs import (
     normalize_packed_stream_backend,
     normalize_router_quantization_policy,
 )
+from mirai.core.moe.runtime.routed_gemm import normalize_routed_gemm_mode
 
 
 # Grouped execution supports the two device-portable primitives only. The
@@ -87,6 +88,7 @@ class Magi2GroupedMoEPlan:
 
     forward_backend: str = "auto"
     dx_backend: str = "auto"
+    routed_gemm: str = "disabled"
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -101,6 +103,7 @@ class Magi2GroupedMoEPlan:
                     + f"; got '{normalized}' for the {field.split('_')[0]} role."
                 )
             object.__setattr__(self, field, normalized)
+        object.__setattr__(self, "routed_gemm", normalize_routed_gemm_mode(self.routed_gemm))
 
 
 def magi2_grouped_mm_alignment_violations(
@@ -522,6 +525,27 @@ class Magi2GroupedMoEBackend:
             x_sorted, getattr(module, key), offsets, forward_backend, dx_backend
         )
 
+    def routed_project(
+        self,
+        module: Any,
+        key: str,
+        activation: torch.Tensor,
+        offsets: torch.Tensor,
+        *,
+        gather_rows: torch.Tensor | None = None,
+        scatter_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Provider-owned entry to the generic routed Triton projection."""
+        from mirai.core.moe.runtime.routed_gemm_triton import routed_projection
+
+        return routed_projection(
+            activation.contiguous(),
+            getattr(module, key),
+            offsets,
+            gather_rows=gather_rows,
+            scatter_rows=scatter_rows,
+        )
+
     def plan_branches(
         self,
         module: Any,
@@ -641,6 +665,85 @@ class Magi2GroupedMoEBackend:
         sorted_probs = topk_probs.reshape(-1)[order]
         counts = torch.bincount(flat_experts, minlength=groups)
         offsets = counts.cumsum(0).to(torch.int32)
+
+        if self.plan.routed_gemm != "disabled" and hasattr(module, "W_gate"):
+            from mirai.core.moe.runtime.routed_gemm import (
+                RoutedFusionSpec,
+                RoutedGroupLayout,
+                RoutedOutputMode,
+                routed_gemm_verdict,
+            )
+
+            layout = RoutedGroupLayout(
+                boundaries=offsets,
+                assignment_rows=order,
+                token_count=tokens * num_heads,
+                top_k=int(topk_indices.shape[-1]),
+                group_count=groups,
+                provider_mapping=("head", "expert"),
+            )
+            x_rows = x_heads.reshape(tokens * num_heads, d_head)
+            verdicts = [
+                routed_gemm_verdict(
+                    self.plan.routed_gemm,
+                    x_rows,
+                    getattr(module, key),
+                    RoutedFusionSpec(gather_tokens=True),
+                    training=torch.is_grad_enabled(),
+                    resident=True,
+                    quantized=False,
+                    layout=layout,
+                )
+                for key in ("W_gate", "W_up")
+            ]
+            verdicts.append(
+                routed_gemm_verdict(
+                    self.plan.routed_gemm,
+                    x_rows.new_empty((int(order.numel()), int(module.W_down.shape[1]))),
+                    module.W_down,
+                    RoutedFusionSpec(output=RoutedOutputMode.WEIGHTED_TOKEN_REDUCTION),
+                    training=torch.is_grad_enabled(),
+                    resident=True,
+                    quantized=False,
+                    layout=layout,
+                )
+            )
+            verdict = next(
+                (item for item in verdicts if item.selected != "triton" or not item.supported),
+                verdicts[-1],
+            )
+            if verdict.selected == "triton" and verdict.supported:
+                gate = self.routed_project(
+                    module, "W_gate", x_rows, offsets, gather_rows=sorted_rows
+                )
+                up = self.routed_project(
+                    module, "W_up", x_rows, offsets, gather_rows=sorted_rows
+                )
+                hidden = _ConfiguredSwiGlu7.apply(
+                    gate,
+                    up,
+                    self.expert_weight_dtype(module, "W_down"),
+                    self.activation_backend,
+                )
+                # ``order`` maps grouped rows to canonical assignment slots.
+                from mirai.core.moe.runtime.routed_gemm_triton import (
+                    routed_weighted_projection,
+                )
+
+                output = routed_weighted_projection(
+                    hidden,
+                    getattr(module, "W_down"),
+                    offsets,
+                    grouped_to_assignment=order,
+                    assignment_to_token=rows,
+                    coefficients=topk_probs.reshape(-1),
+                    token_rows=tokens * num_heads,
+                )
+                return output.view(tokens, num_heads, d_head)
+            if self.plan.routed_gemm == "triton":
+                raise Magi2GroupedMoEPolicyError(
+                    "memory.moe_routed_gemm='triton' " + verdict.reason + "."
+                )
 
         expert_output = self.branch_features(
             module, x_heads, sorted_rows, offsets, forward_backend, dx_backend
@@ -991,6 +1094,140 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         return grad_input, None, None, None, None, None
 
 
+def _segment_routed_projection(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    boundaries: torch.Tensor,
+    *,
+    gather_rows: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run one transient dense segment through the shared routed BF16 kernel."""
+    from mirai.core.moe.runtime.routed_gemm_triton import triton_routed_grouped_mm
+
+    return triton_routed_grouped_mm(
+        activation.contiguous(),
+        weight,
+        boundaries,
+        gather_rows=gather_rows,
+    )
+
+
+class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
+    """Routed BF16 projection over one transient NF4 segment at a time."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        x_rows: torch.Tensor,
+        offsets: torch.Tensor,
+        sorted_rows: torch.Tensor,
+        store: Magi2Nf4ExpertStore,
+        activation_backend: str,
+    ) -> torch.Tensor:
+        boundaries = _grouped_boundaries(offsets)
+        span = store.segment_group_span()
+        outputs: list[torch.Tensor] = []
+        for segment in grouped_mm_segments(boundaries, max_groups=max(1, int(span))):
+            if segment.row_count == 0:
+                continue
+            local_offsets = (
+                offsets[segment.group_start : segment.group_stop] - segment.row_start
+            ).contiguous()
+            local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
+            w_gate = store.materialize_segment(
+                "W_gate", segment.group_start, segment.group_stop,
+                dtype=x_rows.dtype, device=x_rows.device,
+            )
+            gate = _segment_routed_projection(
+                x_rows, w_gate, local_offsets, gather_rows=local_rows
+            )
+            del w_gate
+            w_up = store.materialize_segment(
+                "W_up", segment.group_start, segment.group_stop,
+                dtype=x_rows.dtype, device=x_rows.device,
+            )
+            up = _segment_routed_projection(
+                x_rows, w_up, local_offsets, gather_rows=local_rows
+            )
+            del w_up
+            hidden = _swiglu7_forward(
+                gate, up, output_dtype=x_rows.dtype, backend=str(activation_backend)
+            )
+            del gate, up
+            w_down = store.materialize_segment(
+                "W_down", segment.group_start, segment.group_stop,
+                dtype=x_rows.dtype, device=x_rows.device,
+            )
+            outputs.append(_segment_routed_projection(hidden, w_down, local_offsets))
+            del hidden, w_down
+        if not outputs:
+            output = x_rows.new_empty((0, int(x_rows.shape[-1])))
+        elif len(outputs) == 1:
+            output = outputs[0]
+        else:
+            output = torch.cat(outputs, dim=0)
+        ctx.save_for_backward(x_rows, offsets, sorted_rows)
+        ctx.store = store
+        ctx.activation_backend = str(activation_backend)
+        ctx.boundaries = boundaries
+        ctx.segment_span = int(span)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+        x_rows, offsets, sorted_rows = ctx.saved_tensors
+        grad_input = torch.zeros_like(x_rows)
+        store = ctx.store
+        for segment in grouped_mm_segments(
+            ctx.boundaries, max_groups=max(1, int(ctx.segment_span))
+        ):
+            if segment.row_count == 0:
+                continue
+            local_offsets = (
+                offsets[segment.group_start : segment.group_stop] - segment.row_start
+            ).contiguous()
+            local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
+            grad_rows = grad_output[segment.row_start : segment.row_stop].contiguous()
+            w_gate = store.materialize_segment(
+                "W_gate", segment.group_start, segment.group_stop,
+                dtype=x_rows.dtype, device=x_rows.device,
+            )
+            gate = _segment_routed_projection(
+                x_rows, w_gate, local_offsets, gather_rows=local_rows
+            )
+            w_up = store.materialize_segment(
+                "W_up", segment.group_start, segment.group_stop,
+                dtype=x_rows.dtype, device=x_rows.device,
+            )
+            up = _segment_routed_projection(
+                x_rows, w_up, local_offsets, gather_rows=local_rows
+            )
+            w_down = store.materialize_segment(
+                "W_down", segment.group_start, segment.group_stop,
+                dtype=x_rows.dtype, device=x_rows.device,
+            )
+            grad_hidden = _segment_routed_projection(
+                grad_rows, w_down.transpose(-2, -1), local_offsets
+            )
+            grad_gate, grad_up = _swiglu7_backward(
+                gate, up, grad_hidden, backend=ctx.activation_backend
+            )
+            grad_grouped = _segment_routed_projection(
+                grad_gate.contiguous(), w_gate.transpose(-2, -1), local_offsets
+            )
+            grad_grouped.add_(
+                _segment_routed_projection(
+                    grad_up.contiguous(), w_up.transpose(-2, -1), local_offsets
+                )
+            )
+            grad_input.index_add_(0, local_rows.to(torch.int64), grad_grouped)
+            del (
+                w_gate, w_up, w_down, gate, up, grad_hidden,
+                grad_gate, grad_up, grad_grouped,
+            )
+        return grad_input, None, None, None, None
+
+
 class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
     """Grouped execution over NF4-packed MAGI-2 routed experts.
 
@@ -1066,6 +1303,109 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             x_sorted, offsets, self._store(module), key, forward_backend, dx_backend
         )
 
+    def _routed_inference(
+        self,
+        module: Any,
+        x_heads: torch.Tensor,
+        topk_probs: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        from mirai.core.moe.runtime.routed_gemm_triton import (
+            routed_weighted_projection,
+        )
+
+        tokens, num_heads, d_head = map(int, x_heads.shape)
+        num_experts = int(module.num_experts)
+        groups = num_heads * num_experts
+        device = x_heads.device
+        head_axis = torch.arange(num_heads, device=device).view(num_heads, 1, 1)
+        token_axis = torch.arange(tokens, device=device).view(1, tokens, 1)
+        flat_experts = (topk_indices + head_axis * num_experts).reshape(-1)
+        assignment_to_row = (
+            token_axis * num_heads + head_axis
+        ).expand_as(topk_indices).reshape(-1)
+        order = flat_experts.argsort(stable=True)
+        sorted_rows = assignment_to_row.index_select(0, order)
+        offsets = torch.bincount(flat_experts, minlength=groups).cumsum(0).to(torch.int32)
+        boundaries = _grouped_boundaries(offsets)
+        x_rows = x_heads.reshape(tokens * num_heads, d_head)
+        store = self._store(module)
+        output = x_rows.new_zeros((tokens * num_heads, d_head))
+        for segment in grouped_mm_segments(
+            boundaries, max_groups=max(1, store.segment_group_span())
+        ):
+            if segment.row_count == 0:
+                continue
+            local_offsets = (
+                offsets[segment.group_start : segment.group_stop] - segment.row_start
+            ).contiguous()
+            local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
+            w_gate = store.materialize_segment(
+                "W_gate", segment.group_start, segment.group_stop,
+                dtype=x_rows.dtype, device=device,
+            )
+            gate = _segment_routed_projection(
+                x_rows, w_gate, local_offsets, gather_rows=local_rows
+            )
+            del w_gate
+            w_up = store.materialize_segment(
+                "W_up", segment.group_start, segment.group_stop,
+                dtype=x_rows.dtype, device=device,
+            )
+            up = _segment_routed_projection(
+                x_rows, w_up, local_offsets, gather_rows=local_rows
+            )
+            del w_up
+            hidden = _swiglu7_forward(
+                gate, up, output_dtype=x_rows.dtype, backend=self.activation_backend
+            )
+            del gate, up
+            w_down = store.materialize_segment(
+                "W_down", segment.group_start, segment.group_stop,
+                dtype=x_rows.dtype, device=device,
+            )
+            output.add_(
+                routed_weighted_projection(
+                    hidden,
+                    w_down,
+                    local_offsets,
+                    grouped_to_assignment=order[
+                        segment.row_start : segment.row_stop
+                    ].contiguous(),
+                    assignment_to_token=assignment_to_row,
+                    coefficients=topk_probs.reshape(-1),
+                    token_rows=tokens * num_heads,
+                )
+            )
+            del hidden, w_down
+        return output.view(tokens, num_heads, d_head)
+
+    def _execute_routed_chunk(
+        self,
+        module: Any,
+        x_heads: torch.Tensor,
+        topk_probs: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.plan.routed_gemm != "disabled" and not torch.is_grad_enabled():
+            supported = (
+                x_heads.device.type == "cuda"
+                and x_heads.dtype == torch.bfloat16
+                and probe_backend("persistent", device=x_heads.device).available
+            )
+            if supported:
+                return self._routed_inference(
+                    module, x_heads, topk_probs, topk_indices
+                )
+            if self.plan.routed_gemm == "triton":
+                raise Magi2GroupedMoEPolicyError(
+                    "memory.moe_routed_gemm='triton' with packed experts requires "
+                    "BF16 CUDA activations and the routed Triton backend."
+                )
+        return super()._execute_routed_chunk(
+            module, x_heads, topk_probs, topk_indices
+        )
+
     def branch_features(
         self,
         module: Any,
@@ -1075,6 +1415,28 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         forward_backend: str,
         dx_backend: str,
     ) -> torch.Tensor:
+        if self.plan.routed_gemm != "disabled":
+            supported = (
+                x_heads.device.type == "cuda"
+                and x_heads.dtype == torch.bfloat16
+                and probe_backend("persistent", device=x_heads.device).available
+            )
+            if supported:
+                tokens = int(x_heads.shape[0])
+                num_heads = int(x_heads.shape[1])
+                d_head = int(x_heads.shape[2])
+                return _SegmentedRoutedQuantizedExpertMlp.apply(
+                    x_heads.reshape(tokens * num_heads, d_head),
+                    offsets,
+                    sorted_rows,
+                    self._store(module),
+                    self.activation_backend,
+                )
+            if self.plan.routed_gemm == "triton":
+                raise Magi2GroupedMoEPolicyError(
+                    "memory.moe_routed_gemm='triton' with packed experts requires "
+                    "BF16 CUDA activations and the routed Triton backend."
+                )
         if torch.is_grad_enabled() and self.expert_autograd == "standard":
             return super().branch_features(
                 module,
@@ -1124,6 +1486,10 @@ _CONSUMED_POLICY_FIELDS = frozenset(
         "moe_gemm_backend_forward",
         "moe_gemm_backend_dx",
         "moe_activation_backend",
+        "moe_routed_gemm",
+        "moe_routed_gemm_tuning",
+        "moe_routed_gemm_cache_path",
+        "moe_routed_gemm_architecture",
     }
 )
 
@@ -1243,7 +1609,14 @@ def resolve_magi2_moe_execution(
             "that memory.frozen_weight_quantization='nf4' replaces with packed "
             "storage. Use 'auto' or 'grouped'."
         )
-    if kernel_backend in _DEFAULT_KERNEL_BACKENDS and not quantized_experts:
+    routed_gemm = normalize_routed_gemm_mode(
+        getattr(policy, "moe_routed_gemm", "disabled")
+    )
+    if (
+        kernel_backend in _DEFAULT_KERNEL_BACKENDS
+        and not quantized_experts
+        and routed_gemm == "disabled"
+    ):
         return None
     main = normalize_moe_gemm_backend(getattr(policy, "moe_gemm_backend", "auto"))
     forward = normalize_moe_gemm_role_backend(getattr(policy, "moe_gemm_backend_forward", ""))
@@ -1251,6 +1624,7 @@ def resolve_magi2_moe_execution(
     return Magi2GroupedMoEPlan(
         forward_backend=forward or main,
         dx_backend=dx or main,
+        routed_gemm=routed_gemm,
     )
 
 

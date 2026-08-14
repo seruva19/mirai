@@ -86,7 +86,7 @@
     {"path": "mirai/core/models/magi2_preview/", "checks": ["model_family", "static"]},
     {"path": "mirai/vendors/magi2_preview/", "checks": ["model_family", "static"]},
     {"path": "mirai/vendors/qwen3_moe_fused/", "checks": ["moe_routing", "static"]},
-    {"path": "tests/test_magi2_preview_contract.py", "checks": ["agent_validation", "model_family", "static"]},
+    {"path": "tests/test_magi2_preview_contract.py", "checks": ["agent_validation", "compressed_weights", "model_family", "static"]},
     {"path": "tests/test_magi2_attention_training.py", "checks": ["agent_validation", "model_family", "static"]},
     {"path": "tests/test_magi2_nf4_experts.py", "checks": ["agent_validation", "compressed_weights", "model_family", "static"]},
     {"path": "tests/test_grouped_mm_chunking.py", "checks": ["agent_validation", "model_family", "moe_routing", "static"]},
@@ -245,7 +245,7 @@
         "scripts/agent/probe_moe_runtime.py"
       ],
       "commands": [
-        "python -m pytest tests/test_compressed_weights_quantization.py tests/test_nf4_compressed_weights_quantization.py tests/test_moe_expert_optimizations.py tests/test_magi2_nf4_experts.py mirai/core/moe/contracts/artifact_transforms.py mirai/core/moe/contracts/hierarchical_consolidation.py mirai/core/moe/contracts/parity.py mirai/core/training/calibration/contracts/expert_precision.py mirai/core/training/calibration/contracts/expert_whitening.py mirai/core/training/calibration/contracts/router_quantization.py mirai/core/training/calibration/contracts/flexmoe.py -q"
+        "python -m pytest tests/test_compressed_weights_quantization.py tests/test_nf4_compressed_weights_quantization.py tests/test_moe_expert_optimizations.py tests/test_magi2_nf4_experts.py tests/test_magi2_preview_contract.py tests/test_sparse_moe_contract.py mirai/core/moe/contracts/routed_gemm.py mirai/core/moe/contracts/routed_gemm_autotune.py mirai/core/moe/contracts/routed_gemm_compile.py mirai/core/persistence/contracts/routed_gemm_autotune.py mirai/core/moe/contracts/artifact_transforms.py mirai/core/moe/contracts/hierarchical_consolidation.py mirai/core/moe/contracts/parity.py mirai/core/training/calibration/contracts/expert_precision.py mirai/core/training/calibration/contracts/expert_whitening.py mirai/core/training/calibration/contracts/router_quantization.py mirai/core/training/calibration/contracts/flexmoe.py -q"
       ],
       "invariants": [
         "packed artifacts round-trip with lineage",

@@ -300,7 +300,6 @@ configuration and compatibility rules are documented in
   assigns exact packed bytes under a hard ceiling without a padded
   highest-precision stack.
   [(repo)](https://github.com/ggml-org/llama.cpp/tree/master/tools/imatrix)
-  [(source)](https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs)
 - **Router-norm-protected expert precision** — Optional expert-wise precision
   floors protect the smallest router-norm changes, with maximum intra-neuron
   variance promotion, before measured-error allocation consumes the remaining
@@ -309,8 +308,8 @@ configuration and compatibility rules are documented in
 - **Calibration-free spectral expert precision** — An experimental AlphaQ-inspired
   planner uses projection-wise heavy-tailed weight spectra when representative
   calibration data is unavailable, then measures Mirai's real packed formats
-  under the existing global byte ceiling. This is a clean-room adaptation, not
-  parity with AlphaQ's GPTQ/MILP pipeline.
+  under the existing global byte ceiling. It does not implement AlphaQ's
+  GPTQ-noise surrogate or MILP solver.
   [(paper)](https://arxiv.org/abs/2606.04980)
   [(repo)](https://github.com/Superone77/AlphaQ)
 - **2:4 semi-structured frozen-expert execution** — Frozen projections retain
@@ -327,10 +326,11 @@ configuration and compatibility rules are documented in
   high precision rather than applying the unstable block-scaled Dgrad variant.
   [(paper)](https://arxiv.org/abs/2412.19437)
 - **Native DeepGEMM FP8 experts** — When the SM90 and DeepGEMM capability probes
-  succeed, routed FP8 expert projections execute as one M-grouped tensor-core
-  GEMM while retaining Mirai's high-precision frozen-weight input-gradient and
-  adapter-gradient path. The portable block-scaled implementation remains the
-  reference.
+  succeed, routed FP8 expert projections execute with stable unequal group
+  boundaries and direct routing-weighted token combine while retaining Mirai's
+  high-precision frozen-weight input-gradient, routing-coefficient-gradient,
+  and adapter-gradient paths. The portable block-scaled implementation remains
+  the reference.
   [(repo)](https://github.com/deepseek-ai/DeepGEMM)
   [(repo)](https://github.com/deepseek-ai/DeepSeek-V3)
 - **GGUF low-bit storage** — IQ4_XS, IQ3_XXS, and experimental IQ2_XS artifacts
@@ -415,6 +415,9 @@ configuration and compatibility rules are documented in
 - **Framework grouped matrix multiplication** — Native grouped GEMM is selected
   when the installed framework and tensor layout satisfy its contract.
   [(repo)](https://github.com/pytorch/pytorch)
+- **Routed grouped matrix multiplication** — An explicit, default-off CUDA
+  mode can fuse routed-row gather, assignment scatter, or weighted token
+  reduction for supported expert layouts.
 - **Triton grouped GEMM** — Count-aware padded grouped kernels accelerate
   routed projections while retaining the reference dispatch path.
   [(repo)](https://github.com/triton-lang/triton)
@@ -447,7 +450,7 @@ configuration and compatibility rules are documented in
   artifact layout, gate/up activation rotation, INT8-backed reference GEMM,
   scale epilogues, and active-expert LoRA share one bounded execution contract.
   Export and import reject other provider-declared layouts.
-- **Independent grouped backward selection** — Forward and input-gradient
+- **Role-specific grouped backward selection** — Forward and input-gradient
   grouped GEMMs may select different capability-checked backends.
 - **Autograd-complete dispatch operations** — Routed permutation and
   duplicate-safe weighted combine have explicit inverse-gradient contracts.

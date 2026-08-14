@@ -1,4 +1,4 @@
-"""Clean-room structured expert stage inspired by STUN.
+"""Structured expert clustering and centroid replacement from STUN.
 
 STUN clusters experts from router-row similarity, retains the expert nearest
 the parameter centroid of each cluster, and selectively replaces that expert

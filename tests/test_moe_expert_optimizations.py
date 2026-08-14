@@ -174,19 +174,34 @@ class MoEExpertOptimizationTests(unittest.TestCase):
             with torch.no_grad():
                 adapter.lora_b.normal_(std=0.02)
         module.to(device)
-        scores = torch.softmax(
+        base_scores = torch.softmax(
             torch.randn(29, 2, device=device, dtype=torch.float32), dim=-1
         ).to(torch.bfloat16)
-        indices = torch.randint(0, 3, (29, 2), device=device)
+        # Expert 1 is empty; expert 0 is deliberately much heavier than expert 2.
+        indices = torch.zeros((29, 2), device=device, dtype=torch.long)
+        indices[::7, 1] = 2
         base_tokens = torch.randn(29, 256, device=device, dtype=torch.bfloat16)
 
-        def run(backend: str):
+        def run(backend: str, token_chunk: int = 0):
             module.zero_grad(set_to_none=True)
             tokens = base_tokens.clone().requires_grad_(True)
+            scores = base_scores.clone().requires_grad_(True)
             with active_moe_optimization_policy(
                 MoEOptimizationPolicy(moe_gemm_backend_forward=backend)
             ):
-                output = module.run_direct_routed(tokens, scores, indices)
+                if token_chunk:
+                    output = torch.cat(
+                        [
+                            module.run_direct_routed(
+                                tokens[start : start + token_chunk],
+                                scores[start : start + token_chunk],
+                                indices[start : start + token_chunk],
+                            )
+                            for start in range(0, int(tokens.shape[0]), token_chunk)
+                        ]
+                    )
+                else:
+                    output = module.run_direct_routed(tokens, scores, indices)
                 loss = output.float().square().mean()
                 loss.backward()
             adapter_grads = {
@@ -194,16 +209,32 @@ class MoEExpertOptimizationTests(unittest.TestCase):
                 for key in ("w1", "w2", "w3")
                 for name in ("lora_a", "lora_b")
             }
-            return output.detach(), loss.detach(), tokens.grad.detach(), adapter_grads
+            return (
+                output.detach(), loss.detach(), tokens.grad.detach(),
+                scores.grad.detach(), adapter_grads,
+            )
 
         reference = run("auto")
         native = run("deepgemm_fp8")
+        native_chunked = run("deepgemm_fp8", token_chunk=7)
         torch.testing.assert_close(native[0], reference[0], rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(native[1], reference[1], rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(native[2], reference[2], rtol=3e-2, atol=3e-3)
-        for key in reference[3]:
+        torch.testing.assert_close(native[3], reference[3], rtol=3e-2, atol=3e-3)
+        for key in reference[4]:
             torch.testing.assert_close(
-                native[3][key], reference[3][key], rtol=5e-2, atol=5e-3
+                native[4][key], reference[4][key], rtol=5e-2, atol=5e-3
+            )
+        for candidate, expected, rtol, atol in (
+            (native_chunked[0], native[0], 3e-2, 3e-2),
+            (native_chunked[1], native[1], 3e-2, 3e-2),
+            (native_chunked[2], native[2], 3e-2, 3e-3),
+            (native_chunked[3], native[3], 3e-2, 3e-3),
+        ):
+            torch.testing.assert_close(candidate, expected, rtol=rtol, atol=atol)
+        for key in native[4]:
+            torch.testing.assert_close(
+                native_chunked[4][key], native[4][key], rtol=5e-2, atol=5e-3
             )
 
     @unittest.skipIf(torch is None, "torch is required")

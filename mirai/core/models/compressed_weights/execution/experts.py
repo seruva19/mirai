@@ -1807,7 +1807,15 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             chunk_size = 1
         if self._flexmoe_taylor_observer is not None:
             chunk_size = 1
-        if chunk_size > 1 and self._whitening_calibration_observer is None:
+        use_routed_deepgemm = (
+            resolve_moe_gemm_backend("forward", device=tokens.device)
+            == "deepgemm_fp8"
+        )
+        if use_routed_deepgemm and self._whitening_calibration_observer is not None:
+            raise RuntimeError(
+                "DeepGEMM FP8 routed execution does not support whitening calibration."
+            )
+        if (chunk_size > 1 or use_routed_deepgemm) and self._whitening_calibration_observer is None:
             if self._prototype_calibration_observer is not None:
                 raise RuntimeError(
                     "Prototype calibration does not support batched expert dispatch."
@@ -1992,6 +2000,8 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             runner = self._run_direct_routed_batched_persistent
         elif forward_backend == "torch_grouped":
             runner = self._run_direct_routed_batched_torch_grouped
+        elif forward_backend == "deepgemm_fp8":
+            runner = self._run_direct_routed_deepgemm_fp8
         else:  # auto or a format-owned primitive -> dispatch selects token layout
             mode = resolve_moe_dispatch_mode()
             if mode == "legacy":
@@ -2051,6 +2061,89 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             output=output,
             rotated=rotated,
         )
+
+    def _run_direct_routed_deepgemm_fp8(
+        self,
+        tokens: torch.Tensor,
+        top_scores: torch.Tensor,
+        top_indices: torch.Tensor,
+        *,
+        chunk_size: int,
+        output: torch.Tensor,
+        rotated: bool = False,
+    ) -> torch.Tensor:
+        """Execute the complete routed MLP through block-scaled FP8 forward roles."""
+        del chunk_size, output
+        if rotated:
+            raise RuntimeError("DeepGEMM FP8 does not accept rotated INT8 activations.")
+        if self._quant_format not in BLOCKWISE_FP8_FORMATS:
+            raise RuntimeError(
+                "deepgemm_fp8 requires block-scaled FP8 compressed expert weights."
+            )
+        if self.has_logical_expert_aliases():
+            raise RuntimeError("DeepGEMM FP8 does not support logical expert aliases.")
+        if self.flexmoe_channel_mask_active:
+            raise RuntimeError("DeepGEMM FP8 does not support ragged expert channels.")
+        if self._prototype_calibration_observer is not None:
+            raise RuntimeError("Prototype calibration does not support DeepGEMM FP8.")
+
+        from mirai.core.moe.runtime.routed_gemm import (
+            RoutedFusionSpec,
+            RoutedGroupLayout,
+        )
+        from ..quantization.deepgemm_fp8 import (
+            deepgemm_blockwise_fp8_routed_linear,
+            routed_weighted_combine,
+        )
+
+        flat_experts = top_indices.reshape(-1)
+        grouped_to_assignment = torch.argsort(flat_experts, stable=True)
+        counts = torch.bincount(flat_experts, minlength=self.num_experts)
+        boundaries = counts.cumsum(0).to(torch.int32)
+        layout = RoutedGroupLayout(
+            boundaries=boundaries,
+            assignment_rows=grouped_to_assignment.to(torch.int64).contiguous(),
+            token_count=int(tokens.shape[0]),
+            top_k=int(top_indices.shape[1]),
+            group_count=self.num_experts,
+        )
+        layout.validate(device=tokens.device)
+        source_tokens = torch.div(
+            layout.assignment_rows, layout.top_k, rounding_mode="floor"
+        )
+        grouped_input = tokens.index_select(0, source_tokens)
+        expert_indices = tuple(range(self.num_experts))
+
+        def project(key: str, x: torch.Tensor, *, gather: bool = False) -> torch.Tensor:
+            codes, scales, meta = self._blockwise_fp8_payload(
+                key, expert_indices, device=tokens.device
+            )
+            result = deepgemm_blockwise_fp8_routed_linear(
+                tokens if gather else x,
+                codes,
+                scales,
+                meta,
+                layout,
+                RoutedFusionSpec(gather_tokens=gather),
+            )
+            adapter = self.expert_lora[key] if key in self.expert_lora else None
+            if adapter is not None:
+                adapter_input = grouped_input if gather else x
+                result = result + adapter.grouped_forward(
+                    adapter_input, offsets=layout.boundaries
+                )
+            return result
+
+        primary_role = "gate" if self.expert_mlp_spec.uses_gated_product else "input"
+        primary = project(self.projection_for_role(primary_role), grouped_input, gather=True)
+        secondary = None
+        if self.expert_mlp_spec.uses_gated_product:
+            secondary = project(self.projection_for_role("up"), grouped_input, gather=True)
+        hidden = self._combine_expert_inputs(primary, secondary)
+        self._capture_routed_intermediates(hidden, layout.assignment_rows)
+        grouped_output = project(self.projection_for_role("down"), hidden)
+        self._capture_routed_outputs(grouped_output, layout.assignment_rows)
+        return routed_weighted_combine(grouped_output, layout, top_scores).to(tokens.dtype)
 
     def _run_expert_chunk(
         self,

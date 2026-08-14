@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import gc
+import weakref
 
 import pytest
 import torch
@@ -389,6 +391,21 @@ def test_packed_experts_leave_no_reference_loop_to_fall_back_to() -> None:
     assert resolve_magi2_moe_execution(MoEOptimizationPolicy()) is None
 
 
+def test_packed_experts_admit_default_off_routed_fusion_policy() -> None:
+    assert resolve_magi2_moe_execution(
+        MoEOptimizationPolicy(kernel_backend="grouped", moe_routed_gemm="triton"),
+        quantized_experts=True,
+    ) == Magi2GroupedMoEPlan(
+        forward_backend="auto", dx_backend="auto", routed_gemm="triton"
+    )
+    assert resolve_magi2_moe_execution(
+        MoEOptimizationPolicy(kernel_backend="grouped", moe_routed_gemm="auto"),
+        quantized_experts=True,
+    ) == Magi2GroupedMoEPlan(
+        forward_backend="auto", dx_backend="auto", routed_gemm="auto"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Store contract
 # ---------------------------------------------------------------------------
@@ -641,6 +658,110 @@ def test_nf4_grouped_execution_matches_the_reference_loop_on_its_own_weights(
         assert torch.allclose(want, got, rtol=2e-2, atol=2e-3)
     assert expected[2].abs().max() > 0.0
     assert expected[3].abs().max() > 0.0
+
+
+@_requires_nf4
+@pytest.mark.parametrize("expert_autograd", ["standard", "segmented_recompute"])
+def test_nf4_routed_segments_match_existing_nf4_output_and_gradients(
+    expert_autograd: str,
+) -> None:
+    hidden_size = 256
+    module = _reduced_moe(
+        device=torch.device("cuda"), dtype=torch.bfloat16, hidden_size=hidden_size
+    )
+    store = quantize_magi2_experts_in_place(_container(module))["mlp.moe_mlp"]
+    store.set_expert_weight_access_policy(
+        expert_weight_access="chunked_dequant", expert_dequant_chunk_size=3
+    )
+    adapter = _attach_router_lora(module)
+    module._mirai_moe_kernel_backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"),
+        expert_autograd=expert_autograd,
+    )
+    reference = _run(module, adapter, hidden_size)
+    module.zero_grad(set_to_none=True)
+    adapter.lora_a.grad = None
+    adapter.lora_b.grad = None
+    module._mirai_moe_kernel_backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(
+            forward_backend="bmm", dx_backend="bmm", routed_gemm="triton"
+        ),
+        expert_autograd=expert_autograd,
+    )
+    candidate = _run(module, adapter, hidden_size)
+    for expected, actual in zip(reference, candidate, strict=True):
+        assert torch.allclose(expected, actual, rtol=2e-2, atol=2e-3)
+
+
+@_requires_nf4
+def test_nf4_routed_inference_reduces_segment_outputs_in_token_order() -> None:
+    hidden_size = 256
+    module = _reduced_moe(
+        device=torch.device("cuda"), dtype=torch.bfloat16, hidden_size=hidden_size
+    )
+    store = quantize_magi2_experts_in_place(_container(module))["mlp.moe_mlp"]
+    store.set_expert_weight_access_policy(
+        expert_weight_access="chunked_dequant", expert_dequant_chunk_size=3
+    )
+    torch.manual_seed(7)
+    hidden = torch.randn(16, hidden_size, device="cuda", dtype=torch.bfloat16)
+    module._mirai_moe_kernel_backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm")
+    )
+    with torch.no_grad():
+        reference = module._forward_impl(hidden)
+    module._mirai_moe_kernel_backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(routed_gemm="triton")
+    )
+    with torch.no_grad():
+        candidate = module._forward_impl(hidden)
+    assert torch.allclose(reference, candidate, rtol=2e-2, atol=6.25e-2)
+
+
+@_requires_nf4
+def test_nf4_routed_backward_revisits_only_segment_local_weights() -> None:
+    hidden_size = 256
+    module = _reduced_moe(
+        device=torch.device("cuda"), dtype=torch.bfloat16, hidden_size=hidden_size
+    )
+    store = quantize_magi2_experts_in_place(_container(module))["mlp.moe_mlp"]
+    store.set_expert_weight_access_policy(
+        expert_weight_access="chunked_dequant", expert_dequant_chunk_size=3
+    )
+    visits: list[tuple[str, int, int]] = []
+    live: list[weakref.ReferenceType[torch.Tensor]] = []
+    peak_live = 0
+    materialize = store.materialize_segment
+
+    def recording_materialize(key, start, stop, **kwargs):
+        nonlocal peak_live
+        visits.append((str(key), int(start), int(stop)))
+        live[:] = [reference for reference in live if reference() is not None]
+        result = materialize(key, start, stop, **kwargs)
+        live.append(weakref.ref(result))
+        peak_live = max(peak_live, len(live))
+        return result
+
+    store.materialize_segment = recording_materialize  # type: ignore[method-assign]
+    adapter = _attach_router_lora(module)
+    module._mirai_moe_kernel_backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(routed_gemm="triton"),
+        expert_autograd="segmented_recompute",
+    )
+    _run(module, adapter, hidden_size)
+    ranges = [(start, stop) for _key, start, stop in visits]
+    assert ranges
+    assert all(0 <= start < stop <= store.num_groups for start, stop in ranges)
+    assert all(stop - start <= store.segment_group_span() for start, stop in ranges)
+    for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+        key_ranges = [(start, stop) for seen, start, stop in visits if seen == key]
+        assert len(key_ranges) % 2 == 0
+        midpoint = len(key_ranges) // 2
+        assert key_ranges[:midpoint] == key_ranges[midpoint:]
+    assert peak_live <= len(MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
+    torch.cuda.synchronize()
+    gc.collect()
+    assert not any(reference() is not None for reference in live)
 
 
 @_requires_nf4

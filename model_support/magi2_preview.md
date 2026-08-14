@@ -64,14 +64,13 @@ requirement carries a
 Windows host needs a Windows Triton build installed manually.
 
 The additional MagiAttention, MagiCompiler, and FlashAttention packages
-described by the upstream release are deliberately not package dependencies.
-Every one of those imports is guarded, and Mirai retains a differentiable Torch
-reference path for training and for environments where those kernels are
-unavailable. Install them manually only if you want the accelerated attention
-and compile paths. MagiAttention reads
-`MAGI_ATTENTION_WORKSPACE_BASE` when it is imported; Mirai never writes it for
-you, so set it in the environment that starts the process if you install that
-package.
+described by the upstream release are not package dependencies. MAGI-2 preview
+training uses the family-owned differentiable Torch implementation, including
+its optional PyTorch FlexAttention backend, and does not require an installation
+from another source repository. The optional refiner can use MagiAttention when
+it is already available, but retains a differentiable Torch implementation when
+it is absent. MagiAttention's distributed communication extension is outside
+Mirai's single-GPU runtime and is never required.
 
 ## Download
 

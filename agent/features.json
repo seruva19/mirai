@@ -913,11 +913,14 @@
         "default_path",
         "reference_parity",
         "gradients",
+        "persistence",
         "resource_bound",
         "documentation"
       ],
       "symbols": [
-        "deepgemm_blockwise_fp8_batched_linear"
+        "deepgemm_blockwise_fp8_batched_linear",
+        "deepgemm_blockwise_fp8_routed_linear",
+        "routed_weighted_combine"
       ],
       "config_keys": [
         "memory.moe_gemm_backend_forward"
@@ -2443,7 +2446,7 @@
       "readme_claims": [
         "Router-norm-protected expert precision"
       ],
-      "provenance": "https://github.com/ggml-org/llama.cpp/tree/master/tools/imatrix; https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs; https://arxiv.org/abs/2604.06515",
+      "provenance": "https://github.com/ggml-org/llama.cpp/tree/master/tools/imatrix; https://arxiv.org/abs/2604.06515",
       "promotion_evidence": ""
     },
     {
@@ -3737,10 +3740,59 @@
       "stateful": false,
       "optimized": true,
       "reference_path": "mirai/core/moe/runtime/gemm.py",
-      "readme_claim": "Framework grouped matrix multiplication",
+      "readme_claim": "Routed grouped matrix multiplication",
       "readme_claims": [
-        "Independent grouped backward selection"
+        "Role-specific grouped backward selection"
       ],
+      "provenance": "https://github.com/pytorch/pytorch",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routed_grouped_gemm",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/moe/runtime/routed_gemm.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "RoutedGroupLayout",
+        "routed_gemm_reference",
+        "routed_gemm_verdict"
+      ],
+      "config_keys": [
+        "memory.moe_routed_gemm",
+        "memory.moe_routed_gemm_tuning",
+        "memory.moe_routed_gemm_cache_path",
+        "memory.moe_routed_gemm_architecture"
+      ],
+      "disabled_config": {
+        "memory.moe_routed_gemm": "disabled",
+        "memory.moe_routed_gemm_tuning": "off",
+        "memory.moe_routed_gemm_cache_path": "",
+        "memory.moe_routed_gemm_architecture": "auto"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/routed_gemm.py",
+        "mirai/core/moe/contracts/routed_gemm_autotune.py",
+        "mirai/core/persistence/contracts/routed_gemm_autotune.py",
+        "tests/test_magi2_nf4_experts.py",
+        "tests/test_magi2_preview_contract.py",
+        "tests/test_sparse_moe_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/moe/runtime/routed_gemm.py",
+      "readme_claim": "Framework grouped matrix multiplication",
+      "readme_claims": [],
       "provenance": "https://github.com/pytorch/pytorch",
       "promotion_evidence": ""
     },

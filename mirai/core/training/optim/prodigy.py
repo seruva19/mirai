@@ -2,9 +2,8 @@
 
 The update follows Algorithm 3 of Mishchenko and Defazio,
 "Prodigy: An Expeditiously Adaptive Parameter-Free Learner"
-(https://arxiv.org/abs/2306.06101). The implementation is a single-process,
-clean-room adaptation informed by the MIT-licensed reference implementation at
-https://github.com/konstmish/prodigy.
+(https://arxiv.org/abs/2306.06101). The single-process update is informed by the
+MIT-licensed reference implementation at https://github.com/konstmish/prodigy.
 """
 
 from __future__ import annotations

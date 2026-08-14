@@ -64,6 +64,12 @@ from mirai.core.models.compressed_weights.quantization.blockwise_fp8 import (
 )
 from mirai.core.models.compressed_weights.quantization.deepgemm_fp8 import (
     deepgemm_blockwise_fp8_batched_linear,
+    deepgemm_blockwise_fp8_routed_linear,
+)
+from mirai.core.moe.runtime.routed_gemm import (
+    RoutedFusionSpec,
+    RoutedGroupLayout,
+    RoutedOutputMode,
 )
 from mirai.core.models.compressed_weights.quantization.structured_sparsity import (
     StructuredSparse24GroupedExperts,
@@ -573,6 +579,94 @@ class CompressedWeightQuantizationTests(unittest.TestCase):
             rtol=1e-5,
             atol=2e-6,
         )
+
+    @unittest.skipUnless(
+        torch is not None and torch.cuda.is_available(),
+        "DeepGEMM routed parity requires remote CUDA execution",
+    )
+    def test_deepgemm_routed_fp8_gather_empty_groups_and_weighted_gradients(
+        self,
+    ) -> None:
+        from mirai.core.moe.runtime.gemm import probe_backend
+
+        device = torch.device("cuda")
+        verdict = probe_backend("deepgemm_fp8", device=device)
+        if not verdict.available:
+            self.skipTest(verdict.reason)
+        torch.manual_seed(127)
+        weights = torch.randn(4, 256, 256, device=device) * 0.06
+        payloads = [quantize_blockwise_fp8_weight(weight) for weight in weights]
+        codes = torch.stack([payload[0] for payload in payloads])
+        scales = torch.stack([payload[1] for payload in payloads])
+        meta = payloads[0][2]
+        assignment_rows = torch.tensor(
+            [3, 0, 5, 1, 2, 4], device=device, dtype=torch.int64
+        )
+        layout = RoutedGroupLayout(
+            boundaries=torch.tensor([1, 1, 5, 6], device=device, dtype=torch.int32),
+            assignment_rows=assignment_rows,
+            token_count=3,
+            top_k=2,
+            group_count=4,
+        )
+        reference_input = torch.randn(
+            3, 256, device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        reference_scores = torch.randn(
+            3, 2, device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        native_scores = reference_scores.detach().clone().requires_grad_(True)
+        grouped_input = reference_input.index_select(
+            0, torch.div(assignment_rows, 2, rounding_mode="floor")
+        )
+        reference_grouped = blockwise_fp8_batched_linear(
+            torch.stack(
+                (
+                    torch.nn.functional.pad(grouped_input[:1], (0, 0, 0, 3)),
+                    grouped_input.new_zeros((4, 256)),
+                    grouped_input[1:5],
+                    torch.nn.functional.pad(grouped_input[5:], (0, 0, 0, 3)),
+                )
+            ),
+            codes,
+            scales,
+            meta,
+        )
+        reference_grouped = torch.cat(
+            (reference_grouped[0, :1], reference_grouped[2, :4], reference_grouped[3, :1])
+        )
+        reference_grouped.retain_grad()
+        assignment = torch.empty_like(reference_grouped).index_copy(
+            0, assignment_rows, reference_grouped
+        )
+        reference = (
+            assignment.view(3, 2, -1) * reference_scores[..., None]
+        ).sum(1)
+        gathered_native_input = reference_input.detach().clone().requires_grad_(True)
+        native_grouped = deepgemm_blockwise_fp8_routed_linear(
+            gathered_native_input,
+            codes,
+            scales,
+            meta,
+            layout,
+            RoutedFusionSpec(gather_tokens=True),
+        )
+        torch.testing.assert_close(native_grouped, reference_grouped, rtol=2e-2, atol=2e-2)
+        native_grouped_input = grouped_input.detach().clone().requires_grad_(True)
+        native = deepgemm_blockwise_fp8_routed_linear(
+            native_grouped_input, codes, scales, meta, layout,
+            RoutedFusionSpec(output=RoutedOutputMode.WEIGHTED_TOKEN_REDUCTION),
+            routing_weights=native_scores,
+        )
+        torch.testing.assert_close(native, reference, rtol=2e-2, atol=2e-2)
+        grad = torch.randn_like(native)
+        reference.backward(grad)
+        native.backward(grad)
+        native_grouped.backward(reference_grouped.grad)
+        torch.testing.assert_close(
+            gathered_native_input.grad, reference_input.grad, rtol=1e-5, atol=2e-5
+        )
+        torch.testing.assert_close(native_scores.grad, reference_scores.grad, rtol=2e-2, atol=2e-2)
 
     def test_blockwise_fp8_packed_grouped_experts_execute_exactly_after_restore(
         self,

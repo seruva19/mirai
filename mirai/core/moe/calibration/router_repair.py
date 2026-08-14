@@ -3,7 +3,7 @@
 Router KD updates only student routers by matching the original model's final
 output distribution: https://arxiv.org/abs/2603.02217, Section 4, Eq. (1)-(3).
 Video diffusion has a continuous prediction tensor rather than vocabulary
-logits, so this clean-room adaptation minimizes prediction MSE on exactly paired
+logits, so this objective minimizes prediction MSE on exactly paired
 model inputs. It deliberately does not require teacher and student expert sets
 or router dimensions to match.
 """

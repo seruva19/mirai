@@ -171,7 +171,7 @@ def factorize_mixture_basis_experts(
 ) -> MixtureBasisFactors:
     """Learn a data-free MoBE decomposition by reconstruction-error minimization.
 
-    This is a clean-room adaptation of MoBE (arXiv:2508.05257). Experts are
+    Implements the MoBE factorization from arXiv:2508.05257. Experts are
     initialized from groupwise right singular subspaces, then ``A``, shared
     bases, and softmax mixture logits are jointly optimized with Adam. The
     source stays in CPU memory; expert and row chunks bound target uploads and

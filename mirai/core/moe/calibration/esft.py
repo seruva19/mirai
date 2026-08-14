@@ -1,7 +1,7 @@
 """Task-affinity expert selection for Expert-Specialized Fine-Tuning.
 
-This is a clean-room implementation of Equations 6--8 in
-https://arxiv.org/abs/2407.01906.  A provider exposes router targets; core
+Implements Equations 6--8 from https://arxiv.org/abs/2407.01906. A provider
+exposes router targets; core
 accumulates either selected gate mass (ESFT-Gate) or the paper's ``1 / K``
 token-selection mass (ESFT-Token), then chooses the smallest deterministic
 per-layer prefix whose normalized relevance reaches ``selection_mass``.
