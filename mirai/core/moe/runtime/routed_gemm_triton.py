@@ -119,7 +119,7 @@ def _tiled_indexed_kernel():
     def tiled_routed_grouped_mm(
         x, w, boundaries, row_map, out_map, y,
         stride_wg: tl.constexpr, stride_wk: tl.constexpr, stride_wn: tl.constexpr,
-        rows: tl.constexpr, k_size: tl.constexpr, n_size: tl.constexpr,
+        k_size: tl.constexpr, n_size: tl.constexpr,
         gather: tl.constexpr, scatter: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
@@ -636,7 +636,7 @@ def _launch_routed_grouped_mm(
             activation, weight, boundaries, row_map, out_map, output,
             stride_wg=int(weight.stride(0)), stride_wk=int(weight.stride(1)),
             stride_wn=int(weight.stride(2)),
-            rows=rows, k_size=k_size, n_size=n_size,
+            k_size=k_size, n_size=n_size,
             gather=gather, scatter=scatter,
             BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
             num_warps=8, num_stages=3,

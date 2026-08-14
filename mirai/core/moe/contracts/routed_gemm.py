@@ -279,7 +279,13 @@ def test_weighted_entry_rejects_malformed_static_metadata() -> None:
 )
 def test_max_group_rows_hint_matches_unhinted_projection() -> None:
     pytest.importorskip("triton")
-    from mirai.core.moe.runtime.routed_gemm_triton import triton_routed_grouped_mm
+    from mirai.core.moe.runtime.routed_gemm_triton import (
+        _tiled_indexed_kernel,
+        triton_routed_grouped_mm,
+    )
+
+    kernel, _ = _tiled_indexed_kernel()
+    assert "rows" not in kernel.arg_names
 
     device = torch.device("cuda")
     counts = torch.tensor([0, 17, 3, 0, 31, 1] * 64, device=device)
