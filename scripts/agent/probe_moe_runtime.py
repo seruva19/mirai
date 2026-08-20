@@ -325,6 +325,83 @@ def benchmark_routed_gemm(
     }
 
 
+def benchmark_expert_h2d(
+    device: torch.device,
+    *,
+    expert_bytes: int,
+    warmup: int,
+    iterations: int,
+) -> dict[str, object]:
+    """Measure the actual pinned-host transfer used by expert streaming."""
+
+    if expert_bytes <= 0 or warmup < 0 or iterations <= 0:
+        raise ValueError("expert H2D benchmark sizes and iterations must be positive")
+    elements = (int(expert_bytes) + 1) // 2
+    source = torch.empty(elements, dtype=torch.bfloat16, pin_memory=True)
+    destination = torch.empty(elements, dtype=torch.bfloat16, device=device)
+    moved_bytes = int(source.numel() * source.element_size())
+    samples = _latency_samples_ms(
+        lambda: destination.copy_(source, non_blocking=True),
+        warmup=warmup,
+        iterations=iterations,
+    )
+    latency = _summarize_latency(samples)
+    gib_per_second = (moved_bytes / float(1024**3)) / (
+        float(latency["median_ms"]) / 1000.0
+    )
+    return {
+        "bytes_per_transfer": moved_bytes,
+        "latency": latency,
+        "gib_per_second": gib_per_second,
+        "pinned_source": bool(source.is_pinned()),
+    }
+
+
+def emit_expert_transfer_profile(
+    *,
+    output: Path,
+    device: torch.device,
+    expert_format: str,
+    expert_bytes: int,
+    working_set_experts: int,
+    cache_budget_gib: float,
+    h2d: dict[str, object],
+    routed_gemm: dict[str, object],
+) -> dict[str, object]:
+    """Derive and atomically persist a profile from measured probe results."""
+
+    from mirai.core.moe.runtime.expert_transfer_profile import (
+        build_expert_transfer_profile,
+        save_expert_transfer_profile,
+    )
+
+    shape = routed_gemm["shape"]
+    candidate = routed_gemm["candidate"]
+    weight_bytes = int(shape["groups"]) * int(shape["k_size"]) * int(shape["n_size"]) * 2
+    compute_seconds = float(candidate["latency"]["median_ms"]) / 1000.0
+    compute_gib_per_second = (weight_bytes / float(1024**3)) / compute_seconds
+    capability = torch.cuda.get_device_capability(device)
+    protocol = {
+        "schema": "mirai.expert_transfer_benchmark.v1",
+        "h2d": h2d,
+        "routed_gemm": routed_gemm,
+        "device_index": device.index,
+    }
+    profile = build_expert_transfer_profile(
+        gpu_name=torch.cuda.get_device_name(device),
+        compute_capability=f"{capability[0]}.{capability[1]}",
+        expert_format=expert_format,
+        expert_bytes=expert_bytes,
+        working_set_experts=working_set_experts,
+        cache_budget_gib=cache_budget_gib,
+        h2d_gib_per_second=float(h2d["gib_per_second"]),
+        routed_compute_gib_per_second=compute_gib_per_second,
+        benchmark_protocol=protocol,
+    )
+    save_expert_transfer_profile(output, profile)
+    return {"path": str(output), "profile": profile.to_dict(), "protocol": protocol}
+
+
 def run_probe(device: torch.device) -> dict[str, float | int | bool]:
     torch.manual_seed(19)
 
@@ -399,6 +476,11 @@ def main() -> int:
     parser.add_argument("--benchmark-n", type=int, default=2048)
     parser.add_argument("--benchmark-warmup", type=int, default=10)
     parser.add_argument("--benchmark-iterations", type=int, default=50)
+    parser.add_argument("--expert-transfer-profile-out", type=Path)
+    parser.add_argument("--expert-format", default="int8")
+    parser.add_argument("--expert-bytes", type=int, default=64 * 1024 * 1024)
+    parser.add_argument("--expert-working-set", type=int, default=32)
+    parser.add_argument("--expert-cache-budget-gib", type=float, default=2.0)
     parser.add_argument(
         "--benchmark-routing-distribution",
         choices=("balanced", "quadratic_descending"),
@@ -415,8 +497,9 @@ def main() -> int:
         report = run_probe(device)
         if args.routed_gemm_warmup_cache is not None:
             report.update(warmup_routed_gemm(device, args.routed_gemm_warmup_cache))
-        if args.benchmark_routed_gemm:
-            report["routed_gemm_benchmark"] = benchmark_routed_gemm(
+        routed_gemm_report = None
+        if args.benchmark_routed_gemm or args.expert_transfer_profile_out is not None:
+            routed_gemm_report = benchmark_routed_gemm(
                 device,
                 tokens=args.benchmark_tokens,
                 top_k=args.benchmark_top_k,
@@ -427,6 +510,22 @@ def main() -> int:
                 iterations=args.benchmark_iterations,
                 cache_path=args.routed_gemm_warmup_cache,
                 distribution=args.benchmark_routing_distribution,
+            )
+            report["routed_gemm_benchmark"] = routed_gemm_report
+        if args.expert_transfer_profile_out is not None:
+            h2d = benchmark_expert_h2d(
+                device, expert_bytes=args.expert_bytes,
+                warmup=args.benchmark_warmup, iterations=args.benchmark_iterations,
+            )
+            report["expert_transfer"] = emit_expert_transfer_profile(
+                output=args.expert_transfer_profile_out,
+                device=device,
+                expert_format=args.expert_format,
+                expert_bytes=args.expert_bytes,
+                working_set_experts=args.expert_working_set,
+                cache_budget_gib=args.expert_cache_budget_gib,
+                h2d=h2d,
+                routed_gemm=routed_gemm_report,
             )
         torch.cuda.synchronize(device)
     print(json.dumps(report, indent=2, sort_keys=True))

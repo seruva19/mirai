@@ -600,6 +600,40 @@
       "promotion_evidence": ""
     },
     {
+      "name": "cache_aware_expert_miss_coalescing",
+      "kind": "residency",
+      "owner": "mirai/core/models/compressed_weights/execution/experts.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "CompressedGroupedExperts"
+      ],
+      "config_keys": [
+        "memory.moe_batched_gather"
+      ],
+      "disabled_config": {
+        "memory.moe_batched_gather": false
+      },
+      "contract_paths": [
+        "tests/test_compressed_weights_quantization.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/execution/experts.py",
+      "readme_claim": "Cache-aware expert miss coalescing",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2608.16157",
+      "promotion_evidence": ""
+    },
+    {
       "name": "calibration_free_aimer_expert_pruning",
       "kind": "artifact_transform",
       "owner": "mirai/core/moe/calibration/pruning.py",
@@ -2335,6 +2369,41 @@
       "promotion_evidence": ""
     },
     {
+      "name": "hardware_adaptive_expert_transfer",
+      "kind": "residency",
+      "owner": "mirai/core/moe/runtime/expert_transfer_profile.py",
+      "check": "moe_routing",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "ExpertTransferProfile",
+        "recommend_transfer_policy"
+      ],
+      "config_keys": [
+        "memory.expert_transfer_profile_path"
+      ],
+      "disabled_config": {
+        "memory.expert_transfer_profile_path": ""
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/expert_transfer_profile.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Hardware-adaptive expert transfer profiles",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2608.16157",
+      "promotion_evidence": ""
+    },
+    {
       "name": "hardware_tier_memory_planning",
       "kind": "residency",
       "owner": "mirai/config/hardware_tiers.py",
@@ -3748,55 +3817,6 @@
       "promotion_evidence": ""
     },
     {
-      "name": "routed_grouped_gemm",
-      "kind": "compressed_weight",
-      "owner": "mirai/core/moe/runtime/routed_gemm.py",
-      "check": "compressed_weights",
-      "invariants": [
-        "owner",
-        "config",
-        "default_path",
-        "reference_parity",
-        "gradients",
-        "persistence",
-        "resource_bound",
-        "documentation"
-      ],
-      "symbols": [
-        "RoutedGroupLayout",
-        "routed_gemm_reference",
-        "routed_gemm_verdict"
-      ],
-      "config_keys": [
-        "memory.moe_routed_gemm",
-        "memory.moe_routed_gemm_tuning",
-        "memory.moe_routed_gemm_cache_path",
-        "memory.moe_routed_gemm_architecture"
-      ],
-      "disabled_config": {
-        "memory.moe_routed_gemm": "disabled",
-        "memory.moe_routed_gemm_tuning": "off",
-        "memory.moe_routed_gemm_cache_path": "",
-        "memory.moe_routed_gemm_architecture": "auto"
-      },
-      "contract_paths": [
-        "mirai/core/moe/contracts/routed_gemm.py",
-        "mirai/core/moe/contracts/routed_gemm_autotune.py",
-        "mirai/core/persistence/contracts/routed_gemm_autotune.py",
-        "tests/test_magi2_nf4_experts.py",
-        "tests/test_magi2_preview_contract.py",
-        "tests/test_sparse_moe_contract.py"
-      ],
-      "default_off": true,
-      "stateful": true,
-      "optimized": true,
-      "reference_path": "mirai/core/moe/runtime/routed_gemm.py",
-      "readme_claim": "Framework grouped matrix multiplication",
-      "readme_claims": [],
-      "provenance": "https://github.com/pytorch/pytorch",
-      "promotion_evidence": ""
-    },
-    {
       "name": "routed_expert_device_cache",
       "kind": "residency",
       "owner": "mirai/core/models/compressed_weights/execution/expert_device_cache.py",
@@ -3813,10 +3833,12 @@
         "ExpertDeviceCache"
       ],
       "config_keys": [
-        "memory.expert_device_cache_gib"
+        "memory.expert_device_cache_gib",
+        "memory.expert_device_cache_policy"
       ],
       "disabled_config": {
-        "memory.expert_device_cache_gib": 0.0
+        "memory.expert_device_cache_gib": 0.0,
+        "memory.expert_device_cache_policy": "lru"
       },
       "contract_paths": [
         "mirai/core/training/residency/contracts/device_residency.py"
@@ -3871,6 +3893,55 @@
         "Autograd-complete dispatch operations"
       ],
       "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
+      "name": "routed_grouped_gemm",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/moe/runtime/routed_gemm.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "RoutedGroupLayout",
+        "routed_gemm_reference",
+        "routed_gemm_verdict"
+      ],
+      "config_keys": [
+        "memory.moe_routed_gemm",
+        "memory.moe_routed_gemm_tuning",
+        "memory.moe_routed_gemm_cache_path",
+        "memory.moe_routed_gemm_architecture"
+      ],
+      "disabled_config": {
+        "memory.moe_routed_gemm": "disabled",
+        "memory.moe_routed_gemm_tuning": "off",
+        "memory.moe_routed_gemm_cache_path": "",
+        "memory.moe_routed_gemm_architecture": "auto"
+      },
+      "contract_paths": [
+        "mirai/core/moe/contracts/routed_gemm.py",
+        "mirai/core/moe/contracts/routed_gemm_autotune.py",
+        "mirai/core/persistence/contracts/routed_gemm_autotune.py",
+        "tests/test_magi2_nf4_experts.py",
+        "tests/test_magi2_preview_contract.py",
+        "tests/test_sparse_moe_contract.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/moe/runtime/routed_gemm.py",
+      "readme_claim": "Framework grouped matrix multiplication",
+      "readme_claims": [],
+      "provenance": "https://github.com/pytorch/pytorch",
       "promotion_evidence": ""
     },
     {

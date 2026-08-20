@@ -275,6 +275,10 @@ from mirai.core.moe.adaptation.stage_schedule import RouterStageScheduleControll
 from mirai.core.moe.adaptation.distillation import RouterDistillationController
 from mirai.core.moe.runtime.specs import validate_expert_tensor_specs
 from mirai.core.moe.runtime.kernels import build_moe_kernel_backend
+from mirai.core.moe.runtime.expert_transfer_profile import (
+    load_expert_transfer_profile,
+    validate_expert_transfer_profile_identity,
+)
 from mirai.core.moe.runtime.token_chunking import MoETokenChunkPolicy
 from mirai.core.training.policies.dispersive_loss import DispersiveLossController
 from mirai.core.moe.adaptation import phi_balance as phi_balance_state
@@ -4559,7 +4563,8 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             int(policy.device_residency_budget_gib * (1024**3))
         )
         self._expert_device_cache = ExpertDeviceCache(
-            int(policy.expert_device_cache_gib * (1024**3))
+            int(policy.expert_device_cache_gib * (1024**3)),
+            admission_policy=policy.expert_device_cache_policy,
         )
         self._device_residency_planner.replace(
             "expert_device_cache",
@@ -5084,6 +5089,34 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
 
     def get_device_residency_state(self) -> dict[str, object]:
         return self._device_residency_planner.snapshot()
+
+    def validate_device_placement(self, *, device: Any) -> None:
+        profile_path = str(
+            self._moe_optimization_policy.expert_transfer_profile_path
+        ).strip()
+        if not profile_path:
+            return
+        resolved = torch.device(device)
+        if resolved.type != "cuda" or not torch.cuda.is_available():
+            raise ValueError(
+                "memory.expert_transfer_profile_path requires CUDA placement."
+            )
+        index = resolved.index
+        if index is None:
+            index = torch.cuda.current_device()
+        capability = torch.cuda.get_device_capability(index)
+        quantization = str(self._frozen_weight_quantization).strip().lower()
+        expert_format = (
+            "bf16"
+            if quantization in {"", "none", "off", "disabled"}
+            else normalize_quant_format(quantization)
+        )
+        validate_expert_transfer_profile_identity(
+            load_expert_transfer_profile(profile_path),
+            gpu_name=torch.cuda.get_device_name(index),
+            compute_capability=f"{capability[0]}.{capability[1]}",
+            expert_format=expert_format,
+        )
 
     def place_offloaded_modules(self, *, device: Any, strategy: str) -> None:
         resolved = str(strategy or "disabled").strip().lower()

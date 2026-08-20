@@ -381,7 +381,20 @@ configuration and compatibility rules are documented in
   reconstructed in bounded pairs or chunks per operation; this is not a bound
   on total process VRAM.
 - **Routed-expert device cache** — A byte-bounded cache retains reconstructed
-  INT8 experts while preserving explicit host/device ownership.
+  INT8 experts while preserving explicit host/device ownership. Its optional
+  bounded routing-frequency admission policy protects repeatedly used experts
+  from one-off misses while allowing recurrent candidates to enter.
+- **Cache-aware expert miss coalescing** — Batched gather resolves device-cache
+  hits without transfer, deduplicates repeated routed misses, and moves the
+  supported unique miss set as one exact batch with a per-expert fallback. Its
+  cache snapshot reports transfer bytes, coalescing, deduplication, and fallback
+  totals for deployment tuning.
+- **Hardware-adaptive expert transfer profiles** — A versioned calibration
+  artifact can fill otherwise-unset expert-cache and packed-stream prefetch
+  limits from measured routed compute and host-to-device throughput. Explicit
+  user values win, and an empty profile path preserves the existing runtime.
+  Generate one with `scripts/agent/probe_moe_runtime.py
+  --expert-transfer-profile-out <path>` on an explicitly leased GPU.
 - **Local-routing cache diagnostics** — An offline, lineage-bound report
   computes Segment Cache Best Hit Rate (SCH) oracle curves from detached route
   traces across explicit look-ahead windows and cache sizes. The oracle uses

@@ -23,6 +23,9 @@ from mirai.core.models.compressed_weights import load_compressed_weights_packed_
 from mirai.core.models.compressed_weights import LazyPackedTensorMapping
 from mirai.core.models.compressed_weights import materialize_packed_tensors
 from mirai.core.models.compressed_weights import PreloadedPackedTensorMapping
+from mirai.core.models.compressed_weights.execution.expert_device_cache import (
+    ExpertDeviceCache,
+)
 from mirai.core.models.compressed_weights import prepare_compressed_weights_modules_from_manifest
 from mirai.core.models.compressed_weights import quantize_compressed_weights_modules
 from mirai.core.models.compressed_weights import save_compressed_weights_packed_state
@@ -1585,6 +1588,134 @@ class CompressedWeightPackedPreloadTests(unittest.TestCase):
                 q_off, s_off = experts._quantized_expert_batch(key, active, device=device)
             self.assertTrue(torch.equal(q_on, q_off), f"{key} int8 gather mismatch")
             self.assertTrue(torch.equal(s_on, s_off), f"{key} scale gather mismatch")
+
+    def test_batched_gather_coalesces_unique_device_cache_misses(self) -> None:
+        class _Base(nn.Module):
+            def __init__(self) -> None:
+                self.num_experts = 8
+                super().__init__()
+                self.w1 = torch.randn(8, 32, 48, dtype=torch.bfloat16)
+                self.w2 = torch.randn(8, 48, 32, dtype=torch.bfloat16)
+                self.w3 = torch.randn(8, 32, 48, dtype=torch.bfloat16)
+
+        experts = CompressedGroupedExperts(
+            _Base(), quant_format="int8", expert_weight_access="full_dequant"
+        )
+        experts.bind_expert_device_cache(
+            ExpertDeviceCache(1 << 30), namespace="test"
+        )
+        device = torch.device("cpu")
+        with active_moe_optimization_policy(
+            MoEOptimizationPolicy(moe_batched_gather=False)
+        ):
+            experts._quantized_expert_batch("w1", [0], device=device)
+        telemetry_before = experts.expert_device_cache_snapshot()
+        original = experts._quantized_expert_batch_gather
+        with (
+            patch.object(
+                experts,
+                "_quantized_expert_batch_gather",
+                wraps=original,
+            ) as gather,
+            active_moe_optimization_policy(
+                MoEOptimizationPolicy(moe_batched_gather=True)
+            ),
+        ):
+            actual_q, actual_s = experts._quantized_expert_batch(
+                "w1", [0, 2, 2, 3], device=device
+            )
+        gather.assert_called_once()
+        self.assertEqual(gather.call_args.args[1], [2, 3])
+        expected_q = torch.stack(
+            [getattr(experts, "w1_int8")[index] for index in [0, 2, 2, 3]]
+        )
+        expected_s = torch.stack(
+            [getattr(experts, "w1_scale")[index].float() for index in [0, 2, 2, 3]]
+        )
+        self.assertTrue(torch.equal(actual_q, expected_q))
+        self.assertTrue(torch.equal(actual_s, expected_s))
+        snapshot = experts.expert_device_cache_snapshot()
+        self.assertEqual(snapshot["entries"], 3)
+        self.assertEqual(
+            snapshot["transfer_requested_rows"]
+            - telemetry_before["transfer_requested_rows"],
+            4,
+        )
+        self.assertEqual(
+            snapshot["transfer_hit_rows"] - telemetry_before["transfer_hit_rows"],
+            1,
+        )
+        self.assertEqual(
+            snapshot["transfer_miss_rows"] - telemetry_before["transfer_miss_rows"],
+            3,
+        )
+        self.assertEqual(
+            snapshot["transfer_unique_rows"]
+            - telemetry_before["transfer_unique_rows"],
+            2,
+        )
+        self.assertEqual(
+            snapshot["transfer_deduplicated_rows"]
+            - telemetry_before["transfer_deduplicated_rows"],
+            1,
+        )
+        self.assertEqual(
+            snapshot["transfer_coalesced_requests"]
+            - telemetry_before["transfer_coalesced_requests"],
+            1,
+        )
+        self.assertGreater(
+            snapshot["transfer_bytes"] - telemetry_before["transfer_bytes"], 0
+        )
+
+    def test_cache_aware_batched_gather_preserves_output_and_gradients(self) -> None:
+        class _Base(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.num_experts = 4
+                torch.manual_seed(17)
+                self.w1 = torch.randn(4, 24, 16, dtype=torch.bfloat16) * 0.05
+                self.w2 = torch.randn(4, 16, 24, dtype=torch.bfloat16) * 0.05
+                self.w3 = torch.randn(4, 24, 16, dtype=torch.bfloat16) * 0.05
+
+        experts = CompressedGroupedExperts(
+            _Base(),
+            quant_format="int8",
+            expert_weight_access="chunked_dequant",
+            expert_dequant_chunk_size=4,
+        )
+        experts.bind_expert_device_cache(
+            ExpertDeviceCache(1 << 30), namespace="gradient-test"
+        )
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        for device in devices:
+            indices = torch.tensor(
+                [[0, 2], [2, 3], [0, 2], [3, 2]], device=device
+            )
+
+            def execute(enabled: bool, device=device, indices=indices):
+                experts._expert_device_cache.clear()
+                tokens = torch.randn(
+                    4, 16, dtype=torch.bfloat16, device=device
+                ).requires_grad_(True)
+                scores = torch.softmax(
+                    torch.randn(4, 2, device=device), dim=-1
+                ).requires_grad_(True)
+                with active_moe_optimization_policy(
+                    MoEOptimizationPolicy(moe_batched_gather=enabled)
+                ):
+                    output = experts.run_direct_routed(tokens, scores, indices)
+                    output.float().square().mean().backward()
+                return output.detach(), tokens.detach(), tokens.grad, scores.grad
+
+            torch.manual_seed(29)
+            reference = execute(False)
+            torch.manual_seed(29)
+            candidate = execute(True)
+            for expected, actual in zip(reference, candidate):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def _bound_packed_experts(self, *, num_experts, out_f, in_f, pin=False):
         import mirai.core.models.compressed_weights as compressed_weights

@@ -2734,12 +2734,112 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         # memory.moe_batched_gather opts into contiguous batched gather. The
         # per-expert path transfers pinned RAM-cache views independently.
         if self._expert_device_cache.enabled:
+            if resolve_moe_batched_gather():
+                return self._quantized_expert_batch_cached_gather(
+                    key, expert_indices, device=device
+                )
             return self._quantized_expert_batch_per_expert(key, expert_indices, device=device)
         if resolve_moe_batched_gather():
             batched = self._quantized_expert_batch_gather(key, expert_indices, device=device)
             if batched is not None:
                 return batched
         return self._quantized_expert_batch_per_expert(key, expert_indices, device=device)
+
+    def _load_quantized_expert_pair(
+        self,
+        key: str,
+        expert_idx: int,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._packed_source is not None and not hasattr(self, f"{key}_int8"):
+            return (
+                self._packed_source.get_slice(
+                    self._packed_tensor_names[f"{key}_int8"], expert_idx
+                ).to(device=device),
+                self._packed_source.get_slice(
+                    self._packed_tensor_names[f"{key}_scale"], expert_idx
+                ).to(device=device, dtype=torch.float32),
+            )
+        return (
+            getattr(self, f"{key}_int8")[expert_idx].to(device=device),
+            getattr(self, f"{key}_scale")[expert_idx].to(
+                device=device, dtype=torch.float32
+            ),
+        )
+
+    def _quantized_expert_batch_cached_gather(
+        self,
+        key: str,
+        expert_indices: list[int],
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve hits individually and coalesce the unique miss set."""
+
+        quantized_parts: list[torch.Tensor | None] = [None] * len(expert_indices)
+        scale_parts: list[torch.Tensor | None] = [None] * len(expert_indices)
+        missing_positions: dict[int, list[int]] = {}
+        missing_keys: dict[int, Any] = {}
+        hit_rows = 0
+        for position, expert_idx in enumerate(expert_indices):
+            expert = int(expert_idx)
+            if expert in missing_positions:
+                missing_positions[expert].append(position)
+                continue
+            cache_key = self._expert_device_cache.key(
+                f"{self._expert_device_cache_namespace}:{key}", expert, device
+            )
+            cached = self._expert_device_cache.get(cache_key)
+            if cached is not None:
+                quantized_parts[position], scale_parts[position] = cached
+                hit_rows += 1
+                continue
+            missing_positions[expert] = [position]
+            missing_keys[expert] = cache_key
+
+        missing_experts = list(missing_positions)
+        gathered = (
+            self._quantized_expert_batch_gather(
+                key, missing_experts, device=device
+            )
+            if missing_experts
+            else None
+        )
+        transferred_bytes = 0
+        for row, expert in enumerate(missing_experts):
+            if gathered is None:
+                quantized, scale = self._load_quantized_expert_pair(
+                    key, expert, device=device
+                )
+            else:
+                quantized, scale = gathered[0][row], gathered[1][row]
+            transferred_bytes += (
+                int(quantized.numel()) * int(quantized.element_size())
+                + int(scale.numel()) * int(scale.element_size())
+            )
+            self._expert_device_cache.put(
+                missing_keys[expert], (quantized, scale)
+            )
+            for position in missing_positions[expert]:
+                quantized_parts[position], scale_parts[position] = quantized, scale
+
+        if any(value is None for value in (*quantized_parts, *scale_parts)):
+            raise RuntimeError("Expert cache gather left an unresolved routed row.")
+        miss_rows = sum(len(positions) for positions in missing_positions.values())
+        self._expert_device_cache.record_transfer_request(
+            requested_rows=len(expert_indices),
+            hit_rows=hit_rows,
+            miss_rows=miss_rows,
+            unique_transferred_rows=len(missing_experts),
+            transferred_bytes=transferred_bytes,
+            coalesced=bool(missing_experts and gathered is not None),
+            fallback=bool(missing_experts and gathered is None),
+        )
+        return (
+            torch.stack([value for value in quantized_parts if value is not None]),
+            torch.stack([value for value in scale_parts if value is not None]),
+        )
 
     def _quantized_expert_batch_per_expert(
         self,
@@ -2769,6 +2869,9 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
                 return quantized, scale
         quantized_parts = []
         scale_parts = []
+        hit_rows = 0
+        miss_rows = 0
+        transferred_bytes = 0
         for expert_idx in expert_indices:
             cache_key = self._expert_device_cache.key(
                 f"{self._expert_device_cache_namespace}:{key}",
@@ -2779,22 +2882,29 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             if cached is not None:
                 quantized_parts.append(cached[0])
                 scale_parts.append(cached[1])
+                hit_rows += 1
                 continue
-            if self._packed_source is not None and not hasattr(self, f"{key}_int8"):
-                quantized = self._packed_source.get_slice(
-                    self._packed_tensor_names[f"{key}_int8"], expert_idx
-                ).to(device=device)
-                scale = self._packed_source.get_slice(
-                    self._packed_tensor_names[f"{key}_scale"], expert_idx
-                ).to(device=device, dtype=torch.float32)
-            else:
-                quantized = getattr(self, f"{key}_int8")[expert_idx].to(device=device)
-                scale = getattr(self, f"{key}_scale")[expert_idx].to(
-                    device=device, dtype=torch.float32
-                )
+            quantized, scale = self._load_quantized_expert_pair(
+                key, expert_idx, device=device
+            )
+            miss_rows += 1
+            transferred_bytes += (
+                int(quantized.numel()) * int(quantized.element_size())
+                + int(scale.numel()) * int(scale.element_size())
+            )
             self._expert_device_cache.put(cache_key, (quantized, scale))
             quantized_parts.append(quantized)
             scale_parts.append(scale)
+        if self._expert_device_cache.enabled:
+            self._expert_device_cache.record_transfer_request(
+                requested_rows=len(expert_indices),
+                hit_rows=hit_rows,
+                miss_rows=miss_rows,
+                unique_transferred_rows=miss_rows,
+                transferred_bytes=transferred_bytes,
+                coalesced=False,
+                fallback=False,
+            )
         return torch.stack(quantized_parts, dim=0), torch.stack(scale_parts, dim=0)
 
     def _quantized_expert_batch_gather(

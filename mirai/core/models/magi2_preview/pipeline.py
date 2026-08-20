@@ -49,6 +49,10 @@ from mirai.core.moe.runtime.specs import (
     MoEOptimizationPolicy,
     validate_expert_tensor_specs,
 )
+from mirai.core.moe.runtime.expert_transfer_profile import (
+    load_expert_transfer_profile,
+    validate_expert_transfer_profile_identity,
+)
 from mirai.core.training.residency.block_swap import BlockSwapManager
 from mirai.core.training.residency.device_placement import WeightResidencyExecutionMode
 from mirai.core.training.residency.tensor_residency import (
@@ -1105,6 +1109,33 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             block_swap_transfer_strategy=block_swap_transfer_strategy,
             disk_offload_dir=offload_dir if resolved == "stream_disk" else None,
         ) if enabled else None
+
+    def validate_device_placement(self, *, device: Any) -> None:
+        profile_path = str(
+            self._moe_optimization_policy.expert_transfer_profile_path
+        ).strip()
+        if not profile_path:
+            return
+        resolved = torch.device(device)
+        if resolved.type != "cuda" or not torch.cuda.is_available():
+            raise ValueError(
+                "memory.expert_transfer_profile_path requires CUDA placement."
+            )
+        index = resolved.index
+        if index is None:
+            index = torch.cuda.current_device()
+        capability = torch.cuda.get_device_capability(index)
+        quantization = str(self._frozen_weight_quantization).strip().lower()
+        validate_expert_transfer_profile_identity(
+            load_expert_transfer_profile(profile_path),
+            gpu_name=torch.cuda.get_device_name(index),
+            compute_capability=f"{capability[0]}.{capability[1]}",
+            expert_format=(
+                "bf16"
+                if quantization in {"", "none", "off", "disabled"}
+                else quantization
+            ),
+        )
 
     def place_offloaded_modules(self, *, device: Any, strategy: str) -> None:
         manager = self._block_swap_manager

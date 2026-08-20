@@ -617,6 +617,10 @@ class BasePipeline(ABC):
         """
         _ = device, strategy
 
+    def validate_device_placement(self, *, device: Any) -> None:
+        """Validate provider-owned hardware lineage before moving model state."""
+        _ = device
+
     def set_weight_residency_strategy(
         self,
         *,

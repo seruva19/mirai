@@ -237,6 +237,8 @@ class MoEOptimizationPolicy:
     expert_weight_access: str = "auto"
     expert_dequant_chunk_size: int = 0
     expert_device_cache_gib: float = 0.0
+    expert_device_cache_policy: str = "lru"
+    expert_transfer_profile_path: str = ""
     device_residency_budget_gib: float = 0.0
     quantize_experts_on_load: bool = False
     router_quantization: str = "disabled"
@@ -294,6 +296,8 @@ class MoEOptimizationPolicy:
             raise ValueError("memory.moe_routed_gemm_tuning='warmup_only' requires memory.moe_routed_gemm_cache_path.")
         chunk = int(self.expert_dequant_chunk_size)
         device_cache_gib = float(self.expert_device_cache_gib)
+        device_cache_policy = str(self.expert_device_cache_policy).strip().lower()
+        transfer_profile_path = str(self.expert_transfer_profile_path).strip()
         residency_budget_gib = float(self.device_residency_budget_gib)
         shard_mb = int(self.packed_shard_size_mb)
         workspace_mb = int(self.int8_workspace_mb)
@@ -322,6 +326,11 @@ class MoEOptimizationPolicy:
             raise ValueError("memory.expert_dequant_chunk_size must be >= 0.")
         if device_cache_gib < 0.0:
             raise ValueError("memory.expert_device_cache_gib must be >= 0.")
+        if device_cache_policy not in {"lru", "routing_frequency"}:
+            raise ValueError(
+                "memory.expert_device_cache_policy must be one of: lru, "
+                "routing_frequency."
+            )
         if residency_budget_gib < 0.0:
             raise ValueError("memory.device_residency_budget_gib must be >= 0.")
         if shard_mb <= 0:
@@ -357,6 +366,8 @@ class MoEOptimizationPolicy:
         object.__setattr__(self, "expert_weight_access", access)
         object.__setattr__(self, "expert_dequant_chunk_size", chunk)
         object.__setattr__(self, "expert_device_cache_gib", device_cache_gib)
+        object.__setattr__(self, "expert_device_cache_policy", device_cache_policy)
+        object.__setattr__(self, "expert_transfer_profile_path", transfer_profile_path)
         object.__setattr__(
             self, "device_residency_budget_gib", residency_budget_gib
         )
@@ -394,12 +405,25 @@ class MoEOptimizationPolicy:
 
     @classmethod
     def from_memory_config(cls, memory: Any) -> MoEOptimizationPolicy:
+        profile_path = str(getattr(memory, "expert_transfer_profile_path", "")).strip()
+        device_cache_gib = float(getattr(memory, "expert_device_cache_gib", 0.0))
+        prefetch_depth = int(getattr(memory, "packed_stream_prefetch_depth", 0))
+        if profile_path:
+            from mirai.core.moe.runtime.expert_transfer_profile import load_expert_transfer_profile
+
+            profile = load_expert_transfer_profile(profile_path)
+            if device_cache_gib == 0.0:
+                device_cache_gib = profile.recommended_device_cache_gib
+            if prefetch_depth == 0:
+                prefetch_depth = profile.recommended_prefetch_depth
         return cls(
             expert_weight_access=getattr(memory, "expert_weight_access", "auto"),
             expert_dequant_chunk_size=int(getattr(memory, "expert_dequant_chunk_size", 0)),
-            expert_device_cache_gib=float(
-                getattr(memory, "expert_device_cache_gib", 0.0)
+            expert_device_cache_gib=device_cache_gib,
+            expert_device_cache_policy=getattr(
+                memory, "expert_device_cache_policy", "lru"
             ),
+            expert_transfer_profile_path=profile_path,
             device_residency_budget_gib=float(
                 getattr(memory, "device_residency_budget_gib", 0.0)
             ),
@@ -418,9 +442,7 @@ class MoEOptimizationPolicy:
             packed_stream_backend=getattr(
                 memory, "packed_stream_backend", "staged"
             ),
-            packed_stream_prefetch_depth=int(
-                getattr(memory, "packed_stream_prefetch_depth", 0)
-            ),
+            packed_stream_prefetch_depth=prefetch_depth,
             moe_dispatch=getattr(memory, "moe_dispatch", "vectorized"),
             moe_dispatch_preprocess=getattr(
                 memory, "moe_dispatch_preprocess", "host"
@@ -448,6 +470,7 @@ class MoEOptimizationPolicy:
         return (
             self.expert_weight_access not in {"", "auto", "disabled"}
             or self.expert_device_cache_gib > 0.0
+            or bool(self.expert_transfer_profile_path)
             or self.device_residency_budget_gib > 0.0
             or self.quantize_experts_on_load
             or self.router_quantization != "disabled"

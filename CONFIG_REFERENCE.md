@@ -3176,6 +3176,40 @@ Experts dequantized per chunk (for MAGI-2 Preview, groups of the flattened `head
 
 Global byte-bounded LRU of immutable INT8 expert operands on the compute device. Zero creates no resident entries and preserves demand transfer. Positive values are shared across every compressed MoE layer, cache only routed physical experts and their scales, evict before crossing the exact ceiling, and never retain BF16 weights. Other quantization formats fail explicitly. MAGI-2 Preview rejects any positive value: its packed experts are layer-resident state moved by the block-residency subsystem, so device residency for them is chosen with `training.blocks_to_swap`.
 
+### `expert_device_cache_policy`
+
+- **Type:** string
+- **Default:** `"lru"`
+- **Allowed / range:** `lru`, `routing_frequency`
+
+Admission and eviction policy for the global INT8 expert-device cache. `lru`
+preserves recency eviction. `routing_frequency` tracks a bounded recent set of
+expert identities, rejects a cold candidate when it would displace a more
+frequently routed resident, and admits a recurrent candidate once its observed
+frequency exceeds the least-frequent resident. Frequency metadata is capped at
+4096 identities and is cleared with the cache. Inert when
+`expert_device_cache_gib=0`
+([`expert_device_cache.py`](mirai/core/models/compressed_weights/execution/expert_device_cache.py)).
+
+### `expert_transfer_profile_path`
+
+- **Type:** string path
+- **Default:** `""`
+- **Allowed / range:** empty or a `mirai.expert_transfer_profile.v1` JSON artifact
+
+Loads hardware calibration recommendations for `expert_device_cache_gib` and
+`packed_stream_prefetch_depth` only when their explicit values remain zero.
+Only `int8` profiles may recommend a device-cache allocation; other formats
+recommend transfer lookahead while leaving the INT8-only cache disabled.
+Malformed, unknown-version, and incomplete artifacts fail during runtime-policy
+construction. Before model placement, the provider compares the recorded GPU
+name, compute capability, and normalized expert format with the resolved runtime
+and fails on any mismatch. Empty performs no file access. Regenerate a profile
+when the GPU or expert storage format changes
+with `scripts/agent/probe_moe_runtime.py --expert-transfer-profile-out <path>`
+on an explicitly leased GPU
+([`expert_transfer_profile.py`](mirai/core/moe/runtime/expert_transfer_profile.py)).
+
 ### `device_residency_budget_gib`
 
 - **Type:** float
@@ -3442,7 +3476,19 @@ Enables paired w1/w3 expert dequantization.
 - **Default:** `False`
 - **Allowed / range:** —
 
-Enables contiguous batched expert gather.
+Enables exact batched expert gather. Without a device cache, supported source
+layouts gather the requested expert rows together. With
+`expert_device_cache_gib > 0`, resident experts remain in place, duplicate
+routed misses share one source row, and only the ordered unique miss set is
+gathered. Module-backed tensors support arbitrary miss indices; pinned packed
+sources batch contiguous runs. Unsupported or pageable layouts preserve the
+per-expert transfer path. The resulting quantized weights, scales, outputs, and
+gradients are identical to the per-expert reference path
+([`expert_gather.py`](mirai/core/models/compressed_weights/execution/expert_gather.py),
+[`experts.py`](mirai/core/models/compressed_weights/execution/experts.py)). The
+shared cache snapshot reports request, hit, miss, unique-transfer, deduplicated,
+byte, coalesced-request, and fallback-request totals without retaining route
+identities.
 
 ### `packed_shard_size_mb`
 

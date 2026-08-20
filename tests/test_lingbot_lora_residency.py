@@ -33,6 +33,10 @@ from mirai.core.training.residency.device_placement import (
     WeightResidencyExecutionMode,
 )
 from mirai.core.training.calibration.gora import maybe_initialize_gora
+from mirai.core.moe.runtime.expert_transfer_profile import (
+    ExpertTransferProfile,
+    save_expert_transfer_profile,
+)
 from mirai.core.training.calibration.esft import maybe_initialize_esft
 from mirai.core.training.adapters import normalize_adapter_state
 from mirai.core.training.data.curriculum import CurriculumSchedule
@@ -1550,6 +1554,7 @@ class LingBotLoRAResidencyTests(unittest.TestCase):
             expert_weight_access="active_dequant",
         )
         config.memory.expert_device_cache_gib = 0.0001
+        config.memory.expert_device_cache_policy = "routing_frequency"
         config.memory.device_residency_budget_gib = 0.001
         trainer = Trainer(config)
         experts = [
@@ -1564,6 +1569,13 @@ class LingBotLoRAResidencyTests(unittest.TestCase):
                 for module in experts
             )
         )
+        self.assertTrue(
+            all(
+                module.expert_device_cache_snapshot()["admission_policy"]
+                == "routing_frequency"
+                for module in experts
+            )
+        )
 
     def test_expert_cache_rejects_non_int8_storage(self) -> None:
         config = self._config(quantized=False)
@@ -1571,6 +1583,35 @@ class LingBotLoRAResidencyTests(unittest.TestCase):
         config.memory.device_residency_budget_gib = 0.001
         with self.assertRaisesRegex(ValueError, "requires.*int8"):
             Trainer(config)
+
+    def test_expert_transfer_profile_validates_provider_runtime_identity(self) -> None:
+        profile = ExpertTransferProfile(
+            gpu_name="runtime-gpu", compute_capability="9.0", expert_format="int8",
+            expert_bytes=1024, h2d_gib_per_second=10,
+            routed_compute_gib_per_second=20, recommended_device_cache_gib=0.1,
+            recommended_prefetch_depth=2, benchmark_fingerprint="test",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            save_expert_transfer_profile(path, profile)
+            pipeline = object.__new__(LingBotVideoPipeline)
+            pipeline._moe_optimization_policy = SimpleNamespace(
+                expert_transfer_profile_path=str(path)
+            )
+            pipeline._frozen_weight_quantization = "int8"
+            with (
+                mock.patch("torch.cuda.is_available", return_value=True),
+                mock.patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+                mock.patch("torch.cuda.get_device_name", return_value="runtime-gpu"),
+            ):
+                pipeline.validate_device_placement(device=torch.device("cuda:0"))
+                with mock.patch(
+                    "torch.cuda.get_device_name", return_value="different-gpu"
+                ):
+                    with self.assertRaisesRegex(ValueError, "does not match"):
+                        pipeline.validate_device_placement(
+                            device=torch.device("cuda:0")
+                        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
     def test_tiered_hardware_policy_reaches_runtime_residency(self) -> None:

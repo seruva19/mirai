@@ -636,6 +636,8 @@ class MemoryConfig:
     expert_weight_access: str = "auto"
     expert_dequant_chunk_size: int = 0
     expert_device_cache_gib: float = 0.0
+    expert_device_cache_policy: str = "lru"
+    expert_transfer_profile_path: str = ""
     device_residency_budget_gib: float = 0.0
     quantize_experts_on_load: bool = False
     router_quantization: str = "disabled"
@@ -1359,6 +1361,8 @@ class TrainingConfig:
             "expert_weight_access",
             "expert_dequant_chunk_size",
             "expert_device_cache_gib",
+            "expert_device_cache_policy",
+            "expert_transfer_profile_path",
             "device_residency_budget_gib",
             "quantize_experts_on_load",
             "router_quantization",
@@ -3310,6 +3314,13 @@ class TrainingConfig:
             ),
             expert_device_cache_gib=float(
                 memory_table.get("expert_device_cache_gib", 0.0)
+            ),
+            expert_device_cache_policy=str(
+                memory_table.get("expert_device_cache_policy", "lru")
+            ),
+            expert_transfer_profile_path=_validate_no_control_path(
+                "memory.expert_transfer_profile_path",
+                str(memory_table.get("expert_transfer_profile_path", "")),
             ),
             device_residency_budget_gib=float(
                 memory_table.get("device_residency_budget_gib", 0.0)

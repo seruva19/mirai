@@ -259,6 +259,8 @@ def place_pipeline_on_device(
     if model is None:
         return
 
+    pipeline.validate_device_placement(device=device)
+
     # Record the intended mixed-precision compute dtype so the forward autocasts
     # under it even when master params stay fp32 (e.g. fp8 frozen-weight runs).
     pipeline.set_compute_autocast_dtype(dtype)
