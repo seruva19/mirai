@@ -1656,6 +1656,23 @@ Explicit out-of-tree training-policy plugins. Modules register factories through
 
 Plugin-owned configuration namespaces. A plugin reads only `training.policy_options.<policy_name>` and validates its own values; unknown policy names fail before training.
 
+Built-in `training.policy_options.representation_preservation` enables a
+default-off frozen-reference cosine objective inspired by
+[MoE-ViE](https://arxiv.org/abs/2608.17402). Set `enabled=true`, a finite
+positive `weight`; Mirai derives the teacher fingerprint from `model.path` and
+stores it in checkpoint metadata. The policy requires `adapter.type="lora"`,
+`adapter.train_router=false`, `training.compile=false`, and an objective other
+than `sharp_moe`. For each training input, Mirai first evaluates the same native
+pipeline under `no_grad` with LoRA scale zero, restores the random-number state,
+then evaluates the trainable adapter path. It computes
+`weight * (1 - cosine(student, teacher))` after flattening each sample. The
+teacher is detached and both sides enter the loss in FP32. The original LoRA
+scale is restored even when teacher evaluation fails. This adds one frozen-base
+forward per training prediction but no second copy of the model weights.
+Prior-preservation regularization batches retain their existing MSE path and do
+not receive this additional objective. `epsilon` is finite, positive, and
+defaults to `1e-8`.
+
 Built-in `training.policy_options.momentum_anchor` enables Momentum-Anchored
 Orthogonal Projection (MAOP) from [Rosetta](https://arxiv.org/abs/2607.00293).
 It is default-off; set `enabled=true` with `optimizer.type="adamw"`,

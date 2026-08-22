@@ -1832,6 +1832,39 @@
       "promotion_evidence": ""
     },
     {
+      "name": "frozen_reference_representation_preservation",
+      "kind": "training_policy",
+      "owner": "mirai/core/training/policies/representation_preservation.py",
+      "check": "training_lifecycle",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation"
+      ],
+      "symbols": [
+        "RepresentationPreservationTrainingPolicy",
+        "representation_cosine_loss"
+      ],
+      "config_keys": [
+        "training.policy_options"
+      ],
+      "disabled_config": {
+        "training.policy_options": {}
+      },
+      "contract_paths": [
+        "mirai/core/training/policies/contracts/representation_preservation.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "mirai/core/training/policies/representation_preservation.py",
+      "readme_claim": "Frozen-reference representation preservation",
+      "readme_claims": [],
+      "provenance": "https://arxiv.org/abs/2608.17402",
+      "promotion_evidence": ""
+    },
+    {
       "name": "frozen_router_int8_storage",
       "kind": "compressed_weight",
       "owner": "mirai/vendors/lingbot_video/transformer_lingbot_video.py",

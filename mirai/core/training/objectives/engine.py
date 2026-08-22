@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from mirai.config.schema import TrainingConfig
 from mirai.core.models.base import BasePipeline
@@ -162,6 +162,7 @@ def compute_training_loss(
     strategy_prepare_accepts_objective: bool = False,
     training: bool = True,
     gradient_accumulation: int | None = None,
+    prediction_auxiliary_losses: Callable[..., Mapping[str, Any]] | None = None,
 ) -> TrainingLossResult:
     prepare_kwargs: dict[str, Any] = {
         "batch": batch,
@@ -201,6 +202,18 @@ def compute_training_loss(
         pipeline=pipeline,
         config=config,
         training=bool(training),
+    )
+    policy_auxiliary_losses = (
+        {}
+        if prediction_auxiliary_losses is None
+        else dict(
+            prediction_auxiliary_losses(
+                batch=batch,
+                inputs=inputs,
+                prediction=prediction,
+                training=bool(training),
+            )
+        )
     )
     loss_timesteps = objective.resolve_loss_timesteps(
         prediction=prediction,
@@ -251,6 +264,13 @@ def compute_training_loss(
         loss = loss_result.loss
     task_pre_accum_loss = pre_accum_loss
     auxiliary_losses = dict(pipeline.get_training_auxiliary_losses())
+    overlap = sorted(set(auxiliary_losses) & set(policy_auxiliary_losses))
+    if overlap:
+        raise ValueError(
+            "Pipeline and training policies emitted duplicate auxiliary losses: "
+            + ", ".join(overlap)
+        )
+    auxiliary_losses.update(policy_auxiliary_losses)
     auxiliary_total = None
     for value in auxiliary_losses.values():
         if value is None:

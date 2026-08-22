@@ -215,7 +215,7 @@ class Trainer:
         )
         return result.loss_pre_accum
 
-    def _predict(self, inputs: Any) -> Any:
+    def _predict_once(self, inputs: Any) -> Any:
         try:
             with self._activation_saved_tensor_context():
                 return self._forward_fn(
@@ -243,6 +243,14 @@ class Trainer:
                     )
             else:
                 raise
+
+    def _predict(self, inputs: Any) -> Any:
+        return self.training_policies.predict(
+            pipeline=self.pipeline,
+            inputs=inputs,
+            predict=self._predict_once,
+            training=self._pipeline_is_training(),
+        )
 
     def prepare_calibration_inputs(
         self,
@@ -367,6 +375,9 @@ class Trainer:
             strategy_prepare_accepts_objective=self._strategy_prepare_accepts_objective,
             training=training,
             gradient_accumulation=gradient_accumulation,
+            prediction_auxiliary_losses=(
+                self.training_policies.prediction_auxiliary_losses
+            ),
         )
 
     def compute_loss(

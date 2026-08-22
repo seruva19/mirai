@@ -9,6 +9,10 @@ import torch
 
 from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
 from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
+from mirai.core.training.policies.representation_preservation import (
+    RepresentationPreservationTrainingPolicy,
+)
+from mirai.core.training.training_policy import PredictionContext
 from mirai.vendors.magi2_preview.common.magi2_config import (
     DataProxyConfig,
     MHCConfig,
@@ -119,6 +123,41 @@ def main() -> None:
             )
     pipeline.configure_moe_optimization_policy(MoEOptimizationPolicy())
 
+    for parameter in pipeline.get_trainable_parameters():
+        parameter.grad = None
+    preservation = RepresentationPreservationTrainingPolicy(
+        weight=0.1,
+        teacher_fingerprint="native-train-step-base",
+        epsilon=1e-8,
+    )
+    preservation.before_forward(pipeline, {}, training=True)
+    preserved_output = preservation.predict(
+        pipeline=pipeline,
+        inputs=None,
+        predict=lambda _inputs: model(*packed),
+        training=True,
+    )
+    preservation_losses = preservation.prediction_auxiliary_losses(
+        PredictionContext(
+            batch={},
+            inputs=None,
+            prediction=preserved_output,
+            training=True,
+        )
+    )
+    preservation_loss = preservation_losses["representation_preservation"]
+    (preserved_output.float().square().mean() + preservation_loss).backward()
+    if not torch.isfinite(preservation_loss):
+        raise RuntimeError("MAGI-2 representation-preservation loss is non-finite.")
+    if any(
+        parameter.grad is None or not torch.isfinite(parameter.grad).all()
+        for parameter in pipeline.get_trainable_parameters()
+    ):
+        raise RuntimeError(
+            "MAGI-2 representation-preservation adapter gradients are missing "
+            "or non-finite."
+        )
+
     adapter_state = pipeline.state_dict()
     pipeline.set_lora_scale(0.25)
     if pipeline.get_lora_scale() != 0.25:
@@ -132,6 +171,7 @@ def main() -> None:
                 "peak_memory_bytes": int(torch.cuda.max_memory_allocated(device)),
                 "output_shape": list(output.shape),
                 "adapter_tensors": len(adapter_state),
+                "representation_preservation_loss": float(preservation_loss.detach()),
             },
             sort_keys=True,
         )

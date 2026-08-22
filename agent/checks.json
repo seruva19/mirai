@@ -211,7 +211,7 @@
       "name": "moe_adaptation",
       "paths": ["mirai/core/training/policies/"],
       "commands": [
-        "python -m pytest mirai/core/training/policies/contracts/specialization.py mirai/core/training/policies/contracts/dispersive_loss.py mirai/core/training/policies/contracts/simbal.py mirai/core/moe/contracts/selective_sinkhorn.py mirai/core/moe/contracts/prototypical_routing.py mirai/core/moe/contracts/sharp_moe.py mirai/core/moe/contracts/mixture_of_depths.py mirai/core/training/policies/contracts/diversity.py mirai/core/training/policies/contracts/expert_dropout.py mirai/core/training/policies/contracts/router_temperature.py mirai/core/training/policies/contracts/distillation.py mirai/core/training/policies/contracts/stage_schedule.py mirai/core/training/policies/contracts/domain_specialization.py mirai/core/training/policies/contracts/moe_token_chunking.py -q"
+        "python -m pytest mirai/core/training/policies/contracts/specialization.py mirai/core/training/policies/contracts/dispersive_loss.py mirai/core/training/policies/contracts/simbal.py mirai/core/moe/contracts/selective_sinkhorn.py mirai/core/moe/contracts/prototypical_routing.py mirai/core/moe/contracts/sharp_moe.py mirai/core/moe/contracts/mixture_of_depths.py mirai/core/training/policies/contracts/diversity.py mirai/core/training/policies/contracts/expert_dropout.py mirai/core/training/policies/contracts/router_temperature.py mirai/core/training/policies/contracts/distillation.py mirai/core/training/policies/contracts/stage_schedule.py mirai/core/training/policies/contracts/domain_specialization.py mirai/core/training/policies/contracts/moe_token_chunking.py mirai/core/training/policies/contracts/representation_preservation.py -q"
       ],
       "invariants": [
         "every policy is explicit and default-off",
@@ -354,7 +354,7 @@
         "python -m pytest mirai/core/training/objectives/contracts/sampling.py mirai/core/training/objectives/contracts/contrastive_flow.py mirai/core/training/objectives/contracts/adaptive_weighting.py mirai/core/training/objectives/contracts/latent_wavelet.py mirai/core/moe/contracts/sharp_moe.py -q",
         "python -m pytest mirai/core/training/calibration/contracts/router_repair.py -q",
         "python -m pytest mirai/core/training/calibration/contracts/flexmoe.py -q",
-        "python -m pytest tests/test_training_runtime_policy_contract.py mirai/core/training/optim/contracts/posthoc_ema.py -q",
+        "python -m pytest tests/test_training_runtime_policy_contract.py mirai/core/training/optim/contracts/posthoc_ema.py mirai/core/training/policies/contracts/representation_preservation.py -q",
         "python -m pytest mirai/core/training/data/contracts/progressive_curriculum.py -q",
         "python -m pytest tests/test_thin_slice_e2e.py -q",
         "python -m pytest tests/test_resume_equivalence.py -q",

@@ -28,6 +28,14 @@ class BatchAugmentContext:
 
 
 @dataclass(frozen=True)
+class PredictionContext:
+    batch: Mapping[str, Any]
+    inputs: Any
+    prediction: Any
+    training: bool
+
+
+@dataclass(frozen=True)
 class PreviewRequestContext:
     """Everything a preview-owning policy needs to run a preview at one step.
 
@@ -90,6 +98,26 @@ class TrainingPolicy:
         training: bool,
     ) -> None:
         _ = (pipeline, batch, training)
+
+    def prediction_auxiliary_losses(
+        self, context: PredictionContext
+    ) -> Mapping[str, Any]:
+        _ = context
+        return {}
+
+    def predict(
+        self,
+        *,
+        pipeline: Any,
+        inputs: Any,
+        predict: Callable[[Any], Any],
+        training: bool,
+    ) -> Any | None:
+        _ = (pipeline, inputs, predict, training)
+        return None
+
+    def claims_prediction(self) -> bool:
+        return False
 
     def before_optimizer_step(self, optimizer: Any) -> None:
         _ = optimizer
@@ -299,6 +327,63 @@ class TrainingPolicySet:
     def before_optimizer_step(self, optimizer: Any) -> None:
         for policy in self._policies:
             policy.before_optimizer_step(optimizer)
+
+    def prediction_auxiliary_losses(
+        self,
+        *,
+        batch: Mapping[str, Any],
+        inputs: Any,
+        prediction: Any,
+        training: bool,
+    ) -> dict[str, Any]:
+        losses: dict[str, Any] = {}
+        owners: dict[str, str] = {}
+        context = PredictionContext(
+            batch=batch,
+            inputs=inputs,
+            prediction=prediction,
+            training=bool(training),
+        )
+        for policy in self._policies:
+            additions = dict(policy.prediction_auxiliary_losses(context))
+            for name, value in additions.items():
+                if name in losses:
+                    raise ValueError(
+                        f"Training policy '{policy.name}' cannot emit auxiliary loss "
+                        f"'{name}'; it is already owned by {owners[name]}."
+                    )
+                losses[name] = value
+                owners[name] = f"training policy '{policy.name}'"
+        return losses
+
+    def predict(
+        self,
+        *,
+        pipeline: Any,
+        inputs: Any,
+        predict: Callable[[Any], Any],
+        training: bool,
+    ) -> Any:
+        owners = [policy for policy in self._policies if policy.claims_prediction()]
+        if len(owners) > 1:
+            names = ", ".join(str(policy.name) for policy in owners)
+            raise ValueError(
+                "Multiple training policies claimed model prediction: " + names
+            )
+        if owners:
+            prediction = owners[0].predict(
+                pipeline=pipeline,
+                inputs=inputs,
+                predict=predict,
+                training=bool(training),
+            )
+            if prediction is None:
+                raise RuntimeError(
+                    f"Training policy '{owners[0].name}' claimed prediction but "
+                    "returned no value."
+                )
+            return prediction
+        return predict(inputs)
 
     def after_optimizer_step(self, optimizer: Any, *, applied: bool) -> None:
         for policy in self._policies:

@@ -146,6 +146,10 @@ configuration and compatibility rules are documented in
   diagonal, in bounded feature chunks and requires at least two samples per
   microbatch. [(paper)](https://arxiv.org/abs/2506.09027)
   [(repo)](https://github.com/raywang4/DispLoss)
+- **Frozen-reference representation preservation** — An experimental,
+  default-off cosine objective compares each LoRA prediction with the same
+  frozen-base forward while reusing the resident model weights and exact random
+  inputs. [(paper)](https://arxiv.org/abs/2608.17402)
 - **Loss controls** — Masks, prior preservation, noise offset, and bucket
   normalization.
 - **Training-step safety** — Gradient accumulation, clipping, checkpointing,

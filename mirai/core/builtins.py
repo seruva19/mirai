@@ -31,6 +31,7 @@ BUILTIN_COMPONENT_MODULES: tuple[tuple[str, str], ...] = (
     ("training_policy", "mirai.core.training.policies.router_temperature"),
     ("training_policy", "mirai.core.training.policies.router_stage_schedule"),
     ("training_policy", "mirai.core.training.policies.router_distillation"),
+    ("training_policy", "mirai.core.training.policies.representation_preservation"),
     ("training_policy", "mirai.core.training.policies.simbal"),
     ("training_policy", "mirai.core.training.policies.selective_sinkhorn"),
     ("training_policy", "mirai.core.training.policies.prototypical_routing"),
