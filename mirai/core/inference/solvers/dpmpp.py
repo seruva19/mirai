@@ -67,8 +67,10 @@ class FlowDPMSolverMultistep:
         model_output: torch.Tensor,
         timestep: torch.Tensor | float,
         sample: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
     ) -> SolverOutput:
-        _ = timestep
+        _ = timestep, generator
         idx = self._step_index
         sigma_s = self._sigmas[idx]
         sigma_t = self._sigmas[idx + 1]

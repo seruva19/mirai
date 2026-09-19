@@ -1,12 +1,12 @@
 # LingBot Video
 
-Native training and inference support targets the sparse-MoE 30B-A3B release.
-The provider loads attributed native modules directly; Diffusers is not a runtime
-dependency.
+Native training and inference support targets the sparse-MoE 30B-A3B release;
+inference also supports its eight-step DMD student checkpoint. The provider
+loads attributed native modules directly; Diffusers is not a runtime dependency.
 
 ## Download
 
-Download the public
+Download the public teacher/training
 [`robbyant/lingbot-video-moe-30b-a3b`](https://huggingface.co/robbyant/lingbot-video-moe-30b-a3b)
 snapshot without a token:
 
@@ -360,6 +360,39 @@ The profile selects four Euler steps, CFG 1, rank/alpha 128, unit LoRA scale,
 and the attention-plus-shared-MLP target set. Explicit CLI values override its
 defaults.
 
+### DMD student checkpoint
+
+The Apache-2.0
+[`robbyant/lingbot-video-moe-dmd-30b-a3b`](https://huggingface.co/robbyant/lingbot-video-moe-dmd-30b-a3b)
+checkpoint uses the release's dedicated DMD student sampler. Download it with:
+
+```bash
+python scripts/download.py \
+  --variant lingbot-video-moe-dmd-30b-a3b \
+  --output-dir models/lingbot-video-moe-dmd-30b-a3b
+```
+
+Then select the checkpoint-bound profile:
+
+```bash
+python inference/lingbot_video/generate.py \
+  --inference-profile dmd-8step \
+  --prompt '{"scene":"..."}' \
+  --out outputs/dmd-clip.mp4
+```
+
+The profile defaults to 121 frames at 480×832 and 24 FPS. It requires the
+`dmd_student` scheduler, eight denoising steps, CFG 1, flow shift 3, and a T2V
+or TI2V task. Recipe overrides and unsupported T2I/V2V/refiner combinations
+are rejected before model loading. This is a checkpoint profile, distinct from
+`distilled-4step`: the latter is a four-step Euler profile for a separately
+supplied LightLingBot LoRA adapter.
+
+The sampler behavior follows the upstream
+[DMD student sampling guide](https://github.com/Robbyant/lingbot-video/blob/dd5c231e793406c6a8893e9e4307008a9c2adfe4/docs/en/dmd_student_sampling.md)
+and Apache-2.0
+[scheduler source](https://github.com/Robbyant/lingbot-video/blob/dd5c231e793406c6a8893e9e4307008a9c2adfe4/lingbot_video/scheduling_dmd_student.py).
+
 ## Model-specific features
 
 - **Native sparse-MoE pipeline** — Family-owned loading, latent validation,
@@ -396,7 +429,7 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 |---|---|
 | `model.type` | `lingbot-video`. |
 | `model.path` | Snapshot root containing the native denoiser plus the released text-encoder, processor, VAE, and optional refiner component directories. |
-| `model.params.variant` | Released training and inference target: `lingbot-video-moe-30b-a3b`. |
+| `model.params.variant` | `lingbot-video-moe-30b-a3b` for training and standard inference; `lingbot-video-moe-dmd-30b-a3b` for checkpoint-bound eight-step DMD inference. |
 | `model.params.denoiser_subfolder` | Native denoiser component, normally `transformer`; the value is included in cache and checkpoint lineage. |
 | `model.params.text_encoder_path` | Optional override for the Qwen3-VL text-encoder asset directory; empty resolves it from `model.path`. |
 | `model.params.strict_native_assets` | Requires complete released native assets and snapshot validation; public model configurations set this to `true`. |

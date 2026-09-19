@@ -36,6 +36,9 @@ class LingBotInferenceProfile(NamedTuple):
     scheduler: str
     steps: int
     cfg_scale: float
+    variant: str = "lingbot-video-moe-30b-a3b"
+    model_root: str = "./models/lingbot-video-moe-30b-a3b"
+    flow_shift: float = 3.0
     frames: int = 33
     height: int = 480
     width: int = 832
@@ -52,9 +55,19 @@ DISTILLED_4STEP_PROFILE = LingBotInferenceProfile(
     steps=4,
     cfg_scale=1.0,
 )
+DMD_8STEP_PROFILE = LingBotInferenceProfile(
+    scheduler="dmd_student",
+    steps=8,
+    cfg_scale=1.0,
+    variant="lingbot-video-moe-dmd-30b-a3b",
+    model_root="./models/lingbot-video-moe-dmd-30b-a3b",
+    flow_shift=3.0,
+    frames=121,
+)
 INFERENCE_PROFILES = {
     "standard": DEFAULT_INFERENCE_PROFILE,
     "distilled-4step": DISTILLED_4STEP_PROFILE,
+    "dmd-8step": DMD_8STEP_PROFILE,
 }
 
 
@@ -66,7 +79,8 @@ type = "lingbot-video"
 path = "{model_root}"
 
 [model.params]
-variant = "lingbot-video-moe-30b-a3b"
+variant = "{variant}"
+flow_shift = {flow_shift}
 strict_native_assets = true
 
 [memory]
@@ -390,8 +404,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--config", default="", help="Explicit trainer TOML (else generated)")
     p.add_argument(
         "--model-root",
-        default="./models/lingbot-video-moe-30b-a3b",
-        help="Model root for the generated config",
+        default=None,
+        help="Model root for the generated config (profile default when omitted)",
     )
     p.add_argument(
         "--quant",
@@ -438,12 +452,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--frames",
         type=int,
-        default=DEFAULT_INFERENCE_PROFILE.frames,
+        default=None,
         help="4n+1",
     )
-    p.add_argument("--height", type=int, default=DEFAULT_INFERENCE_PROFILE.height)
-    p.add_argument("--width", type=int, default=DEFAULT_INFERENCE_PROFILE.width)
-    p.add_argument("--fps", type=int, default=DEFAULT_INFERENCE_PROFILE.fps)
+    p.add_argument("--height", type=int, default=None)
+    p.add_argument("--width", type=int, default=None)
+    p.add_argument("--fps", type=int, default=None)
     p.add_argument("--out", default="./outputs/lingbot_generate.mp4")
     # The optional refiner leaves the base path unchanged when disabled.
     # When set, the base 480p latent is upscaled -> re-noised at t_thresh ->
@@ -471,7 +485,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.steps = profile.steps if args.steps is None else args.steps
     args.scheduler = profile.scheduler if args.scheduler is None else args.scheduler
     args.cfg_scale = profile.cfg_scale if args.cfg_scale is None else args.cfg_scale
+    args.frames = profile.frames if args.frames is None else args.frames
+    args.height = profile.height if args.height is None else args.height
+    args.width = profile.width if args.width is None else args.width
+    args.fps = profile.fps if args.fps is None else args.fps
+    args.model_root = profile.model_root if args.model_root is None else args.model_root
     distilled = str(args.inference_profile) == "distilled-4step"
+    dmd = str(args.inference_profile) == "dmd-8step"
     if args.adapter_rank is None:
         args.adapter_rank = 128 if distilled else 32
     if args.adapter_alpha is None:
@@ -482,6 +502,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if distilled and not str(args.adapter).strip():
         p.error("--inference-profile distilled-4step requires --adapter")
+    if dmd:
+        expected = (profile.scheduler, profile.steps, profile.cfg_scale)
+        actual = (str(args.scheduler), int(args.steps), float(args.cfg_scale))
+        if actual != expected:
+            p.error(
+                "--inference-profile dmd-8step requires --scheduler dmd_student, "
+                "--steps 8, and --cfg-scale 1"
+            )
+        if args.task not in {"t2v", "ti2v"}:
+            p.error("--inference-profile dmd-8step supports only --task t2v or ti2v")
+        if args.refine:
+            p.error("--inference-profile dmd-8step does not support --refine")
+        if str(args.config).strip():
+            from mirai.config.loader import load_config
+
+            config = load_config(str(args.config))
+            if str(config.model.params.variant).strip().lower() != profile.variant:
+                p.error(
+                    "--inference-profile dmd-8step requires config model.params.variant="
+                    f'"{profile.variant}"'
+                )
+            if float(config.model.params.flow_shift) != profile.flow_shift:
+                p.error(
+                    "--inference-profile dmd-8step requires config "
+                    "model.params.flow_shift=3"
+                )
     if args.task == "t2i":
         args.frames = 1
         if args.refine:
@@ -512,6 +558,8 @@ def main(argv: list[str] | None = None) -> int:
         quant = str(args.quant)
         rendered = CONFIG_TEMPLATE.format(
             model_root=str(args.model_root).replace("\\", "/"),
+            variant=INFERENCE_PROFILES[str(args.inference_profile)].variant,
+            flow_shift=INFERENCE_PROFILES[str(args.inference_profile)].flow_shift,
             quant=quant if quant != "none" else "none",
             quant_strategy="auto" if quant != "none" else "disabled",
         )

@@ -48,6 +48,56 @@ def _model_config(path: str, *, vae_chunk_size: int = 16) -> ModelConfig:
     )
 
 
+class DmdInferenceRecipeTests(unittest.TestCase):
+    def _pipeline(self, *, variant: str, flow_shift: float = 3.0):
+        from mirai.core.models.lingbot_video.pipeline import LingBotVideoPipeline
+
+        pipeline = object.__new__(LingBotVideoPipeline)
+        pipeline.model_config = SimpleNamespace(
+            params=SimpleNamespace(variant=variant, flow_shift=flow_shift)
+        )
+        return pipeline
+
+    def test_dmd_checkpoint_accepts_only_released_recipe(self) -> None:
+        pipeline = self._pipeline(variant="lingbot-video-moe-dmd-30b-a3b")
+        pipeline.validate_inference_recipe(
+            scheduler="dmd_student",
+            steps=8,
+            cfg_scale=1.0,
+            task="text_to_video",
+        )
+        for override in (
+            {"scheduler": "euler"},
+            {"steps": 7},
+            {"cfg_scale": 3.0},
+            {"task": "video_to_video"},
+        ):
+            recipe = {
+                "scheduler": "dmd_student",
+                "steps": 8,
+                "cfg_scale": 1.0,
+                "task": "text_to_video",
+                **override,
+            }
+            with self.subTest(override=override), self.assertRaisesRegex(
+                ValueError, "dmd-8step"
+            ):
+                pipeline.validate_inference_recipe(**recipe)
+
+    def test_base_checkpoint_keeps_configurable_recipe(self) -> None:
+        pipeline = self._pipeline(variant="lingbot-video-moe-30b-a3b")
+        pipeline.validate_inference_recipe(
+            scheduler="euler", steps=40, cfg_scale=3.0, task="video_to_video"
+        )
+        with self.assertRaisesRegex(ValueError, "(?i)requires the.*dmd"):
+            pipeline.validate_inference_recipe(
+                scheduler="dmd_student",
+                steps=8,
+                cfg_scale=1.0,
+                task="text_to_video",
+            )
+
+
 # --- fake Qwen3-VL processor/encoder for deterministic parity testing --------
 class _FakeBatch(dict):
     def to(self, *args, **kwargs):  # BatchEncoding-like: device move is a no-op

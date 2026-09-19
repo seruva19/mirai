@@ -627,6 +627,14 @@ class InferenceSession:
             task if task is not None else self.cfg.inference.task
         )
         effective_frames = 1 if task_key == TEXT_TO_IMAGE else int(frames)
+        validate_recipe = getattr(self.pipeline, "validate_inference_recipe", None)
+        if callable(validate_recipe) and not decode_latent_path:
+            validate_recipe(
+                scheduler=str(scheduler),
+                steps=int(steps),
+                cfg_scale=float(cfg_scale),
+                task=task_key,
+            )
         strength = float(
             denoising_strength
             if denoising_strength is not None

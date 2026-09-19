@@ -23,6 +23,12 @@ MOE_ARTIFACT_DOWNLOAD_SPECS: tuple[MoEArtifactDownloadSpec, ...] = (
         spec_id="lingbot_video",
         artifact_license="apache-2.0",
     ),
+    MoEArtifactDownloadSpec(
+        variant="lingbot-video-moe-dmd-30b-a3b",
+        repo_id="robbyant/lingbot-video-moe-dmd-30b-a3b",
+        spec_id="lingbot_video",
+        artifact_license="apache-2.0",
+    ),
 )
 
 

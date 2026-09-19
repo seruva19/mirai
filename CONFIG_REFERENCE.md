@@ -199,7 +199,11 @@ family accepts under this table are listed on its page in
 - **Default:** `"lingbot-video-moe-30b-a3b"`
 - **Allowed / range:** provider-defined
 
-Released architecture identifier. LingBot topology is loaded from the snapshot configuration.
+Released architecture identifier. LingBot topology is loaded from the snapshot
+configuration. Shipped LingBot values are `lingbot-video-moe-30b-a3b` for the
+teacher/training release and `lingbot-video-moe-dmd-30b-a3b` for the eight-step
+DMD inference checkpoint. The DMD variant is inference-only and requires its
+checkpoint-bound sampler recipe.
 
 ### `flow_shift`
 

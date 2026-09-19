@@ -350,6 +350,7 @@ VALID_VARIANTS = {
     "scratch",
     "tiny-video",
     "lingbot-video-moe-30b-a3b",
+    "lingbot-video-moe-dmd-30b-a3b",
 }
 SCRATCH_VARIANTS = {"scratch", "tiny-video"}
 SUPPORTED_STRATEGIES = {
@@ -2062,6 +2063,39 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         # refiner/ weights fail fast at load_refiner()/has_refiner_weights().
         variant = str(self.model_config.params.variant).strip().lower()
         return variant not in SCRATCH_VARIANTS
+
+    def validate_inference_recipe(
+        self, *, scheduler: str, steps: int, cfg_scale: float, task: str
+    ) -> None:
+        """Reject incompatible recipes for checkpoint-bound LingBot variants."""
+
+        variant = str(self.model_config.params.variant).strip().lower()
+        scheduler_key = str(scheduler).strip().lower()
+        dmd_variant = "lingbot-video-moe-dmd-30b-a3b"
+        if variant != dmd_variant:
+            if scheduler_key == "dmd_student":
+                raise ValueError(
+                    "The dmd_student scheduler requires the "
+                    "lingbot-video-moe-dmd-30b-a3b checkpoint."
+                )
+            return
+        errors: list[str] = []
+        if scheduler_key != "dmd_student":
+            errors.append("scheduler=dmd_student")
+        if int(steps) != 8:
+            errors.append("steps=8")
+        if float(cfg_scale) != 1.0:
+            errors.append("cfg_scale=1")
+        if float(self.model_config.params.flow_shift) != 3.0:
+            errors.append("model.params.flow_shift=3")
+        if str(task) not in {"text_to_video", "image_to_video"}:
+            errors.append("task=text_to_video or image_to_video")
+        if errors:
+            required = ", ".join(errors)
+            raise ValueError(
+                "LingBot DMD checkpoint requires its dmd-8step inference recipe; "
+                f"expected {required}."
+            )
 
     def validate_refinement_request(
         self,

@@ -582,6 +582,68 @@ class BatchPromptsTests(unittest.TestCase):
         self.assertEqual(args.adapter_alpha, 128.0)
         self.assertEqual(args.adapter_preset, "attn_shared_mlp")
 
+    def test_dmd_profile_applies_released_checkpoint_recipe(self) -> None:
+        generate = _load_module(
+            "lingbot_generate_dmd_profile",
+            "inference/lingbot_video/generate.py",
+        )
+
+        args = generate.parse_args(
+            ["--prompt", '{"scene":"test"}', "--inference-profile", "dmd-8step"]
+        )
+
+        self.assertEqual(args.scheduler, "dmd_student")
+        self.assertEqual(args.steps, 8)
+        self.assertEqual(args.cfg_scale, 1.0)
+        self.assertEqual(args.frames, 121)
+        self.assertEqual((args.height, args.width, args.fps), (480, 832, 24))
+        self.assertEqual(
+            args.model_root, "./models/lingbot-video-moe-dmd-30b-a3b"
+        )
+
+    def test_dmd_profile_rejects_recipe_and_task_overrides(self) -> None:
+        generate = _load_module(
+            "lingbot_generate_dmd_rejections",
+            "inference/lingbot_video/generate.py",
+        )
+
+        for extra in (
+            ["--scheduler", "euler"],
+            ["--steps", "7"],
+            ["--cfg-scale", "3"],
+            ["--task", "v2v", "--input-video", "input.mp4"],
+        ):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                generate.parse_args(
+                    [
+                        "--prompt",
+                        '{"scene":"test"}',
+                        "--inference-profile",
+                        "dmd-8step",
+                        *extra,
+                    ]
+                )
+
+    def test_dmd_profile_rejects_base_checkpoint_config(self) -> None:
+        generate = _load_module(
+            "lingbot_generate_dmd_config_rejection",
+            "inference/lingbot_video/generate.py",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.toml"
+            _write_config(cfg_path)
+            with self.assertRaises(SystemExit):
+                generate.parse_args(
+                    [
+                        "--prompt",
+                        '{"scene":"test"}',
+                        "--inference-profile",
+                        "dmd-8step",
+                        "--config",
+                        str(cfg_path),
+                    ]
+                )
+
     def test_batch_builds_model_once_and_emits_n_outputs(self) -> None:
         """(c) --batch-prompts builds ONE session (Trainer constructed exactly
         once) and produces one output per prompt line."""

@@ -14,6 +14,15 @@ from scripts.download import _snapshot_file_inventory
 
 
 class SnapshotVerificationTests(unittest.TestCase):
+    def test_dmd_checkpoint_is_a_downloadable_apache_artifact(self) -> None:
+        from mirai.core.moe.artifacts.downloads import get_moe_artifact_download_spec
+
+        spec = get_moe_artifact_download_spec(
+            "lingbot-video-moe-dmd-30b-a3b"
+        )
+        self.assertEqual(spec.repo_id, "robbyant/lingbot-video-moe-dmd-30b-a3b")
+        self.assertEqual(spec.artifact_license, "apache-2.0")
+
     def test_model_tree_metadata_fingerprint_avoids_content_hashing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

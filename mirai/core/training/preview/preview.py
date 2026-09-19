@@ -425,10 +425,15 @@ def run_native_denoise_loop(
             # Solver step
             sample = torch.stack(x_list, dim=0) if not isinstance(x_list[0], torch.Tensor) or x_list[0].ndim < 4 else x_list[0].unsqueeze(0)
             if v_out.ndim == 5 and sample.ndim == 5:
-                result = solver.step(v_out.squeeze(0), timestep, sample.squeeze(0))
+                result = solver.step(
+                    v_out.squeeze(0),
+                    timestep,
+                    sample.squeeze(0),
+                    generator=g,
+                )
                 latents = [result.prev_sample]
             else:
-                result = solver.step(v_out, timestep, sample)
+                result = solver.step(v_out, timestep, sample, generator=g)
                 latents = [result.prev_sample.squeeze(0)] if result.prev_sample.ndim == 5 else [result.prev_sample]
             prepared.pin_condition(latents[0])
 

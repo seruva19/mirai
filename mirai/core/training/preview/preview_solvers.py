@@ -2,7 +2,8 @@
 
 Builtins register factories here, config selects ``logging.sample_solver``, and
 resolution fails on unknown names. Euler is the numerical reference. Flow-UniPC
-uses the same sigma grid with a second-order multistep update.
+uses the same sigma grid with a second-order multistep update. The DMD student
+solver preserves its checkpoint-specific stochastic eight-step geometry.
 """
 
 from __future__ import annotations
@@ -91,6 +92,23 @@ def _build_dpmpp_2m_solver(spec: PreviewSolverSpec) -> Any:
     from mirai.core.inference.solvers.dpmpp import FlowDPMSolverMultistep
 
     solver = FlowDPMSolverMultistep(
+        num_train_timesteps=int(spec.num_train_timesteps),
+        shift=float(spec.flow_shift),
+    )
+    solver.set_timesteps(
+        int(spec.num_inference_steps),
+        device=str(spec.device),
+        shift=float(spec.flow_shift),
+    )
+    return solver
+
+
+@register_preview_solver("dmd_student")
+def _build_dmd_student_solver(spec: PreviewSolverSpec) -> Any:
+    """Construct the fixed LingBot DMD student sampler."""
+    from mirai.core.inference.solvers.dmd import DMDStudentSolver
+
+    solver = DMDStudentSolver(
         num_train_timesteps=int(spec.num_train_timesteps),
         shift=float(spec.flow_shift),
     )

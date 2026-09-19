@@ -308,5 +308,151 @@ class DPMSolverPlusPlusTests(unittest.TestCase):
         self.assertLess(dpmpp_error, euler_error)
 
 
+@unittest.skipIf(torch is None, "torch not installed")
+class DMDStudentSolverTests(unittest.TestCase):
+    @staticmethod
+    def _solver():
+        return resolve_preview_solver(
+            "dmd_student",
+            PreviewSolverSpec(
+                num_inference_steps=8,
+                flow_shift=3.0,
+                device="cpu",
+            ),
+        )
+
+    def test_registered_with_exact_reference_schedule(self) -> None:
+        from mirai.core.inference.solvers.dmd import DMDStudentSolver
+
+        solver = self._solver()
+        self.assertIsInstance(solver, DMDStudentSolver)
+        expected = torch.tensor(
+            [
+                0.99999899,
+                0.95459503,
+                0.90011996,
+                0.83355546,
+                0.75037479,
+                0.64346898,
+                0.50099897,
+                0.30167764,
+            ],
+            dtype=torch.float32,
+        )
+        self.assertTrue(torch.equal(solver.timesteps, expected))
+        self.assertEqual(float(solver._sigmas[-1]), 0.0)
+
+    def test_rejects_off_distribution_step_count_and_shift(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly 8 steps"):
+            resolve_preview_solver(
+                "dmd_student",
+                PreviewSolverSpec(
+                    num_inference_steps=7,
+                    flow_shift=3.0,
+                    device="cpu",
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "flow shift 3.0"):
+            resolve_preview_solver(
+                "dmd_student",
+                PreviewSolverSpec(
+                    num_inference_steps=8,
+                    flow_shift=2.0,
+                    device="cpu",
+                ),
+            )
+
+    def test_transition_matches_reference_equations_and_branch_gate(self) -> None:
+        solver = self._solver()
+        generator = torch.Generator(device="cpu").manual_seed(19)
+        reference_generator = torch.Generator(device="cpu").manual_seed(19)
+        sample = torch.tensor([0.25, -1.0, 2.5], dtype=torch.float16)
+        velocity = torch.tensor([-0.5, 0.75, 1.25], dtype=torch.float16)
+
+        sigma, sigma_next = solver._sigmas[:2]
+        signal, noise = 1.0 - sigma, sigma
+        signal_next, noise_next = 1.0 - sigma_next, sigma_next
+        normalizer = 1.0 / torch.sqrt(signal**2 + noise**2)
+        normalizer_next = 1.0 / torch.sqrt(signal_next**2 + noise_next**2)
+        ratio_sq = (
+            (signal * normalizer)
+            / (signal_next * normalizer_next + 1.0e-8)
+        ) ** 2
+        std = torch.minimum(
+            (noise_next * normalizer_next)
+            / (noise * normalizer + 1.0e-8)
+            * (1.0 - ratio_sq).clamp(min=0.0).sqrt()
+            / (normalizer_next + 1.0e-8),
+            noise_next,
+        )
+        latent_f, velocity_f = sample.float(), velocity.float()
+        clean = latent_f - sigma * velocity_f
+        noise_direction = latent_f + (1.0 - sigma) * velocity_f
+        expected = (
+            clean * (1.0 - sigma_next)
+            + noise_direction * torch.sqrt(sigma_next.square() - std.square())
+            + std
+            * torch.randn(
+                velocity.shape,
+                generator=reference_generator,
+                dtype=torch.float32,
+            )
+        )
+        actual = solver.step(
+            velocity,
+            solver.timesteps[0],
+            sample,
+            generator=generator,
+        ).prev_sample
+        self.assertEqual(actual.dtype, torch.float32)
+        self.assertTrue(torch.equal(actual, expected))
+
+        # Advance through the remaining stochastic region. Sigma 0.30167764 is
+        # below the 0.5 gate, so the final landing must not consume RNG.
+        current = actual
+        for index in range(1, 7):
+            current = solver.step(
+                velocity,
+                solver.timesteps[index],
+                current,
+                generator=generator,
+            ).prev_sample
+        before_final = generator.get_state()
+        sigma = solver._sigmas[7]
+        expected_final = current.float() + velocity.float() * (0.0 - sigma)
+        actual_final = solver.step(
+            velocity,
+            solver.timesteps[7],
+            current,
+            generator=generator,
+        ).prev_sample
+        self.assertTrue(torch.equal(actual_final, expected_final))
+        self.assertTrue(torch.equal(before_final, generator.get_state()))
+
+    def test_supplied_generator_is_reproducible_and_global_rng_isolated(self) -> None:
+        def trajectory(seed: int) -> torch.Tensor:
+            solver = self._solver()
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+            value = torch.linspace(-1.0, 1.0, 9)
+            velocity = torch.linspace(0.5, -0.5, 9)
+            for timestep in solver.timesteps:
+                value = solver.step(
+                    velocity,
+                    timestep,
+                    value,
+                    generator=generator,
+                ).prev_sample
+            return value
+
+        before = torch.random.get_rng_state()
+        first = trajectory(123)
+        after = torch.random.get_rng_state()
+        second = trajectory(123)
+        different = trajectory(124)
+        self.assertTrue(torch.equal(before, after))
+        self.assertTrue(torch.equal(first, second))
+        self.assertFalse(torch.equal(first, different))
+
+
 if __name__ == "__main__":
     unittest.main()

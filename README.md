@@ -214,7 +214,8 @@ configuration and compatibility rules are documented in
   [(paper)](https://arxiv.org/abs/2312.02696)
   [(repo)](https://github.com/NVlabs/edm2)
 - **LoRA interchange** — Kohya, Diffusers, LyCORIS, and ComfyUI layouts.
-- **Inference solvers** — Native Euler, Flow-UniPC, and DPM++ 2M.
+- **Inference solvers** — Native Euler, Flow-UniPC, DPM++ 2M, and
+  checkpoint-bound stochastic few-step sampling where declared by a provider.
 - **Classifier-free guidance** — Sequential execution and a capability-gated
   batched path with explicit variable-length prefix masks.
 - **Batch inference sessions** — Per-request negative prompts, seeds, FPS, and

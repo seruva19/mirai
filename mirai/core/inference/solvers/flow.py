@@ -86,8 +86,11 @@ class EulerFlowSolver:
         model_output: torch.Tensor,
         timestep: torch.Tensor | float,
         sample: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
     ) -> SolverOutput:
         """One Euler step: x_{t-dt} = x_t - v * dt."""
+        _ = generator
         idx = self._step_index
         sigmas = self.timesteps
         if idx + 1 < len(sigmas):
@@ -320,8 +323,11 @@ class FlowUniPCMultistepSolver:
         model_output: torch.Tensor,
         timestep: torch.Tensor | float,
         sample: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
     ) -> SolverOutput:
         """One UniPC predictor-corrector step; advances ``self._step_index``."""
+        _ = generator
         idx = self._step_index
         orig_dtype = sample.dtype
         # UniPC's finite differences are ill-conditioned in low precision; run
