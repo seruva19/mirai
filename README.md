@@ -108,11 +108,14 @@ configuration and compatibility rules are documented in
   for fixed-task training and curriculum-selected homogeneous microbatches.
 - **Progressive video curriculum** — Step-keyed resolution and frame stages can
   change the deterministic T2I:T2V:I2V sampling ratio. Every active task pool is
-  validated before training; task selection derives from the restored step and
-  RNG state, and dynamic flow shifting recomputes from each selected latent
-  shape. [(paper)](https://arxiv.org/abs/2412.03603)
+  validated before training; task selection derives from the seed and global
+  microbatch index, and dynamic flow shifting recomputes from each selected
+  latent shape. An experimental default-off mode can instead schedule tagged
+  data pools, including physics/general mixtures, while validating every active
+  pool before training. [(paper)](https://arxiv.org/abs/2412.03603)
   [(paper)](https://arxiv.org/abs/2511.18870)
   [(paper)](https://arxiv.org/abs/2502.10248)
+  [(paper)](https://arxiv.org/abs/2609.18430)
 - **Training objectives** — Flow matching, regression, and opt-in recursive
   full-trajectory flow matching for saliency-guided MoE routing.
 - **Contrastive flow matching** — Opt-in in-batch negative-flow repulsion with

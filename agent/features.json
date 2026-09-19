@@ -3696,7 +3696,7 @@
       "reference_path": "mirai/core/training/data/curriculum.py",
       "readme_claim": "Progressive video curriculum",
       "readme_claims": [],
-      "provenance": "https://arxiv.org/abs/2511.18870",
+      "provenance": "https://arxiv.org/abs/2511.18870; https://arxiv.org/abs/2609.18430",
       "promotion_evidence": ""
     },
     {

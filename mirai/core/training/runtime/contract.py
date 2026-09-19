@@ -102,6 +102,23 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
             "strategy.type='multi_task_video' requires an enabled "
             "training.curriculum.task_mix_schedule.",
         )
+        _check(
+            not curriculum.uses_pool_mix or not curriculum.uses_task_mix,
+            "training.curriculum.pool_mix_schedule cannot be combined with "
+            "task_mix_schedule.",
+        )
+        _check(
+            not curriculum.uses_pool_mix
+            or str(config.strategy.type).strip().lower() != "multi_task_video",
+            "training.curriculum.pool_mix_schedule cannot be combined with "
+            "strategy.type='multi_task_video'.",
+        )
+        _check(
+            not curriculum.uses_pool_mix
+            or str(config.dataset.caption_format).strip().lower() == "raw",
+            "training.curriculum.pool_mix_schedule requires "
+            "dataset.caption_format='raw'.",
+        )
 
     routing_mode = str(config.model.params.moe_routing_mode).strip().lower()
     if routing_mode == "expert_choice":

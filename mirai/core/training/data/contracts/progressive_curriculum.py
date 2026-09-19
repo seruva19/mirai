@@ -81,6 +81,106 @@ def test_task_choice_is_stateless_and_resume_exact() -> None:
     ]
     assert first == replay
     assert {"text_to_video", "image_to_video"} <= set(first)
+    assert first[:8] == [
+        "image_to_video",
+        "text_to_video",
+        "text_to_video",
+        "text_to_video",
+        "image_to_video",
+        "text_to_video",
+        "text_to_video",
+        "text_to_video",
+    ]
+
+
+def test_pool_choice_is_stateless_and_uses_a_distinct_salt() -> None:
+    curriculum = CurriculumSchedule.from_config(
+        {
+            "enabled": True,
+            "pool_metadata_key": "training_pool",
+            "pool_mix_schedule": {"0": {"general": 1, "physics": 1}},
+        }
+    )
+    choices = [
+        curriculum.select_pool(step=0, seed=29, global_batch_index=index)
+        for index in range(64)
+    ]
+    assert choices == [
+        curriculum.select_pool(step=0, seed=29, global_batch_index=index)
+        for index in range(64)
+    ]
+    assert {"general", "physics"} <= set(choices)
+    task_curriculum = CurriculumSchedule.from_config(
+        {
+            "enabled": True,
+            "task_mix_schedule": {
+                "0": {"text_to_video": 1, "image_to_video": 1}
+            },
+        }
+    )
+    assert choices != [
+        task_curriculum.select_task(step=0, seed=29, global_batch_index=index)
+        for index in range(64)
+    ]
+
+    records = [
+        {**_record("general", "text_to_video", 512, 17), "metadata": {"training_pool": "general"}},
+        {**_record("physics", "text_to_video", 512, 17), "metadata": {"training_pool": "physics"}},
+    ]
+    selected, selected_task = curriculum.filter_records_for_batch(
+        records,
+        step=0,
+        seed=29,
+        global_batch_index=0,
+    )
+    assert selected_task is None
+    assert len(selected) == 1
+    assert selected[0]["metadata"]["training_pool"] == choices[0]
+
+
+def test_pool_mix_validates_metadata_and_active_stage_pools() -> None:
+    curriculum = CurriculumSchedule.from_config(
+        {
+            "enabled": True,
+            "resolution_schedule": {"0": "256x256", "10": "512x512"},
+            "pool_metadata_key": "training_pool",
+            "pool_mix_schedule": {
+                "0": {"general": 1},
+                "10": {"general": 1, "physics": 1},
+            },
+        }
+    )
+    missing_tag = [_record("untagged", "text_to_video", 256, 17)]
+    with pytest.raises(ValueError, match="non-empty metadata 'training_pool'"):
+        curriculum.validate_records(missing_tag)
+
+    records = [
+        {**_record("general-256", "text_to_video", 256, 17), "metadata": {"training_pool": "general"}},
+        {**_record("general-512", "text_to_video", 512, 17), "metadata": {"training_pool": "general"}},
+        {**_record("physics-256", "text_to_video", 256, 17), "metadata": {"training_pool": "physics"}},
+    ]
+    with pytest.raises(ValueError, match="pool 'physics'"):
+        curriculum.validate_records(records)
+
+
+def test_disabled_pool_mix_preserves_record_identity() -> None:
+    curriculum = CurriculumSchedule.from_config(
+        {
+            "enabled": False,
+            "pool_metadata_key": "training_pool",
+            "pool_mix_schedule": {"0": {"physics": 1}},
+        }
+    )
+    records = [_record("untagged", "text_to_video", 512, 17)]
+    selected, task = curriculum.filter_records_for_batch(
+        records,
+        step=0,
+        seed=1,
+        global_batch_index=0,
+    )
+    assert selected is records
+    assert task is None
+    curriculum.validate_records(records)
 
 
 def test_positive_weight_without_eligible_records_fails_before_training() -> None:
@@ -216,6 +316,40 @@ def test_cache_copies_required_training_task_from_registration(tmp_path) -> None
     assert payload["records"][0]["metadata"]["training_task"] == "text_to_video"
 
 
+def test_cache_preserves_pool_metadata_and_declares_lineage(tmp_path) -> None:
+    data_dir = tmp_path / "pool-data"
+    data_dir.mkdir()
+    torch.save(torch.tensor([0.1]), data_dir / "sample.pt")
+    (data_dir / "sample.txt").write_text("caption", encoding="utf-8")
+    registration_path = data_dir / "registration.json"
+    registration = register_dataset(
+        dataset_path=data_dir,
+        output_path=registration_path,
+        split_seed=1,
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        compliance_enabled=False,
+        usage_mode="internal",
+    )
+    registration["samples"][0]["training_pool"] = "physics"
+    registration_path.write_text(json.dumps(registration), encoding="utf-8")
+
+    cache_path = tmp_path / "cache.pt"
+    first = build_cache(
+        data_dir,
+        cache_path,
+        required_registration_metadata_keys=("training_pool",),
+    )
+    second = build_cache(
+        data_dir,
+        cache_path,
+        required_registration_metadata_keys=("training_pool",),
+    )
+    assert first["required_registration_metadata_keys"] == ["training_pool"]
+    assert second["records"][0]["metadata"]["training_pool"] == "physics"
+
+
 class _RecordSelectingPolicy:
     def __init__(self) -> None:
         self.seen_records: list[list[dict]] = []
@@ -276,6 +410,56 @@ def test_task_filter_composes_before_other_record_selection_policies() -> None:
     ] == ["text_to_video"]
 
 
+def test_pool_filter_composes_before_other_record_selection_policies() -> None:
+    curriculum = CurriculumSchedule.from_config(
+        {
+            "enabled": True,
+            "pool_metadata_key": "training_pool",
+            "pool_mix_schedule": {"0": {"general": 1, "physics": 1}},
+        }
+    )
+    records = [
+        {**_record("general", "text_to_video", 512, 17), "metadata": {"training_pool": "general"}},
+        {**_record("physics", "text_to_video", 512, 17), "metadata": {"training_pool": "physics"}},
+    ]
+    policies = _RecordSelectingPolicy()
+    session = SimpleNamespace(
+        config=SimpleNamespace(
+            dataset=SimpleNamespace(
+                online_temporal_resampling=False,
+                online_tag_shuffle=False,
+                online_tag_shuffle_dropout=0.0,
+                online_tag_shuffle_keep_first_n_tags=1,
+            ),
+            training=SimpleNamespace(batch_size=1, masked_loss=False, seed=7),
+        ),
+        run_state=SimpleNamespace(global_step=0),
+        grad_accum=1,
+        curriculum=curriculum,
+        trainer=SimpleNamespace(training_policies=policies),
+        compute_device=torch.device("cpu"),
+        compute_dtype=torch.float32,
+        rng=random.Random(7),
+    )
+    context = StepSamplingContext(
+        curriculum_profile=curriculum.profile_for_step(0),
+        eligible_records=records,
+        temporal_base_ids_step=[],
+        temporal_groups_step={},
+        epoch_index=0,
+    )
+    _build_training_batch_factory(session=session, sampling_context=context)(0)
+    selected_pool = curriculum.select_pool(
+        step=0,
+        seed=7,
+        global_batch_index=0,
+    )
+    assert [
+        record["metadata"]["training_pool"]
+        for record in policies.seen_records[0]
+    ] == [selected_pool]
+
+
 def test_runtime_contract_binds_task_mix_to_multi_task_strategy() -> None:
     config = TrainingConfig()
     config.training.curriculum = {
@@ -287,3 +471,27 @@ def test_runtime_contract_binds_task_mix_to_multi_task_strategy() -> None:
 
     config.strategy = StrategyConfig(type="multi_task_video")
     validate_training_runtime_config(config)
+
+
+def test_runtime_contract_restricts_pool_mix_surface() -> None:
+    config = TrainingConfig()
+    config.training.curriculum = {
+        "enabled": True,
+        "pool_metadata_key": "training_pool",
+        "pool_mix_schedule": {"0": {"physics": 1}},
+    }
+    validate_training_runtime_config(config)
+
+    config.dataset.caption_format = "lingbot_json"
+    with pytest.raises(ValueError, match="caption_format='raw'"):
+        validate_training_runtime_config(config)
+
+    config.dataset.caption_format = "raw"
+    config.strategy = StrategyConfig(type="multi_task_video")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        validate_training_runtime_config(config)
+
+    config.strategy = StrategyConfig(type="text_to_video")
+    config.training.curriculum["task_mix_schedule"] = {"0": {"text_to_video": 1}}
+    with pytest.raises(ValueError, match="cannot be combined"):
+        validate_training_runtime_config(config)

@@ -16,6 +16,7 @@ class CurriculumProfile:
     resolution: str | None = None
     frame_count: int | None = None
     task_weights: tuple[tuple[str, float], ...] = ()
+    pool_weights: tuple[tuple[str, float], ...] = ()
 
 
 def _parse_schedule(raw: Any, *, value_type: str) -> dict[int, Any]:
@@ -76,6 +77,45 @@ def _normalize_task_weights(raw: Any, *, step: int) -> tuple[tuple[str, float], 
     return tuple(weights)
 
 
+def _normalize_pool_weights(raw: Any, *, step: int) -> tuple[tuple[str, float], ...]:
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "Invalid curriculum pool-mix schedule at step "
+            f"{int(step)}: expected a pool-to-weight table."
+        )
+    weights: list[tuple[str, float]] = []
+    for raw_pool, raw_weight in sorted(raw.items(), key=lambda item: str(item[0])):
+        pool = str(raw_pool).strip()
+        if not pool:
+            raise ValueError(
+                "Invalid curriculum pool-mix schedule at step "
+                f"{int(step)}: pool names must be non-empty."
+            )
+        weight = float(raw_weight)
+        if weight < 0.0:
+            raise ValueError(
+                "Invalid curriculum pool-mix schedule at step "
+                f"{int(step)}: weight for '{pool}' must be >= 0."
+            )
+        if weight > 0.0:
+            weights.append((pool, weight))
+    if not weights:
+        raise ValueError(
+            "Invalid curriculum pool-mix schedule at step "
+            f"{int(step)}: at least one pool weight must be > 0."
+        )
+    return tuple(weights)
+
+
+def _record_metadata_value(record: Any, *, metadata_key: str) -> str:
+    value = record.get(metadata_key)
+    if value is None:
+        metadata = record.get("metadata", {})
+        if isinstance(metadata, dict):
+            value = metadata.get(metadata_key)
+    return str(value or "").strip()
+
+
 def record_training_task(
     record: Any,
     *,
@@ -83,12 +123,7 @@ def record_training_task(
 ) -> str:
     """Read one canonical training task from cache-record metadata."""
 
-    value = record.get(metadata_key)
-    if value is None:
-        metadata = record.get("metadata", {})
-        if isinstance(metadata, dict):
-            value = metadata.get(metadata_key)
-    task = str(value or "").strip().lower()
+    task = _record_metadata_value(record, metadata_key=metadata_key).lower()
     if task and task not in TRAINING_TASKS:
         raise ValueError(
             f"Record has unsupported curriculum task '{task}' in metadata "
@@ -126,11 +161,15 @@ class CurriculumSchedule:
         resolution_schedule: dict[int, str],
         frame_schedule: dict[int, int],
         task_mix_schedule: dict[int, tuple[tuple[str, float], ...]],
+        pool_metadata_key: str,
+        pool_mix_schedule: dict[int, tuple[tuple[str, float], ...]],
     ):
         self.enabled = bool(enabled)
         self._resolution_schedule = dict(sorted(resolution_schedule.items()))
         self._frame_schedule = dict(sorted(frame_schedule.items()))
         self._task_mix_schedule = dict(sorted(task_mix_schedule.items()))
+        self.pool_metadata_key = str(pool_metadata_key).strip()
+        self._pool_mix_schedule = dict(sorted(pool_mix_schedule.items()))
         self.task_metadata_key = TRAINING_TASK_METADATA_KEY
 
     @classmethod
@@ -141,6 +180,8 @@ class CurriculumSchedule:
             "resolution_schedule",
             "frame_schedule",
             "task_mix_schedule",
+            "pool_metadata_key",
+            "pool_mix_schedule",
         }
         unknown = sorted(str(key) for key in payload if str(key) not in allowed)
         if unknown:
@@ -162,6 +203,16 @@ class CurriculumSchedule:
             payload.get("task_mix_schedule", {}),
             value_type="task-mix",
         )
+        pool_mix_raw = _parse_schedule(
+            payload.get("pool_mix_schedule", {}),
+            value_type="pool-mix",
+        )
+        pool_metadata_key = str(payload.get("pool_metadata_key", "")).strip()
+        if pool_mix_raw and not pool_metadata_key:
+            raise ValueError(
+                "training.curriculum.pool_metadata_key must be non-empty when "
+                "pool_mix_schedule is configured."
+            )
         resolution_schedule = {
             int(step): str(value)
             for step, value in resolution_raw.items()
@@ -176,11 +227,17 @@ class CurriculumSchedule:
             int(step): _normalize_task_weights(value, step=int(step))
             for step, value in task_mix_raw.items()
         }
+        pool_mix_schedule = {
+            int(step): _normalize_pool_weights(value, step=int(step))
+            for step, value in pool_mix_raw.items()
+        }
         return cls(
             enabled=enabled,
             resolution_schedule=resolution_schedule,
             frame_schedule=frame_schedule,
             task_mix_schedule=task_mix_schedule,
+            pool_metadata_key=pool_metadata_key,
+            pool_mix_schedule=pool_mix_schedule,
         )
 
     def profile_for_step(self, step: int) -> CurriculumProfile:
@@ -189,6 +246,7 @@ class CurriculumSchedule:
         current_resolution: str | None = None
         current_frames: int | None = None
         current_task_weights: tuple[tuple[str, float], ...] = ()
+        current_pool_weights: tuple[tuple[str, float], ...] = ()
         for start_step, resolution in self._resolution_schedule.items():
             if int(step) >= int(start_step):
                 current_resolution = str(resolution)
@@ -198,15 +256,47 @@ class CurriculumSchedule:
         for start_step, task_weights in self._task_mix_schedule.items():
             if int(step) >= int(start_step):
                 current_task_weights = tuple(task_weights)
+        for start_step, pool_weights in self._pool_mix_schedule.items():
+            if int(step) >= int(start_step):
+                current_pool_weights = tuple(pool_weights)
         return CurriculumProfile(
             resolution=current_resolution,
             frame_count=current_frames,
             task_weights=current_task_weights,
+            pool_weights=current_pool_weights,
         )
 
     @property
     def uses_task_mix(self) -> bool:
         return bool(self.enabled and self._task_mix_schedule)
+
+    @property
+    def uses_pool_mix(self) -> bool:
+        return bool(self.enabled and self._pool_mix_schedule)
+
+    @staticmethod
+    def _select_weighted(
+        weights: tuple[tuple[str, float], ...],
+        *,
+        seed: int,
+        global_batch_index: int,
+        salt: str = "",
+    ) -> str | None:
+        if not weights:
+            return None
+        selection_key = f"{int(seed)}:{int(global_batch_index)}"
+        if salt:
+            selection_key = f"{salt}:{selection_key}"
+        digest = hashlib.blake2b(selection_key.encode("utf-8"), digest_size=8).digest()
+        unit = int.from_bytes(digest, "little") / float(2**64)
+        total = sum(weight for _, weight in weights)
+        target = unit * total
+        cumulative = 0.0
+        for name, weight in weights:
+            cumulative += weight
+            if target < cumulative:
+                return name
+        return weights[-1][0]
 
     def select_task(
         self,
@@ -218,21 +308,25 @@ class CurriculumSchedule:
         """Choose one task deterministically for a homogeneous microbatch."""
 
         weights = self.profile_for_step(step).task_weights
-        if not weights:
-            return None
-        digest = hashlib.blake2b(
-            f"{int(seed)}:{int(global_batch_index)}".encode("utf-8"),
-            digest_size=8,
-        ).digest()
-        unit = int.from_bytes(digest, "little") / float(2**64)
-        total = sum(weight for _, weight in weights)
-        target = unit * total
-        cumulative = 0.0
-        for task, weight in weights:
-            cumulative += weight
-            if target < cumulative:
-                return task
-        return weights[-1][0]
+        return self._select_weighted(
+            weights,
+            seed=seed,
+            global_batch_index=global_batch_index,
+        )
+
+    def select_pool(
+        self,
+        *,
+        step: int,
+        seed: int,
+        global_batch_index: int,
+    ) -> str | None:
+        return self._select_weighted(
+            self.profile_for_step(step).pool_weights,
+            seed=seed,
+            global_batch_index=global_batch_index,
+            salt="curriculum-pool-v1",
+        )
 
     def filter_records_for_batch(
         self,
@@ -242,6 +336,27 @@ class CurriculumSchedule:
         seed: int,
         global_batch_index: int,
     ) -> tuple[list[dict[str, Any]], str | None]:
+        pool = self.select_pool(
+            step=step,
+            seed=seed,
+            global_batch_index=global_batch_index,
+        )
+        if pool is not None:
+            records = [
+                record
+                for record in records
+                if _record_metadata_value(
+                    record,
+                    metadata_key=self.pool_metadata_key,
+                )
+                == pool
+            ]
+            if not records:
+                raise ValueError(
+                    "Curriculum pool mix selected "
+                    f"'{pool}' at step {int(step)}, but the active stage has no "
+                    f"matching records in metadata key '{self.pool_metadata_key}'."
+                )
         task = self.select_task(
             step=step,
             seed=seed,
@@ -269,17 +384,42 @@ class CurriculumSchedule:
     def validate_records(self, records: list[dict[str, Any]]) -> None:
         """Fail before training when any configured stage/task pool is unusable."""
 
-        if not self.uses_task_mix:
+        if not self.uses_task_mix and not self.uses_pool_mix:
             return
         transition_steps = sorted(
             {
                 *self._resolution_schedule,
                 *self._frame_schedule,
                 *self._task_mix_schedule,
+                *self._pool_mix_schedule,
             }
         )
         for step in transition_steps:
             stage_records = self.filter_records(records, step=step)
+            if self.uses_pool_mix:
+                for record in records:
+                    if not _record_metadata_value(
+                        record,
+                        metadata_key=self.pool_metadata_key,
+                    ):
+                        raise ValueError(
+                            "Every curriculum pool-mix record must have non-empty "
+                            f"metadata '{self.pool_metadata_key}'."
+                        )
+                for pool, _weight in self.profile_for_step(step).pool_weights:
+                    if not any(
+                        _record_metadata_value(
+                            record,
+                            metadata_key=self.pool_metadata_key,
+                        )
+                        == pool
+                        for record in stage_records
+                    ):
+                        raise ValueError(
+                            "Curriculum stage at step "
+                            f"{int(step)} assigns positive weight to pool '{pool}', "
+                            "but no matching records remain after the stage filters."
+                        )
             for task, _weight in self.profile_for_step(step).task_weights:
                 task_records = [
                     record

@@ -271,6 +271,12 @@ def build_cache_from_config(cfg: Any) -> dict[str, Any]:
         curriculum_payload.get("enabled", False)
         and curriculum_payload.get("task_mix_schedule")
     )
+    curriculum_pool_metadata_key = (
+        str(curriculum_payload.get("pool_metadata_key", "")).strip()
+        if curriculum_payload.get("enabled", False)
+        and curriculum_payload.get("pool_mix_schedule")
+        else ""
+    )
     return build_cache(
         cfg.dataset.path,
         cfg.dataset.cache_path,
@@ -302,10 +308,17 @@ def build_cache_from_config(cfg: Any) -> dict[str, Any]:
             cfg.dataset.moe_routing.domain_metadata_key
         ).strip(),
         required_registration_metadata_keys=(
-            ("training_task",)
-            if curriculum_task_mix_enabled
-            or str(cfg.strategy.type).strip().lower() == "multi_task_video"
-            else ()
+            tuple(
+                key
+                for key in (
+                    "training_task"
+                    if curriculum_task_mix_enabled
+                    or str(cfg.strategy.type).strip().lower() == "multi_task_video"
+                    else "",
+                    curriculum_pool_metadata_key,
+                )
+                if key
+            )
         ),
     )
 
@@ -1148,6 +1161,13 @@ def build_cache(
             "partial_recovery": bool(partial_recovery),
             "recovered_records": int(recovered_count),
             "dataset_registration_present": bool(resolved_registration_path is not None),
+            "required_registration_metadata_keys": sorted(
+                {
+                    str(key).strip()
+                    for key in required_registration_metadata_keys
+                    if str(key).strip()
+                }
+            ),
             "dataset_registration_path": (
                 str(resolved_registration_path) if resolved_registration_path is not None else ""
             ),
@@ -1229,6 +1249,9 @@ def build_cache(
                             payload.get("model_component_label", "")
                         ),
                         "denoiser_subfolder": str(payload.get("denoiser_subfolder", "")),
+                        "required_registration_metadata_keys": list(
+                            payload.get("required_registration_metadata_keys", [])
+                        ),
                     },
                 )
             except ModuleNotFoundError:

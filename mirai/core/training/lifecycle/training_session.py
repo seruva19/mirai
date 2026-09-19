@@ -188,6 +188,21 @@ def create_training_session(
                 "strategy.type='multi_task_video' requires an enabled "
                 "training.curriculum.task_mix_schedule."
             )
+        if curriculum.uses_pool_mix and curriculum.uses_task_mix:
+            raise ValueError(
+                "training.curriculum.pool_mix_schedule cannot be combined with "
+                "task_mix_schedule."
+            )
+        if curriculum.uses_pool_mix and config.strategy.type == "multi_task_video":
+            raise ValueError(
+                "training.curriculum.pool_mix_schedule cannot be combined with "
+                "strategy.type='multi_task_video'."
+            )
+        if curriculum.uses_pool_mix and config.dataset.caption_format != "raw":
+            raise ValueError(
+                "training.curriculum.pool_mix_schedule requires "
+                "dataset.caption_format='raw'."
+            )
         curriculum.validate_records(prepared_data.train_records)
     except ValueError as exc:
         raise SystemExit(str(exc))
