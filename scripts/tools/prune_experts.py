@@ -170,6 +170,18 @@ def prune_packed_base(
     from safetensors.torch import save_file
 
     _require_prune_gate(config)
+    criterion = normalize_expert_pruning_criterion(
+        config.model.params.expert_pruning_criterion
+    )
+    if criterion == "diet":
+        if calibration_file is None or score_threshold is not None:
+            raise ValueError("DIET requires --calibration and --keep-fraction; score thresholds are unsupported.")
+        from scripts.tools.prune_diet import prune_diet_packed_base
+
+        return prune_diet_packed_base(
+            config, packed_state=packed_state, calibration_file=calibration_file,
+            output=output, keep_fraction=keep_fraction, min_keep=min_keep,
+        )
     top_k = int(config.model.params.experts_per_token)
 
     packed_path = Path(packed_state)

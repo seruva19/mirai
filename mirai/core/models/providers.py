@@ -13,7 +13,10 @@ if TYPE_CHECKING:
     from mirai.config.schema import TrainingConfig
     from mirai.core.moe.calibration.esft import ESFTCalibrationTarget
     from mirai.core.moe.calibration.flexmoe import FlexMoECalibrationTarget
-    from mirai.core.moe.calibration.pruning import ExpertPruningCalibrationTarget
+    from mirai.core.moe.calibration.pruning import (
+        DietCalibrationTarget,
+        ExpertPruningCalibrationTarget,
+    )
     from mirai.core.moe.calibration.projection import PrototypeCalibrationTarget
     from mirai.core.moe.calibration.quantization import QuantizationCalibrationTarget
     from mirai.core.moe.calibration.router_quantization import (
@@ -505,6 +508,12 @@ class ModelFamilyProvider:
         self,
         pipeline: Any,
     ) -> dict[str, "ExpertPruningCalibrationTarget"]:
+        _ = pipeline
+        return {}
+
+    def build_diet_calibration_targets(
+        self, pipeline: Any
+    ) -> dict[str, "DietCalibrationTarget"]:
         _ = pipeline
         return {}
 

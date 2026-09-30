@@ -16,6 +16,10 @@ import torch.distributed as dist
 from mirai.core.models.attention_backends import dispatch_varlen_attention
 from mirai.core.moe.routing.depth import attention_with_received_scores
 from mirai.core.moe.routing.depth import select_depth_tokens
+from mirai.core.moe.storage.deletion import (
+    ExpertDeletionPlan,
+    remap_deleted_expert_routes,
+)
 
 from .native_compat import ContextParallelInput, ContextParallelOutput
 from .native_compat import TimestepEmbedding, Timesteps
@@ -542,6 +546,7 @@ class LingBotVideoRouter(nn.Module):
         self._router_logit_extension = None
         self._route_score_extension = None
         self._router_distillation_extension = None
+        self._expert_deletion_plan = None
         self.training_router_distillation = None
         self.training_gradient_probabilities = None
         self._balance_gradient_ratio_capture = False
@@ -885,6 +890,52 @@ class LingBotVideoRouter(nn.Module):
         masked = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
         return masked
 
+    def configure_expert_deletion(self, plan: ExpertDeletionPlan | None) -> None:
+        if plan is not None:
+            plan.validate(
+                top_k=self.top_k,
+                n_group=self.n_group or 1,
+                group_score_topk=2,
+            )
+            if int(plan.logical_num_experts) != int(self.num_experts):
+                raise ValueError("DIET logical expert count does not match the router.")
+            if (
+                int(plan.top_k) != int(self.top_k)
+                or int(plan.n_group) != int(self.n_group or 1)
+                or int(plan.topk_group) != int(self.topk_group or 1)
+                or int(plan.group_score_topk) != 2
+                or bool(plan.norm_topk_prob) != bool(self.norm_topk_prob)
+                or float(plan.route_scale) != float(self.route_scale)
+            ):
+                raise ValueError("DIET topology does not match the native router.")
+        self._expert_deletion_plan = plan
+
+    def _mask_deleted_experts(self, scores):
+        plan = self._expert_deletion_plan
+        if plan is None:
+            return scores
+        keep = torch.zeros(self.num_experts, dtype=torch.bool, device=scores.device)
+        keep[list(plan.kept_logical_ids)] = True
+        return scores.masked_fill(~keep.unsqueeze(0), 0.0)
+
+    def _validate_expert_deletion_runtime(self) -> None:
+        if self._expert_deletion_plan is None:
+            return
+        incompatible = (
+            self._lightweight_expert_extension is not None
+            or self._expert_choice_extension is not None
+            or self._route_selection_extension is not None
+            or self._route_score_extension is not None
+            or self._router_logit_extension is not None
+            or self.decoupled_routing is not None
+            or bool(getattr(self, "_subset_size", 0))
+            or getattr(self, "_dataset_token_allowed", None) is not None
+        )
+        if incompatible:
+            raise RuntimeError(
+                "DIET expert deletion supports only baseline native token-choice routing."
+            )
+
     def _group_limited_topk(self, scores_for_choice):
         masked = self._group_limited_choice_scores(scores_for_choice)
         return torch.topk(masked, k=self.top_k, dim=-1, sorted=False)[1]
@@ -967,6 +1018,7 @@ class LingBotVideoRouter(nn.Module):
         valid_token_mask: Optional[torch.Tensor] = None,
         route_scope_mask: Optional[torch.Tensor] = None,
     ):
+        self._validate_expert_deletion_runtime()
         if not self.training:
             self.training_gradient_probabilities = None
         if _infer_bf16_fastmath(self, self.training):
@@ -1003,7 +1055,16 @@ class LingBotVideoRouter(nn.Module):
             scores = F.softmax(routed_logits, dim=-1)
         else:
             scores = routed_logits.sigmoid()
+        scores = self._mask_deleted_experts(scores)
         scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        if self._expert_deletion_plan is not None:
+            keep = torch.zeros(
+                self.num_experts, dtype=torch.bool, device=scores_for_choice.device
+            )
+            keep[list(self._expert_deletion_plan.kept_logical_ids)] = True
+            scores_for_choice = scores_for_choice.masked_fill(
+                ~keep.unsqueeze(0), torch.finfo(scores_for_choice.dtype).min
+            )
         # Stochastic per-step expert-subset routing (opt-in). Mask the router
         # scores to the sampled subset so tokens re-route within it; when active
         # we use plain masked top-k (bypassing group-limiting, which is a
@@ -1114,6 +1175,7 @@ class LingBotVideoRouter(nn.Module):
                 unbiased_scores = F.softmax(score_logits, dim=-1)
             else:
                 unbiased_scores = score_logits.sigmoid()
+            unbiased_scores = self._mask_deleted_experts(unbiased_scores)
             unbiased_top_indices = torch.topk(
                 unbiased_scores, k=self.top_k, dim=-1, sorted=False
             )[1]
@@ -1136,6 +1198,7 @@ class LingBotVideoGroupedExperts(nn.Module):
     """Weight layout matches GroupedExperts: w1 [E,I,H], w2 [E,H,I], w3 [E,I,H]. Eager per-expert compute."""
 
     mirai_expert_tensor_host = True
+    manages_logical_expert_routes = False
 
     def __init__(self, num_experts, hidden_size, intermediate_size):
         super().__init__()
@@ -1144,6 +1207,21 @@ class LingBotVideoGroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
         self.w3 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
         self._mirai_linear_extension = None
+        self._expert_deletion_plan = None
+
+    def configure_expert_deletion(self, plan):
+        if plan is not None:
+            plan.validate()
+            if int(plan.physical_num_experts) != int(self.num_experts):
+                raise ValueError("DIET physical expert count does not match experts.")
+        self._expert_deletion_plan = plan
+
+    def remap_logical_routes(self, top_indices):
+        if self._expert_deletion_plan is None:
+            return top_indices
+        return remap_deleted_expert_routes(
+            top_indices, self._expert_deletion_plan.logical_to_physical
+        )
 
     def set_linear_extension(self, extension):
         """Install a non-owning expert-linear executor supplied by the provider."""
@@ -1196,6 +1274,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         self._mirai_adjugate_expert_extension = None
         self._mirai_moe_kernel_backend = None
         self._mirai_token_chunk_policy = None
+        self._diet_capture_observer = None
         self.chain_of_experts = None
         if n_shared_experts is not None and n_shared_experts > 0:
             self.shared_experts = LingBotVideoMLP(
@@ -1253,6 +1332,88 @@ class LingBotVideoSparseMoeBlock(nn.Module):
 
     def get_expert_output_observer(self):
         return self._mirai_expert_output_observer
+
+    def set_diet_capture_observer(self, observer):
+        if observer is not None and not callable(
+            getattr(observer, "sample_token_indices", None)
+        ):
+            raise TypeError("DIET capture observer must expose sample_token_indices().")
+        if observer is not None and not callable(getattr(observer, "capture_layer", None)):
+            raise TypeError("DIET capture observer must expose capture_layer().")
+        if observer is not None:
+            router = self.router
+            incompatible = (
+                self.chain_of_experts is not None
+                or router._lightweight_expert_extension is not None
+                or router._expert_choice_extension is not None
+                or router._route_selection_extension is not None
+                or router._route_score_extension is not None
+                or router._router_logit_extension is not None
+                or router.decoupled_routing is not None
+                or bool(getattr(router, "_subset_size", 0))
+                or getattr(router, "_dataset_token_allowed", None) is not None
+            )
+            if incompatible:
+                raise RuntimeError(
+                    "DIET calibration supports only baseline native token-choice routing."
+                )
+        self._diet_capture_observer = observer
+
+    def get_diet_capture_observer(self):
+        return self._diet_capture_observer
+
+    def _capture_diet_layer(self, tokens, router_scores):
+        observer = self._diet_capture_observer
+        if observer is None:
+            return
+        rows = torch.as_tensor(
+            observer.sample_token_indices(tokens, layer_name="experts"),
+            device=tokens.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if rows.numel() == 0:
+            return
+        if int(rows.min().item()) < 0 or int(rows.max().item()) >= int(tokens.shape[0]):
+            raise ValueError("DIET sampled token index is out of range.")
+        sampled = tokens.index_select(0, rows)
+        evaluate_all = getattr(self.experts, "evaluate_all_experts", None)
+        if callable(evaluate_all):
+            expert_outputs = evaluate_all(sampled)
+        elif all(hasattr(self.experts, name) for name in ("w1", "w2", "w3")):
+            outputs = []
+            for expert_id in range(int(self.router.num_experts)):
+                gate = F.linear(sampled, self.experts.w1[expert_id])
+                up = F.linear(sampled, self.experts.w3[expert_id])
+                outputs.append(F.linear(F.silu(gate) * up, self.experts.w2[expert_id]))
+            expert_outputs = torch.stack(outputs, dim=1)
+        else:
+            raise RuntimeError("DIET calibration cannot evaluate this expert storage.")
+        shared_output = (
+            None
+            if self.shared_experts is None
+            else self.shared_experts(sampled).detach()
+        )
+        context = getattr(self, "_diet_parent_postprocess", None) or {}
+        residual_gate = context.get("residual_gate")
+        if residual_gate is not None:
+            residual_gate = residual_gate.reshape(-1, residual_gate.shape[-1]).index_select(0, rows)
+        observer.capture_layer(
+            tokens=sampled.detach(),
+            router_scores=router_scores.detach(),
+            choice_bias=self.router.e_score_correction_bias.detach(),
+            expert_outputs=expert_outputs.detach(),
+            sampled_token_indices=rows.detach(),
+            shared_output=shared_output,
+            residual=residual_gate,
+            rms_weight=context.get("rms_weight"),
+            epsilon=context.get("epsilon"),
+            top_k=int(self.router.top_k),
+            n_group=int(self.router.n_group or 1),
+            topk_group=int(self.router.topk_group or 1),
+            group_score_topk=2,
+            norm_topk_prob=bool(self.router.norm_topk_prob),
+            route_scale=float(self.router.route_scale),
+        )
 
     def _bind_expert_output_routes(
         self,
@@ -1704,8 +1865,8 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             torch.empty(0, device=tokens.device),
         )
         runner_config = LightSglangMoeRunnerConfig(
-            num_experts=self.num_experts,
-            num_local_experts=self.num_experts,
+            num_experts=int(self.experts.num_experts),
+            num_local_experts=int(self.experts.num_experts),
             activation="silu",
             is_gated=True,
             inplace=False,
@@ -1731,8 +1892,8 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             torch.empty(0, device=tokens.device),
         )
         runner_config = LightSglangMoeRunnerConfig(
-            num_experts=self.num_experts,
-            num_local_experts=self.num_experts,
+            num_experts=int(self.experts.num_experts),
+            num_local_experts=int(self.experts.num_experts),
             activation="silu",
             is_gated=True,
             inplace=False,
@@ -1758,6 +1919,26 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         drop_slots: Optional[bool] = None,
         token_offset: int = 0,
     ) -> torch.Tensor:
+        dispatch_num_experts = int(getattr(self.experts, "num_experts", self.router.num_experts))
+        routes_are_physical = not bool(
+            getattr(self.experts, "manages_logical_expert_routes", False)
+        )
+        if routes_are_physical:
+            remap = getattr(self.experts, "remap_logical_routes", None)
+            if callable(remap):
+                top_indices = remap(top_indices)
+
+        def ensure_physical_routes():
+            nonlocal routes_are_physical, top_scores, top_indices
+            if routes_are_physical:
+                return
+            remap = getattr(self.experts, "remap_routes_for_dispatch", None)
+            if not callable(remap):
+                raise RuntimeError(
+                    "Logical expert storage does not expose a dispatch remap."
+                )
+            top_scores, top_indices = remap(top_scores, top_indices)
+            routes_are_physical = True
         should_drop_slots = self.training if drop_slots is None else bool(drop_slots)
         if (
             self.training
@@ -1837,11 +2018,12 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             if bool(getattr(kernel_backend, "direct_only", False)):
                 kernel_backend = None
             else:
+                ensure_physical_routes()
                 routed = kernel_backend.route(
                     tokens,
                     top_scores,
                     top_indices,
-                    num_experts=self.router.num_experts,
+                    num_experts=dispatch_num_experts,
                 )
                 expert_output = kernel_backend.compute(
                     self.experts,
@@ -1861,6 +2043,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
                         top_k=int(top_k),
                     )
                 return kernel_backend.restore(expert_output, routed)
+        ensure_physical_routes()
         backend = _moe_expert_backend(self)
         prefers_for_loop = getattr(self.experts, "prefers_for_loop", None)
         if callable(prefers_for_loop) and bool(prefers_for_loop()):
@@ -1877,7 +2060,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
                 tokens,
                 top_scores,
                 top_indices,
-                self.router.num_experts,
+                dispatch_num_experts,
                 drop_slots=should_drop_slots,
             )
             expert_output = self._run_with_intermediate_capture(
@@ -1922,7 +2105,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
                 tokens,
                 top_scores,
                 top_indices,
-                self.router.num_experts,
+                dispatch_num_experts,
                 drop_slots=should_drop_slots,
             )
             expert_output = self._run_with_intermediate_capture(
@@ -2262,6 +2445,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
                 valid_token_mask=padding_mask,
                 route_scope_mask=route_scope_mask,
             )
+            self._capture_diet_layer(tokens, scores)
             del logits, scores, scores_for_choice
         else:
             decision = self.router.forward_expert_choice(
@@ -2387,6 +2571,8 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         saliency_router_input: Optional[torch.Tensor] = None,
     ):
         extension = self.chain_of_experts
+        if extension is not None and self.router._expert_deletion_plan is not None:
+            raise RuntimeError("DIET expert deletion does not support chain-of-experts routing.")
         if extension is None:
             return self._forward_once(
                 hidden_states,
@@ -2607,14 +2793,33 @@ class LingBotVideoBlock(nn.Module):
         ffn_router_input = self.norm2(x)
         ffn_in = (ffn_router_input * scale_mlp + shift_mlp).to(bulk_dtype)
         if isinstance(self.ffn, LingBotVideoSparseMoeBlock):
-            ffn_out = self.ffn(
-                ffn_in,
-                padding_mask=moe_padding_mask,
-                router_input=ffn_router_input.to(bulk_dtype),
-                timestep_router_input=router_timestep_input,
-                route_scope_mask=moe_route_scope_mask,
-                saliency_router_input=moe_saliency_states,
-            )
+            if self.ffn.get_diet_capture_observer() is None:
+                ffn_out = self.ffn(
+                    ffn_in,
+                    padding_mask=moe_padding_mask,
+                    router_input=ffn_router_input.to(bulk_dtype),
+                    timestep_router_input=router_timestep_input,
+                    route_scope_mask=moe_route_scope_mask,
+                    saliency_router_input=moe_saliency_states,
+                )
+            else:
+                previous_postprocess = getattr(self.ffn, "_diet_parent_postprocess", None)
+                self.ffn._diet_parent_postprocess = {
+                    "rms_weight": self.norm_post_ffn.weight,
+                    "epsilon": self.norm_post_ffn.eps,
+                    "residual_gate": gate_mlp.expand_as(ffn_in),
+                }
+                try:
+                    ffn_out = self.ffn(
+                        ffn_in,
+                        padding_mask=moe_padding_mask,
+                        router_input=ffn_router_input.to(bulk_dtype),
+                        timestep_router_input=router_timestep_input,
+                        route_scope_mask=moe_route_scope_mask,
+                        saliency_router_input=moe_saliency_states,
+                    )
+                finally:
+                    self.ffn._diet_parent_postprocess = previous_postprocess
         else:
             ffn_out = self.ffn(ffn_in)
         ffn_normed = self.norm_post_ffn(ffn_out)

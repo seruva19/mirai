@@ -2457,10 +2457,11 @@ class TrainingConfig:
             "man",
             "msan",
             "aimer",
+            "diet",
         }:
             raise ConfigError(
                 "model.params.expert_pruning_criterion must be frequency, "
-                "reap, man, msan, or aimer."
+                "reap, man, msan, aimer, or diet."
             )
         if str(_mp.expert_consolidation).strip().lower() not in {
             "off",

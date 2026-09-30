@@ -444,3 +444,53 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.inference_bf16_fastmath` | Enables the family-owned optional BF16 inference fast-math path. |
 | `dataset.caption_format` | `lingbot_json` resolves each training caption to the caption body the encoder consumes at cache time; structured captions are normalized rather than re-wrapped, and the caption schema is checked per caption. |
 | `inference.prompt_rewriter` | `lingbot_json` applies the same family-owned caption resolution and schema check to inference prompts. |
+
+## DIET expert pruning
+
+DIET is an experimental opt-in offline transform. Paired CFG deletion responses
+and cosine-distance ODL select survivors while retaining original router IDs
+and groups. Evaluate quality on held-out prompts before adopting a pruned base.
+
+Enable both settings:
+
+```toml
+[model.params]
+expert_pruning = "prune"
+expert_pruning_criterion = "diet"
+
+[memory]
+expert_weight_access = "active_dequant"
+```
+
+Select the source using `memory.frozen_weight_packed_state_path`. Supply a JSON
+calibration manifest with requests such as:
+
+```json
+[{"prompt":"A boat crossing a quiet lake", "negative_prompt":"",
+  "seed":42, "steps":20, "cfg_scale":3.0,
+  "frames":17, "height":256, "width":256}]
+```
+
+```bash
+python scripts/tools/calibrate_diet.py --config config.toml --manifest prompts.json --output diet.safetensors --samples-per-layer 32
+python scripts/tools/prune_diet.py --config config.toml --packed-state base.safetensors --calibration diet.safetensors --output diet-base.safetensors --keep-fraction 0.75
+```
+
+Alternatively, `--layer-counts counts.json` accepts exact module names mapped to
+retained counts. Counts must satisfy original group routing and top-k bounds.
+Evidence must cover every packed grouped-expert module and match the exact
+source fingerprint. Published masks are not automatically applied.
+
+`--samples-per-layer` is a total paired-row budget, distributed across every
+request and its denoising steps; it must be at least the number of requests.
+All requests in one artifact use the same finite CFG scale greater than one.
+Calibration uses the unmodified packed base and the GPU lease. Packed experts
+are evaluated one at a time on sampled rows; `active_dequant` avoids materializing
+the whole expert pool. DIET currently supports baseline native token-choice
+routing; combinations with other routing extensions fail explicitly.
+
+For training or inference, select the output through
+`memory.frozen_weight_packed_state_path` and keep both DIET settings enabled.
+Compressed DIET runtime requires `memory.expert_weight_access="active_dequant"`.
+Unsupported providers, transformed pools, and topology mismatches fail
+explicitly. Default settings preserve the original expert pool.

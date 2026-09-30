@@ -31,6 +31,7 @@ from mirai.core.moe.calibration.projection import (
     projection_block_experts,
 )
 from mirai.core.moe.runtime.specs import ExpertTensorSpec
+from mirai.core.moe.storage.deletion import build_expert_deletion_plan
 
 try:
     import torch
@@ -41,7 +42,7 @@ EXPERT_PRUNING_CALIBRATION_FORMAT = "mirai.moe.expert_pruning_calibration"
 EXPERT_PRUNING_CALIBRATION_SCHEMA_VERSION = 1
 EXPERT_PRUNING_CALIBRATION_METADATA_KEY = "mirai_expert_pruning_calibration"
 EXPERT_PRUNING_CALIBRATION_CRITERIA = ("frequency", "reap", "man", "msan")
-EXPERT_PRUNING_CRITERIA = (*EXPERT_PRUNING_CALIBRATION_CRITERIA, "aimer")
+EXPERT_PRUNING_CRITERIA = (*EXPERT_PRUNING_CALIBRATION_CRITERIA, "aimer", "diet")
 
 
 def normalize_expert_pruning_criterion(value: str) -> str:
@@ -91,6 +92,37 @@ class ExpertPruningCalibrationTarget:
                 "Expert-pruning calibration hosts must expose "
                 "get_expert_output_observer()."
             )
+        return self
+
+
+@dataclasses.dataclass(frozen=True)
+class DietCalibrationTarget:
+    """Provider-owned sampled all-expert capture host."""
+
+    name: str
+    host: Any
+    num_experts: int
+    top_k: int
+    n_group: int
+    topk_group: int
+    group_score_topk: int
+    norm_topk_prob: bool
+    route_scale: float
+
+    def validate(self) -> "DietCalibrationTarget":
+        if not self.name or int(self.num_experts) < 2:
+            raise ValueError("DIET target must name at least two experts.")
+        for method in ("set_diet_capture_observer", "get_diet_capture_observer"):
+            if not callable(getattr(self.host, method, None)):
+                raise TypeError(f"DIET calibration host must expose {method}().")
+        if not 1 <= int(self.top_k) <= int(self.num_experts):
+            raise ValueError("DIET target has invalid top_k.")
+        if int(self.n_group) < 1 or int(self.num_experts) % int(self.n_group):
+            raise ValueError("DIET target has invalid router groups.")
+        if not 1 <= int(self.topk_group) <= int(self.n_group):
+            raise ValueError("DIET target has invalid topk_group.")
+        if int(self.group_score_topk) < 1 or not math.isfinite(self.route_scale):
+            raise ValueError("DIET target has invalid group score or route scale.")
         return self
 
 
@@ -990,3 +1022,109 @@ def prune_packed_state(
                 break
 
     return new_tensors, new_manifest
+
+
+def compact_packed_state_for_diet(
+    tensors: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    keep_by_module: Mapping[str, Sequence[int]],
+    *,
+    topology_by_module: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Compact only expert tensors while preserving original router identities."""
+    if torch is None:  # pragma: no cover
+        raise RuntimeError("DIET expert compaction requires torch.")
+    import copy
+
+    modules = manifest.get("modules")
+    if not isinstance(modules, Mapping) or not modules:
+        raise ValueError("packed-state manifest must have a non-empty modules object.")
+    if set(keep_by_module) != set(topology_by_module):
+        raise ValueError("DIET requires topology metadata for every compacted module.")
+    output_manifest = copy.deepcopy(dict(manifest))
+    output_tensors = {str(key): value for key, value in tensors.items()}
+    for module_name, keep in keep_by_module.items():
+        spec = output_manifest["modules"].get(str(module_name))
+        if not isinstance(spec, dict) or str(spec.get("kind")) != "grouped_experts":
+            raise ValueError(f"DIET target {module_name!r} is not grouped_experts.")
+        if "logical_to_physical" in spec or spec.get("expert_deletion") is not None:
+            raise ValueError("DIET requires an unconsolidated, undeleted source artifact.")
+        if spec.get("physical_weight_provider") is not None:
+            raise ValueError("DIET does not rewrite physical-weight provider artifacts.")
+        old_num = int(spec.get("num_experts", 0))
+        normalized_keep = tuple(sorted(set(int(value) for value in keep)))
+        if normalized_keep == tuple(range(old_num)):
+            continue
+        topology = topology_by_module[module_name]
+        required_topology = {
+            "top_k", "num_groups", "topk_group", "group_score_topk",
+            "normalize_topk_prob", "route_scale", "expert_to_group",
+        }
+        missing_topology = required_topology - set(topology)
+        if missing_topology:
+            raise ValueError(
+                f"DIET topology for {module_name!r} is missing "
+                f"{sorted(missing_topology)}."
+            )
+        num_groups = int(topology["num_groups"])
+        if old_num % num_groups:
+            raise ValueError("DIET requires evenly divisible contiguous router groups.")
+        expected_groups = tuple(
+            expert // (old_num // num_groups) for expert in range(old_num)
+        )
+        declared_groups = tuple(int(value) for value in topology["expert_to_group"])
+        if declared_groups and declared_groups != expected_groups:
+            raise ValueError("DIET runtime supports only native contiguous router groups.")
+        plan = build_expert_deletion_plan(
+            old_num,
+            normalized_keep,
+            top_k=int(topology.get("top_k", 0)),
+            n_group=num_groups,
+            topk_group=int(topology.get("topk_group", 1)),
+            group_score_topk=int(topology.get("group_score_topk", 2)),
+            norm_topk_prob=bool(topology.get("normalize_topk_prob", False)),
+            route_scale=float(topology.get("route_scale", 0.0)),
+        )
+        index = torch.as_tensor(plan.kept_logical_ids, dtype=torch.long)
+        tensor_names = spec.get("tensors") or {}
+        if not isinstance(tensor_names, Mapping) or not tensor_names:
+            raise ValueError(f"DIET target {module_name!r} has no tensor map.")
+        for local_name, tensor_name in tensor_names.items():
+            key = str(tensor_name)
+            tensor = output_tensors[key]
+            if str(local_name).endswith(("_nf4_code", "_nf4_ncode", "_rotation")):
+                continue
+            if tensor.ndim < 1 or int(tensor.shape[0]) != old_num:
+                raise ValueError(
+                    f"Packed expert tensor {local_name!r} has no expert axis of "
+                    f"length {old_num}."
+                )
+            output_tensors[key] = tensor.index_select(0, index.to(tensor.device)).contiguous()
+        spec["num_experts"] = plan.physical_num_experts
+        shapes = spec.get("shapes")
+        if isinstance(shapes, dict):
+            for key, shape in list(shapes.items()):
+                updated = list(shape)
+                if updated:
+                    updated[0] = plan.physical_num_experts
+                shapes[key] = updated
+        spec["expert_deletion"] = plan.manifest_spec()
+    summary = output_manifest.get("summary")
+    if isinstance(summary, dict):
+        quantized_numel = 0
+        for spec in output_manifest["modules"].values():
+            if not isinstance(spec, Mapping):
+                continue
+            if str(spec.get("kind")) == "linear":
+                quantized_numel += int(spec.get("in_features", 0)) * int(
+                    spec.get("out_features", 0)
+                )
+            elif str(spec.get("kind")) == "grouped_experts":
+                shapes = spec.get("shapes") or {}
+                quantized_numel += sum(
+                    math.prod(int(dim) for dim in shape)
+                    for shape in shapes.values()
+                    if isinstance(shape, (list, tuple))
+                )
+        summary["quantized_numel"] = quantized_numel
+    return output_tensors, output_manifest

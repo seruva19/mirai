@@ -247,6 +247,8 @@ class PublicationContractTests(unittest.TestCase):
                 "calibrate_adaptive_lora_ranks.py",
                 "calibrate_expert_consolidation.py",
                 "calibrate_expert_pruning.py",
+                "calibrate_diet.py",
+                "prune_diet.py",
                 "calibrate_expert_precision.py",
                 "calibrate_expert_whitening.py",
                 "calibrate_flexmoe.py",

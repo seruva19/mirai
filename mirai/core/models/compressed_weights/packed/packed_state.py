@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from mirai.core.lineage import sha256_file
 from mirai.core.moe.storage.aliases import logical_to_physical_from_manifest_spec
+from mirai.core.moe.storage.deletion import expert_deletion_from_manifest_spec
 from mirai.core.moe.runtime.specs import (
     CANONICAL_PACKED_EXPERT_MLP_SPEC,
     normalize_expert_weight_access_policy,
@@ -129,6 +130,11 @@ def prepare_compressed_weights_modules_from_manifest(
                     aliases,
                     prototype_logical_ids=raw_spec.get("prototype_logical_ids"),
                 )
+            deletion = expert_deletion_from_manifest_spec(
+                raw_spec, physical_num_experts=replacement.num_experts
+            )
+            if deletion is not None:
+                replacement.configure_expert_deletion(deletion)
             replace_packed_child_module(root, str(module_name), replacement)
             grouped_modules += 1
             group_shapes = raw_spec.get("shapes") or {}
@@ -347,6 +353,9 @@ def _packed_state_inventory(
                     modules[module_name]["prototype_logical_ids"] = list(
                         module.prototype_logical_ids
                     )
+                deletion = module.expert_deletion_plan()
+                if deletion is not None:
+                    modules[module_name]["expert_deletion"] = deletion.manifest_spec()
                 grouped_modules += 1
                 quantized_tensors += 3
                 quantized_numel += sum(math.prod(shape) for shape in shapes.values())
@@ -470,6 +479,9 @@ def _packed_state_inventory(
                 modules[module_name]["prototype_logical_ids"] = list(
                     module.prototype_logical_ids
                 )
+            deletion = module.expert_deletion_plan()
+            if deletion is not None:
+                modules[module_name]["expert_deletion"] = deletion.manifest_spec()
             if quant_format == "nf4":
                 modules[module_name]["nf4_meta"] = _nf4_meta_to_spec(module._nf4_meta)
             elif quant_format in GGUF_FORMATS:
@@ -684,6 +696,17 @@ def load_compressed_weights_packed_state(
                             "prototype_logical_ids"
                         ),
                     )
+            deletion = expert_deletion_from_manifest_spec(
+                raw_spec, physical_num_experts=module.num_experts
+            )
+            if deletion is not None:
+                existing_deletion = module.expert_deletion_plan()
+                if existing_deletion is not None and existing_deletion != deletion:
+                    raise ValueError(
+                        f"Target module {module_name!r} expert deletion mismatch."
+                    )
+                if existing_deletion is None:
+                    module.configure_expert_deletion(deletion)
             group_sizes = raw_spec.get("group_sizes")
             if not isinstance(group_sizes, dict):
                 raise ValueError(f"compressed_weights packed module {module_name!r} has no group_sizes map.")

@@ -209,7 +209,10 @@ from mirai.core.moe.adaptation.global_balance import GlobalBatchLoadAccumulator
 from mirai.core.moe.adaptation.global_balance import dispatch_counts
 from mirai.core.moe.adaptation.global_balance import normalize_moe_balance_scope
 from mirai.core.moe.calibration.projection import PrototypeCalibrationTarget
-from mirai.core.moe.calibration.pruning import ExpertPruningCalibrationTarget
+from mirai.core.moe.calibration.pruning import (
+    DietCalibrationTarget,
+    ExpertPruningCalibrationTarget,
+)
 from mirai.core.moe.calibration.flexmoe import FlexMoECalibrationTarget
 from mirai.core.moe.calibration.router_repair import RouterRepairTarget
 from mirai.core.moe.calibration.router_repair import (
@@ -1063,6 +1066,38 @@ class LingBotVideoModelFamilyProvider(ModelFamilyProvider):
             )
         return targets
 
+    def build_diet_calibration_targets(
+        self,
+        pipeline: Any,
+    ) -> dict[str, DietCalibrationTarget]:
+        training_model = pipeline.get_training_model()
+        if training_model is None:
+            raise ValueError("LingBot DIET calibration requires an exposed training model.")
+        targets: dict[str, DietCalibrationTarget] = {}
+        for module_name, module in training_model.named_modules():
+            router = getattr(module, "router", None)
+            experts = getattr(module, "experts", None)
+            if router is None or experts is None or not callable(
+                getattr(module, "set_diet_capture_observer", None)
+            ):
+                continue
+            name = f"{module_name}.experts" if module_name else "experts"
+            target = DietCalibrationTarget(
+                name=name,
+                host=module,
+                num_experts=int(router.num_experts),
+                top_k=int(router.top_k),
+                n_group=int(router.n_group or 1),
+                topk_group=int(router.topk_group or 1),
+                group_score_topk=2,
+                norm_topk_prob=bool(router.norm_topk_prob),
+                route_scale=float(router.route_scale),
+            ).validate()
+            targets[name] = target
+        if not targets:
+            raise ValueError("LingBot DIET calibration found no native MoE hosts.")
+        return targets
+
     def build_flexmoe_calibration_targets(
         self,
         pipeline: Any,
@@ -1816,6 +1851,21 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
 
     def _load_packed_compressed_weights_state(self, packed_state_path: str) -> None:
         manifest = read_compressed_weights_packed_state_manifest(packed_state_path)
+        manifest_modules = manifest.get("modules") or {}
+        has_diet = any(
+            isinstance(spec, Mapping) and spec.get("expert_deletion") is not None
+            for spec in manifest_modules.values()
+        )
+        diet_enabled = (
+            str(self.model_config.params.expert_pruning).strip().lower() == "prune"
+            and str(self.model_config.params.expert_pruning_criterion).strip().lower()
+            == "diet"
+        )
+        if has_diet and not diet_enabled:
+            raise ValueError(
+                "DIET packed expert deletion requires exactly "
+                "expert_pruning='prune' and expert_pruning_criterion='diet'."
+            )
         validate_drop_upcycling_selection(
             manifest,
             mode=self.model_config.params.expert_upcycling,
@@ -1892,6 +1942,20 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 continue
             physical_experts = int(getattr(module.experts, "num_experts", 0))
             router_experts = int(getattr(module.router, "num_experts", 0))
+            deletion = getattr(module.experts, "expert_deletion_plan", lambda: None)()
+            if deletion is not None:
+                if str(getattr(module.experts, "expert_weight_access", "")) != "active_dequant":
+                    raise ValueError(
+                        "DIET compact compressed experts currently require "
+                        "expert_weight_access='active_dequant'."
+                    )
+                if int(deletion.logical_num_experts) != router_experts:
+                    raise ValueError(
+                        "DIET original router count does not match its manifest."
+                    )
+                module.router.configure_expert_deletion(deletion)
+                module.num_experts = router_experts
+                continue
             if physical_experts != router_experts:
                 raise ValueError(
                     "Packed grouped experts and their sibling router have different "

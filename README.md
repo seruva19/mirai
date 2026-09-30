@@ -807,6 +807,10 @@ configuration and compatibility rules are documented in
   [(REAP repo)](https://github.com/CerebrasResearch/reap)
   [(MAN/MSAN paper)](https://arxiv.org/abs/2606.15716)
   [(MAN/MSAN repo)](https://github.com/ZongfangLiu/unified-expert-pruning)
+- **DIET expert pruning** — Experimental, default-off paired-CFG deletion
+  calibration and ODL survivor selection preserve original router groups while
+  compacting expert storage. Artifacts are tied to the exact source checkpoint.
+  [Configuration](CONFIG_REFERENCE.md) · [Paper](https://arxiv.org/abs/2609.37829).
 - **Calibration-free AIMER expert pruning** — A weight-only offline criterion
   streams bounded dense projection blocks from the selected packed artifact and
   scores each expert as the absolute mean divided by RMS across its combined

@@ -803,15 +803,25 @@ Reverse-KL router-consistency loss weight (EMoE hierarchical router loss). Only 
 - **Default:** `"off"`
 - **Allowed / range:** `off`, `prune`
 
-Offline structured expert-pruning gate. `off` preserves the training path exactly. `prune` arms [`prune_experts.py`](scripts/tools/prune_experts.py): the calibrated criteria first use [`calibrate_expert_pruning.py`](scripts/tools/calibrate_expert_pruning.py), while `aimer` reads weights directly and forbids a calibration artifact. Both paths retain experts by keep fraction or score threshold with `keep >= experts_per_token`, slice grouped expert tensors and router rows, and write a new lineage-bound packed artifact without mutating the source. Numeric controls are script arguments.
+Offline structured expert-pruning gate. `off` preserves the training path exactly. `prune` arms [`prune_experts.py`](scripts/tools/prune_experts.py): scalar calibrated criteria first use [`calibrate_expert_pruning.py`](scripts/tools/calibrate_expert_pruning.py), while `aimer` reads weights directly and forbids a calibration artifact. These criteria retain experts by keep fraction or score threshold with `keep >= experts_per_token`, slice grouped expert tensors and router rows, and write a new lineage-bound packed artifact without mutating the source. `diet` uses its paired-CFG calibration and preserves original router rows and groups as described below. Numeric controls are script arguments.
 
 ### `expert_pruning_criterion`
 
 - **Type:** str
 - **Default:** `"frequency"`
-- **Allowed / range:** `frequency`, `reap`, `man`, `msan`, `aimer`
+- **Allowed / range:** `frequency`, `reap`, `man`, `msan`, `aimer`, `diet`
 
 Ranking criterion for opt-in expert pruning. `frequency` ranks selected-route counts. `reap` uses the conditional mean of router-weighted expert-output L2 norms; `man` removes the router weight; `msan` uses the conditional mean squared output norm. `aimer` is calibration-free: [`prune_experts.py`](scripts/tools/prune_experts.py) dequantizes bounded expert blocks from the selected packed artifact, computes `sum(abs(w)) / sqrt(numel(w) * sum(w²))` over combined `w1/w2/w3`, and prunes the largest scores. AIMER accepts `--max-block-elements` and `--metric-device cpu\|cuda`; CUDA obtains the GPU lease. The key is inert while `expert_pruning="off"`.
+
+`diet` is experimental and requires `expert_pruning="prune"`. It uses paired
+conditional/unconditional deletion responses and cosine-distance ODL survivor
+selection rather than scalar ranking. Run `scripts/tools/calibrate_diet.py`
+on the source packed base, then `scripts/tools/prune_diet.py` with
+`--keep-fraction` or `--layer-counts`. Calibration must match the exact source
+fingerprint. DIET preserves original router rows and group membership, masks
+deleted logical experts, and compacts only expert storage. Loading its output
+requires the same opt-in gate and `memory.expert_weight_access="active_dequant"`
+for compressed experts. See [DIET usage](model_support/lingbot_video.md#diet-expert-pruning).
 
 ### `expert_consolidation`
 

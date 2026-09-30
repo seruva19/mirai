@@ -11,6 +11,10 @@ from mirai.core.moe.storage.aliases import (
     coalesce_alias_routes,
     validate_logical_to_physical,
 )
+from mirai.core.moe.storage.deletion import (
+    ExpertDeletionPlan,
+    remap_deleted_expert_routes,
+)
 from mirai.core.moe.runtime.specs import (
     CANONICAL_PACKED_EXPERT_MLP_SPEC,
     ExpertMLPExecutionSpec,
@@ -89,6 +93,8 @@ logger = logging.getLogger(__name__)
 
 class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
     """Provider-described grouped experts stored in frozen packed formats."""
+
+    manages_logical_expert_routes = True
 
     def __init__(
         self,
@@ -209,6 +215,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         self.logical_num_experts = int(num_experts)
         self.prototype_logical_ids: tuple[int, ...] = ()
         self._logical_to_physical: torch.Tensor | None = None
+        self._expert_deletion_plan: ExpertDeletionPlan | None = None
         self._prototype_calibration_observer: PrototypeCalibrationObserver | None = None
         self._whitening_calibration_observer: Any | None = None
         self._flexmoe_channel_mask: torch.Tensor | None = None
@@ -430,6 +437,19 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         self.prototype_logical_ids = prototypes
         self._logical_to_physical = torch.tensor(values, dtype=torch.long)
 
+    def configure_expert_deletion(self, plan: ExpertDeletionPlan) -> None:
+        """Attach an original-router-id to compact physical expert map."""
+        plan.validate()
+        if self.has_logical_expert_aliases():
+            raise ValueError("Expert deletion cannot be combined with prototype aliases.")
+        if int(plan.physical_num_experts) != int(self.num_experts):
+            raise ValueError("Expert deletion physical count does not match this module.")
+        self.logical_num_experts = int(plan.logical_num_experts)
+        self._expert_deletion_plan = plan
+
+    def expert_deletion_plan(self) -> ExpertDeletionPlan | None:
+        return self._expert_deletion_plan
+
     def has_logical_expert_aliases(self) -> bool:
         return self._logical_to_physical is not None
 
@@ -517,6 +537,23 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
     def clear_whitening_calibration_observer(self) -> None:
         self._whitening_calibration_observer = None
 
+    def evaluate_all_experts(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Evaluate packed experts one at a time on bounded DIET rows."""
+        if self.has_logical_expert_aliases() or self._expert_deletion_plan is not None:
+            raise RuntimeError("DIET calibration requires an unconsolidated source artifact.")
+        keys = tuple(self.projection_for_role(role) for role in ("gate", "up", "down"))
+        outputs = []
+        for expert_id in range(self.num_experts):
+            gate, up, down = (
+                self._dequant_expert_stack(
+                    key, (expert_id,), dtype=tokens.dtype, device=tokens.device
+                )[0]
+                for key in keys
+            )
+            hidden = F.silu(F.linear(tokens, gate)) * F.linear(tokens, up)
+            outputs.append(F.linear(hidden, down))
+        return torch.stack(outputs, dim=1)
+
     def _record_whitening_inputs(
         self,
         projections: str | tuple[str, ...],
@@ -531,6 +568,12 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         top_scores: torch.Tensor,
         top_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._expert_deletion_plan is not None:
+            physical = remap_deleted_expert_routes(
+                top_indices,
+                self._expert_deletion_plan.logical_to_physical,
+            )
+            return top_scores, physical
         if not self.has_logical_expert_aliases():
             return top_scores, top_indices
         if self._logical_to_physical is None:  # pragma: no cover - narrowed above
@@ -540,6 +583,14 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             top_indices,
             self._logical_to_physical,
         )
+
+    def remap_routes_for_dispatch(
+        self,
+        top_scores: torch.Tensor,
+        top_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve logical routes before a provider-owned physical dispatch."""
+        return self._coalesce_logical_routes(top_scores, top_indices)
 
     def attach_expert_lora(
         self,
