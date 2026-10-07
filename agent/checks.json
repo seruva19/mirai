@@ -238,6 +238,9 @@
         "scripts/tools/calibrate_diet.py",
         "scripts/tools/prune_diet.py",
         "tests/test_diet_cli.py",
+        "tests/test_w4a8_quantization.py",
+        "tests/test_w4a8_runtime.py",
+        "tests/test_w4a8_policy.py",
         "mirai/core/models/quantization.py",
         "mirai/core/models/compressed_weights/",
         "mirai/core/moe/runtime/specs.py",
@@ -259,7 +262,7 @@
         "scripts/agent/probe_moe_runtime.py"
       ],
       "commands": [
-        "python -m pytest tests/test_compressed_weights_quantization.py tests/test_nf4_compressed_weights_quantization.py tests/test_moe_expert_optimizations.py tests/test_magi2_nf4_experts.py tests/test_magi2_preview_contract.py tests/test_sparse_moe_contract.py mirai/core/moe/contracts/routed_gemm.py mirai/core/moe/contracts/routed_gemm_autotune.py mirai/core/moe/contracts/routed_gemm_compile.py mirai/core/persistence/contracts/routed_gemm_autotune.py mirai/core/moe/contracts/artifact_transforms.py mirai/core/moe/contracts/hierarchical_consolidation.py mirai/core/moe/contracts/parity.py mirai/core/training/calibration/contracts/expert_precision.py mirai/core/training/calibration/contracts/expert_whitening.py mirai/core/training/calibration/contracts/router_quantization.py mirai/core/training/calibration/contracts/flexmoe.py mirai/core/moe/contracts/diet.py mirai/core/moe/contracts/diet_runtime.py mirai/core/training/calibration/contracts/diet_capture.py tests/test_diet_cli.py -q"
+        "python -m pytest tests/test_compressed_weights_quantization.py tests/test_nf4_compressed_weights_quantization.py tests/test_moe_expert_optimizations.py tests/test_magi2_nf4_experts.py tests/test_magi2_preview_contract.py tests/test_sparse_moe_contract.py mirai/core/moe/contracts/routed_gemm.py mirai/core/moe/contracts/routed_gemm_autotune.py mirai/core/moe/contracts/routed_gemm_compile.py mirai/core/persistence/contracts/routed_gemm_autotune.py mirai/core/moe/contracts/artifact_transforms.py mirai/core/moe/contracts/hierarchical_consolidation.py mirai/core/moe/contracts/parity.py mirai/core/training/calibration/contracts/expert_precision.py mirai/core/training/calibration/contracts/expert_whitening.py mirai/core/training/calibration/contracts/router_quantization.py mirai/core/training/calibration/contracts/flexmoe.py mirai/core/moe/contracts/diet.py mirai/core/moe/contracts/diet_runtime.py mirai/core/training/calibration/contracts/diet_capture.py tests/test_diet_cli.py tests/test_w4a8_quantization.py tests/test_w4a8_runtime.py tests/test_w4a8_policy.py -q"
       ],
       "invariants": [
         "packed artifacts round-trip with lineage",

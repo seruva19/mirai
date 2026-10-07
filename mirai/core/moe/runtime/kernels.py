@@ -12,6 +12,7 @@ MOE_KERNEL_BACKENDS = {
     "auto",
     "torch",
     "rotated_int8",
+    "w4a8_int8",
     "compiled_packed",
     "megablocks",
     # Selects a model-family-owned grouped-GEMM expert execution seam; it has no
@@ -182,6 +183,27 @@ class CompiledPackedKernelBackend(TorchChunkedKernelBackend):
     name = "compiled_packed"
 
 
+class W4A8Int8KernelBackend:
+    """Explicit rotated W4A8 execution through an integer expert GEMM."""
+
+    name = "w4a8_int8"
+
+    def execute_direct(
+        self,
+        experts: Any,
+        tokens: Any,
+        top_scores: Any,
+        top_indices: Any,
+    ) -> Any:
+        runner = getattr(experts, "run_direct_routed_w4a8", None)
+        if not callable(runner):
+            raise RuntimeError(
+                "w4a8_int8 requires an expert provider implementing "
+                "run_direct_routed_w4a8(tokens, top_scores, top_indices)."
+            )
+        return runner(tokens, top_scores, top_indices)
+
+
 def build_moe_kernel_backend(
     value: str | None,
     *,
@@ -190,6 +212,7 @@ def build_moe_kernel_backend(
     MegaBlocksKernelBackend
     | TorchChunkedKernelBackend
     | RotatedInt8KernelBackend
+    | W4A8Int8KernelBackend
     | CompiledPackedKernelBackend
     | None
 ):
@@ -206,6 +229,10 @@ def build_moe_kernel_backend(
         if not direct_routed:
             raise ValueError("rotated_int8 requires a direct-routed expert provider.")
         return RotatedInt8KernelBackend()
+    if backend == "w4a8_int8":
+        if not direct_routed:
+            raise ValueError("w4a8_int8 requires a direct-routed expert provider.")
+        return W4A8Int8KernelBackend()
     if backend == "compiled_packed":
         if not direct_routed:
             raise ValueError("compiled_packed requires direct-routed experts.")

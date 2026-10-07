@@ -13,11 +13,12 @@ from ..quantization.gguf_quant import _GgufMeta
 from ..quantization.microscaling_quant import MicroscalingMeta
 from ..quantization.blockwise_fp8 import BlockwiseFP8Meta
 from ..quantization.quant import _Nf4Meta, normalize_quant_format
+from ..quantization.w4a8 import W4A8Metadata
 
 
 COMPRESSED_WEIGHT_PACKED_STATE_SCHEMA_VERSION = 2
 COMPRESSED_WEIGHT_PACKED_STATE_SUPPORTED_SCHEMA_VERSIONS = frozenset(
-    {1, 2, 3, 4, 5}
+    {1, 2, 3, 4, 5, 6}
 )
 COMPRESSED_WEIGHT_PACKED_MANIFEST_METADATA_KEY = "mirai_compressed_weights_manifest"
 DEFAULT_PACKED_SHARD_BYTES = 2 * 1024 * 1024 * 1024
@@ -153,6 +154,34 @@ def _blockwise_fp8_meta_from_spec(spec: Mapping[str, Any]) -> BlockwiseFP8Meta:
         shape=tuple(int(dim) for dim in shape),
         weight_block=tuple(int(dim) for dim in weight_block),
         activation_block=int(raw.get("activation_block", 0)),
+    )
+
+
+def _w4a8_meta_to_spec(meta: W4A8Metadata) -> dict[str, Any]:
+    return {
+        "version": int(meta.version),
+        "shape": [int(dim) for dim in meta.shape],
+        "group_size": int(meta.group_size),
+        "rotation_group_size": int(meta.rotation_group_size),
+        "scheme": str(meta.scheme),
+        "scale_format": str(meta.scale_format),
+    }
+
+
+def _w4a8_meta_from_spec(spec: Mapping[str, Any]) -> W4A8Metadata:
+    raw = spec.get("w4a8_meta")
+    if not isinstance(raw, Mapping):
+        raise ValueError("W4A8 packed module has no metadata object.")
+    shape = raw.get("shape")
+    if not isinstance(shape, (list, tuple)) or len(shape) != 3:
+        raise ValueError("W4A8 packed module has invalid shape metadata.")
+    return W4A8Metadata(
+        version=int(raw.get("version", 0)),
+        shape=tuple(int(dim) for dim in shape),
+        group_size=int(raw.get("group_size", 0)),
+        rotation_group_size=int(raw.get("rotation_group_size", 0)),
+        scheme=str(raw.get("scheme", "")),
+        scale_format=str(raw.get("scale_format", "")),
     )
 
 

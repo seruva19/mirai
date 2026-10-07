@@ -74,6 +74,13 @@ from ..quantization.blockwise_fp8 import (
     quantize_blockwise_fp8_weight,
     validate_blockwise_fp8_payload,
 )
+from ..quantization.w4a8 import (
+    W4A8Metadata,
+    W4A8Weight,
+    dequantize_w4a8,
+    quantize_w4a8,
+    w4a8_linear,
+)
 from .expert_gather import BatchedExpertGatherStrategy
 from .expert_device_cache import ExpertDeviceCache
 from .routed_output_observer import RoutedOutputObserverHost
@@ -183,6 +190,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         self._microscaling_shapes: dict[str, tuple[int, ...]] = {}
         self._blockwise_fp8_meta: dict[str, BlockwiseFP8Meta] = {}
         self._blockwise_fp8_shapes: dict[str, tuple[int, ...]] = {}
+        self._w4a8_metadata: dict[str, W4A8Metadata] = {}
         # Cache of (key_a, key_b) -> bool: whether the two keys share bit-identical
         # NF4 codebooks so their packed stacks can be concatenated into one dequant.
         self._nf4_pair_codebook_cache: dict[tuple[str, str], bool] = {}
@@ -202,6 +210,13 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
                 "(no hardware tier matched this device to supply a default)."
             )
         self.expert_dequant_chunk_size = max(0, chunk)
+        if self._quant_format == "w4a8":
+            if self.expert_mlp_spec != CANONICAL_PACKED_EXPERT_MLP_SPEC:
+                raise ValueError("W4A8 supports only the canonical SwiGLU expert layout.")
+            if self.expert_weight_access not in {"active_dequant", "chunked_dequant"}:
+                raise ValueError(
+                    "W4A8 experts require active_dequant or chunked_dequant access."
+                )
         self._loaded_dense_keys: set[str] = set()
         self.expert_lora = nn.ModuleDict()
         self._expert_device_cache = ExpertDeviceCache()
@@ -782,6 +797,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             or hasattr(self, f"{key}_gguf")
             or hasattr(self, f"{key}_mx")
             or hasattr(self, f"{key}_fp8")
+            or hasattr(self, f"{key}_w4a8_packed")
             or str(key) in self._packed_shapes
         )
 
@@ -798,6 +814,8 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             return self._microscaling_shapes[str(key)]
         if str(key) in self._blockwise_fp8_shapes:
             return self._blockwise_fp8_shapes[str(key)]
+        if str(key) in self._w4a8_metadata:
+            return self._w4a8_metadata[str(key)].shape
         if hasattr(self, f"{key}_int8"):
             return tuple(int(dim) for dim in getattr(self, f"{key}_int8").shape)
         if str(key) in self._packed_shapes:
@@ -1029,6 +1047,13 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             self._loaded_dense_keys.add(key)
             self._packed_source = None
             return
+        if self._quant_format == "w4a8":
+            if rotation is not None:
+                raise ValueError("W4A8 owns its fixed activation rotation.")
+            self._store_w4a8_grouped(key, source)
+            self._loaded_dense_keys.add(key)
+            self._packed_source = None
+            return
         group_size = best_group_size(int(source.shape[-1]), self._group_sizes)
         quantized, scale, resolved_group = _quantize_weight(
             source,
@@ -1045,6 +1070,77 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         )
         self._loaded_dense_keys.add(key)
         self._packed_source = None
+
+    def _store_w4a8_grouped(self, key: str, source: torch.Tensor) -> None:
+        if int(source.shape[0]) != self.num_experts:
+            raise ValueError(
+                f"W4A8 grouped expert tensor {key} has {source.shape[0]} experts, "
+                f"expected {self.num_experts}."
+            )
+        rotation_group_size = best_group_size(int(source.shape[-1]), self._group_sizes)
+        payload = quantize_w4a8(
+            source.detach(), rotation_group_size=rotation_group_size
+        )
+        self._w4a8_metadata[key] = payload.metadata
+        self._set_buffer(f"{key}_w4a8_packed", payload.packed)
+        self._set_buffer(f"{key}_w4a8_group_scales", payload.group_scales)
+        self._set_buffer(f"{key}_w4a8_row_scales", payload.row_scales)
+        self._set_buffer(f"{key}_w4a8_codebook", payload.codebook)
+
+    def _w4a8_weight(
+        self,
+        key: str,
+        expert_idx: int | None = None,
+        *,
+        device: torch.device | None = None,
+    ) -> W4A8Weight:
+        meta = self._w4a8_metadata[key]
+        fields = {
+            "packed": getattr(self, f"{key}_w4a8_packed"),
+            "group_scales": getattr(self, f"{key}_w4a8_group_scales"),
+            "row_scales": getattr(self, f"{key}_w4a8_row_scales"),
+            "codebook": getattr(self, f"{key}_w4a8_codebook"),
+        }
+        if expert_idx is not None:
+            fields["packed"] = fields["packed"][int(expert_idx)]
+            fields["group_scales"] = fields["group_scales"][int(expert_idx)]
+            fields["row_scales"] = fields["row_scales"][int(expert_idx)]
+            meta = W4A8Metadata(
+                version=meta.version,
+                shape=meta.shape[1:],
+                group_size=meta.group_size,
+                rotation_group_size=meta.rotation_group_size,
+                scheme=meta.scheme,
+                scale_format=meta.scale_format,
+            )
+        if device is not None:
+            fields = {name: value.to(device=device) for name, value in fields.items()}
+        return W4A8Weight(metadata=meta, **fields)
+
+    def load_w4a8_packed_weight(
+        self,
+        key: str,
+        *,
+        packed: torch.Tensor,
+        group_scales: torch.Tensor,
+        row_scales: torch.Tensor,
+        codebook: torch.Tensor,
+        metadata: W4A8Metadata,
+    ) -> None:
+        if key not in self.expert_mlp_spec.tensor_names:
+            raise ValueError(f"Unknown compressed_weights grouped expert tensor {key!r}.")
+        if self._quant_format != "w4a8":
+            raise ValueError("W4A8 packed state requires a W4A8 grouped-expert wrapper.")
+        value = W4A8Weight(packed, group_scales, row_scales, codebook, metadata)
+        value.validate()
+        if len(metadata.shape) != 3 or int(metadata.shape[0]) != self.num_experts:
+            raise ValueError(f"W4A8 grouped expert {key} has invalid shape {metadata.shape}.")
+        self._w4a8_metadata[key] = metadata
+        self._set_buffer(f"{key}_w4a8_packed", packed.detach().contiguous())
+        self._set_buffer(f"{key}_w4a8_group_scales", group_scales.detach().contiguous())
+        self._set_buffer(f"{key}_w4a8_row_scales", row_scales.detach().contiguous())
+        self._set_buffer(f"{key}_w4a8_codebook", codebook.detach().contiguous())
+        self._loaded_dense_keys.add(key)
 
     def _store_nf4_grouped(self, key: str, source: torch.Tensor) -> None:
         num_experts, out_features, in_features = (int(dim) for dim in source.shape)
@@ -1414,6 +1510,8 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         self._packed_source = None
 
     def frozen_quantized_numel(self) -> int:
+        if self._quant_format == "w4a8":
+            return int(sum(math.prod(meta.shape) for meta in self._w4a8_metadata.values()))
         if self._quant_format in BLOCKWISE_FP8_FORMATS:
             return int(sum(math.prod(shape) for shape in self._blockwise_fp8_shapes.values()))
         if self._quant_format in MICROSCALING_FORMATS:
@@ -1548,6 +1646,13 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
     ) -> torch.Tensor:
+        if self._quant_format == "w4a8":
+            value = self._w4a8_weight(key, device=device)
+            return dequantize_w4a8(
+                value,
+                dtype=dtype or torch.get_default_dtype(),
+                _numeric_validation=False,
+            )
         if self._physical_weight_provider is not None:
             if self.has_ragged_intermediate_widths():
                 raise RuntimeError(
@@ -1657,6 +1762,9 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
     def _dequantize_expert(
         self, key: str, expert_idx: int, *, dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
+        if self._quant_format == "w4a8":
+            value = self._w4a8_weight(key, int(expert_idx), device=device)
+            return dequantize_w4a8(value, dtype=dtype, _numeric_validation=False)
         if self._physical_weight_provider is not None:
             return self._physical_weight_provider.materialize_expert(
                 key,
@@ -2001,6 +2109,61 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             output=output,
             rotated=True,
         )
+
+    def run_direct_routed_w4a8(
+        self,
+        tokens: torch.Tensor,
+        top_scores: torch.Tensor,
+        top_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute canonical routed SwiGLU with the explicit W4A8 kernel."""
+        if self._quant_format != "w4a8":
+            raise RuntimeError("w4a8_int8 execution requires W4A8 expert storage.")
+        if self.expert_weight_access != "chunked_dequant":
+            raise RuntimeError("w4a8_int8 execution requires chunked_dequant access.")
+        if int(self.expert_dequant_chunk_size) <= 0:
+            raise RuntimeError("w4a8_int8 execution requires a positive expert chunk size.")
+        if self._physical_weight_provider is not None or self.has_ragged_intermediate_widths():
+            raise RuntimeError("w4a8_int8 does not support provider-backed or ragged experts.")
+        if self._whitening_calibration_observer is not None:
+            raise RuntimeError("w4a8_int8 does not support whitening calibration.")
+        if top_scores.shape != top_indices.shape or top_indices.ndim != 2:
+            raise ValueError("W4A8 routes must use matching [tokens, top_k] tensors.")
+        if int(top_indices.shape[0]) != int(tokens.shape[0]):
+            raise ValueError("W4A8 route indices do not match the token count.")
+        top_scores, top_indices = self._coalesce_logical_routes(top_scores, top_indices)
+        output = torch.zeros(
+            (tokens.shape[0], tokens.shape[1]), dtype=torch.float32, device=tokens.device
+        )
+        gate_key = self.projection_for_role("gate")
+        up_key = self.projection_for_role("up")
+        down_key = self.projection_for_role("down")
+        top_k = int(top_indices.shape[1])
+        for expert_idx in range(self.num_experts):
+            assignments = torch.nonzero(top_indices == expert_idx, as_tuple=False)
+            if assignments.numel() == 0:
+                continue
+            token_indices, route_slots = assignments[:, 0], assignments[:, 1]
+            expert_tokens = tokens.index_select(0, token_indices)
+            gate = self._w4a8_expert_linear(gate_key, expert_tokens, expert_idx)
+            up = self._w4a8_expert_linear(up_key, expert_tokens, expert_idx)
+            hidden = self._combine_expert_inputs(gate, up)
+            self._capture_routed_intermediates(hidden, token_indices * top_k + route_slots)
+            expert_output = self._w4a8_expert_linear(down_key, hidden, expert_idx)
+            route_weights = top_scores[token_indices, route_slots].float().unsqueeze(1)
+            self._capture_routed_outputs(expert_output, token_indices * top_k + route_slots)
+            output.index_add_(0, token_indices, expert_output.float() * route_weights)
+        return output.to(dtype=tokens.dtype)
+
+    def _w4a8_expert_linear(
+        self, key: str, x: torch.Tensor, expert_idx: int
+    ) -> torch.Tensor:
+        payload = self._w4a8_weight(key, expert_idx, device=x.device)
+        output = w4a8_linear(x, payload, backend="triton")
+        adapter = self.expert_lora[key] if key in self.expert_lora else None
+        if adapter is not None:
+            output = output + adapter(x, expert_idx=int(expert_idx))
+        return output
 
     def run_expert_choice_routed(
         self,
@@ -3043,6 +3206,33 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
                     for expert_idx in expert_indices
                 ],
                 dim=0,
+            )
+        if self._quant_format == "w4a8":
+            metadata = self._w4a8_metadata[key]
+            source = getattr(self, f"{key}_w4a8_packed")
+            index = torch.as_tensor(
+                expert_indices, device=source.device, dtype=torch.long
+            )
+            payload = W4A8Weight(
+                packed=source.index_select(0, index).to(device=device),
+                group_scales=getattr(self, f"{key}_w4a8_group_scales")
+                .index_select(0, index)
+                .to(device=device),
+                row_scales=getattr(self, f"{key}_w4a8_row_scales")
+                .index_select(0, index)
+                .to(device=device),
+                codebook=getattr(self, f"{key}_w4a8_codebook").to(device=device),
+                metadata=W4A8Metadata(
+                    version=metadata.version,
+                    shape=(len(expert_indices), *metadata.shape[1:]),
+                    group_size=metadata.group_size,
+                    rotation_group_size=metadata.rotation_group_size,
+                    scheme=metadata.scheme,
+                    scale_format=metadata.scale_format,
+                ),
+            )
+            return dequantize_w4a8(
+                payload, dtype=dtype, _numeric_validation=False
             )
         # memory.moe_batched_dequant (default ON) is
         # the explicit selector for chunk-batched dequant versus per-expert execution.

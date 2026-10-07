@@ -79,6 +79,11 @@ Available examples:
 - [`train_nf4.toml`](../configs/lingbot_video/train_nf4.toml) — NF4 compressed
   frozen base with chunked expert reconstruction. This example uses the
   bitsandbytes optimizer installed with Mirai.
+- [`train_w4a8.toml`](../configs/lingbot_video/train_w4a8.toml) — Experimental
+  frozen routed-expert W4 storage with A8/INT8 forward execution. Requires CUDA
+  SM80+ and Triton; input gradients use high-precision reconstructed weights.
+  It does not establish a quality or speed advantage over NF4. Set
+  `memory.moe_kernel_backend="torch"` for the weight-only dequantized reference.
 - [`train_nf4_32gb.toml`](../configs/lingbot_video/train_nf4_32gb.toml) — NF4
   training profile for 128 GiB RAM and 32 GiB VRAM. It combines bounded async
   RAM-to-VRAM block residency, aggressive activation checkpointing, chunked

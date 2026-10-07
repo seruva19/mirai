@@ -12,6 +12,7 @@ from mirai.core.models.providers import get_model_family_provider
 from mirai.core.moe.runtime.touch_guard import EXPERT_TOUCH_GUARD_MODES
 from mirai.core.moe.runtime.kernels import megablocks_runtime_available
 from mirai.core.moe.runtime.kernels import normalize_moe_kernel_backend
+from mirai.core.moe.runtime.specs import CANONICAL_PACKED_EXPERT_MLP_SPEC
 from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
 from mirai.core.training.optim.optimizer import (
     OptimizerRegistry,
@@ -723,6 +724,90 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
     try:
         resolved_moe_kernel = normalize_moe_kernel_backend(config.memory.moe_kernel_backend)
         expert_access = str(config.memory.expert_weight_access).strip().lower()
+        frozen_quantization = str(
+            config.memory.frozen_weight_quantization
+        ).strip().lower()
+        _check(
+            resolved_moe_kernel != "w4a8_int8" or frozen_quantization == "w4a8",
+            "memory.moe_kernel_backend='w4a8_int8' requires "
+            "memory.frozen_weight_quantization='w4a8'.",
+        )
+        if frozen_quantization == "w4a8":
+            strategy = str(
+                config.memory.frozen_weight_quantization_strategy
+            ).strip().lower()
+            _check(
+                strategy in {"", "auto", "compressed_weights"},
+                "memory.frozen_weight_quantization='w4a8' requires "
+                "memory.frozen_weight_quantization_strategy='auto' or "
+                "'compressed_weights'.",
+            )
+            _check(
+                expert_access == "chunked_dequant",
+                "memory.frozen_weight_quantization='w4a8' requires "
+                "memory.expert_weight_access='chunked_dequant'.",
+            )
+            _check(
+                int(config.memory.expert_dequant_chunk_size) > 0,
+                "memory.frozen_weight_quantization='w4a8' requires "
+                "memory.expert_dequant_chunk_size > 0.",
+            )
+            _check(
+                resolved_moe_kernel in {"auto", "torch", "w4a8_int8"},
+                "memory.frozen_weight_quantization='w4a8' supports only "
+                "memory.moe_kernel_backend='auto', 'torch', or 'w4a8_int8'.",
+            )
+            _check(
+                str(config.memory.weight_residency_strategy).strip().lower()
+                != "stream_disk",
+                "memory.frozen_weight_quantization='w4a8' does not support "
+                "disk-backed packed streaming.",
+            )
+            _check(
+                not bool(str(config.memory.frozen_weight_packed_state_path).strip())
+                or str(config.memory.packed_state_preload).strip().lower()
+                in {"ram", "pinned"},
+                "Packed W4A8 artifacts require memory.packed_state_preload='ram' "
+                "or 'pinned'; disk streaming is unsupported.",
+            )
+            _check(
+                str(config.model.params.expert_quantization_rotation).strip().lower()
+                != "learned",
+                "memory.frozen_weight_quantization='w4a8' does not support "
+                "learned expert rotations.",
+            )
+            _check(
+                not bool(str(config.memory.expert_precision_plan_path).strip()),
+                "memory.frozen_weight_quantization='w4a8' does not support "
+                "mixed expert precision plans.",
+            )
+            provider = get_model_family_provider(config.model.type)
+            if provider is not None:
+                _check(
+                    provider.expert_mlp_execution_spec
+                    == CANONICAL_PACKED_EXPERT_MLP_SPEC,
+                    "memory.frozen_weight_quantization='w4a8' requires a provider "
+                    "with the canonical routed expert layout (w1/w3/w2 gated SiLU).",
+                )
+            if resolved_moe_kernel == "w4a8_int8":
+                try:
+                    import torch
+                except ModuleNotFoundError:
+                    torch = None  # type: ignore[assignment]
+                _check(
+                    torch is not None and bool(torch.cuda.is_available()),
+                    "memory.moe_kernel_backend='w4a8_int8' requires CUDA.",
+                )
+                if torch is not None and torch.cuda.is_available():
+                    major, _minor = torch.cuda.get_device_capability()
+                    _check(
+                        int(major) >= 8,
+                        "memory.moe_kernel_backend='w4a8_int8' requires CUDA SM80+.",
+                    )
+                require_module(
+                    "triton",
+                    reason="memory.moe_kernel_backend='w4a8_int8' requires Triton.",
+                )
         if expert_access == "fused_kernel":
             _check(
                 str(config.memory.frozen_weight_quantization).strip().lower() == "int8",
@@ -828,6 +913,7 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
             "mxfp8_e4m3",
             "mxfp4",
             "nvfp4",
+            "w4a8",
         },
         "memory.expert_precision_plan_path requires frozen expert quantization.",
     )

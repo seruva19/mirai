@@ -1632,8 +1632,15 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             if memory_config is not None
             else ""
         )
-        self._refiner_frozen_weight_quantization = (
-            refiner_quantization or self._frozen_weight_quantization
+        if refiner_quantization == "w4a8":
+            raise ValueError(
+                "memory.refiner_frozen_weight_quantization='w4a8' is unsupported; "
+                "W4A8 is restricted to routed grouped experts."
+            )
+        self._refiner_frozen_weight_quantization = refiner_quantization or (
+            "none"
+            if self._frozen_weight_quantization == "w4a8"
+            else self._frozen_weight_quantization
         )
         self._nf4_blocksize = (
             int(getattr(memory_config, "quantization_block_size", NF4_BLOCKSIZE) or NF4_BLOCKSIZE)
@@ -1684,6 +1691,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 "mxfp8_e4m3",
                 "mxfp4",
                 "nvfp4",
+                "w4a8",
             } or strategy not in {
                 "",
                 "auto",
@@ -1694,8 +1702,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 raise ValueError(
                     "LingBot-Video packed state requires frozen_weight_quantization to be "
                     "'fp8', 'int8', 'nf4', 'gguf_iq4', 'gguf_iq3', 'gguf_iq2', 'mxfp8_e4m3', "
-                    "'mxfp4', or "
-                    "'nvfp4' and strategy to be "
+                    "'mxfp4', 'nvfp4', or expert-only 'w4a8' and strategy to be "
                     "compressed_weights or auto."
                 )
         if load_quantized_experts or load_packed_state:
@@ -1801,6 +1808,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 "mxfp8_e4m3",
                 "mxfp4",
                 "nvfp4",
+                "w4a8",
             }
             else "int8"
         )
@@ -1809,7 +1817,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             group_sizes="auto",
             expert_weight_access=access,
             expert_dequant_chunk_size=policy.expert_dequant_chunk_size,
-            replace_linear=True,
+            replace_linear=quant_format != "w4a8",
             replace_grouped_experts=True,
             quant_format=quant_format,
             nf4_blocksize=self._nf4_blocksize,
@@ -1821,6 +1829,13 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             raise ValueError(
                 "LingBot-Video quantize_experts_on_load found no linear/expert tensors "
                 "to quantize on load."
+            )
+        if quant_format == "w4a8" and (
+            prepare_report.linear_modules != 0
+            or prepare_report.grouped_expert_modules <= 0
+        ):
+            raise ValueError(
+                "W4A8 checkpoint loading must replace routed grouped experts only."
             )
         report = load_lingbot_transformer_checkpoint(
             self.transformer,
@@ -4699,11 +4714,13 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             "mxfp8_e4m3",
             "mxfp4",
             "nvfp4",
+            "w4a8",
         }:
             raise ValueError(
                 "LingBot-Video quantized frozen weights support only "
                 "memory.frozen_weight_quantization='fp8', 'int8', 'nf4', 'gguf_iq4', "
-                "'gguf_iq3', 'gguf_iq2', 'mxfp8_e4m3', 'mxfp4', or 'nvfp4'."
+                "'gguf_iq3', 'gguf_iq2', 'mxfp8_e4m3', 'mxfp4', 'nvfp4', or "
+                "expert-only 'w4a8'."
             )
         quant_format = normalize_quant_format(scheme)
         strategy = normalize_compressed_weights_strategy(kwargs.pop("strategy", "auto"))
@@ -4726,6 +4743,17 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         learn_expert_rotations = bool(
             kwargs.pop("learn_expert_rotations", False)
         )
+        if quant_format == "w4a8":
+            if policy.expert_weight_access != "chunked_dequant":
+                raise ValueError(
+                    "W4A8 requires memory.expert_weight_access='chunked_dequant'."
+                )
+            if int(policy.expert_dequant_chunk_size) <= 0:
+                raise ValueError("W4A8 requires memory.expert_dequant_chunk_size > 0.")
+            if precision_plan_path:
+                raise ValueError("W4A8 does not support mixed expert precision plans.")
+            if learn_expert_rotations:
+                raise ValueError("W4A8 does not support learned expert rotations.")
         rotation_optimization_steps = int(
             kwargs.pop("rotation_optimization_steps", 200)
         )
@@ -4792,6 +4820,7 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             expert_dequant_chunk_size=policy.expert_dequant_chunk_size,
             quant_format=quant_format,
             nf4_blocksize=block_size,
+            replace_linear=quant_format != "w4a8",
             expert_formats=expert_formats,
             expert_tensor_formats=expert_tensor_formats,
             learn_expert_rotations=learn_expert_rotations,
@@ -4805,6 +4834,13 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 "lingbot-video"
             ).expert_mlp_execution_spec,
         )
+        if quant_format == "w4a8" and (
+            report.linear_modules != 0 or report.grouped_expert_modules <= 0
+        ):
+            raise ValueError(
+                "W4A8 must replace routed grouped experts only; dense replacement "
+                "or an empty expert set is unsupported."
+            )
         combined = combine_compressed_weights_reports(self._compressed_weights_report, report)
         if combined is None or combined.replaced_modules <= 0:
             raise ValueError("LingBot-Video compressed_weights found no quantizable frozen weights.")

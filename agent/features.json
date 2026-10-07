@@ -5392,6 +5392,48 @@
       "readme_claims": [],
       "provenance": "https://arxiv.org/abs/2402.09353",
       "promotion_evidence": ""
+    },
+    {
+      "name": "rotated_w4a8_expert_execution",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/compressed_weights/quantization/w4a8.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "persistence",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "W4A8Metadata",
+        "W4A8Weight",
+        "w4a8_linear"
+      ],
+      "config_keys": [
+        "memory.frozen_weight_quantization",
+        "memory.moe_kernel_backend"
+      ],
+      "disabled_config": {
+        "memory.frozen_weight_quantization": "none",
+        "memory.moe_kernel_backend": "auto"
+      },
+      "contract_paths": [
+        "tests/test_w4a8_quantization.py",
+        "tests/test_w4a8_runtime.py",
+        "tests/test_w4a8_policy.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": true,
+      "reference_path": "mirai/core/models/compressed_weights/quantization/w4a8.py",
+      "readme_claim": "Rotated W4A8 expert execution",
+      "readme_claims": [],
+      "provenance": "https://github.com/Comfy-Org/comfy-kitchen/tree/be003b7c23c5b01328657955b8bc5d3f073d868e",
+      "promotion_evidence": ""
     }
   ]
 }

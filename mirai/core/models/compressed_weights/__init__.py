@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from . import prepare
 from .execution import expert_gather, linear, experts
-from .quantization import blockwise_fp8, gguf_quant, learned_rotation, microscaling_quant, quant
+from .quantization import blockwise_fp8, gguf_quant, learned_rotation, microscaling_quant, quant, w4a8
 from .quantization import structured_sparse_provider
 from .packed import packed_residency, packed_state
 
@@ -58,6 +58,14 @@ from .quantization.learned_rotation import (
     expert_weight_fingerprint,
     learn_groupwise_expert_rotation,
     validate_learned_rotation_selection,
+)
+from .quantization.w4a8 import (
+    W4A8Metadata,
+    W4A8Weight,
+    dequantize_w4a8,
+    quantize_w4a8,
+    w4a8_linear,
+    w4a8_linear_reference,
 )
 from .execution.active_expert_lora import ActiveExpertLoRA
 from .execution.experts import CompressedGroupedExperts
@@ -190,6 +198,12 @@ __all__ = [
     "save_compressed_weights_packed_state",
     "save_compressed_weights_packed_tensors",
     "validate_learned_rotation_selection",
+    "W4A8Metadata",
+    "W4A8Weight",
+    "dequantize_w4a8",
+    "quantize_w4a8",
+    "w4a8_linear",
+    "w4a8_linear_reference",
     "SHARED_BASIS_PROVIDER_NAME",
     "SHARED_BASIS_PROVIDER_SCHEMA_VERSION",
     "SharedBasisFactors",

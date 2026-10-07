@@ -13,6 +13,7 @@ from mirai.config.hardware_tiers import apply_hardware_memory_plan
 from mirai.config.schema import TrainingConfig
 from mirai.core.models.quantization import expert_quantization_formats
 from mirai.core.moe.runtime.specs import (
+    CANONICAL_PACKED_EXPERT_MLP_SPEC,
     MoEOptimizationPolicy,
     set_active_moe_optimization_policy,
 )
@@ -351,6 +352,23 @@ def _configure_pipeline_runtime(
         )
     if extension_caps.adapter_type_controls:
         pipeline.set_adapter_type(adapter_type)
+    if frozen_weight_quantization == "w4a8":
+        from mirai.core.models.providers import get_model_family_provider
+
+        provider = get_model_family_provider(config.model.type)
+        provider_spec = (
+            provider.expert_mlp_execution_spec if provider is not None else None
+        )
+        if provider_spec != CANONICAL_PACKED_EXPERT_MLP_SPEC:
+            raise ValueError(
+                "memory.frozen_weight_quantization='w4a8' requires a provider "
+                "with the canonical routed expert layout (w1/w3/w2 gated SiLU)."
+            )
+        if not memory_caps.quantized_frozen_weights or not memory_caps.packed_frozen_weight_state:
+            raise ValueError(
+                f"model.type='{config.model.type}' does not implement the packed "
+                "expert-only W4A8 frozen-weight contract."
+            )
     pipeline.set_gradient_checkpointing(config.training.gradient_checkpointing)
     if trainable_parameter_offload:
         if not memory_caps.trainable_parameter_offload:
@@ -447,11 +465,12 @@ def _configure_pipeline_runtime(
         "mxfp8_e4m3",
         "mxfp4",
         "nvfp4",
+        "w4a8",
     }:
         raise ValueError(
             "memory.frozen_weight_packed_state_path requires "
             "memory.frozen_weight_quantization='fp8', 'int8', 'nf4', 'gguf_iq4', "
-            "'gguf_iq3', 'gguf_iq2', 'mxfp8_e4m3', 'mxfp4', or 'nvfp4'."
+            "'gguf_iq3', 'gguf_iq2', 'mxfp8_e4m3', 'mxfp4', 'nvfp4', or 'w4a8'."
         )
     if frozen_weight_packed_state_path and not memory_caps.packed_frozen_weight_state:
         raise ValueError(

@@ -457,6 +457,13 @@ configuration and compatibility rules are documented in
   boundary, and preserves adapter gradients. This is compact INT8 storage, not
   a packed INT8 GEMM throughput claim.
   [(paper)](https://arxiv.org/abs/2404.00456)
+- **Rotated W4A8 expert execution** — Experimental, default-off four-bit
+  frozen routed-expert storage with a fixed Hadamard basis. The explicit
+  `w4a8_int8` backend uses quantized activations and integer GEMM; input
+  gradients reconstruct high-precision weights, and expert adapters remain
+  in the original activation basis. No model-quality or speedup claim is
+  made.
+  [(reference)](https://github.com/Comfy-Org/comfy-kitchen/tree/be003b7c23c5b01328657955b8bc5d3f073d868e)
 - **Learned orthogonal expert quantization rotations** — Packed INT8 export can
   replace the fixed Hadamard basis with Cayley-parameterized group rotations
   learned directly from frozen expert weights. Gate/up share one transform so

@@ -415,6 +415,7 @@ def quantize_compressed_weights_modules(
     expert_dequant_chunk_size: int = 0,
     quant_format: str = "int8",
     nf4_blocksize: int = NF4_BLOCKSIZE,
+    replace_linear: bool = True,
     expert_formats: Iterable[str] | None = None,
     expert_tensor_formats: Mapping[str, Mapping[str, Iterable[str]]] | None = None,
     learn_expert_rotations: bool = False,
@@ -431,6 +432,11 @@ def quantize_compressed_weights_modules(
     if torch is None:  # pragma: no cover
         raise RuntimeError("compressed_weights quantization requires torch.")
     quant_format = normalize_quant_format(quant_format)
+    if quant_format == "w4a8" and replace_linear:
+        raise ValueError(
+            "W4A8 is an expert-only format; pass replace_linear=False and configure "
+            "dense frozen-weight quantization independently."
+        )
     if learn_expert_rotations and quant_format != "int8":
         raise ValueError("Learned expert rotations require INT8 quantization.")
     if learn_expert_rotations and (
@@ -458,7 +464,7 @@ def quantize_compressed_weights_modules(
             ):
                 skipped.append(child_prefix)
                 continue
-            if isinstance(child, nn.Linear):
+            if isinstance(child, nn.Linear) and replace_linear:
                 replacement = CompressedLinear(
                     child,
                     group_sizes=group_sizes,

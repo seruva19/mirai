@@ -3270,6 +3270,7 @@ class TrainingConfig:
             "fp8",
             "int8",
             "nf4",
+            "w4a8",
             "gguf_iq4",
             "gguf_iq3",
             "gguf_iq2",

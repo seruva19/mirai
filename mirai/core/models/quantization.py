@@ -76,6 +76,19 @@ def expert_quantization_formats() -> frozenset[str]:
     )
 
 
+@register_quant("w4a8")
+class W4A8ExpertOnly:
+    """Registry capability sentinel for routed-expert W4A8 storage."""
+
+    supports_expert_quantization = True
+
+    def __init__(self, _base: Any, **_kwargs: Any):
+        raise ValueError(
+            "W4A8 is an expert-only format and cannot wrap dense nn.Linear modules; "
+            "configure dense frozen-weight quantization independently."
+        )
+
+
 # ---------------------------------------------------------------------------
 # FP8 (float8_e4m3fn)
 # ---------------------------------------------------------------------------

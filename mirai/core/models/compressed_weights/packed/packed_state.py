@@ -50,6 +50,8 @@ from .packed_contract import (
     _nf4_meta_to_spec,
     _packed_tensor_key,
     _validate_manifest_header,
+    _w4a8_meta_from_spec,
+    _w4a8_meta_to_spec,
     get_compressed_weights_packed_state_quant_formats,
 )
 from ..execution.linear import CompressedLinear
@@ -365,6 +367,22 @@ def _packed_state_inventory(
             shapes: dict[str, tuple[int, ...]] = {}
             rotations: dict[str, str] = {}
             for key in ("w1", "w2", "w3"):
+                if quant_format == "w4a8":
+                    for suffix in (
+                        "w4a8_packed",
+                        "w4a8_group_scales",
+                        "w4a8_row_scales",
+                        "w4a8_codebook",
+                    ):
+                        local_name = f"{key}_{suffix}"
+                        tensor_names[local_name] = _packed_tensor_key(module_name, local_name)
+                        inventory.append((tensor_names[local_name], getattr(module, local_name)))
+                        packed_tensor_keys.add(tensor_names[local_name])
+                    shape = tuple(int(v) for v in module.expert_weight_shape(key))
+                    shapes[key] = shape
+                    quantized_tensors += 1
+                    quantized_numel += math.prod(shape)
+                    continue
                 if quant_format in BLOCKWISE_FP8_FORMATS:
                     for suffix in ("fp8", "fp8_scale"):
                         local_name = f"{key}_{suffix}"
@@ -456,6 +474,21 @@ def _packed_state_inventory(
                 "shapes": shapes,
                 "tensors": tensor_names,
             }
+            if quant_format == "w4a8":
+                metadata = [module._w4a8_metadata[key] for key in ("w1", "w2", "w3")]
+                common = metadata[0]
+                if any(
+                    (meta.version, meta.group_size, meta.scheme, meta.scale_format)
+                    != (common.version, common.group_size, common.scheme, common.scale_format)
+                    for meta in metadata[1:]
+                ):
+                    raise RuntimeError("W4A8 expert projections use inconsistent metadata.")
+                if metadata[0].rotation_group_size != metadata[2].rotation_group_size:
+                    raise RuntimeError("W4A8 gate and up projections must share a rotation basis.")
+                modules[module_name]["w4a8_meta"] = {
+                    key: _w4a8_meta_to_spec(module._w4a8_metadata[key])
+                    for key in ("w1", "w2", "w3")
+                }
             if rotations:
                 if set(rotations) != {"w1", "w2", "w3"}:
                     raise RuntimeError(
@@ -521,7 +554,12 @@ def _packed_state_inventory(
     }
     manifest = {
         "schema_version": (
-            5
+            6
+            if any(
+                isinstance(spec, Mapping) and spec.get("quant_format") == "w4a8"
+                for spec in modules.values()
+            )
+            else 5
             if any(
                 isinstance(spec, Mapping) and "rotations" in spec
                 for spec in modules.values()
@@ -804,6 +842,48 @@ def load_compressed_weights_packed_state(
                         shape=shapes[key],
                         meta=gguf_meta,
                     )
+                    quantized_tensors += 1
+                    quantized_numel += math.prod(int(v) for v in shapes[key])
+                grouped_modules += 1
+                last_expert_access = normalize_expert_weight_access_policy(access)
+                last_expert_chunk_size = chunk
+                continue
+            if quant_format == "w4a8":
+                if schema_version < 6:
+                    raise ValueError("W4A8 packed experts require schema version 6.")
+                if isinstance(tensors, LazyPackedTensorMapping):
+                    raise ValueError(
+                        "W4A8 packed experts require RAM or pinned preload; disk streaming is unsupported."
+                    )
+                raw_meta = raw_spec.get("w4a8_meta")
+                if not isinstance(raw_meta, Mapping):
+                    raise ValueError("W4A8 packed expert module has no metadata map.")
+                for key in ("w1", "w2", "w3"):
+                    required = [
+                        f"{key}_w4a8_packed",
+                        f"{key}_w4a8_group_scales",
+                        f"{key}_w4a8_row_scales",
+                        f"{key}_w4a8_codebook",
+                    ]
+                    missing = [
+                        name for name in required
+                        if str(tensor_names.get(name) or "") not in tensors
+                    ]
+                    if missing:
+                        raise KeyError(
+                            f"compressed_weights packed module {module_name!r} missing W4A8 tensors for {missing}."
+                        )
+                    used_tensor_keys.update(str(tensor_names[name]) for name in required)
+                    module.load_w4a8_packed_weight(
+                        key,
+                        packed=tensors[str(tensor_names[required[0]])],
+                        group_scales=tensors[str(tensor_names[required[1]])],
+                        row_scales=tensors[str(tensor_names[required[2]])],
+                        codebook=tensors[str(tensor_names[required[3]])],
+                        metadata=_w4a8_meta_from_spec({"w4a8_meta": raw_meta.get(key)}),
+                    )
+                    if tuple(module.expert_weight_shape(key)) != tuple(int(v) for v in shapes[key]):
+                        raise ValueError(f"W4A8 packed shape mismatch for {module_name}.{key}.")
                     quantized_tensors += 1
                     quantized_numel += math.prod(int(v) for v in shapes[key])
                 grouped_modules += 1

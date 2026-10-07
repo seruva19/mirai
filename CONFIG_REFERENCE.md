@@ -3121,9 +3121,23 @@ Opt-in resolution from `config/defaults/hardware_tiers.toml`. `tiered` matches c
 
 - **Type:** str
 - **Default:** `"none"`
-- **Allowed / range:** `none`, `fp8`, `int8`, `nf4`, `gguf_iq4`, `gguf_iq3`, `gguf_iq2`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
+- **Allowed / range:** `none`, `fp8`, `int8`, `nf4`, `w4a8`, `gguf_iq4`, `gguf_iq3`, `gguf_iq2`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
 
 Frozen-weight quant scheme ([`quantization.py`](mirai/core/models/quantization.py), compressed_weights). `fp8` is DeepSeek-style E4M3 W8A8 reference execution: 128×128 FP32 weight scales, online per-token-per-128-channel activation scales, FP32 K=128 accumulation, and high-precision input gradients; packed dense and routed-expert artifacts use separate `*_fp8`/`*_fp8_scale` roles. `nf4` requires bitsandbytes; MAGI-2 Preview implements `nf4` only, and packs exactly the three routed expert tensors of each multi-head MoE layer ([`quantized_experts.py`](mirai/core/models/magi2_preview/quantized_experts.py)). `gguf_iq4`/`gguf_iq3`/`gguf_iq2` provide GGUF sub-4-bit expert storage; IQ2_XS uses canonical 74-byte blocks (2.3125 bits/weight), uniform code assignment, and imatrix-weighted calibration for per-projection format selection. It does not claim to reproduce llama.cpp's imatrix encoder. `mxfp8_e4m3` is the distinct OCP microscaling format with 32-value E4M3 blocks and round-up UE8M0 scales (`ceil(log2(amax / 448))`). `mxfp4` implements OCP E2M1 with 32-value E8M0-scaled blocks; `nvfp4` implements E2M1 with 16-value E4M3 block scales and a tensor FP32 scale. The portable paths are default-off and make no native-kernel speed claim.
+
+`w4a8` is experimental frozen routed-expert storage. It uses Mirai's fixed
+Hadamard basis rather than Comfy Kitchen's ConvRot basis and is not a
+ComfyUI checkpoint format. Packed nibbles and E4M3 group-scale bytes use
+4.5 bits per weight, plus FP32 row scales and a shared codebook. Canonical
+`w1`/`w3`/`w2` SwiGLU experts require
+`expert_weight_access="chunked_dequant"` and a positive chunk size. Dense
+weights, selected-expert updates, learned rotations, mixed-precision plans,
+and disk-backed packed loading are unsupported. The `auto`/`torch` path
+dequantizes weights for the reference GEMM; `w4a8_int8` explicitly enables
+A8 arithmetic. Validation: `tests/test_w4a8_quantization.py`,
+`tests/test_w4a8_runtime.py`, and `tests/test_w4a8_policy.py`; model-quality
+and efficiency evaluation requires paired native LingBot generations and
+latency, peak VRAM, host RAM, and artifact-size measurements.
 
 ### `refiner_frozen_weight_quantization`
 
@@ -3132,7 +3146,8 @@ Frozen-weight quant scheme ([`quantization.py`](mirai/core/models/quantization.p
 - **Allowed / range:** empty, `none`, `fp8`, `int8`, `nf4`, `gguf_iq4`, `gguf_iq3`, `gguf_iq2`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
 
 Frozen-weight format for a separately loaded refiner DiT. Empty inherits
-`memory.frozen_weight_quantization`; an explicit value lets the base and refiner
+`memory.frozen_weight_quantization`, except expert-only `w4a8`, which leaves
+the separate refiner unquantized; an explicit value lets the base and refiner
 use different storage formats. The provider must support compressed on-load
 construction for its refiner. Packed integer codes and FP32 scale metadata retain
 their storage dtypes when the model compute dtype is applied
@@ -3281,9 +3296,18 @@ Optional EAQuant calibration artifact consumed while frozen router INT8 storage 
 
 - **Type:** str
 - **Default:** `"auto"`
-- **Allowed / range:** `auto`, `torch`, `rotated_int8`, `compiled_packed`, `megablocks`, `grouped` ([`kernels.py`](mirai/core/moe/runtime/kernels.py))
+- **Allowed / range:** `auto`, `torch`, `rotated_int8`, `w4a8_int8`, `compiled_packed`, `megablocks`, `grouped` ([`kernels.py`](mirai/core/moe/runtime/kernels.py))
 
 MoE execution backend. `rotated_int8` requires INT8 frozen weights with chunked access and moves the stored-weight rotation onto activations before batched multiplication. `compiled_packed` uses shape-specialized TorchInductor decode kernels for GGUF IQ4/IQ3 or microscaling storage (`mxfp8_e4m3`, MXFP4, NVFP4) before grouped GEMM and fails if compilation is unavailable. `megablocks` requires `megablocks.ops` and `grouped_gemm`. `grouped` selects a model-family-owned grouped-GEMM expert seam and has no generic implementation; MAGI-2 Preview implements it for training with frozen experts ([`grouped_moe.py`](mirai/core/models/magi2_preview/grouped_moe.py)) and other families reject it. With MAGI-2 NF4 experts, `auto` resolves to that seam and `torch` is rejected, because the vendored per-expert reference loop reads the dense expert tensors packed storage replaces.
+
+`w4a8_int8` requires `frozen_weight_quantization="w4a8"`, canonical
+frozen SwiGLU experts, chunked access, CUDA SM80+, and Triton. Packed
+four-bit weights expand to transient INT8 operands; rotated activations
+are quantized per row before INT32 accumulation and scale epilogues.
+Backward uses high-precision decoded weights with a straight-through
+activation-quantization gradient. A8 forward arithmetic is approximate
+relative to the weight-only reference. Explicit backend selection never
+falls back when the integer kernel is unavailable.
 
 ### `cuda_memory_fraction`
 

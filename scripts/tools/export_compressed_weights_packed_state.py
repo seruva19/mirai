@@ -55,11 +55,12 @@ def _ensure_compressed_weights_config(config: TrainingConfig) -> None:
         "mxfp8_e4m3",
         "mxfp4",
         "nvfp4",
+        "w4a8",
     }:
         raise ValueError(
             "Packed compressed_weights export requires memory.frozen_weight_quantization "
             "to be 'none', 'int8', 'nf4', 'gguf_iq4', 'gguf_iq3', 'gguf_iq2', "
-            "'mxfp8_e4m3', 'mxfp4', or 'nvfp4'."
+            "'mxfp8_e4m3', 'mxfp4', 'nvfp4', or expert-only 'w4a8'."
         )
     if strategy in {"", "disabled", "none"}:
         config.memory.frozen_weight_quantization_strategy = "compressed_weights"
@@ -110,6 +111,8 @@ def export_compressed_weights_packed_state_from_config(
         config.model.params.expert_quantization_rotation
     ).strip().lower()
     learn_rotations = rotation_mode == "learned"
+    if scheme == "w4a8" and learn_rotations:
+        raise ValueError("W4A8 packed export does not support learned expert rotations.")
     if learn_rotations and scheme != "int8":
         raise ValueError(
             "Learned expert rotations require "

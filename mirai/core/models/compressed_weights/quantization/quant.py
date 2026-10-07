@@ -34,6 +34,7 @@ QUANT_FORMATS = (
     "mxfp8_e4m3",
     "mxfp4",
     "nvfp4",
+    "w4a8",
 )
 DEFAULT_QUANTIZATION_WORKSPACE_BYTES = 256 * 1024 * 1024
 _HADAMARD_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
