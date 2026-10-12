@@ -174,14 +174,9 @@ class InferenceSessionEquivalenceTests(unittest.TestCase):
     def test_saved_preview_latent_can_enter_refiner_without_base_denoise(self) -> None:
         import mirai.core.inference.session as session_module
         from mirai.core.inference.session import InferenceSession
+        from mirai.core.models.providers import FamilyGenerationDefaults
 
         source = torch.randn(2, 3, 4)
-
-        class _Defaults:
-            @staticmethod
-            def empty_negative_prompt_warning(_prompt, *, model_type):
-                _ = model_type
-                return None
 
         class _Provider:
             model_type = "resume_test"
@@ -189,7 +184,7 @@ class InferenceSessionEquivalenceTests(unittest.TestCase):
 
             @staticmethod
             def generation_defaults():
-                return _Defaults()
+                return FamilyGenerationDefaults()
 
             @staticmethod
             def validate_inference_prompt_rewriter(_name):
@@ -555,6 +550,48 @@ class InferenceSessionEquivalenceTests(unittest.TestCase):
             session._ensure_base_placement()
             self.assertEqual(len(placements), 2)
 
+    def test_native_runtime_preparation_runs_once_after_load_and_before_placement(self):
+        import mirai.core.inference.session as session_module
+        from mirai.core.models.native_video import NativeVideoPipeline
+
+        events = []
+        original_trainer = session_module.Trainer
+
+        def trainer_factory(config):
+            trainer = original_trainer(config)
+            base_type = type(trainer.pipeline)
+
+            class NativeFixture(base_type, NativeVideoPipeline):
+                def prepare_inference_runtime(self):
+                    events.append("prepare")
+
+            trainer.pipeline.__class__ = NativeFixture
+            original_load = trainer.load_state_dict
+
+            def load(state):
+                events.append("load")
+                return original_load(state)
+
+            trainer.load_state_dict = load
+            return trainer
+
+        class CudaDevice:
+            type = "cuda"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.toml"
+            checkpoint = Path(tmp) / "checkpoint.pt"
+            _write_config(cfg_path)
+            _write_checkpoint(checkpoint, cfg_path)
+            with mock.patch.object(session_module, "Trainer", trainer_factory):
+                session = session_module.InferenceSession.from_config(
+                    str(cfg_path), checkpoint=str(checkpoint), device_fn=CudaDevice,
+                    place_fn=lambda pipeline, **kwargs: events.append("place"),
+                )
+                session._base_placement_dirty = True
+                session._ensure_base_placement()
+            self.assertEqual(events, ["load", "prepare", "place", "place"])
+
 
 @unittest.skipIf(torch is None, "torch not installed")
 class BatchPromptsTests(unittest.TestCase):
@@ -874,6 +911,61 @@ class FamilyGenerationDefaultsTests(unittest.TestCase):
                             **_RUN_KW,
                         )
                     self.assertNotIn("declares a default negative prompt", quiet.getvalue())
+                finally:
+                    session.close()
+        finally:
+            type(provider).generation_defaults = original
+
+    def test_session_resolves_omitted_negative_prompt_before_generation(self) -> None:
+        """The programmatic API preserves omitted, explicit, and empty requests."""
+        from mirai.core.inference.session import InferenceSession
+        from mirai.core.models.agnes_video.pipeline import (
+            agnes_default_negative_prompt,
+        )
+        from mirai.core.models.providers import (
+            FamilyGenerationDefaults,
+            get_model_family_provider,
+        )
+
+        provider = get_model_family_provider("sparse_moe_test")
+        assert provider is not None
+        released = agnes_default_negative_prompt()
+        original = type(provider).generation_defaults
+        type(provider).generation_defaults = lambda _self: FamilyGenerationDefaults(
+            negative_prompt=released
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmpdir = Path(tmp)
+                cfg_path = tmpdir / "config.toml"
+                _write_config(cfg_path)
+                session = InferenceSession.from_config(str(cfg_path))
+                try:
+                    omitted = session.generate(
+                        prompt="a red cube spinning",
+                        out_path=tmpdir / "omitted.mp4",
+                        **_RUN_KW,
+                    )
+                    explicit = session.generate(
+                        prompt="a red cube spinning",
+                        negative_prompt="custom negative",
+                        out_path=tmpdir / "explicit.mp4",
+                        **_RUN_KW,
+                    )
+                    errors = io.StringIO()
+                    with contextlib.redirect_stderr(errors):
+                        emptied = session.generate(
+                            prompt="a red cube spinning",
+                            negative_prompt="",
+                            out_path=tmpdir / "empty.mp4",
+                            **_RUN_KW,
+                        )
+                    self.assertEqual(omitted["negative_prompt"], released)
+                    self.assertEqual(explicit["negative_prompt"], "custom negative")
+                    self.assertEqual(emptied["negative_prompt"], "")
+                    self.assertIn(
+                        "declares a default negative prompt", errors.getvalue()
+                    )
                 finally:
                     session.close()
         finally:

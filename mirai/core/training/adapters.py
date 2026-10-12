@@ -548,7 +548,15 @@ def _restore_mirai_scaling_metadata(
 ) -> dict[str, Any]:
     metadata = payload.get("_metadata")
     restored = dict(state)
+    lineage = payload.get("__mirai_adapter_lineage__")
+    if lineage is not None:
+        restored["__mirai_adapter_lineage__"] = lineage
     if isinstance(metadata, dict):
+        lineage = metadata.get("mirai_adapter_lineage")
+        if lineage is not None and "__mirai_adapter_lineage__" not in restored:
+            restored["__mirai_adapter_lineage__"] = torch.tensor(
+                list(str(lineage).encode("utf-8")), dtype=torch.uint8
+            )
         rule = str(metadata.get("mirai_adapter_scaling_rule", "")).strip()
         if rule and rule != "alpha_over_rank":
             if rule != "alpha_over_sqrt_rank":
@@ -593,6 +601,11 @@ def _append_structural_adapter_safetensors_state(
     metadata: dict[str, str],
     adapter_state: dict[str, Any],
 ) -> None:
+    lineage = adapter_state.get("__mirai_adapter_lineage__")
+    if lineage is not None:
+        if not _is_tensor(lineage) or lineage.dtype != torch.uint8 or lineage.ndim != 1:
+            raise ValueError("Adapter lineage must be a one-dimensional uint8 JSON tensor.")
+        metadata["mirai_adapter_lineage"] = bytes(lineage.detach().cpu().tolist()).decode("utf-8")
     for prefix, schema_metadata, topology_metadata in (
         _STRUCTURAL_ADAPTER_EXTENSIONS
     ):

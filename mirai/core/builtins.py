@@ -12,6 +12,7 @@ BUILTIN_COMPONENT_MODULES: tuple[tuple[str, str], ...] = (
     ("prompt_rewriter", "mirai.core.models.lingbot_video.prompting"),
     ("model", "mirai.core.models.lingbot_video.pipeline"),
     ("model", "mirai.core.models.magi2_preview.pipeline"),
+    ("model", "mirai.core.models.agnes_video.pipeline"),
     ("strategy", "mirai.core.training.strategies.text_to_video"),
     ("strategy", "mirai.core.training.strategies.image_to_video"),
     ("strategy", "mirai.core.training.strategies.hybrid_conditioning"),

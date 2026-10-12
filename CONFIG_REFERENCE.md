@@ -1022,7 +1022,14 @@ Strategy-owned options; must be a table and unknown keys fail. `text_to_video` a
 - **Type:** str
 - **Default:** `"text_to_video"`
 
-`text_to_video`, `text_to_image`, `image_to_video`, `video_to_video` (CLI aliases: `t2v`, `t2i`, `ti2v`/`i2v`, `v2v`). The selected model provider must declare the task. T2I forces one output frame; TI2V and V2V require per-generation `--input-image` and `--input-video` respectively ([`conditioning.py`](mirai/core/inference/conditioning.py), [`session.py`](mirai/core/inference/session.py)).
+`text_to_video`, `text_to_image`, `image_to_video`, `video_to_video`, `audio_to_video` (CLI aliases: `t2v`, `t2i`, `ti2v`/`i2v`, `v2v`, `a2v`). The selected model provider must declare the task. T2I forces one output frame; TI2V, V2V, and A2V require per-generation `--input-image`, `--input-video`, and `--input-audio` respectively. I2V and V2V may additionally carry explicit audio when the provider supports that modality ([`conditioning.py`](mirai/core/inference/conditioning.py), [`session.py`](mirai/core/inference/session.py)).
+
+### `input_audio`
+
+- **Type:** str
+- **Default:** `""`
+
+Optional audio source path used by `audio_to_video`, or as an additional source modality for `image_to_video` and `video_to_video`. The CLI `--input-audio` override takes precedence. Other tasks reject a configured audio source before model execution.
 
 ### `denoising_strength`
 

@@ -17,7 +17,10 @@ to a single ``scripts/infer.py`` run for the same seed and geometry.
 from __future__ import annotations
 
 import sys
+import shutil
+import subprocess
 import time
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +33,13 @@ from mirai.core.inference.prompt_rewriter import (
 from mirai.core.inference.component_residency import (
     resolve_inference_component_residency,
 )
-from mirai.core.models.native_video import resolve_output_fps
+from mirai.core.models.native_video import (
+    DecodedMedia,
+    JointMediaLatents,
+    JOINT_MEDIA_LATENTS_FORMAT,
+    NativeVideoPipeline,
+    resolve_output_fps,
+)
 from mirai.core.models.providers import get_model_family_provider
 from mirai.core.training.adapters import load_adapter_payload, normalize_adapter_state
 from mirai.core.persistence.checkpoints import load_checkpoint
@@ -61,18 +70,100 @@ def _sync_perf_counter() -> float:
     return time.perf_counter()
 
 
-def decode_pipeline_video(
-    *, pipeline, pred: torch.Tensor, video_path: Path, fps: float | None = None
-) -> None:
+def serialize_inference_latent(value: Any) -> Any:
+    """Return a weights-only-safe latent payload, preserving legacy tensors."""
+    if isinstance(value, JointMediaLatents):
+        return value.to_payload()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    raise TypeError(f"Unsupported inference latent type: {type(value).__name__}")
+
+
+def deserialize_inference_latent(payload: Any) -> Any:
+    """Restore typed latent payloads while accepting legacy tensor artifacts."""
+    if isinstance(payload, torch.Tensor):
+        return payload
+    if isinstance(payload, dict) and payload.get("format") == JOINT_MEDIA_LATENTS_FORMAT:
+        return JointMediaLatents.from_payload(payload)
+    raise TypeError(f"Unsupported inference latent payload: {type(payload).__name__}")
+
+
+def _write_pcm_wav(path: Path, audio: Any, sample_rate: int) -> None:
+    if not isinstance(audio, torch.Tensor):
+        raise TypeError("Decoded audio must be a tensor.")
+    waveform = audio.detach().float().cpu()
+    while waveform.ndim > 2 and waveform.shape[0] == 1:
+        waveform = waveform[0]
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0)
+    if waveform.ndim != 2:
+        raise ValueError(f"Decoded audio must have shape (samples,) or (channels, samples), got {tuple(waveform.shape)}.")
+    if waveform.shape[0] > 8 and waveform.shape[1] <= 8:
+        waveform = waveform.transpose(0, 1)
+    if waveform.shape[0] > 8:
+        raise ValueError(f"Decoded audio has unsupported channel count {waveform.shape[0]}.")
+    pcm = (
+        waveform.clamp(-1.0, 1.0)
+        .mul(32767.0)
+        .round()
+        .to(torch.int16)
+        .transpose(0, 1)
+        .contiguous()
+        .numpy()
+    )
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(int(waveform.shape[0]))
+        handle.setsampwidth(2)
+        handle.setframerate(int(sample_rate))
+        handle.writeframes(pcm.tobytes())
+
+
+def _write_decoded_video(media_path: Path, decoded: DecodedMedia, *, fps: float) -> bool:
     from mirai.core.training.preview.preview import _write_mp4
 
+    if decoded.audio is None:
+        return bool(_write_mp4(media_path, decoded.frames, fps=float(fps)))
+    if decoded.sample_rate is None or int(decoded.sample_rate) <= 0:
+        raise ValueError("Decoded audio requires a positive sample_rate.")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is required to mux decoded joint audio and video.")
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path = media_path.with_name(f".{media_path.stem}.video.tmp.mp4")
+    audio_path = media_path.with_name(f".{media_path.stem}.audio.tmp.wav")
+    try:
+        if not _write_mp4(video_path, decoded.frames, fps=float(fps)):
+            return False
+        _write_pcm_wav(audio_path, decoded.audio, int(decoded.sample_rate))
+        completed = subprocess.run(
+            [
+                ffmpeg, "-y", "-loglevel", "error", "-i", str(video_path),
+                "-i", str(audio_path), "-c:v", "copy", "-c:a", "aac", "-shortest",
+                str(media_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"ffmpeg audio mux failed: {completed.stderr.strip()}")
+        return media_path.is_file() and media_path.stat().st_size > 0
+    finally:
+        video_path.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
+
+
+def decode_pipeline_video(
+    *, pipeline, pred: Any, video_path: Path, fps: float | None = None
+) -> None:
     fps = resolve_output_fps(pipeline=pipeline, requested=fps)
     try:
         pipeline.load_vae(
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
-        frames = pipeline.decode_latents_native([pred])
-        written = bool(_write_mp4(video_path, frames, fps=float(fps)))
+        decoded = pipeline.decode_media_native(pred)
+        frames = decoded.frames
+        written = _write_decoded_video(video_path, decoded, fps=float(fps))
     except Exception as exc:
         raise RuntimeError(f"Native VAE decode failed: {exc}") from exc
     finally:
@@ -95,14 +186,13 @@ def decode_pipeline_video(
 def decode_pipeline_media(
     *,
     pipeline,
-    pred: torch.Tensor,
+    pred: Any,
     out_path: Path,
     task: str,
     fps: float | None = None,
 ) -> Path:
     """Decode one latent and write the task's native PNG or MP4 artifact."""
     from mirai.core.inference.conditioning import TEXT_TO_IMAGE
-    from mirai.core.training.preview.preview import _write_mp4
 
     fps = resolve_output_fps(pipeline=pipeline, requested=fps)
     task_key = str(task)
@@ -115,8 +205,11 @@ def decode_pipeline_media(
         pipeline.load_vae(
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
-        frames = pipeline.decode_latents_native([pred])
+        decoded = pipeline.decode_media_native(pred)
+        frames = decoded.frames
         if task_key == TEXT_TO_IMAGE:
+            if decoded.audio is not None:
+                raise ValueError("Text-to-image decode cannot emit audio.")
             if int(frames.ndim) != 4 or tuple(frames.shape[:2]) != (1, 3):
                 raise ValueError(
                     "T2I decode must produce exactly one RGB frame; got "
@@ -140,7 +233,7 @@ def decode_pipeline_media(
             Image.fromarray(rgb, mode="RGB").save(media_path)
             written = media_path.is_file()
         else:
-            written = bool(_write_mp4(media_path, frames, fps=float(fps)))
+            written = _write_decoded_video(media_path, decoded, fps=float(fps))
     except Exception as exc:
         raise RuntimeError(f"Native VAE decode failed: {exc}") from exc
     finally:
@@ -293,6 +386,7 @@ class InferenceSession:
             trainer.load_state_dict(ckpt.get("trainer_state", {}))
         if adapter_path:
             adapter_payload = load_adapter_payload(adapter_path)
+            trainer.pipeline.validate_adapter_payload(adapter_payload)
             trainer.pipeline.load_adapter_state(
                 normalize_adapter_state(adapter_payload, lora_format=lora_format)
             )
@@ -309,6 +403,9 @@ class InferenceSession:
             if not merge_applied:
                 raise RuntimeError("Adapter merge was requested but did not complete.")
         effective_scale = 1.0 if merge_applied else lora_scale
+
+        if isinstance(trainer.pipeline, NativeVideoPipeline):
+            trainer.pipeline.prepare_inference_runtime()
 
         inference_mode = resolve_inference_mode(trainer.pipeline)
         compute_device = _device_fn()
@@ -564,7 +661,7 @@ class InferenceSession:
         *,
         prompt: str,
         out_path,
-        negative_prompt: str = "",
+        negative_prompt: str | None = None,
         seed: int = 42,
         steps: int = 20,
         cfg_scale: float = 5.0,
@@ -582,6 +679,7 @@ class InferenceSession:
         task: str | None = None,
         input_image: Any | None = None,
         input_video: Any | None = None,
+        input_audio: Any | None = None,
         denoising_strength: float | None = None,
     ) -> dict:
         """Run one denoise + decode and return the ``scripts/infer.py`` payload.
@@ -670,6 +768,7 @@ class InferenceSession:
         # empty unconditional is a legitimate deliberate request (ablation,
         # cfg_scale=1). It is unreachable from a correct run, which omits the
         # negative prompt and receives the family default.
+        negative_prompt = provider.generation_defaults().resolve_negative_prompt(negative_prompt)
         empty_negative_warning = provider.generation_defaults().empty_negative_prompt_warning(
             str(negative_prompt), model_type=str(provider.model_type)
         )
@@ -746,11 +845,14 @@ class InferenceSession:
             if timings is not None:
                 timings["conditioning_s"] = _sync_perf_counter() - _conditioning_t0
         if decode_latent_path:
-            pred = torch.load(decode_latent_path, map_location="cpu", weights_only=True)
-            if not isinstance(pred, torch.Tensor):
-                raise SystemExit(
-                    f"--decode-latent expects a tensor .pt file, got {type(pred).__name__}"
+            try:
+                pred = deserialize_inference_latent(
+                    torch.load(decode_latent_path, map_location="cpu", weights_only=True)
                 )
+            except (TypeError, ValueError) as exc:
+                raise SystemExit(
+                    f"--decode-latent contains an unsupported latent artifact: {exc}"
+                ) from exc
         else:
             _denoise_t0 = _sync_perf_counter() if timings is not None else 0.0
             if use_native:
@@ -758,6 +860,11 @@ class InferenceSession:
                     task=task_key,
                     input_image=input_image,
                     input_video=input_video,
+                    input_audio=(
+                        input_audio
+                        if input_audio is not None
+                        else self.cfg.inference.input_audio or None
+                    ),
                     denoising_strength=strength,
                     frame_count=effective_frames,
                     height=int(height),
@@ -798,7 +905,7 @@ class InferenceSession:
                 )
             if timings is not None:
                 timings["denoise_s"] = _sync_perf_counter() - _denoise_t0
-            torch.save(pred.detach().cpu(), out_path.with_suffix(".pt"))
+            torch.save(serialize_inference_latent(pred), out_path.with_suffix(".pt"))
         refined = False
         if refine and ran_denoise_loop:
             device = self._compute_device
@@ -820,7 +927,7 @@ class InferenceSession:
             )
             if timings is not None:
                 timings["refine_s"] = _sync_perf_counter() - _refine_t0
-            torch.save(pred.detach().cpu(), out_path.with_suffix(".pt"))
+            torch.save(serialize_inference_latent(pred), out_path.with_suffix(".pt"))
             refined = True
         if ran_denoise_loop:
             # VAE decode and task-native media write.
@@ -905,4 +1012,6 @@ __all__ = [
     "decode_pipeline_video",
     "resolve_inference_mode",
     "resolve_output_fps",
+    "serialize_inference_latent",
+    "deserialize_inference_latent",
 ]

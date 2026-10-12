@@ -11,6 +11,21 @@ from mirai.core.training.runtime.contract import validate_training_runtime_confi
 
 
 class ConfigTests(unittest.TestCase):
+    def test_inference_audio_source_is_typed_and_task_scoped(self) -> None:
+        cfg = TrainingConfig.from_dict(
+            {"inference": {"task": "a2v", "input_audio": "voice.wav"}}
+        )
+        self.assertEqual(cfg.inference.task, "audio_to_video")
+        self.assertEqual(cfg.inference.input_audio, "voice.wav")
+        with self.assertRaisesRegex(ConfigError, "supported only"):
+            TrainingConfig.from_dict(
+                {"inference": {"task": "t2v", "input_audio": "voice.wav"}}
+            )
+        with self.assertRaisesRegex(ConfigError, "path string"):
+            TrainingConfig.from_dict(
+                {"inference": {"task": "a2v", "input_audio": 3}}
+            )
+
     def test_explicit_default_family_uses_provider_owned_defaults(self) -> None:
         cfg = load_config(self._write('[model]\ntype = "lingbot-video"\n'))
         self.assertEqual(cfg.model.path, "./models/lingbot_video")

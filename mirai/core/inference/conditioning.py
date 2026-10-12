@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -10,6 +10,7 @@ TEXT_TO_VIDEO = "text_to_video"
 TEXT_TO_IMAGE = "text_to_image"
 IMAGE_TO_VIDEO = "image_to_video"
 VIDEO_TO_VIDEO = "video_to_video"
+AUDIO_TO_VIDEO = "audio_to_video"
 
 INFERENCE_TASK_ALIASES = {
     "t2v": TEXT_TO_VIDEO,
@@ -22,12 +23,15 @@ INFERENCE_TASK_ALIASES = {
     IMAGE_TO_VIDEO: IMAGE_TO_VIDEO,
     "v2v": VIDEO_TO_VIDEO,
     VIDEO_TO_VIDEO: VIDEO_TO_VIDEO,
+    "a2v": AUDIO_TO_VIDEO,
+    AUDIO_TO_VIDEO: AUDIO_TO_VIDEO,
 }
 INFERENCE_TASKS = (
     TEXT_TO_VIDEO,
     TEXT_TO_IMAGE,
     IMAGE_TO_VIDEO,
     VIDEO_TO_VIDEO,
+    AUDIO_TO_VIDEO,
 )
 
 
@@ -49,6 +53,7 @@ class InferenceConditioningRequest:
     task: str = TEXT_TO_VIDEO
     input_image: Any | None = None
     input_video: Any | None = None
+    input_audio: Any | None = None
     denoising_strength: float = 1.0
     frame_count: int = 17
     height: int = 480
@@ -69,10 +74,13 @@ class InferenceConditioningRequest:
         has_video = self.input_video is not None and (
             not isinstance(self.input_video, str) or bool(self.input_video.strip())
         )
+        has_audio = self.input_audio is not None and (
+            not isinstance(self.input_audio, str) or bool(self.input_audio.strip())
+        )
         if task == TEXT_TO_IMAGE:
             if int(self.frame_count) != 1:
                 raise ValueError("text_to_image requires frame_count=1.")
-            if has_image or has_video:
+            if has_image or has_video or has_audio:
                 raise ValueError("text_to_image does not accept input media.")
         elif task == IMAGE_TO_VIDEO:
             if not has_image or has_video:
@@ -84,7 +92,12 @@ class InferenceConditioningRequest:
                 raise ValueError(
                     "video_to_video requires input_video and does not accept input_image."
                 )
-        elif has_image or has_video:
+        elif task == AUDIO_TO_VIDEO:
+            if not has_audio or has_image or has_video:
+                raise ValueError(
+                    "audio_to_video requires input_audio and does not accept input_image or input_video."
+                )
+        elif has_image or has_video or has_audio:
             raise ValueError("text_to_video does not accept input media.")
 
         if task != VIDEO_TO_VIDEO and strength != 1.0:
@@ -103,6 +116,7 @@ class PreparedInferenceConditioning:
     condition_latent: Any | None = None
     source_latent: Any | None = None
     denoising_strength: float = 1.0
+    forward_media: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def unconditioned(
@@ -178,6 +192,7 @@ def blend_source_with_noise(source: Any, noise: Any, sigma: Any) -> Any:
 
 
 __all__ = [
+    "AUDIO_TO_VIDEO",
     "IMAGE_TO_VIDEO",
     "INFERENCE_TASKS",
     "InferenceConditioningRequest",

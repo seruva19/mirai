@@ -15,6 +15,100 @@ if TYPE_CHECKING:
 
 # Frame rate written when neither the caller nor the model family states one.
 DEFAULT_OUTPUT_FPS = 8.0
+JOINT_MEDIA_LATENTS_FORMAT = "mirai.joint_media_latents"
+JOINT_MEDIA_LATENTS_VERSION = 2
+
+
+@dataclass(frozen=True)
+class JointMediaLatents:
+    """Typed denoiser output for models that jointly generate video and audio."""
+
+    video: Any
+    audio: Any
+    audio_lengths: Any | None = None
+    fps: float | None = None
+    sample_rate: int | None = None
+    requested_frame_count: int | None = None
+
+    def validate(self) -> "JointMediaLatents":
+        import torch
+
+        if not isinstance(self.video, torch.Tensor) or not isinstance(self.audio, torch.Tensor):
+            raise TypeError("Joint media video and audio latents must be tensors.")
+        if self.audio_lengths is not None and not isinstance(self.audio_lengths, torch.Tensor):
+            raise TypeError("Joint media audio_lengths must be a tensor when provided.")
+        if self.fps is not None and float(self.fps) <= 0:
+            raise ValueError("Joint media fps must be positive when provided.")
+        if self.sample_rate is not None and int(self.sample_rate) <= 0:
+            raise ValueError("Joint media sample_rate must be positive when provided.")
+        if self.requested_frame_count is not None and (
+            isinstance(self.requested_frame_count, bool)
+            or not isinstance(self.requested_frame_count, int)
+            or self.requested_frame_count <= 0
+        ):
+            raise ValueError("Joint media requested_frame_count must be a positive integer when provided.")
+        return self
+
+    def detach_cpu(self) -> "JointMediaLatents":
+        self.validate()
+        return JointMediaLatents(
+            video=self.video.detach().cpu(),
+            audio=self.audio.detach().cpu(),
+            audio_lengths=(
+                self.audio_lengths.detach().cpu() if self.audio_lengths is not None else None
+            ),
+            fps=self.fps,
+            sample_rate=self.sample_rate,
+            requested_frame_count=self.requested_frame_count,
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        value = self.detach_cpu()
+        return {
+            "format": JOINT_MEDIA_LATENTS_FORMAT,
+            "version": JOINT_MEDIA_LATENTS_VERSION,
+            "video": value.video,
+            "audio": value.audio,
+            "audio_lengths": value.audio_lengths,
+            "fps": value.fps,
+            "sample_rate": value.sample_rate,
+            "requested_frame_count": value.requested_frame_count,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "JointMediaLatents":
+        if not isinstance(payload, dict):
+            raise TypeError("Joint media latent payload must be a dictionary.")
+        expected = {
+            "format", "version", "video", "audio", "audio_lengths", "fps", "sample_rate"
+        }
+        if not expected.issubset(payload):
+            raise ValueError("Joint media latent payload fields are incomplete.")
+        if payload["format"] != JOINT_MEDIA_LATENTS_FORMAT:
+            raise ValueError("Unknown joint media latent payload format.")
+        if payload["version"] not in (1, JOINT_MEDIA_LATENTS_VERSION):
+            raise ValueError(f"Unsupported joint media latent version: {payload['version']!r}.")
+        if payload["version"] == JOINT_MEDIA_LATENTS_VERSION:
+            expected.add("requested_frame_count")
+        if set(payload) != expected:
+            raise ValueError(f"Joint media latent payload fields do not match version {payload['version']}.")
+        return cls(
+            video=payload["video"],
+            audio=payload["audio"],
+            audio_lengths=payload["audio_lengths"],
+            fps=payload["fps"],
+            sample_rate=payload["sample_rate"],
+            requested_frame_count=payload.get("requested_frame_count"),
+        ).validate()
+
+
+@dataclass(frozen=True)
+class DecodedMedia:
+    """Family-decoded RGB frames with optional waveform audio."""
+
+    frames: Any
+    audio: Any | None = None
+    sample_rate: int | None = None
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -96,6 +190,9 @@ class VideoLatentLayout:
 
 class NativeVideoPipeline(BasePipeline):
     """Base contract for native sparse-MoE video diffusion backends."""
+
+    def prepare_inference_runtime(self) -> None:
+        """Prepare family-owned inference math after loading weights/adapters."""
 
     def get_video_latent_layout(self) -> VideoLatentLayout:
         raise NotImplementedError(
@@ -204,6 +301,11 @@ class NativeVideoPipeline(BasePipeline):
         raise NotImplementedError(
             f"{type(self).__name__} does not implement native VAE decoding."
         )
+
+    def decode_media_native(self, latents: Any) -> DecodedMedia:
+        """Decode a video-only result; joint families override this hook."""
+        video = latents.video if isinstance(latents, JointMediaLatents) else latents
+        return DecodedMedia(frames=self.decode_latents_native([video]))
 
     def offload_vae(self) -> None:
         raise NotImplementedError(

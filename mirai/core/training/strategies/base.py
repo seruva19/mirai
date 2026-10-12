@@ -10,6 +10,17 @@ from mirai.core.models.base import BasePipeline
 from mirai.core.training.objectives.sampling import NoiseGenerator, TimestepSampler
 
 
+@dataclass(frozen=True)
+class VideoTrainingConditioning:
+    """Per-sample first-frame conditioning policy for joint media providers."""
+
+    first_frame_conditioning_p: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.first_frame_conditioning_p <= 1.0:
+            raise ValueError("first_frame_conditioning_p must be in [0, 1].")
+
+
 @dataclass
 class TrainingInputs:
     noisy_latents: Any

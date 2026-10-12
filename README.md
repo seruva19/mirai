@@ -36,6 +36,7 @@ is required.
 
 - [LingBot Video](model_support/lingbot_video.md)
 - [MAGI-2 Preview](model_support/magi2_preview.md)
+- [Agnes Video 2.0](model_support/agnes_video.md)
 
 Each model page documents its supported training and inference paths,
 family-specific configuration, and native runtime capabilities.

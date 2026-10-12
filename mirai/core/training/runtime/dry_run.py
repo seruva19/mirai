@@ -129,10 +129,32 @@ def _build_synthetic_moe_batch(
             dtype=input_dtype,
         )
     )
-    return {
+    batch = {
         "latents": latents,
         "text_embeds": text_embeds,
     }
+    extras_builder = getattr(pipeline, "build_synthetic_batch_extras", None)
+    extras = (
+        extras_builder(
+            batch_size=batch_size,
+            frame_count=frame_count,
+            height=height,
+            width=width,
+            dtype=input_dtype,
+        )
+        if callable(extras_builder)
+        else {}
+    )
+    if not isinstance(extras, dict):
+        raise TypeError("build_synthetic_batch_extras() must return a dictionary.")
+    collisions = sorted(set(batch) & set(extras))
+    if collisions:
+        raise ValueError(
+            "Synthetic batch extras may not replace core fields: "
+            + ", ".join(collisions)
+        )
+    batch.update(extras)
+    return batch
 
 
 def _resolve_pipeline_input_dtype(trainer: Any, config: Any) -> Any:

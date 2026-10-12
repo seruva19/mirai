@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product": "native sparse-MoE video adapter trainer",
-  "supported_families": ["lingbot_video", "magi2_preview"],
+  "supported_families": ["lingbot_video", "magi2_preview", "agnes_video"],
   "domains": [
     {
       "name": "feature_extensions",
@@ -49,6 +49,12 @@
         "root": "mirai/core/models/magi2_preview",
         "authority": "mirai/core/models/magi2_preview/pipeline.py",
         "search_terms": ["Magi2PreviewPipeline", "Magi2PreviewModelFamilyProvider"]
+      },
+      {
+        "name": "agnes_video",
+        "root": "mirai/core/models/agnes_video",
+        "authority": "mirai/core/models/agnes_video/pipeline.py",
+        "search_terms": ["AgnesVideoPipeline", "AgnesVideoModelFamilyProvider"]
       },
       {
         "name": "model_adapters",
@@ -263,12 +269,15 @@
         "mirai.core.models.lingbot_video",
         "mirai.vendors.lingbot_video",
         "mirai.core.models.magi2_preview",
-        "mirai.vendors.magi2_preview"
+        "mirai.vendors.magi2_preview",
+        "mirai.core.models.agnes_video",
+        "mirai.vendors.agnes_video"
       ],
       "exclude_globs": [
         "mirai/core/builtins.py",
         "mirai/core/models/lingbot_video/**",
         "mirai/core/models/magi2_preview/**",
+        "mirai/core/models/agnes_video/**",
         "**/contracts/**"
       ]
     },

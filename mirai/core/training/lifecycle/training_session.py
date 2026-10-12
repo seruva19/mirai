@@ -42,6 +42,18 @@ from mirai.core.training.residency.device_placement import (
 from mirai.core.training.data.loader import load_prepared_training_data
 from mirai.core.training.data.preprocessing import ensure_cache_artifacts_for_training
 from mirai.core.training.trainer import Trainer
+from mirai.core.models.providers import NativeCacheEncoderConfig
+
+
+def _native_cache_config_for_training(config: Any) -> NativeCacheEncoderConfig:
+    return NativeCacheEncoderConfig(
+        enabled=True, model_type=str(config.model.type),
+        variant=str(getattr(config.model.params, "variant", "")),
+        model_path=str(config.model.path), dtype_name=str(config.model.dtype), max_frames=1,
+        strict_assets=bool(getattr(config.model.params, "strict_native_assets", True)),
+        text_encoder_path=str(getattr(config.model.params, "text_encoder_path", "")),
+        family_params=dict(getattr(config.model.params, "family_params", {}) or {}),
+    )
 
 
 @dataclass
@@ -105,6 +117,10 @@ def create_training_session(
     resume_path: str = "",
 ) -> TrainingSession:
     try:
+        ensure_cache_artifacts_for_training(config)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        raise SystemExit(str(exc))
+    try:
         context = build_session_artifact_context(
             config=config,
             config_path=config_path,
@@ -146,10 +162,6 @@ def create_training_session(
     )
 
     try:
-        ensure_cache_artifacts_for_training(config)
-    except (FileNotFoundError, ValueError, RuntimeError) as exc:
-        raise SystemExit(str(exc))
-    try:
         prepared_data = load_prepared_training_data(
             cache_path=config.dataset.cache_path,
             model_type=config.model.type,
@@ -161,6 +173,7 @@ def create_training_session(
                 context.manifest.model_snapshot_meta.get("model_component_id", "")
             ),
             batch_schema=batch_schema,
+            native_cache_config=_native_cache_config_for_training(config),
         )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(str(exc))

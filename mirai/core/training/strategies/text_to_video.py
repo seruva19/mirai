@@ -44,6 +44,33 @@ class TextToVideoStrategy(TrainingStrategy):
             return ["conditioning_dropout_p must be in [0, 1]."]
         return []
 
+    def _drop_conditioning(self, batch: dict[str, Any], *, training: bool) -> dict[str, Any]:
+        p = self._conditioning_dropout_p()
+        if not training or p <= 0:
+            return batch
+        result = dict(batch)
+        latents = batch["latents"]
+        batch_size = latents.shape[0] if is_torch_tensor(latents) else len(latents)
+        text = batch.get("text_embeds", [])
+        empty = self._empty_text_embed()
+        if is_torch_tensor(text):
+            text = text.clone()
+            if p >= 1:
+                text[:] = empty
+            else:
+                mask = torch.rand((batch_size,), device=text.device) < p
+                text[mask] = empty
+        else:
+            if p >= 1:
+                text = [empty for _ in text]
+            else:
+                import random
+
+                rng = random.Random(batch_size + batch.get("_step", 0))
+                text = [empty if rng.random() < p else value for value in text]
+        result["text_embeds"] = text
+        return result
+
     def prepare_inputs(
         self,
         batch: dict[str, Any],
@@ -54,6 +81,20 @@ class TextToVideoStrategy(TrainingStrategy):
         training: bool = True,
         objective: Any = None,
     ) -> TrainingInputs:
+        prepare = getattr(pipeline, "prepare_training_inputs", None)
+        prepared = prepare(
+            batch, timestep_sampler=timestep_sampler, noise_generator=noise_generator,
+            objective=objective, training=training,
+        ) if callable(prepare) else None
+        if prepared is not None:
+            if not isinstance(prepared, TrainingInputs):
+                raise TypeError("prepare_training_inputs must return TrainingInputs or None.")
+            if "t5" in prepared.text_embeds:
+                conditioned = self._drop_conditioning(
+                    {**batch, "text_embeds": prepared.text_embeds["t5"]}, training=training,
+                )
+                prepared.text_embeds = {**prepared.text_embeds, "t5": conditioned["text_embeds"]}
+            return prepared
         latents = batch["latents"]
         batch_size = latents.shape[0] if is_torch_tensor(latents) else len(latents)
         timesteps = timestep_sampler.sample(batch_size, like=latents)
@@ -69,27 +110,8 @@ class TextToVideoStrategy(TrainingStrategy):
             timesteps,
             latents=latents,
         )
-        p = self._conditioning_dropout_p()
-        empty_embed = self._empty_text_embed()
-        if training and p > 0.0:
-            if is_torch_tensor(text_embeds):
-                text_embeds = text_embeds.clone()
-                if p >= 1.0:
-                    text_embeds[:] = empty_embed
-                else:
-                    mask = torch.rand((batch_size,), device=text_embeds.device) < p
-                    text_embeds[mask] = empty_embed
-            else:
-                out = list(text_embeds)
-                if p >= 1.0:
-                    out = [empty_embed for _ in out]
-                else:
-                    import random
-
-                    step_hint = batch.get("_step", 0)
-                    rng = random.Random(batch_size + step_hint)
-                    out = [empty_embed if rng.random() < p else value for value in out]
-                text_embeds = out
+        batch = self._drop_conditioning(batch, training=training)
+        text_embeds = batch.get("text_embeds", [])
         return TrainingInputs(
             noisy_latents=noisy_latents,
             timestep=model_timesteps,

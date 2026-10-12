@@ -1,0 +1,20 @@
+[model]
+type = "agnes-video"
+path = "./models/agnes-video"
+
+[model.params]
+variant = "agnes-video-2.0-moe-28b-a15b"
+strict_native_assets = true
+flow_shift = 5.0
+latent_channels = 48
+num_experts = 3
+experts_per_token = 1
+
+[model.params.family_params]
+fps = 30.0
+allow_missing_audio = false
+
+[adapter]
+type = "lora"
+target_preset = "attn_only"
+train_router = false

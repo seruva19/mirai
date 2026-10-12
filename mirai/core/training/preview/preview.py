@@ -284,6 +284,23 @@ def run_native_denoise_loop(
     # Generate initial noise
     noise = torch.randn(target_shape, dtype=torch.float32, device=device, generator=g)
 
+    conditioned_sampler = getattr(pipeline, "sample_native_conditioned_media", None)
+    if callable(conditioned_sampler):
+        sampled = conditioned_sampler(
+            request=request,
+            prepared=prepared,
+            noise=noise,
+            context=context,
+            context_null=context_null,
+            denoise_steps=max(1, int(denoise_steps)),
+            guidance_scale=float(scale),
+            generator=g,
+            solver_name=str(solver_name),
+            **({} if requested_cfg_mode is None else {"cfg_mode": requested_cfg_mode}),
+        )
+        if sampled is not None:
+            return sampled, []
+
     native_sampler = getattr(pipeline, "sample_native_preview", None)
     if callable(native_sampler) and request.task == TEXT_TO_VIDEO:
         sampled = native_sampler(
@@ -639,14 +656,17 @@ def generate_preview(
         out_dir.mkdir(parents=True, exist_ok=True)
         name = str(sample_name).strip() or "preview"
         out_path = out_dir / f"{name}.pt"
-        torch.save(pred.detach().cpu(), out_path)
+        from mirai.core.inference.session import serialize_inference_latent
+
+        torch.save(serialize_inference_latent(pred), out_path)
 
         # Decode latents to pixel frames. A native decode failure invalidates the
         # preview and propagates to the caller; fabricated frames are never emitted.
         if use_native:
             pipeline.load_vae(device="cuda" if torch.cuda.is_available() else "cpu")
             try:
-                frames = pipeline.decode_latents_native([pred])
+                decoded = pipeline.decode_media_native(pred)
+                frames = decoded.frames
                 decode_chunk_count = 1
             finally:
                 pipeline.offload_vae()
@@ -661,13 +681,21 @@ def generate_preview(
             )
 
         video_path = out_dir / f"{name}.mp4"
-        wrote_mp4 = _write_mp4(
-            video_path,
-            frames,
-            fps=resolve_output_fps(pipeline=pipeline, requested=None),
-        )
+        output_fps = resolve_output_fps(pipeline=pipeline, requested=None)
+        if use_native and decoded.audio is not None:
+            from mirai.core.inference.session import _write_decoded_video
+
+            wrote_mp4 = _write_decoded_video(
+                video_path,
+                decoded,
+                fps=output_fps,
+            )
+        else:
+            wrote_mp4 = _write_mp4(video_path, frames, fps=output_fps)
         png_dir = ""
         if not wrote_mp4:
+            if use_native and decoded.audio is not None:
+                raise RuntimeError("Joint audio/video preview write produced no media file.")
             video_path = Path()
             png_dir = str(_write_png_fallback(out_dir, name, frames))
     finally:

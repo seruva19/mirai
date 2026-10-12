@@ -158,12 +158,22 @@ class PublicationContractTests(unittest.TestCase):
                 "configs/magi2_preview/train_offload.toml",
                 "model_support/lingbot_video.md",
                 "model_support/magi2_preview.md",
+                "model_support/agnes_video.md",
+                "configs/agnes_video/train_bf16.toml",
+                "configs/agnes_video/inference.toml",
                 "scripts/train.py",
+                "mirai/vendors/agnes_video/LICENSE",
+                "mirai/vendors/agnes_video/NOTICE",
             }
             self.assertEqual(required_source_paths - source_names, set())
             self.assertIn("mirai/config/defaults/moe.toml", wheel_names)
             self.assertIn("mirai/config/defaults/lingbot_video.toml", wheel_names)
             self.assertIn("mirai/config/defaults/magi2_preview.toml", wheel_names)
+            self.assertIn("mirai/config/defaults/agnes_video.toml", wheel_names)
+            self.assertIn(
+                "mirai/core/models/agnes_video/default_negative_prompt.txt",
+                wheel_names,
+            )
             self.assertIn(
                 "mirai/config/presets/magi2_preview_offload.toml", wheel_names
             )
@@ -179,6 +189,8 @@ class PublicationContractTests(unittest.TestCase):
                     for name in wheel_names
                 )
             )
+            self.assertIn("mirai/vendors/agnes_video/LICENSE", wheel_names)
+            self.assertIn("mirai/vendors/agnes_video/NOTICE", wheel_names)
             self.assertFalse(
                 any(
                     ".dev-private" in name
@@ -425,13 +437,14 @@ class PublicationContractTests(unittest.TestCase):
             [
                 *(config_root / "lingbot_video").glob("*.toml"),
                 *(config_root / "magi2_preview").glob("*.toml"),
+                *(config_root / "agnes_video").glob("*.toml"),
             ]
         )
         self.assertEqual(public_configs, expected)
         self.assertGreaterEqual(len(public_configs), 2)
         for path in public_configs:
             config = load_config(path)
-            self.assertIn(config.model.type, {"lingbot-video", "magi2-preview"})
+            self.assertIn(config.model.type, {"lingbot-video", "magi2-preview", "agnes-video"})
             if (
                 config.model.type == "lingbot-video"
                 and config.memory.frozen_weight_quantization == "none"

@@ -33,6 +33,9 @@ class BatchSchema:
 
 
 def _record_has_non_empty_value(record: Any, key: str) -> bool:
+    extras = record.get("extra_tensors", {}) if hasattr(record, "get") else {}
+    if key in extras:
+        return extras[key] is not None
     try:
         if key in record:
             value = record.get(key) if hasattr(record, "get") else record[key]

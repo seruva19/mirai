@@ -10,6 +10,7 @@ from mirai.core.dataset.cache import IndexedCacheRecord
 from mirai.core.dataset.record_batch import (
     pad_text_embeddings,
     stack_latent_tensors,
+    text_embed_value_to_tensor,
 )
 from mirai.core.training.data.online import (
     build_temporal_groups,
@@ -27,6 +28,36 @@ except ModuleNotFoundError:  # pragma: no cover
 
 def _record_batch_values(records: list[Any], key: str) -> list[Any]:
     return IndexedCacheRecord.batch_get(records, key)
+
+
+def _collate_extra_tensors(records: list[Any]) -> dict[str, Any]:
+    payloads = [record.get("extra_tensors", {}) for record in records]
+    schemas = [record.get("extra_tensor_schema", {}) for record in records]
+    names = set(payloads[0])
+    if any(set(payload) != names for payload in payloads):
+        raise ValueError("A microbatch must have identical extra tensor fields.")
+    result: dict[str, Any] = {}
+    for name in sorted(names):
+        policy = schemas[0].get(name, {"collation": "stack"})
+        if any(schema.get(name, {"collation": "stack"}) != policy for schema in schemas):
+            raise ValueError(f"Extra tensor '{name}' has inconsistent collation schemas.")
+        values = [payload[name] for payload in payloads]
+        if not all(isinstance(value, torch.Tensor) for value in values):
+            raise TypeError(f"Extra tensor '{name}' must contain tensors.")
+        collation = policy.get("collation", "stack")
+        if collation == "stack":
+            result[name] = torch.stack(values)
+        elif collation == "pad_sequence":
+            lengths_key = policy.get("lengths_key", "")
+            if not lengths_key or lengths_key in names or lengths_key in result:
+                raise ValueError(f"Extra tensor '{name}' requires a unique lengths_key.")
+            if any(value.ndim < 1 or value.shape[1:] != values[0].shape[1:] for value in values):
+                raise ValueError(f"Extra tensor '{name}' has incompatible sequence shapes.")
+            result[name] = torch.nn.utils.rnn.pad_sequence(values, batch_first=True)
+            result[lengths_key] = torch.tensor([value.shape[0] for value in values], dtype=torch.long)
+        else:
+            raise ValueError(f"Unsupported extra tensor collation '{collation}'.")
+    return result
 
 
 def _shuffled_epoch_indices(
@@ -105,6 +136,25 @@ def build_batch_from_records(
     ]
     text_embeds = pad_text_embeddings(text_values)
     out: dict[str, Any] = {"latents": latents, "text_embeds": text_embeds, "_step": step}
+    text_mask = torch.zeros(text_embeds.shape[:2], dtype=torch.bool)
+    for index, (record, value) in enumerate(zip(records, text_values, strict=True)):
+        length = int(text_embed_value_to_tensor(value).shape[0])
+        explicit = record.get("text_mask")
+        if explicit is None:
+            text_mask[index, :length] = True
+        else:
+            mask = torch.as_tensor(explicit, dtype=torch.bool).reshape(-1)
+            if mask.numel() == 1:
+                text_mask[index, :length] = mask[0]
+            elif mask.numel() == length:
+                text_mask[index, :length] = mask
+            else:
+                raise ValueError("Record text_mask must match its embedding sequence length.")
+    out["text_mask"] = text_mask
+    extras = _collate_extra_tensors(records)
+    if set(extras) & {"latents", "text_embeds", "text_mask", "_step", "clip_embed", "source_loss_multiplier", "source_type", "training_task", "loss_mask"}:
+        raise ValueError("Extra tensor fields conflict with standard training batch fields.")
+    out.update(extras)
     if all("clip_embed" in record and record.get("clip_embed") is not None for record in records):
         out["clip_embed"] = pad_text_embeddings(_record_batch_values(records, "clip_embed"))
     if all("source_loss_multiplier" in record for record in records):

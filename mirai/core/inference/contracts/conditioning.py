@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from mirai.core.inference.conditioning import (
+    AUDIO_TO_VIDEO,
     IMAGE_TO_VIDEO,
     TEXT_TO_IMAGE,
     VIDEO_TO_VIDEO,
@@ -20,6 +21,7 @@ from mirai.core.training.preview.preview import run_native_denoise_loop
 def test_task_aliases_and_invalid_media_combinations_fail_before_execution() -> None:
     assert normalize_inference_task("ti2v") == IMAGE_TO_VIDEO
     assert normalize_inference_task("v2v") == VIDEO_TO_VIDEO
+    assert normalize_inference_task("a2v") == AUDIO_TO_VIDEO
     assert (
         InferenceConditioningRequest(task="t2i", frame_count=1).validate().task
         == TEXT_TO_IMAGE
@@ -32,6 +34,13 @@ def test_task_aliases_and_invalid_media_combinations_fail_before_execution() -> 
         InferenceConditioningRequest(
             task="t2v", denoising_strength=0.5
         ).validate()
+    with pytest.raises(ValueError, match="requires input_audio"):
+        InferenceConditioningRequest(task="a2v").validate()
+    with pytest.raises(ValueError, match="does not accept input media"):
+        InferenceConditioningRequest(task="t2v", input_audio=object()).validate()
+    assert InferenceConditioningRequest(
+        task="i2v", input_image=object(), input_audio=object()
+    ).validate().input_audio is not None
 
 
 def test_condition_latent_pins_only_the_temporal_prefix() -> None:
@@ -155,3 +164,45 @@ def test_zero_strength_v2v_returns_source_without_model_forward() -> None:
     assert torch.equal(result, source[0])
     assert stats == []
     assert pipeline.forward_inputs == []
+
+
+def test_conditioned_native_sampler_receives_request_and_prepared_media() -> None:
+    prepared = PreparedInferenceConditioning(
+        task=AUDIO_TO_VIDEO,
+        forward_media={"audio_latents": torch.ones(1, 2, 3)},
+    )
+
+    class Pipeline(_ConditionedPipeline):
+        def __init__(self):
+            super().__init__(prepared)
+            self.received = None
+
+        def sample_native_conditioned_media(self, **kwargs):
+            self.received = kwargs
+            return torch.full((1, 3, 2, 2), 9.0)
+
+        def sample_native_preview(self, **kwargs):
+            raise AssertionError("legacy native sampler must not run")
+
+    pipeline = Pipeline()
+    request = InferenceConditioningRequest(
+        task="a2v", input_audio=object(), frame_count=9, height=16, width=16
+    )
+    result, stats = run_native_denoise_loop(
+        pipeline=pipeline,
+        prompt="p",
+        negative_prompt="",
+        cfg_scale=1.0,
+        seed=1,
+        step=0,
+        denoise_steps=2,
+        scheduler="euler",
+        frame_count=9,
+        height=16,
+        width=16,
+        conditioning=request,
+    )
+    assert torch.equal(result, torch.full((1, 3, 2, 2), 9.0))
+    assert stats == []
+    assert pipeline.received["request"] is request
+    assert pipeline.received["prepared"] is prepared

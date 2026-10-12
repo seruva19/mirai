@@ -55,6 +55,7 @@ class ResumeEquivalenceTests(unittest.TestCase):
         cache_path: Path,
         out_dir: Path,
         max_steps: int,
+        auto_preprocess_cache: bool = False,
     ) -> None:
         path.write_text(
             textwrap.dedent(
@@ -67,6 +68,7 @@ class ResumeEquivalenceTests(unittest.TestCase):
                 [dataset]
                 path = "{data_dir.as_posix()}"
                 cache_path = "{cache_path.as_posix()}"
+                auto_preprocess_cache = {str(auto_preprocess_cache).lower()}
 
                 [training]
                 max_steps = {max_steps}
@@ -93,7 +95,71 @@ class ResumeEquivalenceTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_lazy_cache_creation_binds_checkpoint_lineage_for_resume(self) -> None:
+        from mirai.core.lineage import snapshot_descriptor_for_path
+
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            data_dir = tmpdir / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(torch.tensor([0.1], dtype=torch.float32), data_dir / "sample.pt")
+            (data_dir / "sample.txt").write_text("caption", encoding="utf-8")
+
+            cache_path = tmpdir / "cache" / "dataset_cache.pt"
+            out_dir = tmpdir / "run"
+            first_config = tmpdir / "first.toml"
+            resume_config = tmpdir / "resume.toml"
+            self._write_config(
+                path=first_config,
+                data_dir=data_dir,
+                cache_path=cache_path,
+                out_dir=out_dir,
+                max_steps=1,
+                auto_preprocess_cache=True,
+            )
+            self._write_config(
+                path=resume_config,
+                data_dir=data_dir,
+                cache_path=cache_path,
+                out_dir=out_dir,
+                max_steps=2,
+                auto_preprocess_cache=True,
+            )
+
+            self.assertFalse(cache_path.exists())
+            self._run(
+                repo_root,
+                [sys.executable, "scripts/train.py", "--config", str(first_config)],
+            )
+            first_checkpoint = torch.load(
+                out_dir / "checkpoints" / "step_1.pt",
+                map_location="cpu",
+            )
+            self.assertEqual(
+                first_checkpoint["cache_snapshot_id"],
+                snapshot_descriptor_for_path(cache_path).snapshot_id,
+            )
+
+            self._run(
+                repo_root,
+                [
+                    sys.executable,
+                    "scripts/train.py",
+                    "--config",
+                    str(resume_config),
+                    "--resume",
+                    str(out_dir / "checkpoints" / "step_1.pt"),
+                ],
+            )
+            resumed_checkpoint = torch.load(
+                out_dir / "checkpoints" / "last.pt",
+                map_location="cpu",
+            )
+            self.assertEqual(int(resumed_checkpoint["global_step"]), 2)
+
     def _run(self, repo_root: Path, cmd: list[str]) -> None:
+        config_path = Path(cmd[cmd.index("--config") + 1])
         result = subprocess.run(
             cmd,
             cwd=repo_root,
@@ -102,7 +168,10 @@ class ResumeEquivalenceTests(unittest.TestCase):
             check=False,
             env={
                 **os.environ,
-                "MIRAI_GPU_LEASE_PATH": str(repo_root / ".tmp_test_resume_equivalence.lock"),
+                "CUDA_VISIBLE_DEVICES": "-1",
+                "MIRAI_GPU_LEASE_PATH": str(
+                    config_path.parent / ".mirai_test_gpu_lease.lock"
+                ),
             },
         )
         self.assertEqual(

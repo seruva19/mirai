@@ -30,6 +30,7 @@ dependencies = [
     "ftfy>=6.0.0",
     "regex>=2024.0.0",
     "numpy>=1.26",
+    "PyYAML>=6.0",
     "pillow>=10.0.0",
     "opencv-python>=4.9.0",
     "zstandard>=0.23.0",
@@ -65,9 +66,11 @@ exclude = ["mirai.*.contracts", "mirai.*.contracts.*"]
 [tool.setuptools.package-data]
 "mirai.config" = ["defaults/*.toml", "presets/*.toml"]
 "mirai.core.models.lingbot_video" = ["default_negative_prompt.json"]
+"mirai.core.models.agnes_video" = ["default_negative_prompt.txt"]
 "mirai.vendors.lingbot_video" = ["LICENSE"]
 "mirai.vendors.qwen3_moe_fused" = ["LICENSE"]
 "mirai.vendors.magi2_preview" = ["LICENSE", "configs/*.json"]
+"mirai.vendors.agnes_video" = ["LICENSE", "NOTICE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "mirai"]

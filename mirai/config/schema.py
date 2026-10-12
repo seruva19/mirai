@@ -337,6 +337,7 @@ class StrategyConfig:
 @dataclass
 class InferenceConfig:
     task: str = "text_to_video"
+    input_audio: str = ""
     denoising_strength: float = 1.0
     prompt_rewriter: str = "none"
     cfg_mode: str = "sequential"
@@ -751,6 +752,7 @@ class TrainingConfig:
             inference_table,
             {
                 "task",
+                "input_audio",
                 "denoising_strength",
                 "prompt_rewriter",
                 "cfg_mode",
@@ -865,6 +867,21 @@ class TrainingConfig:
             )
         except ValueError as exc:
             raise ConfigError(str(exc)) from exc
+        raw_input_audio = inference_table.get("input_audio", "")
+        if raw_input_audio is None:
+            raw_input_audio = ""
+        if not isinstance(raw_input_audio, str):
+            raise ConfigError("inference.input_audio must be a path string.")
+        inference_input_audio = str(raw_input_audio).strip()
+        if inference_input_audio and inference_task not in {
+            "audio_to_video",
+            "image_to_video",
+            "video_to_video",
+        }:
+            raise ConfigError(
+                "inference.input_audio is supported only for audio_to_video, "
+                "image_to_video, or video_to_video."
+            )
         denoising_strength = float(
             inference_table.get("denoising_strength", 1.0)
         )
@@ -3523,6 +3540,7 @@ class TrainingConfig:
             strategy=strategy,
             inference=InferenceConfig(
                 task=inference_task,
+                input_audio=inference_input_audio,
                 denoising_strength=denoising_strength,
                 prompt_rewriter=prompt_rewriter,
                 cfg_mode=cfg_mode,

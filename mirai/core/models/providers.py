@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import importlib
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +43,7 @@ class NativeCacheEncoderConfig:
     resolution_buckets: list[tuple[int, int]] | None = None
     frame_buckets: list[int] | None = None
     bucket_resize_mode: str = "resize_crop"
+    family_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

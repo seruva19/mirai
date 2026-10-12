@@ -19,6 +19,7 @@ from mirai.core.training.data.schema import (
     validate_records_against_schema,
 )
 from mirai.core.training.data.online import build_temporal_groups
+from mirai.core.models.providers import NativeCacheEncoderConfig, build_native_cache_encoder
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,7 @@ def load_prepared_training_data(
     model_variant: str = "",
     model_component_id: str = "",
     batch_schema: BatchSchema | None = None,
+    native_cache_config: NativeCacheEncoderConfig | None = None,
 ) -> PreparedTrainingData:
     resolved_cache_path = Path(cache_path)
     if not resolved_cache_path.exists():
@@ -170,13 +172,25 @@ def load_prepared_training_data(
         indexed_cache_enabled = True
         metadata_path = str(indexed_cache_metadata_path(resolved_cache_path))
         tensor_path = str(indexed_cache_tensor_path(resolved_cache_path))
-        observed_metadata = _normalized_cache_metadata(
-            load_indexed_cache_metadata(resolved_cache_path)
-        )
+        raw_metadata = load_indexed_cache_metadata(resolved_cache_path)
+        observed_metadata = _normalized_cache_metadata(raw_metadata)
     else:
         cache = load_cache(resolved_cache_path)
         all_records = list(cache.get("records", []))
         observed_metadata = _normalized_cache_metadata(cache)
+        raw_metadata = cache
+    observed_assets = raw_metadata.get("native_asset_fingerprints")
+    if native_cache_config is not None:
+        encoder = build_native_cache_encoder(native_cache_config)
+        fingerprint = getattr(encoder, "cache_asset_fingerprints", None)
+        if callable(fingerprint):
+            expected_assets = fingerprint()
+            if not isinstance(observed_assets, dict) or observed_assets != expected_assets:
+                raise ValueError("Cache native asset lineage mismatch. Rebuild cache with the current conditioning assets.")
+        elif observed_assets:
+            raise ValueError("Current native encoder cannot validate cached conditioning asset lineage.")
+    elif observed_assets:
+        raise ValueError("Native cache configuration is required to validate conditioning asset lineage.")
     _validate_cache_lineage_metadata(
         observed_metadata=observed_metadata,
         dataset_snapshot_id=dataset_snapshot_id,

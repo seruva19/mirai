@@ -1,0 +1,33 @@
+[model]
+type = "agnes-video"
+path = "./models/agnes-video"
+
+[training]
+max_steps = 1000
+gradient_checkpointing = "standard"
+blocks_to_swap = 30
+block_swap_mode = "sync"
+
+[adapter]
+type = "lora"
+target_preset = "attn_mlp"
+rank = 32
+alpha = 32.0
+
+[dataset]
+path = "./data/videos"
+auto_preprocess_cache = true
+preprocess_raw_media_to_pt = true
+enable_bucketing = true
+frame_buckets = [17, 33]
+bucket_resolutions = ["256x448"]
+
+[memory]
+frozen_weight_quantization = "none"
+weight_residency_strategy = "block_swap"
+
+[logging]
+output_dir = "./outputs/agnes_video_lora_block_swap"
+save_every_n_steps = 100
+sample_solver = "unipc"
+sample_frame_count = 121

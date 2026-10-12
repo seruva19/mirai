@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import io
 from pathlib import Path
 import hashlib
@@ -25,6 +25,7 @@ from mirai.core.dataset.fingerprint import (
     text_cache_fingerprint,
 )
 from mirai.core.dataset.native_encode import (
+    BucketInfo,
     ValidationCacheEncoder,
     native_cache_encoder_contract_error,
     validate_native_cache_encoder,
@@ -42,6 +43,16 @@ try:
     import torch
 except ModuleNotFoundError as exc:  # pragma: no cover
     raise RuntimeError(f"Torch is required for cache pipeline: {exc}")
+
+
+@dataclass
+class EncodedMediaVariant:
+    latent: torch.Tensor
+    bucket: BucketInfo | None = None
+    extra_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    extra_tensor_schema: dict[str, dict[str, str]] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    clip_embed: Any | None = None
 
 
 @dataclass
@@ -63,6 +74,8 @@ class CachedRecord:
     bucket_w: int = 0
     bucket_frames: int = 0
     metadata: dict[str, Any] | None = None
+    extra_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    extra_tensor_schema: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 def _caption_embed(caption: str) -> float:
@@ -300,6 +313,7 @@ def build_cache_from_config(cfg: Any) -> dict[str, Any]:
         native_max_frames=native_max_frames,
         strict_native_assets=bool(cfg.model.params.strict_native_assets),
         text_encoder_path=str(getattr(cfg.model.params, "text_encoder_path", "")),
+        family_params=dict(getattr(cfg.model.params, "family_params", {}) or {}),
         enable_bucketing=enable_bucketing,
         resolution_buckets=resolution_buckets,
         frame_buckets=frame_buckets,
@@ -386,6 +400,9 @@ class IndexedCacheRecord:
         self._tensor_cache = tensor_cache
 
     def _tensor_key_for(self, key: str) -> str | None:
+        extra_key = self._metadata.get("extra_tensor_keys", {}).get(key)
+        if extra_key is not None:
+            return str(extra_key)
         if key == "latent":
             return str(self._metadata["latent_key"])
         if key == "text_embed":
@@ -396,6 +413,8 @@ class IndexedCacheRecord:
         return None
 
     def __getitem__(self, key: str) -> Any:
+        if key == "extra_tensors":
+            return {name: self[name] for name in self._metadata.get("extra_tensor_keys", {})}
         tensor_key = self._tensor_key_for(key)
         if tensor_key is not None:
             return self._tensor_cache[tensor_key]
@@ -404,6 +423,8 @@ class IndexedCacheRecord:
         return self._metadata[key]
 
     def get(self, key: str, default: Any = None) -> Any:
+        if key == "extra_tensors":
+            return self[key]
         tensor_key = self._tensor_key_for(key)
         if tensor_key is not None:
             return self._tensor_cache[tensor_key]
@@ -414,6 +435,8 @@ class IndexedCacheRecord:
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):
             return False
+        if key == "extra_tensors" or key in self._metadata.get("extra_tensor_keys", {}):
+            return True
         if key in {"latent", "text_embed"}:
             return True
         if key == "clip_embed":
@@ -425,8 +448,8 @@ class IndexedCacheRecord:
         if not records:
             return []
         if (
-            key in {"latent", "text_embed", "clip_embed"}
-            and all(isinstance(record, IndexedCacheRecord) for record in records)
+            all(isinstance(record, IndexedCacheRecord) for record in records)
+            and all(record._tensor_key_for(key) is not None for record in records)
         ):
             typed_records = [record for record in records if isinstance(record, IndexedCacheRecord)]
             first = typed_records[0]
@@ -459,6 +482,7 @@ def save_indexed_cache_sidecar(
     metadata_records: list[dict[str, Any]] = []
 
     for idx, record in enumerate(records):
+        _validate_extra_tensor_fields(record, record.get("extra_tensors", {}), source_label=f"record[{idx}]")
         metadata = dict(record)
         latent_key = f"latent__{idx}"
         text_embed_key = f"text_embed__{idx}"
@@ -471,6 +495,18 @@ def save_indexed_cache_sidecar(
             clip_embed_key = f"clip_embed__{idx}"
             tensors[clip_embed_key] = text_embed_value_to_tensor(clip_value).clone()
             metadata["clip_embed_key"] = clip_embed_key
+        extra_tensors = metadata.pop("extra_tensors", {})
+        if extra_tensors:
+            extra_keys = {}
+            for field_index, (name, tensor) in enumerate(extra_tensors.items()):
+                if not isinstance(name, str) or not name or name in metadata or name in {"latent", "text_embed", "clip_embed", "extra_tensors"}:
+                    raise ValueError(f"Invalid or conflicting extra tensor field '{name}'.")
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError(f"Extra tensor '{name}' must be a torch.Tensor.")
+                tensor_key = f"extra__{idx}__{field_index}"
+                tensors[tensor_key] = tensor.detach().cpu().contiguous().clone()
+                extra_keys[name] = tensor_key
+            metadata["extra_tensor_keys"] = extra_keys
         metadata_records.append(metadata)
 
     save_tensor_cache_safetensors(tensor_path, tensors)
@@ -507,6 +543,15 @@ def load_indexed_cache_metadata(
     records = payload.get("records", [])
     if not isinstance(records, list):
         raise ValueError(f"Invalid indexed cache metadata at {metadata_path}: 'records' must be a list.")
+    for idx, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(f"Invalid indexed cache metadata record[{idx}].")
+        keys = record.get("extra_tensor_keys", {})
+        _validate_extra_tensor_fields(record, keys, source_label=str(metadata_path), validate_tensors=False)
+        if any(not isinstance(value, str) or not value for value in keys.values()):
+            raise ValueError("Indexed extra tensor references must be non-empty strings.")
+        if len(set(keys.values())) != len(keys):
+            raise ValueError("Indexed extra tensor references must be unique.")
     expected_checksum = str(payload.get("source_cache_checksum", "")).strip()
     observed_checksum = _read_checksum_text(Path(cache_path))
     if expected_checksum and observed_checksum and expected_checksum != observed_checksum:
@@ -565,11 +610,14 @@ def load_indexed_cache_records(
         indexed_cache_tensor_path(cache_path),
         verify_checksum=verify_checksum,
     )
-    return [
+    records = [
         IndexedCacheRecord(record, tensor_cache)
         for record in payload.get("records", [])
         if isinstance(record, dict)
     ]
+    for record in records:
+        _validate_extra_tensor_fields(record._metadata, record["extra_tensors"], source_label=str(cache_path))
+    return records
 
 
 def _atomic_torch_save(path: Path, payload: dict, *, cache_compression: str = "none") -> None:
@@ -613,6 +661,39 @@ def cache_write_lock(cache_file: Path):
             lock_path.unlink()
 
 
+def _validate_extra_tensor_fields(record: dict, extras: Any, *, source_label: str, validate_tensors: bool = True) -> None:
+    if not isinstance(extras, dict):
+        raise ValueError(f"Extra tensors must be a mapping in '{source_label}'.")
+    schema = record.get("extra_tensor_schema", {})
+    if not isinstance(schema, dict) or set(schema) - set(extras):
+        raise ValueError(f"Extra tensor schema must describe existing tensor fields in '{source_label}'.")
+    reserved = {"latent", "text_embed", "clip_embed", "latents", "text_embeds", "text_mask", "_step",
+                "source_loss_multiplier", "source_type", "training_task", "loss_mask", "extra_tensors"}
+    reserved.update(CachedRecord.__dataclass_fields__)
+    lengths_keys: set[str] = set()
+    for name, value in extras.items():
+        if not isinstance(name, str) or not name or name in reserved or name in record:
+            raise ValueError(f"Invalid or conflicting extra tensor field '{name}' in '{source_label}'.")
+        policy = schema.get(name, {"collation": "stack"})
+        if not isinstance(policy, dict) or set(policy) - {"collation", "lengths_key"}:
+            raise ValueError(f"Invalid extra tensor schema for '{name}' in '{source_label}'.")
+        collation = policy.get("collation", "stack")
+        if collation not in {"stack", "pad_sequence"}:
+            raise ValueError(f"Invalid extra tensor collation for '{name}' in '{source_label}'.")
+        if collation == "pad_sequence":
+            lengths = policy.get("lengths_key")
+            if not isinstance(lengths, str) or not lengths or lengths in reserved or lengths in extras or lengths in record or lengths in lengths_keys:
+                raise ValueError(f"Invalid extra tensor lengths_key for '{name}' in '{source_label}'.")
+            lengths_keys.add(lengths)
+        elif "lengths_key" in policy:
+            raise ValueError(f"Stacked extra tensor '{name}' cannot declare lengths_key.")
+        if validate_tensors:
+            if not isinstance(value, torch.Tensor) or not value.numel() or not bool(torch.isfinite(value).all()):
+                raise ValueError(f"Extra tensor '{name}' must be a finite non-empty tensor in '{source_label}'.")
+            if collation == "pad_sequence" and value.ndim < 1:
+                raise ValueError(f"Extra tensor '{name}' requires a sequence dimension.")
+
+
 def validate_cache_payload(payload: dict, *, source_label: str) -> None:
     records = payload.get("records", [])
     if not isinstance(records, list):
@@ -623,6 +704,7 @@ def validate_cache_payload(payload: dict, *, source_label: str) -> None:
                 f"Invalid cache payload in {source_label}: record[{idx}] is not a table."
             )
         sample_id = str(record.get("sample_id", f"idx_{idx}"))
+        _validate_extra_tensor_fields(record, record.get("extra_tensors", {}), source_label=f"{source_label}, sample '{sample_id}'")
         for field_name in ("latent", "text_embed"):
             value = record.get(field_name)
             if value is None:
@@ -680,6 +762,7 @@ def build_cache(
     native_max_frames: int = 33,
     strict_native_assets: bool = False,
     text_encoder_path: str = "",
+    family_params: dict[str, Any] | None = None,
     registration_path: str | Path | None = None,
     routing_domain_metadata_key: str = "",
     required_registration_metadata_keys: tuple[str, ...] = (),
@@ -742,6 +825,7 @@ def build_cache(
             resolution_buckets=list(resolution_buckets) if resolution_buckets else None,
             frame_buckets=list(frame_buckets) if frame_buckets else None,
             bucket_resize_mode=str(bucket_resize_mode),
+            family_params=dict(family_params or {}),
         )
         media_files = _collect_media_files(dataset_dir, mask_extension=str(mask_extension))
         if not media_files:
@@ -792,6 +876,13 @@ def build_cache(
             f"{component_id}:{native_status.vae_mode or 'fallback'}:"
             f"{int(native.latent_channels)}"
         )
+        asset_fingerprints: dict[str, str] = {}
+        fingerprint_assets = getattr(native, "cache_asset_fingerprints", None)
+        if callable(fingerprint_assets):
+            asset_fingerprints = fingerprint_assets()
+            asset_identity = json.dumps(asset_fingerprints, sort_keys=True)
+            latent_vae_id += f":assets={asset_identity}"
+            text_encoder_id += f":assets={asset_identity}"
         model_is_native = bool(provider is not None and provider.is_native_model())
         allows_asset_free_cache = bool(
             provider is not None and provider.allows_asset_free_cache_encoding()
@@ -886,69 +977,93 @@ def build_cache(
                     f"bucket_resize_mode={str(bucket_resize_mode)};"
                     f"mask_fp={mask_fp};"
                     f"mask_extension={str(mask_extension)}"
+                    + (f";family_params={json.dumps(family_params, sort_keys=True)}" if family_params else "")
+                    + (f";resolution_buckets={resolution_buckets};frame_buckets={frame_buckets}"
+                       if callable(getattr(native, "encode_extra_tensors", None)) else "")
                 ),
             )
-            _bucket_info = None
-            try:
-                latent_value, _bucket_info = native.encode_latent(media_file)
-            except Exception as exc:
-                if native_cache_encoder_contract_error(exc, native):
-                    raise ValueError(
-                        f"Native cache encoder {type(native).__name__} violates the "
-                        f"NativeCacheEncoder contract during encode_latent(): {exc}"
-                    ) from exc
-                if supports_native_cache:
-                    raise ValueError(
-                        f"Native cache encoder failed for '{media_file}': {exc}"
-                    ) from exc
-                if media_file.suffix.lower() == ".pt":
-                    tensor = torch.load(media_file, map_location="cpu").float()
-                    latent_value = float(tensor.reshape(-1).mean().item())
-                    _bucket_info = None
-                else:
+            encode_variant = getattr(native, "encode_media_variant", None)
+            if callable(encode_variant):
+                latent_value = None
+                _bucket_info = None
+                extra_tensors = {}
+                extra_tensor_schema = {}
+                clip_embed_value = None
+            else:
+                _bucket_info = None
+                try:
+                    latent_value, _bucket_info = native.encode_latent(media_file)
+                except Exception as exc:
+                    if native_cache_encoder_contract_error(exc, native):
+                        raise ValueError(
+                            f"Native cache encoder {type(native).__name__} violates the "
+                            f"NativeCacheEncoder contract during encode_latent(): {exc}"
+                        ) from exc
+                    if supports_native_cache:
+                        raise ValueError(
+                            f"Native cache encoder failed for '{media_file}': {exc}"
+                        ) from exc
+                    if media_file.suffix.lower() == ".pt":
+                        tensor = torch.load(media_file, map_location="cpu").float()
+                        latent_value = float(tensor.reshape(-1).mean().item())
+                        _bucket_info = None
+                    else:
+                        _record_skipped_sample(
+                            skipped,
+                            skip_reasons,
+                            sample_id=media_file.stem,
+                            status="skipped_decode_error",
+                            reason=f"{type(exc).__name__}: {exc}",
+                        )
+                        continue
+                if not _is_finite_payload_value(latent_value):
                     _record_skipped_sample(
                         skipped,
                         skip_reasons,
                         sample_id=media_file.stem,
-                        status="skipped_decode_error",
+                        status="skipped_nan",
+                        reason="non-finite latent",
+                    )
+                    continue
+                extra_tensors: dict[str, torch.Tensor] = {}
+                extra_tensor_schema: dict[str, dict[str, str]] = {}
+                encode_extra = getattr(native, "encode_extra_tensors", None)
+                if callable(encode_extra):
+                    extra_tensors, extra_tensor_schema = encode_extra(media_file)
+                    if not all(isinstance(value, torch.Tensor) and bool(torch.isfinite(value).all()) for value in extra_tensors.values()):
+                        raise ValueError(f"Native extra tensors for '{media_file}' must be finite tensors.")
+                media_metadata = getattr(native, "cache_media_metadata", None)
+                if callable(media_metadata):
+                    selected_metadata = media_metadata(media_file)
+                    if set(selected_metadata) & set(routing_metadata):
+                        raise ValueError("Native media metadata conflicts with registered metadata.")
+                    routing_metadata.update(selected_metadata)
+                clip_embed_value = None
+                try:
+                    clip_embed_value = native.encode_clip(media_file)
+                except Exception as exc:
+                    if native_cache_encoder_contract_error(exc, native):
+                        raise ValueError(
+                            f"Native cache encoder {type(native).__name__} violates the "
+                            f"NativeCacheEncoder contract during encode_clip(): {exc}"
+                        ) from exc
+                    _record_skipped_sample(
+                        skipped,
+                        skip_reasons,
+                        sample_id=media_file.stem,
+                        status="skipped_clip_error",
                         reason=f"{type(exc).__name__}: {exc}",
                     )
                     continue
-            if not _is_finite_payload_value(latent_value):
-                _record_skipped_sample(
-                    skipped,
-                    skip_reasons,
-                    sample_id=media_file.stem,
-                    status="skipped_nan",
-                    reason="non-finite latent",
-                )
-                continue
-            clip_embed_value = None
-            try:
-                clip_embed_value = native.encode_clip(media_file)
-            except Exception as exc:
-                if native_cache_encoder_contract_error(exc, native):
-                    raise ValueError(
-                        f"Native cache encoder {type(native).__name__} violates the "
-                        f"NativeCacheEncoder contract during encode_clip(): {exc}"
-                    ) from exc
-                _record_skipped_sample(
-                    skipped,
-                    skip_reasons,
-                    sample_id=media_file.stem,
-                    status="skipped_clip_error",
-                    reason=f"{type(exc).__name__}: {exc}",
-                )
-                continue
-            if clip_embed_value is not None and not _is_finite_payload_value(clip_embed_value):
-                _record_skipped_sample(
-                    skipped,
-                    skip_reasons,
-                    sample_id=media_file.stem,
-                    status="skipped_clip_nan",
-                    reason="non-finite clip embedding",
-                )
-                continue
+                if clip_embed_value is not None and not _is_finite_payload_value(clip_embed_value):
+                    _record_skipped_sample(
+                        skipped,
+                        skip_reasons,
+                        sample_id=media_file.stem,
+                        status="skipped_clip_nan",
+                        reason="non-finite clip embedding",
+                    )
+                    continue
             loss_mask_value: float | None = None
             if mask_extension:
                 if mask_file.exists():
@@ -996,6 +1111,27 @@ def build_cache(
                 captions = expanded
 
             for clip_idx in range(clips_per_video):
+                sample_latent_fp = latent_fp
+                variant_metadata = dict(routing_metadata)
+                if callable(encode_variant):
+                    encoded = encode_variant(media_file, clip_index=clip_idx, clip_count=clips_per_video)
+                    if not isinstance(encoded, EncodedMediaVariant):
+                        raise TypeError("encode_media_variant must return EncodedMediaVariant.")
+                    if not isinstance(encoded.latent, torch.Tensor) or not bool(torch.isfinite(encoded.latent).all()):
+                        raise ValueError("Encoded media variant must contain finite latent tensors.")
+                    if encoded.bucket is not None and not isinstance(encoded.bucket, BucketInfo):
+                        raise TypeError("Encoded media variant bucket must be BucketInfo or None.")
+                    if not isinstance(encoded.metadata, dict):
+                        raise TypeError("Encoded media variant metadata must be a mapping.")
+                    if not all(isinstance(value, torch.Tensor) and bool(torch.isfinite(value).all()) for value in encoded.extra_tensors.values()):
+                        raise ValueError("Encoded media variant extra tensors must be finite.")
+                    if set(encoded.metadata) & set(variant_metadata):
+                        raise ValueError("Native variant metadata conflicts with registration metadata.")
+                    variant_metadata.update(encoded.metadata)
+                    latent_value, _bucket_info = encoded.latent, encoded.bucket
+                    extra_tensors, extra_tensor_schema = encoded.extra_tensors, encoded.extra_tensor_schema
+                    clip_embed_value = encoded.clip_embed
+                    sample_latent_fp = hashlib.sha256((latent_fp + json.dumps(encoded.metadata, sort_keys=True)).encode()).hexdigest()
                 for idx, caption in enumerate(captions):
                     sample_id = media_file.stem if len(captions) == 1 else f"{media_file.stem}::cap{idx}"
                     base_sample_id = sample_id
@@ -1028,7 +1164,7 @@ def build_cache(
                         encoder_dtype=str(model_dtype),
                     )
                     current_fingerprints = {
-                        "latent": latent_fp,
+                        "latent": sample_latent_fp,
                         "text": text_fp,
                     }
                     text_mask_override = None
@@ -1101,7 +1237,9 @@ def build_cache(
                                 bucket_h=int(recovered.get("bucket_h", _bh)),
                                 bucket_w=int(recovered.get("bucket_w", _bw)),
                                 bucket_frames=int(recovered.get("bucket_frames", _bf)),
-                                metadata=dict(routing_metadata),
+                                metadata=dict(variant_metadata),
+                                extra_tensors=extra_tensors,
+                                extra_tensor_schema=extra_tensor_schema,
                             )
                         )
                         continue
@@ -1123,7 +1261,9 @@ def build_cache(
                             bucket_h=_bh,
                             bucket_w=_bw,
                             bucket_frames=_bf,
-                            metadata=dict(routing_metadata),
+                            metadata=dict(variant_metadata),
+                            extra_tensors=extra_tensors,
+                            extra_tensor_schema=extra_tensor_schema,
                         )
                     )
 
@@ -1193,6 +1333,7 @@ def build_cache(
                 "text_mode": native_status.text_mode,
                 "clip_mode": native_status.clip_mode,
             },
+            **({"native_asset_fingerprints": asset_fingerprints} if asset_fingerprints else {}),
             "records": [
                 {
                     "sample_id": r.sample_id,
@@ -1212,6 +1353,7 @@ def build_cache(
                     "bucket_w": r.bucket_w,
                     "bucket_frames": r.bucket_frames,
                     "metadata": dict(r.metadata or {}),
+                    **({"extra_tensors": r.extra_tensors, "extra_tensor_schema": r.extra_tensor_schema} if r.extra_tensors else {}),
                 }
                 for r in records
             ],
@@ -1232,6 +1374,7 @@ def build_cache(
                     cache_file,
                     list(payload.get("records", [])),
                     metadata_extra={
+                        **({"native_asset_fingerprints": asset_fingerprints} if asset_fingerprints else {}),
                         "dataset_snapshot_id": str(payload.get("dataset_snapshot_id", "")),
                         "dataset_snapshot_source_path": str(
                             payload.get("dataset_snapshot_source_path", "")

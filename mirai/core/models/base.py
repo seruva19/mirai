@@ -12,6 +12,9 @@ from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
 from mirai.core.moe.runtime.specs import validate_expert_tensor_specs
 
 if TYPE_CHECKING:
+    from mirai.core.training.strategies.base import TrainingInputs, VideoTrainingConditioning
+    from mirai.core.training.objectives.base import TrainingObjective
+    from mirai.core.training.objectives.sampling import NoiseGenerator, TimestepSampler
     from mirai.config.schema import TrainingConfig
     from mirai.core.moe.adaptation.dataset_routing import DatasetRoutingBatch
     from mirai.core.moe.adaptation.dataset_routing import DatasetRoutingPolicy
@@ -87,6 +90,44 @@ class SyntheticBatchSpec:
 class BasePipeline(ABC):
     """Model abstraction the trainer depends on."""
 
+    def prepare_training_inputs(
+        self, batch: dict[str, Any], *, timestep_sampler: TimestepSampler,
+        noise_generator: NoiseGenerator, objective: TrainingObjective | None, training: bool,
+        conditioning: VideoTrainingConditioning | None = None,
+    ) -> TrainingInputs | None:
+        """Prepare family-owned joint modalities, or use the standard strategy."""
+        _ = batch, timestep_sampler, noise_generator, objective, training, conditioning
+        return None
+
+    def sample_native_conditioned_media(
+        self,
+        *,
+        request: Any,
+        prepared: Any,
+        noise: Any,
+        context: Any,
+        context_null: Any,
+        denoise_steps: int,
+        guidance_scale: float,
+        generator: Any,
+        solver_name: str,
+        cfg_mode: str = "sequential",
+    ) -> Any | None:
+        """Run a family-owned conditioned native sampler, when supported."""
+        _ = (
+            request,
+            prepared,
+            noise,
+            context,
+            context_null,
+            denoise_steps,
+            guidance_scale,
+            generator,
+            solver_name,
+            cfg_mode,
+        )
+        return None
+
     @abstractmethod
     def apply_noise(
         self, clean_latents: Any, noise: Any, timesteps: Any
@@ -142,6 +183,19 @@ class BasePipeline(ABC):
     def get_synthetic_batch_spec(self) -> SyntheticBatchSpec:
         """Batch shapes this model requires when no cached batch exists."""
         return SyntheticBatchSpec()
+
+    def build_synthetic_batch_extras(
+        self,
+        *,
+        batch_size: int,
+        frame_count: int,
+        height: int,
+        width: int,
+        dtype: Any,
+    ) -> dict[str, Any]:
+        """Return family-owned fields required by a synthetic dry-run batch."""
+        _ = batch_size, frame_count, height, width, dtype
+        return {}
 
     def get_model_extension_capabilities(self) -> ModelExtensionCapabilities:
         """Return optional model-extension surfaces implemented by this pipeline."""
@@ -427,6 +481,10 @@ class BasePipeline(ABC):
     def get_lora_scale(self) -> float:
         """Get current adapter scale."""
         return 1.0
+
+    def validate_adapter_payload(self, payload: dict[str, Any]) -> None:
+        """Validate provider-owned lineage before adapter format normalization."""
+        _ = payload
 
     def load_adapter_state(self, state: dict[str, Any]) -> None:
         """Load an adapter-only checkpoint payload."""

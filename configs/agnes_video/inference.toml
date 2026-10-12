@@ -1,0 +1,16 @@
+[model]
+type = "agnes-video"
+path = "./models/agnes-video"
+
+[inference]
+task = "text_to_video"
+cfg_mode = "sequential"
+keep_text_encoder_resident = false
+keep_vae_resident = false
+
+[memory]
+frozen_weight_quantization = "none"
+weight_residency_strategy = "disabled"
+
+[logging]
+output_dir = "./outputs/agnes_video_inference"

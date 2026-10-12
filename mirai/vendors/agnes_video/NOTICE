@@ -1,0 +1,17 @@
+Agnes-Video-2.0-MoE
+Source revision: fc3971e378b53c766baa06898bfe84d7a56653ea
+https://huggingface.co/Agnes-AI/Agnes-Video-2.0-MoE
+
+Copyright (c) 2026 SandAI. All Rights Reserved.
+The native implementation is modified for Mirai and distributed under the
+Apache License, Version 2.0.
+
+Agnes-Video-2.0-MoE is based on DaVinci-MagiHuman. We acknowledge the
+DaVinci-MagiHuman authors and project:
+https://github.com/GAIR-NLP/daVinci-MagiHuman
+The upstream project is licensed under Apache License 2.0; its license and
+notices apply to upstream-covered materials.
+
+This distribution does not include pretrained DaVinci-MagiHuman base
+checkpoints, T5Gemma weights, OmniVAE assets, or Wan2.2 VAE assets. Those
+components remain subject to their own license terms.

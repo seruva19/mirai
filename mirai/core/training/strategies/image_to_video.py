@@ -9,7 +9,7 @@ from mirai.core.models.base import BasePipeline
 from mirai.core.registry import register_strategy
 from mirai.core.tensors import is_torch_tensor
 from mirai.core.training.objectives.sampling import NoiseGenerator, TimestepSampler
-from mirai.core.training.strategies.base import TrainingInputs, TrainingStrategy
+from mirai.core.training.strategies.base import TrainingInputs, TrainingStrategy, VideoTrainingConditioning
 
 try:
     import torch
@@ -84,6 +84,16 @@ class ImageToVideoStrategy(TrainingStrategy):
         training: bool = True,
         objective: Any = None,
     ) -> TrainingInputs:
+        prepare = getattr(pipeline, "prepare_training_inputs", None)
+        prepared = prepare(
+            batch, timestep_sampler=timestep_sampler, noise_generator=noise_generator,
+            objective=objective, training=training,
+            conditioning=VideoTrainingConditioning(first_frame_conditioning_p=self._p()),
+        ) if callable(prepare) else None
+        if prepared is not None:
+            if not isinstance(prepared, TrainingInputs):
+                raise TypeError("prepare_training_inputs must return TrainingInputs or None.")
+            return prepared
         latents = batch["latents"]
         batch_size = latents.shape[0] if is_torch_tensor(latents) else len(latents)
         timesteps = timestep_sampler.sample(batch_size, like=latents)

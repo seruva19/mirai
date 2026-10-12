@@ -75,13 +75,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--task",
-        choices=["t2v", "t2i", "ti2v", "i2v", "v2v", "text_to_video",
-                 "text_to_image", "image_to_video", "video_to_video"],
+        choices=["t2v", "t2i", "ti2v", "i2v", "v2v", "a2v", "text_to_video",
+                 "text_to_image", "image_to_video", "video_to_video", "audio_to_video"],
         default="",
         help="Generation task override (default: inference.task).",
     )
     p.add_argument("--input-image", default="", help="Condition image for TI2V.")
     p.add_argument("--input-video", default="", help="Source video for V2V.")
+    p.add_argument("--input-audio", default="", help="Condition audio for A2V, I2V, or V2V.")
     p.add_argument(
         "--denoising-strength",
         type=float,
@@ -448,6 +449,7 @@ def main() -> int:
             task=str(args.task) or None,
             input_image=str(args.input_image) or None,
             input_video=str(args.input_video) or None,
+            input_audio=str(args.input_audio) or None,
             denoising_strength=args.denoising_strength,
         )
         if collect_timings and timings_box is not None:
