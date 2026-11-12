@@ -15,12 +15,13 @@ def migrate_cache_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Cache payload must be a mapping.")
 
     out = dict(payload)
-    raw_records = out.get("records", [])
-    records = raw_records if isinstance(raw_records, list) else []
+    records = out.get("records", [])
+    if not isinstance(records, list):
+        raise ValueError("Invalid cache payload: 'records' must be a list.")
     migrated_records: list[dict[str, Any]] = []
     for idx, item in enumerate(records):
         if not isinstance(item, dict):
-            continue
+            raise ValueError(f"Invalid cache payload: record[{idx}] is not a table.")
         rec = dict(item)
         rec.setdefault("sample_id", f"idx_{idx}")
         rec.setdefault("caption_variant_index", 0)

@@ -4,9 +4,10 @@ import contextlib
 import io
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
-from mirai.core.dataset.cache import build_cache, load_cache
+from mirai.core.dataset.cache import _write_checksum, build_cache, load_cache
 from mirai.core.dataset.native_encode import (
     ValidationCacheEncoder,
     validate_native_cache_encoder,
@@ -16,6 +17,7 @@ from mirai.core.models.providers import (
     NativeCacheEncoderConfig,
     register_model_family_provider,
 )
+from mirai.core.persistence.migrations import migrate_cache_payload
 
 try:
     import torch
@@ -25,6 +27,78 @@ except ModuleNotFoundError:  # pragma: no cover
 
 @unittest.skipIf(torch is None, "torch not installed")
 class CacheRecoveryAndVariantsTests(unittest.TestCase):
+    def test_malformed_records_fail_migration_and_load(self) -> None:
+        cases = (
+            (None, r"'records' must be a list"),
+            ({"bad": 1}, r"'records' must be a list"),
+            ("bad", r"'records' must be a list"),
+            ([None], r"record\[0\] is not a table"),
+            ([{"sample_id": "kept"}, None], r"record\[1\] is not a table"),
+            ([{"sample_id": "kept"}, []], r"record\[1\] is not a table"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "cache.pt"
+            for records, message in cases:
+                with self.subTest(records=records):
+                    payload = {"records": records, "num_records": 2}
+                    original = deepcopy(payload)
+                    with self.assertRaisesRegex(ValueError, message):
+                        migrate_cache_payload(payload)
+                    self.assertEqual(payload, original)
+                    torch.save(payload, cache_path)
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_cache(cache_path, verify_checksum=False)
+
+    def test_legacy_and_empty_cache_migrate_without_mutating_input(self) -> None:
+        legacy = {"records": [{"caption": "legacy caption"}], "partial_recovery": False}
+        original = deepcopy(legacy)
+        migrated = migrate_cache_payload(legacy)
+        self.assertEqual(legacy, original)
+        self.assertEqual(migrated["num_records"], 1)
+        self.assertFalse(migrated["partial_recovery"])
+        self.assertEqual(
+            migrated["records"],
+            [{
+                "sample_id": "idx_0",
+                "caption_variant_index": 0,
+                "caption": "legacy caption",
+                "base_sample_id": "idx_0",
+                "clip_index": 0,
+                "text_mask": [1],
+                "loss_mask": None,
+            }],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "cache.pt"
+            for payload in (legacy, {}, {"records": []}):
+                with self.subTest(payload=payload):
+                    torch.save(payload, cache_path)
+                    loaded = load_cache(cache_path, verify_checksum=False)
+                    self.assertEqual(loaded["records"], migrate_cache_payload(payload)["records"])
+                    self.assertEqual(loaded["num_records"], len(loaded["records"]))
+                    self.assertEqual(loaded["partial_recovery"], payload.get("partial_recovery", True))
+
+    def test_partial_recovery_rebuilds_after_malformed_cache_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            data_dir = tmpdir / "data"
+            cache_path = tmpdir / "cache.pt"
+            data_dir.mkdir()
+            for index in range(2):
+                torch.save(torch.tensor([index], dtype=torch.float32), data_dir / f"s{index}.pt")
+                (data_dir / f"s{index}.txt").write_text(f"caption {index}", encoding="utf-8")
+            original = build_cache(data_dir, cache_path, partial_recovery=False)
+            original["records"][1] = None
+            torch.save(original, cache_path)
+            _write_checksum(cache_path)
+            with self.assertRaisesRegex(ValueError, r"record\[1\] is not a table"):
+                load_cache(cache_path)
+
+            rebuilt = build_cache(data_dir, cache_path, partial_recovery=True)
+            self.assertEqual(rebuilt["recovered_records"], 0)
+            self.assertEqual(len(rebuilt["records"]), 2)
+            self.assertEqual(len(load_cache(cache_path)["records"]), 2)
+
     def test_tag_shuffle_variants_expand_caption_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
