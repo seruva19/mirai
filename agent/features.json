@@ -3265,6 +3265,41 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_packed_companion_projections",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/magi2_preview/companion_weights.py",
+      "check": "compressed_weights",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "pack_magi2_companion_weights"
+      ],
+      "config_keys": [
+        "model.params.family_params"
+      ],
+      "disabled_config": {
+        "model.params.family_params": {}
+      },
+      "contract_paths": [
+        "tests/test_magi2_preview_contract.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/vendors/magi2_preview/model/magi2_preview.py",
+      "readme_claim": "Packed MAGI-2 companion projections",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_preview",
       "kind": "model_family",
       "owner": "mirai/core/models/magi2_preview/pipeline.py",

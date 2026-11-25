@@ -60,13 +60,18 @@ def execute_grouped_linear_lora(
     groups = int(module.num_experts)
     rows = int(module.out_features)
     cols = int(module.in_features)
-    weight = original.view(groups, rows, cols)
-    bias = (
-        module.bias.view(groups, rows) if module.bias is not None else None
-    )
+    packed = hasattr(module, "_mirai_companion_projections")
+    if packed:
+        from .companion_weights import execute_companion_linear
+
+        base = execute_companion_linear(module, input, cu_seqlens, m_splits, gather_ids)
+    else:
+        weight = original.view(groups, rows, cols)
+        bias = module.bias.view(groups, rows) if module.bias is not None else None
     factor = float(adapter.scale) * float(adapter.runtime_scale)
     if groups == 1:
-        base = F.linear(input, weight[0], None if bias is None else bias[0])
+        if not packed:
+            base = F.linear(input, weight[0], None if bias is None else bias[0])
         return base + _lora_linear(
             input,
             lora_a=adapter.lora_a,
@@ -77,7 +82,8 @@ def execute_grouped_linear_lora(
 
     splits = _m_splits_from(cu_seqlens, m_splits)
     ordered = _maybe_gather(input, gather_ids)
-    base = _torch_grouped_linear(input, weight, bias, splits, gather_ids)
+    if not packed:
+        base = _torch_grouped_linear(input, weight, bias, splits, gather_ids)
     outputs: list[torch.Tensor] = []
     start = 0
     lora_b = adapter.lora_b.view(groups, rows, adapter.rank)

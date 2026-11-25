@@ -200,6 +200,8 @@ class LowRankWeight(nn.Module):
         nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
 
     def forward(self, base: torch.Tensor) -> torch.Tensor:
+        if base.numel() == 0:
+            raise RuntimeError("Packed MAGI-2 companion adapters use activation-space execution.")
         delta = (self.lora_b @ self.lora_a).reshape(self.shape)
         return base + delta.to(dtype=base.dtype) * self.scale * self.runtime_scale
 
@@ -249,6 +251,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     _refine_settings: "Magi2RefineSettings | None" = None
     _residency_request: "Magi2ResidencyRequest | None" = None
     _expert_stores: "dict[str, Magi2Nf4ExpertStore]" = {}
+    _packed_companion_linears: tuple[nn.Module, ...] = ()
+    _companion_weight_quantization = "none"
     _routing_collapse: Any | None = None
     _last_diagnostics: "dict[str, float]" = {}
 
@@ -281,6 +285,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             getattr(memory_config, "quantization_block_size", MAGI2_NF4_BLOCKSIZE)
         )
         self._expert_stores: dict[str, Magi2Nf4ExpertStore] = {}
+        self._packed_companion_linears: tuple[nn.Module, ...] = ()
         self._applied_expert_precision_plan = ""
         self._moe_optimization_policy = MoEOptimizationPolicy()
         self._moe_token_chunk_policy: Any | None = None
@@ -291,6 +296,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         from mirai.core.models.magi2_preview.mixed_experts import MAGI2_EXPERT_ROTATION_SIZES
 
         self._expert_rotation_group_size = family.get("expert_rotation_group_size", 0)
+        from mirai.core.models.magi2_preview.companion_weights import MAGI2_COMPANION_FORMATS
+
+        self._companion_weight_quantization = family.get("companion_weight_quantization", "none")
+        if self._companion_weight_quantization not in MAGI2_COMPANION_FORMATS:
+            raise ValueError("MAGI-2 companion_weight_quantization must be 'none', 'fp8', or 'nf4'.")
         if type(self._expert_rotation_group_size) is not int or self._expert_rotation_group_size not in MAGI2_EXPERT_ROTATION_SIZES:
             raise ValueError("Invalid MAGI-2 expert Hadamard group size.")
         if self._expert_rotation_group_size and not (
@@ -478,6 +488,12 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 pruning_plan = Magi2ExpertPruningPlan.load(self._expert_pruning_plan_path)
                 apply_magi2_expert_pruning(transformer, pruning_plan)
                 self._expert_pruning_digest = pruning_plan.topology_digest()
+        if self._companion_weight_quantization != "none":
+            from mirai.core.models.magi2_preview.companion_weights import pack_magi2_companion_weights
+
+            self._packed_companion_linears = pack_magi2_companion_weights(
+                transformer, quant_format=self._companion_weight_quantization, blocksize=self._nf4_blocksize,
+            )
         transformer.train()
         self._configure_attention_backend(transformer)
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
@@ -857,7 +873,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             validate_grouped_moe_backend_support,
         )
 
-        quantized = self.has_quantized_frozen_weights()
+        quantized = bool(self._expert_stores)
         policy = self._moe_optimization_policy
         token_chunk_size = int(
             getattr(getattr(self, "_moe_token_chunk_policy", None), "token_chunk_size", 0)
@@ -986,7 +1002,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 quantize_magi2_mixed_experts,
             )
 
-            if not self.has_quantized_frozen_weights():
+            if not self._expert_stores:
                 self._expert_stores = quantize_magi2_mixed_experts(
                     self.transformer, plan_path=precision_plan_path, base_format=scheme,
                     blocksize=block_size,
@@ -998,7 +1014,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             ):
                 raise ValueError("A MAGI-2 precision plan cannot replace an existing packed store.")
             self._applied_expert_precision_plan = precision_plan_path
-        elif not self.has_quantized_frozen_weights():
+        elif not self._expert_stores:
             from mirai.core.models.magi2_preview.quantized_experts import (
                 quantize_magi2_experts_in_place,
             )
@@ -1009,25 +1025,35 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._attach_moe_execution()
 
     def has_quantized_frozen_weights(self) -> bool:
-        return bool(self._expert_stores)
+        return bool(self._expert_stores or self._packed_companion_linears)
 
     def get_quantized_frozen_weight_report(self) -> dict[str, Any] | None:
-        if not self._expert_stores:
+        if not self.has_quantized_frozen_weights():
             return None
         stores = list(self._expert_stores.values())
+        companion_projections = [
+            projection
+            for module in self._packed_companion_linears
+            for projection in module._mirai_companion_projections
+        ]
+        companion_bytes = sum(
+            buffer.numel() * buffer.element_size()
+            for projection in companion_projections for buffer in projection.buffers()
+        )
         return {
             "strategy": "compressed_weights",
-            "quant_format": stores[0].quant_format,
-            "mixed_precision": bool(getattr(stores[0], "is_mixed_precision", False)),
-            "linear_modules": 0,
+            "quant_format": stores[0].quant_format if stores else self._companion_weight_quantization,
+            "companion_quant_format": self._companion_weight_quantization,
+            "mixed_precision": bool(stores and getattr(stores[0], "is_mixed_precision", False)),
+            "linear_modules": len(self._packed_companion_linears),
             "grouped_expert_modules": len(stores),
-            "quantized_tensors": sum(
-                len(MAGI2_ROUTED_EXPERT_TENSORS) for _store in stores
+            "quantized_tensors": len(MAGI2_ROUTED_EXPERT_TENSORS) * len(stores) + len(companion_projections),
+            "quantized_numel": sum(store.quantized_numel() for store in stores) + sum(
+                projection.frozen_quantized_numel() for projection in companion_projections
             ),
-            "quantized_numel": sum(store.quantized_numel() for store in stores),
-            "packed_bytes": sum(store.payload_bytes() for store in stores),
-            "expert_weight_access": stores[0].expert_weight_access,
-            "expert_dequant_chunk_size": stores[0].expert_dequant_chunk_size,
+            "packed_bytes": sum(store.payload_bytes() for store in stores) + companion_bytes,
+            "expert_weight_access": stores[0].expert_weight_access if stores else None,
+            "expert_dequant_chunk_size": stores[0].expert_dequant_chunk_size if stores else None,
         }
 
     def preserves_native_parameter_dtypes(self) -> bool:
@@ -1077,18 +1103,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 full_name = f"{name}.{tensor_name}" if name else tensor_name
                 owner_name = f".{name}" if name else ""
                 if not any(
-                    owner_name.endswith(target) or full_name.endswith(target)
+                    (tensor_name == "weight" and owner_name.endswith(target)) or full_name.endswith(target)
                     for target in targets
                 ):
                     continue
                 if parametrize.is_parametrized(module, tensor_name):
                     continue
+                packed = tensor_name == "weight" and hasattr(module, "_mirai_companion_projections")
+                shape = (module.num_experts * module.out_features, module.in_features) if packed else tuple(parameter.shape)
                 parameter.requires_grad_(False)
                 parametrize.register_parametrization(
                     module,
                     tensor_name,
-                    LowRankWeight(tuple(parameter.shape), rank=rank, alpha=alpha),
-                    unsafe=False,
+                    LowRankWeight(shape, rank=rank, alpha=alpha),
+                    unsafe=packed,
                 )
                 module.parametrizations[tensor_name].original.requires_grad_(False)
                 from mirai.core.models.magi2_preview.lora_execution import (
@@ -1971,6 +1999,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "nf4_fuse_gate_up",
         "expert_pruning_plan_path",
         "expert_rotation_group_size",
+        "companion_weight_quantization",
         "config_path",
         "audio_tokens",
         "refiner_config_path",
@@ -2016,10 +2045,13 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         return (*MAGI2_PACKED_EXPERT_FORMATS, "bf16")
 
     def validate_family_params(self, params: dict[str, Any]) -> list[str]:
+        from mirai.core.models.magi2_preview.companion_weights import MAGI2_COMPANION_FORMATS
         from mirai.core.models.magi2_preview.mixed_experts import MAGI2_EXPERT_ROTATION_SIZES
 
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        if params.get("companion_weight_quantization", "none") not in MAGI2_COMPANION_FORMATS:
+            errors.append("MAGI-2 companion_weight_quantization must be 'none', 'fp8', or 'nf4'.")
         rotation = params.get("expert_rotation_group_size", 0)
         if type(rotation) is not int or rotation not in MAGI2_EXPERT_ROTATION_SIZES:
             errors.append("MAGI-2 expert_rotation_group_size must be 0, 4, 16, 64, or 256.")

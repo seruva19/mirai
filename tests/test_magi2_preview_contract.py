@@ -158,6 +158,86 @@ def test_magi2_grouped_linear_lora_executes_without_dense_delta() -> None:
     assert "parametrizations.weight.0.lora_b" in state_keys
 
 
+def test_magi2_packed_companion_preserves_grouped_lora_output_and_gradients() -> None:
+    from types import SimpleNamespace
+
+    from mirai.core.models.magi2_preview.companion_weights import pack_magi2_companion_weights
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+    from mirai.vendors.magi2_preview.model.magi2_preview import CustomGroupedLinear
+
+    def projection(groups):
+        module = CustomGroupedLinear(16, 16, groups, 1, 1, bias=True, dtype=torch.float32)
+        with torch.no_grad():
+            module.weight.normal_(std=0.1)
+            module.bias.normal_(std=0.1)
+        return module
+
+    torch.manual_seed(47)
+    attention = torch.nn.Module()
+    attention.linear_qkv = projection(3)
+    layer = torch.nn.Module()
+    layer.attention = attention
+    layer.mlp = torch.nn.Sequential(projection(1))
+    transformer = torch.nn.Module()
+    transformer.block = torch.nn.Module()
+    transformer.block.layers = torch.nn.ModuleList([layer])
+    packed_linears = pack_magi2_companion_weights(transformer, quant_format="fp8", blocksize=64)
+    module = attention.linear_qkv
+    assert module.weight.numel() == 0
+    assert layer.mlp[0].weight.numel() == 0
+    rows = torch.randn(3, 16)
+    single = layer.mlp[0]
+    torch.testing.assert_close(
+        single(rows),
+        torch.nn.functional.linear(
+            rows, single._mirai_companion_projections[0]._materialize_weight(dtype=torch.float32, device="cpu"),
+            single.bias,
+        ),
+    )
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = transformer
+    pipeline._packed_companion_linears = packed_linears
+    pipeline._companion_weight_quantization = "fp8"
+    assert pipeline.has_quantized_frozen_weights()
+    report = pipeline.get_quantized_frozen_weight_report()
+    assert report["linear_modules"] == 2
+    assert report["grouped_expert_modules"] == 0
+    assert report["quantized_numel"] == 4 * 16 * 16
+    assert report["packed_bytes"] > 0
+    pipeline.set_adapter_config(SimpleNamespace(type="lora", target_preset="attn_only", rank=3, alpha=6.0))
+    adapter = module.parametrizations.weight[0]
+    with torch.no_grad():
+        adapter.lora_b.normal_(std=0.1)
+    weights = torch.cat([
+        packed._materialize_weight(dtype=torch.float32, device="cpu")
+        for packed in module._mirai_companion_projections
+    ]).view(3, 16, 16)
+    values = torch.randn(6, 16, requires_grad=True)
+    gather = torch.tensor([5, 4, 3, 2, 1, 0])
+    splits = [3, 0, 3]
+    actual = module(values, splits, gather_ids=gather)
+    dense = weights + (adapter.lora_b @ adapter.lora_a).view(3, 16, 16) * adapter.scale
+    ordered = values.index_select(0, gather)
+    expected = torch.cat([
+        torch.nn.functional.linear(ordered[:3], dense[0], module.bias[:16]),
+        torch.nn.functional.linear(ordered[3:], dense[2], module.bias[32:]),
+    ])
+    torch.testing.assert_close(actual, expected)
+    gradient_inputs = (values, adapter.lora_a, adapter.lora_b)
+    for got, want in zip(
+        torch.autograd.grad(actual.square().sum(), gradient_inputs),
+        torch.autograd.grad(expected.square().sum(), gradient_inputs), strict=True,
+    ):
+        torch.testing.assert_close(got, want)
+    state = pipeline.state_dict()
+    assert set(state) == {
+        "block.layers.0.attention.linear_qkv.parametrizations.weight.0.lora_a",
+        "block.layers.0.attention.linear_qkv.parametrizations.weight.0.lora_b",
+    }
+    pipeline.load_adapter_state(state)
+
+
 def test_magi2_router_lora_executes_without_dense_delta() -> None:
     module, adapter = _build_reduced_moe(
         device=torch.device("cpu"), dtype=torch.float32

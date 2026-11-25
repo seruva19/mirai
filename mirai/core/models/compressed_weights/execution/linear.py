@@ -807,6 +807,10 @@ class CompressedLinear(nn.Module):
                 else None
             )
             return output if bias is None else output + bias
+        return self.forward_weight_only(x)
+
+    def forward_weight_only(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the stored weight while keeping activations in compute dtype."""
         output = _FrozenCompressedLinear.apply(x, self)
         bias = self.bias.to(device=x.device, dtype=x.dtype) if self.bias is not None else None
         return output if bias is None else output + bias

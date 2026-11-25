@@ -200,9 +200,10 @@ described in [`CONFIG_REFERENCE.md`](../CONFIG_REFERENCE.md).
 NF4 instead of BF16. Exactly three tensors per MoE layer are packed —
 `moe_mlp.W_gate`, `moe_mlp.W_up`, and `moe_mlp.W_down` — because they are the
 only tensors addressed on the flattened `head * num_experts + expert` axis. The
-router projection (`moe_mlp.gate`, FP32), the router bias buffers, both shared
-experts, the hyper-connection state, the attention projections, and every norm
-keep their released dtype and are not quantized by this family.
+router projection (`moe_mlp.gate`), router bias buffers, hyper-connection
+state, and norms keep their released dtype. The independent
+`companion_weight_quantization` option controls attention and shared-expert
+projection storage.
 
 Storage is one NF4 quantization per group, stacked along the group axis, which
 is what makes a contiguous group range independently dequantizable. NF4 requires
@@ -724,6 +725,14 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 
 ## Model-specific features
 
+- **Packed MAGI-2 companion projections** — Set
+  `model.params.family_params.companion_weight_quantization` to `"fp8"` or
+  `"nf4"` to pack the denoiser's attention, shared-expert, and dense MLP
+  projections. The grouped projection keeps modality dispatch and supports
+  the existing attention LoRA targets. Router and normalization weights
+  retain their original storage. Companion projections pack from the
+  checkpoint at load time.
+
 - **Intra-block routed expert offload** — Set
   `memory.block_swap_transfer_strategy = "routed_experts"` with async CUDA
   block swap. The denoiser starts transfers at block entry and waits before
@@ -842,6 +851,7 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.strict_native_assets` | Requires the complete released native assets; the shipped preset sets this to `true`. |
 | `model.params.flow_shift` | Preset value `7.0`, matching the release's `evaluation_config.shift`. |
 | `model.params.family_params.config_path` | Override for the vendored architecture JSON; empty resolves to the shipped `magi2_preview.json`. |
+| `model.params.family_params.companion_weight_quantization` | `"none"` (default), `"fp8"`, or `"nf4"`. Packs attention and MLP companion weights after loading the denoiser checkpoint. NF4 packing requires CUDA and bitsandbytes. |
 | `model.params.family_params.refiner_config_path` | Override for the vendored refiner profile JSON; empty resolves to the shipped `magi2_refiner.json`. The profile states the refiner architecture, its step count, guidance scale, flow shift, VAE stride and the zero-terminal-SNR index the stage re-noises at, so changing the refinement means pointing this at a different profile. Only read when `--refine` is requested. |
 | `model.params.family_params.refiner_subfolder` | Snapshot subdirectory holding the refiner shards; defaults to `refiner`. Must be relative to the snapshot root and must not traverse upwards. |
 | `model.params.family_params.refiner_attention_backend` | `auto`, `native_flex`, or `vendor_eager`, selecting how the refiner's local-attention layers evaluate their paired query/key ranges. `auto` uses, in order, a registered `torch.ops.magi2.flex_flash_attn_func` operator, the authors' importable single-GPU MagiAttention kernel on Hopper, then Mirai's portable FlexAttention range-union path. `native_flex` always binds the portable path. `vendor_eager` leaves the vendored dispatch unchanged, which needs either MagiAttention or a FlashAttention-2 install. Both accelerated paths and the portable path implement the union of every key range paired with a query position under one softmax; only the final FlashAttention-2 correction fallback merges per-range partial softmaxes and can double-count keys reachable through more than one range. Only read when `--refine` is requested. |
