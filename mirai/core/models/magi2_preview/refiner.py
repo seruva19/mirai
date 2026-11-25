@@ -579,6 +579,52 @@ class Magi2RefineSettings:
 # --------------------------------------------------------------------------- #
 # Refiner transformer lifecycle (on-demand load / release)
 # --------------------------------------------------------------------------- #
+class _CompressedRefinerLinear(torch.nn.Module):
+    """Preserve the Refiner's modality dispatch and BF16 compute contract."""
+
+    def __init__(self, source, quant_format: str) -> None:
+        super().__init__()
+        from mirai.core.models.compressed_weights.execution.linear import CompressedLinear
+
+        self.in_features = source.in_features
+        self.out_features = source.out_features
+        self.num_experts = source.num_experts
+        self.projections = torch.nn.ModuleList()
+        for weight in source.weight.detach().chunk(self.num_experts):
+            projection = CompressedLinear.from_empty(
+                in_features=self.in_features, out_features=self.out_features,
+                group_size=0, has_bias=False, quant_format=quant_format,
+            )
+            projection.load_dense_weight(source=weight)
+            self.projections.append(projection)
+        self.register_buffer("bias", source.bias.detach() if source.bias is not None else None)
+
+    def forward(self, input, output_dtype=None, modality_dispatcher=None):
+        from mirai.vendors.magi2_preview.model.magi2_refiner import _bf16_compute_linear
+
+        dtype = input.dtype if output_dtype is None else output_dtype
+        inputs = (input,) if self.num_experts == 1 else modality_dispatcher.dispatch(input)
+        biases = (None,) * self.num_experts if self.bias is None else self.bias.chunk(self.num_experts)
+        outputs = []
+        for rows, projection, bias in zip(inputs, self.projections, biases, strict=True):
+            if rows.numel() == 0:
+                outputs.append(rows.new_empty((*rows.shape[:-1], self.out_features), dtype=dtype))
+                continue
+            weight = projection._materialize_weight(dtype=torch.bfloat16, device=rows.device)
+            outputs.append(_bf16_compute_linear(rows, weight, bias, dtype))
+            del weight
+        return outputs[0] if self.num_experts == 1 else modality_dispatcher.undispatch(*outputs)
+
+
+def _compress_refiner_linears(transformer: torch.nn.Module, quant_format: str) -> None:
+    from mirai.vendors.magi2_preview.model.magi2_refiner import BaseLinear
+
+    for parent in [module for module in transformer.modules() if not isinstance(module, BaseLinear)]:
+        for name, child in list(parent.named_children()):
+            if isinstance(child, BaseLinear):
+                setattr(parent, name, _CompressedRefinerLinear(child, quant_format))
+
+
 class Magi2Refiner:
     """On-demand owner of the refiner transformer and its data proxy.
 
@@ -595,12 +641,16 @@ class Magi2Refiner:
         subfolder: str = MAGI2_REFINER_SUBFOLDER,
         attention_backend: str = MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT,
         query_chunk_size: int = 0,
+        weight_quantization: str = "none",
     ) -> None:
         self.model_config = model_config
         self.config_path = str(config_path)
         self.subfolder = str(subfolder or MAGI2_REFINER_SUBFOLDER)
         self.attention_backend = normalize_refiner_attention_backend(attention_backend)
         self.query_chunk_size = query_chunk_size
+        if weight_quantization not in {"none", "fp8", "nf4"}:
+            raise ValueError("Refiner weight quantization must be 'none', 'fp8', or 'nf4'.")
+        self.weight_quantization = weight_quantization
         self._transformer: Any | None = None
         self._data_proxy: Any | None = None
         self._runtime_config: Any | None = None
@@ -845,6 +895,8 @@ class Magi2Refiner:
             transformer.eval()
             for parameter in transformer.parameters():
                 parameter.requires_grad_(False)
+            if self.weight_quantization != "none":
+                _compress_refiner_linears(transformer, self.weight_quantization)
             self._transformer = transformer
             self._data_proxy = Magi2RefinerDataProxy(
                 config.evaluation_config.magi2_refiner_data_proxy_config

@@ -1877,7 +1877,11 @@ class MLP(torch.nn.Module):
         return x
 
     def extra_repr(self) -> str:
-        return f"{self.up_gate_proj.weight.shape=}, {self.down_proj.weight.shape=}"
+        up, down = self.up_gate_proj, self.down_proj
+        return (
+            f"up_gate_shape={(up.out_features * up.num_experts, up.in_features)}, "
+            f"down_shape={(down.out_features * down.num_experts, down.in_features)}"
+        )
 
 
 # Define the Adapter module

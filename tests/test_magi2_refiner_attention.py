@@ -451,6 +451,40 @@ def test_query_chunking_preserves_absolute_range_membership(chunk_size) -> None:
         torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-4)
 
 
+def test_range_cache_invalidates_when_source_is_modified() -> None:
+    query, key, value = _inputs(query_tokens=32, key_tokens=32, heads_q=4, heads_kv=2, seed=57)
+    backend = Magi2RefinerFlexAttentionBackend(query_chunk_size=13)
+    q_ranges, k_ranges = _ranges([(0, 32)]), _ranges([(0, 10)])
+    options = dict(q_ranges=q_ranges, k_ranges=k_ranges, attn_type_map=None, max_seqlen_q=32)
+    first, _ = backend.execute(query, key, value, **options)
+    k_ranges[0, 1] = 23
+    second, _ = backend.execute(query, key, value, **options)
+    reference, _ = flex_range_attention(query, key, value, q_ranges, k_ranges)
+    assert not torch.equal(first, second)
+    torch.testing.assert_close(second, reference)
+
+
+def test_refiner_fp8_projection_preserves_modality_and_output_dtype(vendored_refiner_module):
+    from mirai.core.models.magi2_preview.refiner import _compress_refiner_linears
+
+    torch.manual_seed(59)
+    source = vendored_refiner_module.NativeMoELinear(8, 16, 1, 3, True)
+    model = torch.nn.Sequential(source)
+    with torch.no_grad():
+        source.weight.normal_(std=0.25)
+        source.bias.normal_(std=0.1)
+    _compress_refiner_linears(model, "fp8")
+    packed = model[0]
+    assert not hasattr(packed, "weight")
+    dispatcher = vendored_refiner_module.ModalityDispatcher(torch.tensor([0, 0, 2]), 3)
+    x = torch.randn(3, 8)
+    with torch.inference_mode():
+        observed = packed(x, torch.float32, dispatcher)
+        reference = source(x, torch.float32, dispatcher)
+    assert observed.dtype == torch.float32
+    torch.testing.assert_close(observed, reference, rtol=0.1, atol=0.08)
+
+
 def test_refiner_mlp_token_chunking_preserves_modality_outputs(
     vendored_refiner_module,
 ) -> None:

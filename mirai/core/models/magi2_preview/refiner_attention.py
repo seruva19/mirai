@@ -540,13 +540,19 @@ def _resolve_cached_range_mask(
     *,
     query_tokens: int,
     key_tokens: int,
+    device: torch.device,
 ) -> tuple[Magi2RangeUnionMask, Any]:
     """Reuse immutable geometry across refiner layers and denoise steps."""
+    versions = None if torch.is_inference(q_ranges) or torch.is_inference(k_ranges) else (
+        q_ranges._version, k_ranges._version
+    )
+    geometry = (query_tokens, key_tokens, device, backend.query_chunk_size)
     if (
         backend._cached_q_source is q_ranges
         and backend._cached_k_source is k_ranges
-        and backend._cached_query_tokens == int(query_tokens)
-        and backend._cached_key_tokens == int(key_tokens)
+        and versions is not None
+        and backend._cached_versions == versions
+        and backend._cached_geometry == geometry
     ):
         assert backend._cached_range_mask is not None
         assert backend._cached_block_mask is not None
@@ -556,19 +562,21 @@ def _resolve_cached_range_mask(
     cache_matches = (
         backend._cached_q_ranges is not None
         and backend._cached_k_ranges is not None
-        and backend._cached_query_tokens == int(query_tokens)
-        and backend._cached_key_tokens == int(key_tokens)
+        and backend._cached_geometry == geometry
         and torch.equal(backend._cached_q_ranges, q_cpu)
         and torch.equal(backend._cached_k_ranges, k_cpu)
     )
     if cache_matches:
+        backend._cached_q_source = q_ranges
+        backend._cached_k_source = k_ranges
+        backend._cached_versions = versions
         assert backend._cached_range_mask is not None
         assert backend._cached_block_mask is not None
         return backend._cached_range_mask, backend._cached_block_mask
 
     mask = build_range_union_mask(
-        q_cpu.to(device=q_ranges.device),
-        k_cpu.to(device=k_ranges.device),
+        q_cpu.to(device=device),
+        k_cpu.to(device=device),
         query_tokens=int(query_tokens),
         key_tokens=int(key_tokens),
     )
@@ -582,8 +590,8 @@ def _resolve_cached_range_mask(
     object.__setattr__(backend, "_cached_k_ranges", k_cpu.clone())
     object.__setattr__(backend, "_cached_q_source", q_ranges)
     object.__setattr__(backend, "_cached_k_source", k_ranges)
-    object.__setattr__(backend, "_cached_query_tokens", int(query_tokens))
-    object.__setattr__(backend, "_cached_key_tokens", int(key_tokens))
+    backend._cached_versions = versions
+    backend._cached_geometry = geometry
     object.__setattr__(backend, "_cached_range_mask", mask)
     object.__setattr__(backend, "_cached_block_mask", block_mask)
     return mask, block_mask
@@ -607,8 +615,8 @@ class Magi2RefinerFlexAttentionBackend:
     _cached_k_ranges: torch.Tensor | None = field(default=None, init=False, repr=False)
     _cached_q_source: torch.Tensor | None = field(default=None, init=False, repr=False)
     _cached_k_source: torch.Tensor | None = field(default=None, init=False, repr=False)
-    _cached_query_tokens: int = field(default=-1, init=False, repr=False)
-    _cached_key_tokens: int = field(default=-1, init=False, repr=False)
+    _cached_geometry: tuple[int, int, torch.device, int] | None = field(default=None, init=False, repr=False)
+    _cached_versions: tuple[int, int] | None = field(default=None, init=False, repr=False)
     _cached_range_mask: Magi2RangeUnionMask | None = field(
         default=None, init=False, repr=False
     )
@@ -631,6 +639,7 @@ class Magi2RefinerFlexAttentionBackend:
             k_ranges,
             query_tokens=int(query.shape[0]),
             key_tokens=int(key.shape[0]),
+            device=query.device,
         )
         return flex_range_attention(
             query,
