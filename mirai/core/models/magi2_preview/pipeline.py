@@ -314,6 +314,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         ):
             raise ValueError("MAGI-2 expert rotation requires precision calibration, a mixed plan, or a rotated artifact.")
         self._expert_pruning_plan_path = str(family.get("expert_pruning_plan_path", "")).strip()
+        self._expert_consolidation_plan_path = str(family.get("expert_consolidation_plan_path", "")).strip()
         self._expert_pruning_adapter_source_plan_path = str(
             family.get("expert_pruning_adapter_source_plan_path", "") or ""
         ).strip()
@@ -325,6 +326,12 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("MAGI-2 pruned-adapter source verification requires the dense checkpoint.")
         if self._expert_pruning_plan_path and self._expert_precision_plan_path and not self._quantizes_experts_on_load():
             raise ValueError("MAGI-2 pruning with a mixed precision plan requires quantize_experts_on_load.")
+        if self._expert_consolidation_plan_path and (
+            self._expert_pruning_plan_path or self._expert_pruning_adapter_source_plan_path
+            or self._quantize_experts_on_load or self._packed_expert_state_path
+            or self._expert_precision_plan_path or self._frozen_weight_quantization not in {"", "none", "off", "disabled"}
+        ):
+            raise ValueError("MAGI-2 hierarchical consolidation requires a dense source and no pruning plan.")
         default_config = (
             Path(__file__).resolve().parents[3]
             / "vendors"
@@ -435,9 +442,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         config.engine_config.load = str(checkpoint_dir)
         packed_experts = self._quantizes_experts_on_load() or bool(self._packed_expert_state_path)
         pruning_plan_path = self._expert_pruning_plan_path
+        consolidation_plan_path = getattr(self, "_expert_consolidation_plan_path", "")
         transformer = (
             Transformer(config.arch_config, ep_size=1, routed_weight_device="meta")
-            if packed_experts or pruning_plan_path else Transformer(config.arch_config, ep_size=1)
+            if packed_experts or pruning_plan_path or consolidation_plan_path else Transformer(config.arch_config, ep_size=1)
         )
         mixed_stream = self._quantizes_experts_on_load() and self._expert_precision_plan_path
         preloaded_keys = set()
@@ -446,7 +454,16 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             from mirai.core.models.magi2_preview.expert_pruning import Magi2ExpertPruningPlan
 
             pruning_plan = Magi2ExpertPruningPlan.load(pruning_plan_path)
-        if mixed_stream:
+        if consolidation_plan_path:
+            from mirai.core.models.magi2_preview.expert_pruning import (
+                Magi2ExpertConsolidationPlan,
+                stream_merge_magi2_experts,
+            )
+
+            consolidation_plan = Magi2ExpertConsolidationPlan.load(consolidation_plan_path)
+            preloaded_keys = stream_merge_magi2_experts(transformer, consolidation_plan, checkpoint_dir)
+            self._expert_pruning_digest = consolidation_plan.topology_digest()
+        elif mixed_stream:
             from mirai.core.models.magi2_preview.mixed_experts import stream_quantize_magi2_mixed_experts
 
             self._expert_stores, preloaded_keys = stream_quantize_magi2_mixed_experts(
@@ -943,6 +960,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             getattr(getattr(self, "_moe_token_chunk_policy", None), "token_chunk_size", 0)
         )
         plan = resolve_magi2_moe_execution(policy, quantized_experts=quantized)
+        if plan is not None and getattr(self, "_expert_consolidation_plan_path", ""):
+            raise ValueError("MAGI-2 consolidated experts require native reference execution.")
         if plan is not None:
             validate_grouped_moe_backend_support(
                 plan, device=self._transformer_device()
@@ -2119,6 +2138,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
         "nf4_fuse_gate_up",
         "expert_pruning_plan_path",
+        "expert_consolidation_plan_path",
         "expert_pruning_adapter_source_plan_path",
         "expert_rotation_group_size",
         "companion_weight_quantization",
@@ -2204,6 +2224,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             errors.append("MAGI-2 family_params.audio_tokens must be -1 (auto) or >= 0.")
         for name in (
             "expert_pruning_plan_path",
+            "expert_consolidation_plan_path",
             "expert_pruning_adapter_source_plan_path",
             "refiner_config_path",
             "refiner_subfolder",

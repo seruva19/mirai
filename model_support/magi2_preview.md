@@ -807,6 +807,10 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   `observe_magi2_hierarchical_merge_head` records sampled activations into
   the shared mean-output accumulator. Save or load the resulting plan
   with `Magi2ExpertConsolidationPlan`.
+  Set `model.params.family_params.expert_consolidation_plan_path` to load
+  a saved plan from the original checkpoint, merging one source projection
+  at a time. Use dense reference expert execution and the `attn_only` adapter
+  preset for training with this plan.
   Clustering and weight averaging operate within each head while routing
   retains the original expert IDs. The merged model uses reference execution.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,

@@ -837,14 +837,19 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
 
 def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(tmp_path) -> None:
     from copy import deepcopy
+    from dataclasses import replace
+
+    from safetensors.torch import save_file
 
     from mirai.core.models.magi2_preview.expert_pruning import (
         Magi2ExpertConsolidationPlan, apply_magi2_hierarchical_merge,
         build_magi2_hierarchical_merge_plan, observe_magi2_hierarchical_merge_head,
+        stream_merge_magi2_experts,
     )
     from mirai.core.moe.calibration.prototypes import MeanExpertOutputAccumulator, PrototypeCalibrationEvidence
 
     layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    layer.router.expert_bias.copy_(layer.router.expert_bias_ema)
     reference = deepcopy(layer)
     transformer = _container(layer)
     evidence = []
@@ -870,9 +875,20 @@ def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(t
     restored = Magi2ExpertConsolidationPlan.load(path)
     assert restored == plan
     assert restored.topology_digest() == plan.topology_digest()
+    save_file(transformer.state_dict(), str(tmp_path / "model.safetensors"))
+    skeleton = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, routed_weight_device="meta",
+    ))
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        stream_merge_magi2_experts(skeleton, replace(plan, source_weight_fingerprint="sha256:wrong"), tmp_path)
+    assert skeleton.mlp.moe_mlp.W_gate.is_meta
+    preloaded = stream_merge_magi2_experts(skeleton, restored, tmp_path)
+    assert preloaded == set(skeleton.state_dict())
     apply_magi2_hierarchical_merge(transformer, restored)
     assert layer.num_experts == 4
     assert layer._mirai_expert_aliases == (0, 0, 1, 1, 2, 3, 2, 3)
+    for key, value in transformer.state_dict().items():
+        torch.testing.assert_close(skeleton.state_dict()[key], value, rtol=0, atol=0)
     for current, prior in zip(layer._route(tokens), before, strict=True):
         torch.testing.assert_close(current, prior, rtol=0, atol=0)
     with torch.no_grad():

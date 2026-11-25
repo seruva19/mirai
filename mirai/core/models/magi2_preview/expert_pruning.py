@@ -277,16 +277,32 @@ def apply_magi2_hierarchical_merge(
     transformer: nn.Module, plan: Magi2ExpertConsolidationPlan,
 ) -> None:
     """Store merged expert matrices while preserving every logical router row."""
+    layers = _dense_pruning_layers(transformer)
+    layouts = _merge_layouts(layers, plan)
+    if _source_fingerprint({name: layers[name] for name in layouts}) != plan.source_weight_fingerprint:
+        raise ValueError("MAGI-2 consolidation source-weight fingerprint mismatch.")
+    for name in layouts:
+        layer = layers[name]
+        if layer._mirai_moe_kernel_backend is not None or any(
+            layer._parameters[key].requires_grad for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+        ):
+            raise ValueError("MAGI-2 consolidation requires frozen experts and native reference execution.")
+    for name, (aliases, clusters) in layouts.items():
+        layer = layers[name]
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            compact = _merge_projection(layer._parameters[key], clusters)
+            setattr(layer, key, nn.Parameter(compact, requires_grad=False))
+        layer._mirai_expert_aliases = aliases
+
+
+def _merge_layouts(layers, plan):
     from mirai.core.moe.storage.aliases import validate_logical_to_physical
 
-    layers = _dense_pruning_layers(transformer)
     if not plan.heads_by_layer or set(plan.heads_by_layer) - set(layers):
         raise ValueError("MAGI-2 consolidation plan does not match model topology.")
-    selected = {name: layers[name] for name in plan.heads_by_layer}
-    if _source_fingerprint(selected) != plan.source_weight_fingerprint:
-        raise ValueError("MAGI-2 consolidation source-weight fingerprint mismatch.")
+    layouts = {}
     for name, heads in plan.heads_by_layer.items():
-        layer = selected[name]
+        layer = layers[name]
         if len(heads) != layer.num_heads or any(
             item.validate().consolidation.logical_experts != layer.num_experts for item in heads
         ):
@@ -296,12 +312,6 @@ def apply_magi2_hierarchical_merge(
                 item.consolidation.logical_to_physical,
                 physical_experts=item.consolidation.physical_experts,
             )
-        if layer._mirai_moe_kernel_backend is not None or any(
-            layer._parameters[key].requires_grad for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
-        ):
-            raise ValueError("MAGI-2 consolidation requires frozen experts and native reference execution.")
-    for name, heads in plan.heads_by_layer.items():
-        layer = selected[name]
         mapping = []
         clusters = []
         for head, item in enumerate(heads):
@@ -312,16 +322,69 @@ def apply_magi2_hierarchical_merge(
                     (head * layer.num_experts + expert, item.merge_weights[expert])
                     for expert, alias in enumerate(aliases) if alias == physical
                 ])
-        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
-            weight = layer._parameters[key]
-            compact = weight.new_empty((len(clusters), *weight.shape[1:]))
-            for physical, members in enumerate(clusters):
-                merged = torch.zeros_like(weight[0], dtype=torch.float32)
-                for expert, coefficient in members:
-                    merged.add_(weight[expert].float(), alpha=coefficient)
-                compact[physical].copy_(merged)
-            setattr(layer, key, nn.Parameter(compact, requires_grad=False))
-        layer._mirai_expert_aliases = tuple(mapping)
+        layouts[name] = (tuple(mapping), clusters)
+    return layouts
+
+
+def _merge_projection(weight, clusters):
+    compact = weight.new_empty((len(clusters), *weight.shape[1:]))
+    for physical, members in enumerate(clusters):
+        merged = torch.zeros_like(weight[0], dtype=torch.float32)
+        for expert, coefficient in members:
+            merged.add_(weight[expert].float(), alpha=coefficient)
+        compact[physical].copy_(merged)
+    return compact
+
+
+@torch.no_grad()
+def stream_merge_magi2_experts(
+    transformer: nn.Module, plan: Magi2ExpertConsolidationPlan, checkpoint_dir: str | Path,
+) -> set[str]:
+    """Read and merge one original projection at a time before publishing the new pool."""
+    from safetensors import safe_open
+
+    from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import read_safetensors_weight_map
+
+    layers = _dense_pruning_layers(transformer)
+    layouts = _merge_layouts(layers, plan)
+    weight_map = read_safetensors_weight_map(str(checkpoint_dir))
+    sources = {}
+    for name, layer in layers.items():
+        for key in _PARAMETERS if name in layouts else MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            full_key = f"{name}.{key}"
+            sources[full_key] = (name, layer, key, full_key)
+        if name in layouts:
+            for key in _ROUTER_BUFFERS:
+                full_key = f"{name}.router.{key}"
+                sources[full_key] = (name, layer.router, key, f"{name}.router.expert_bias_ema")
+    missing = sorted((sources.keys() | {item[3] for item in sources.values()}) - weight_map.keys())
+    if missing:
+        raise ValueError(f"MAGI-2 checkpoint is missing consolidation source tensors: {missing[:4]}.")
+    digest = hashlib.sha256()
+    staged = {}
+    for full_key, (name, owner, key, source_key) in sorted(sources.items()):
+        target = getattr(owner, key)
+        with safe_open(weight_map[source_key], framework="pt", device="cpu") as shard:
+            value = shard.get_tensor(source_key)
+            if value.shape != target.shape or not value.is_floating_point():
+                raise ValueError(f"MAGI-2 consolidation tensor {source_key!r} has incompatible shape or dtype.")
+            value = value.to(dtype=target.dtype)
+            if name in layouts:
+                update_router_tensor_fingerprints((digest,), full_key, value)
+                if key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+                    value = _merge_projection(value, layouts[name][1])
+            if isinstance(target, nn.Parameter):
+                merged_projection = name in layouts and key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+                value = nn.Parameter(value, requires_grad=target.requires_grad and not merged_projection)
+            staged[full_key] = value
+    if f"sha256:{digest.hexdigest()}" != plan.source_weight_fingerprint:
+        raise ValueError("MAGI-2 consolidation source-weight fingerprint mismatch.")
+    for full_key, value in staged.items():
+        _, owner, key, _ = sources[full_key]
+        setattr(owner, key, value)
+    for name, (aliases, _) in layouts.items():
+        layers[name]._mirai_expert_aliases = aliases
+    return set(staged)
 
 
 def build_magi2_expert_pruning_plan(

@@ -3207,7 +3207,8 @@
         "build_magi2_hierarchical_merge_plan",
         "apply_magi2_hierarchical_merge",
         "observe_magi2_hierarchical_merge_head",
-        "Magi2ExpertConsolidationPlan"
+        "Magi2ExpertConsolidationPlan",
+        "stream_merge_magi2_experts"
       ],
       "config_keys": [],
       "disabled_config": {},
