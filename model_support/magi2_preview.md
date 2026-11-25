@@ -708,6 +708,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 
 ## Model-specific features
 
+- **Spatial TurboVAE decoding** — Experimental overlapping latent tiles
+  with weighted blending on CPU.
 - **Packed MAGI-2 Refiner projections** — Experimental FP8 or NF4 storage
   for frozen Refiner linear weights.
 - **Paired MAGI-2 Preview CFG** — Experimental per-layer execution of separate
@@ -777,6 +779,8 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.family_params.refiner_weight_quantization` | Experimental Refiner-only linear weight storage. `"none"` (default) uses native weights. `"fp8"` and `"nf4"` compress the loaded Refiner before device placement, then decode each active projection for BF16 computation. NF4 packing requires CUDA and bitsandbytes. |
 | `model.params.family_params.refiner_block_swap_mode` | `sync` (default) or `async`. This is independent of `inference.block_swap_mode`: `sync` keeps only the current streamed refiner layer resident, while `async` also prefetches the next layer. Only read when `--refine` is requested. |
 | `model.params.family_params.vae_decode_chunk_size` | Temporal Turbo VAE window size. `0` (default) selects a deterministic geometry-bounded schedule: released 7/7 for preview and 2/2 for the full 1920×1088 refined latent. A positive integer forces that size and changes decoder workspace residency. This never crops or rescales the latent. |
+| `model.params.family_params.vae_decode_tile_size` | Maximum tile height and width in latent cells. `0` (default) uses whole-frame decoding. Positive values enable experimental tiling when a spatial axis exceeds the tile size. |
+| `model.params.family_params.vae_decode_tile_overlap` | Overlap in latent cells between adjacent tiles. Defaults to `4`. It must be positive and smaller than an enabled tile size. Tile boundaries change the decoder context and can affect pixel values. |
 | `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, and it takes part in attention and MoE routing. The training forward redraws it on every call from a family-owned generator seeded from `training.seed`, so a step is reproducible under its seed and the track length never perturbs the process RNG stream; native sampling draws it once per generation from the generation generator. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
 | `model.params.moe_routing_health` | Arms the family's routing-collapse tap. MAGI-2 emits no router statistic without it, so this is the only way `emits_router_metrics` becomes true and the only routing signal an `attn_router` run has. Default off; when off no tap is attached and no diagnostic key appears. |
 | `memory.frozen_weight_quantization` | `none` or `nf4`. `nf4` packs only the three routed expert tensors of each MoE layer and requires bitsandbytes; every other format is rejected. |

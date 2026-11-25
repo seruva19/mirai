@@ -1760,6 +1760,37 @@ def test_magi2_vae_decode_chunk_override_is_scoped_even_on_failure() -> None:
     assert pipeline._last_vae_decode_chunk_size == 2
 
 
+def test_magi2_vae_spatial_tiles_preserve_geometry_and_overlap() -> None:
+    from mirai.core.models.magi2_preview.pipeline import Magi2RuntimeOptions
+
+    class VAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+            self.first_chunk_size = self.step_size = 7
+            self.shapes = []
+
+        def decode(self, value, *, output_offload):
+            assert output_offload
+            self.shapes.append(value.shape[-2:])
+            return value.repeat_interleave(2, dim=-2).repeat_interleave(3, dim=-1)
+
+    pipeline = _bare_pipeline()
+    pipeline._vae = VAE()
+    latent = torch.linspace(-1, 1, 2 * 7 * 11).reshape(1, 2, 7, 11)
+    pipeline.options = Magi2RuntimeOptions(config_path="")
+    expected = pipeline.decode_latents_native([latent])
+    pipeline.options = Magi2RuntimeOptions(
+        config_path="", vae_decode_tile_size=5, vae_decode_tile_overlap=2
+    )
+    actual = pipeline.decode_latents_native([latent])
+    torch.testing.assert_close(actual, expected)
+    assert pipeline._vae.shapes[0] == (7, 11)
+    assert len(pipeline._vae.shapes[1:]) == 6
+    assert all(max(shape) <= 5 for shape in pipeline._vae.shapes[1:])
+    assert (pipeline._vae.first_chunk_size, pipeline._vae.step_size) == (7, 7)
+
+
 def test_magi2_release_base_transformer_ends_block_residency_binding() -> None:
     pipeline = _bare_pipeline()
     pipeline.transformer = torch.nn.Linear(2, 2)

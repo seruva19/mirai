@@ -3139,6 +3139,39 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_spatial_turbovae",
+      "kind": "inference",
+      "owner": "mirai/core/models/magi2_preview/vae_tiling.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "native_execution",
+        "documentation"
+      ],
+      "symbols": [
+        "decode_spatial_tiles"
+      ],
+      "config_keys": [
+        "model.params.family_params"
+      ],
+      "disabled_config": {
+        "model.params.family_params": {}
+      },
+      "contract_paths": [
+        "tests/test_magi2_preview_contract.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Spatial TurboVAE decoding",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "mechanism_driven_preemptive_monitoring",
       "kind": "monitoring",
       "owner": "mirai/core/moe/monitoring/preemptive.py",

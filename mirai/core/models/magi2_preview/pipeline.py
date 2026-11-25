@@ -207,6 +207,8 @@ class Magi2RuntimeOptions:
     refiner_weight_quantization: str = "none"
     refiner_block_swap_mode: str = "sync"
     vae_decode_chunk_size: int = 0
+    vae_decode_tile_size: int = 0
+    vae_decode_tile_overlap: int = 4
 
 
 @dataclass(frozen=True)
@@ -297,6 +299,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 family.get("refiner_block_swap_mode", "sync") or "sync"
             ).strip().lower(),
             vae_decode_chunk_size=int(family.get("vae_decode_chunk_size", 0) or 0),
+            vae_decode_tile_size=int(family.get("vae_decode_tile_size", 0)),
+            vae_decode_tile_overlap=int(family.get("vae_decode_tile_overlap", 4)),
         )
         self.runtime_config, self.transformer, self.data_proxy = self._build_model()
         # Routing telemetry is opt-in: with the gate off no observer, tracker, or
@@ -621,12 +625,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise RuntimeError("load_vae() must be called before decode_latents_native().")
         value = torch.stack([torch.as_tensor(item) for item in latents], dim=0)
         device = next(self._vae.parameters()).device
+        tile_size = int(getattr(self.options, "vae_decode_tile_size", 0))
+        tiled = 0 < tile_size < max(value.shape[-2:])
         released_first = int(self._vae.first_chunk_size)
         released_step = int(self._vae.step_size)
         chunk_size = resolve_magi2_vae_decode_chunk_size(
             latent_frames=int(value.shape[-3]),
-            latent_height=int(value.shape[-2]),
-            latent_width=int(value.shape[-1]),
+            latent_height=int(min(value.shape[-2], tile_size) if tiled else value.shape[-2]),
+            latent_width=int(min(value.shape[-1], tile_size) if tiled else value.shape[-1]),
             released_chunk_size=min(released_first, released_step),
             requested_chunk_size=int(self.options.vae_decode_chunk_size),
         )
@@ -634,9 +640,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._vae.first_chunk_size = chunk_size
         self._vae.step_size = chunk_size
         try:
-            decoded = self._vae.decode(
-                value.to(device=device, dtype=torch.bfloat16), output_offload=True
-            )
+            def decode(tile: torch.Tensor):
+                return self._vae.decode(
+                    tile.to(device=device, dtype=torch.bfloat16), output_offload=True
+                )
+
+            if tiled:
+                from mirai.core.models.magi2_preview.vae_tiling import decode_spatial_tiles
+
+                decoded = decode_spatial_tiles(
+                    value, decode, tile_size=tile_size,
+                    overlap=self.options.vae_decode_tile_overlap,
+                )
+            else:
+                decoded = decode(value)
         finally:
             self._vae.first_chunk_size = released_first
             self._vae.step_size = released_step
@@ -1798,6 +1815,8 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "refiner_weight_quantization",
         "refiner_block_swap_mode",
         "vae_decode_chunk_size",
+        "vae_decode_tile_size",
+        "vae_decode_tile_overlap",
     }
 
     def __init__(self, model_type: str = "magi2-preview") -> None:
@@ -1849,6 +1868,12 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             except Magi2RefinerAttentionUnsupported as exc:
                 errors.append(str(exc))
         vae_chunk = params.get("vae_decode_chunk_size")
+        tile = params.get("vae_decode_tile_size", 0)
+        overlap = params.get("vae_decode_tile_overlap", 4)
+        if type(tile) is not int or tile < 0:
+            errors.append("MAGI-2 family_params.vae_decode_tile_size must be a nonnegative integer.")
+        elif type(overlap) is not int or overlap < 1 or (tile and overlap >= tile):
+            errors.append("MAGI-2 VAE tile overlap must be positive and smaller than an enabled tile size.")
         if vae_chunk is not None and (
             isinstance(vae_chunk, bool)
             or not isinstance(vae_chunk, int)
