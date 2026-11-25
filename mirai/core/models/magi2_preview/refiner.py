@@ -594,11 +594,13 @@ class Magi2Refiner:
         config_path: str,
         subfolder: str = MAGI2_REFINER_SUBFOLDER,
         attention_backend: str = MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT,
+        query_chunk_size: int = 0,
     ) -> None:
         self.model_config = model_config
         self.config_path = str(config_path)
         self.subfolder = str(subfolder or MAGI2_REFINER_SUBFOLDER)
         self.attention_backend = normalize_refiner_attention_backend(attention_backend)
+        self.query_chunk_size = query_chunk_size
         self._transformer: Any | None = None
         self._data_proxy: Any | None = None
         self._runtime_config: Any | None = None
@@ -808,7 +810,9 @@ class Magi2Refiner:
         )
 
         config = self.runtime_config()
-        backend = resolve_magi2_refiner_attention(self.attention_backend)
+        backend = resolve_magi2_refiner_attention(
+            self.attention_backend, query_chunk_size=self.query_chunk_size
+        )
         if backend is not None:
             validate_refiner_flex_support()
         required = refiner_required_magi2_ops(

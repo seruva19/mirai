@@ -2331,6 +2331,11 @@ def test_magi2_provider_accepts_and_validates_refiner_family_params() -> None:
     assert provider.validate_family_params({"vae_decode_chunk_size": 2}) == []
     assert provider.validate_family_params({"vae_decode_chunk_size": -1})
     assert provider.validate_family_params({"vae_decode_chunk_size": True})
+    assert provider.validate_family_params({
+        "refiner_attention_backend": "native_flex", "refiner_query_chunk_size": 17
+    }) == []
+    assert provider.validate_family_params({"refiner_query_chunk_size": 17})
+    assert provider.validate_family_params({"refiner_query_chunk_size": True})
 
 
 _REFINER_DEFAULT_OFF_PROBE = """

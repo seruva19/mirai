@@ -203,6 +203,7 @@ class Magi2RuntimeOptions:
     refiner_config_path: str = ""
     refiner_subfolder: str = MAGI2_REFINER_SUBFOLDER
     refiner_attention_backend: str = MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT
+    refiner_query_chunk_size: int = 0
     refiner_block_swap_mode: str = "sync"
     vae_decode_chunk_size: int = 0
 
@@ -289,6 +290,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             refiner_attention_backend=normalize_refiner_attention_backend(
                 family.get("refiner_attention_backend")
             ),
+            refiner_query_chunk_size=int(family.get("refiner_query_chunk_size", 0)),
             refiner_block_swap_mode=str(
                 family.get("refiner_block_swap_mode", "sync") or "sync"
             ).strip().lower(),
@@ -1476,6 +1478,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 config_path=self.options.refiner_config_path,
                 subfolder=self.options.refiner_subfolder,
                 attention_backend=self.options.refiner_attention_backend,
+                query_chunk_size=self.options.refiner_query_chunk_size,
             )
         return self._refiner
 
@@ -1788,6 +1791,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "refiner_config_path",
         "refiner_subfolder",
         "refiner_attention_backend",
+        "refiner_query_chunk_size",
         "refiner_block_swap_mode",
         "vae_decode_chunk_size",
     }
@@ -1827,6 +1831,11 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             if value is not None and not isinstance(value, str):
                 errors.append(f"MAGI-2 family_params.{name} must be a string.")
         attention = params.get("refiner_attention_backend")
+        chunk = params.get("refiner_query_chunk_size", 0)
+        if type(chunk) is not int or chunk < 0:
+            errors.append("MAGI-2 family_params.refiner_query_chunk_size must be a nonnegative integer.")
+        elif chunk and str(attention).strip().lower() != "native_flex":
+            errors.append("MAGI-2 refiner query chunking requires refiner_attention_backend='native_flex'.")
         if isinstance(attention, str):
             try:
                 normalize_refiner_attention_backend(attention)

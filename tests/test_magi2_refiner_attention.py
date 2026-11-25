@@ -402,13 +402,14 @@ def test_asymmetric_key_length_is_accepted() -> None:
     torch.testing.assert_close(observed, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_backend_reuses_block_metadata_for_identical_range_content() -> None:
+@pytest.mark.parametrize("query_chunk_size", [0, 13])
+def test_backend_reuses_block_metadata_for_identical_range_content(query_chunk_size) -> None:
     query, key, value = _inputs(
         query_tokens=32, key_tokens=32, heads_q=4, heads_kv=2, seed=19
     )
     q_ranges = _ranges([(0, 16), (16, 32)])
     k_ranges = _ranges([(0, 24), (8, 32)])
-    backend = Magi2RefinerFlexAttentionBackend()
+    backend = Magi2RefinerFlexAttentionBackend(query_chunk_size=query_chunk_size)
     first, _ = backend.execute(
         query,
         key,
@@ -432,6 +433,22 @@ def test_backend_reuses_block_metadata_for_identical_range_content() -> None:
     assert backend._cached_range_mask is cached_mask
     assert backend._cached_block_mask is cached_blocks
     assert torch.equal(first, second)
+
+
+@pytest.mark.parametrize("chunk_size", [17, 130, 200])
+@torch.inference_mode()
+def test_query_chunking_preserves_absolute_range_membership(chunk_size) -> None:
+    query, key, value = _inputs(
+        query_tokens=139, key_tokens=19, heads_q=4, heads_kv=2, seed=43
+    )
+    q_ranges = _ranges([(4, 71), (33, 113), (118, 138)])
+    k_ranges = _ranges([(0, 9), (4, 16), (11, 19)])
+    expected = flex_range_attention(query, key, value, q_ranges, k_ranges)
+    observed = flex_range_attention(
+        query, key, value, q_ranges, k_ranges, query_chunk_size=chunk_size
+    )
+    for actual, reference in zip(observed, expected):
+        torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-4)
 
 
 def test_refiner_mlp_token_chunking_preserves_modality_outputs(

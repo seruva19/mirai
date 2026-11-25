@@ -155,7 +155,7 @@ class Magi2RangeUnionMask:
         """Per query position: whether any key is reachable from it at all."""
         return self.segment_has_keys[self.segment_of]
 
-    def mask_mod(self) -> Callable[..., torch.Tensor]:
+    def mask_mod(self, *, query_start: int = 0) -> Callable[..., torch.Tensor]:
         interval_starts = self.interval_starts
         interval_ends = self.interval_ends
         segment_of = self.segment_of
@@ -167,7 +167,7 @@ class Magi2RangeUnionMask:
             query_index: torch.Tensor,
             key_index: torch.Tensor,
         ) -> torch.Tensor:
-            segment = segment_of[query_index]
+            segment = segment_of[query_index + query_start]
             allowed = torch.zeros_like(query_index, dtype=torch.bool)
             # A fixed Python loop is unrolled while FlexAttention traces the
             # score modifier; released masks keep this slot count very small.
@@ -181,11 +181,16 @@ class Magi2RangeUnionMask:
 
         return range_union_mask
 
-    def block_mask(self, *, query_tokens: int, block_size: int = 128) -> Any:
+    def block_mask(
+        self, *, query_tokens: int, block_size: int = 128, query_start: int = 0
+    ) -> Any:
         """Build FlexAttention's sparse block metadata without a dense Q*K mask."""
         from torch.nn.attention.flex_attention import BlockMask
 
         query_tokens = int(query_tokens)
+        query_end = query_start + query_tokens
+        if query_start < 0 or query_end > self.segment_of.numel():
+            raise ValueError("Query chunk lies outside the Refiner range mask.")
         key_tokens = int(self.key_tokens)
         block_size = int(block_size)
         query_blocks = math.ceil(query_tokens / block_size)
@@ -193,13 +198,15 @@ class Magi2RangeUnionMask:
         boundaries = [int(value) for value in self.boundaries.detach().cpu().tolist()]
         starts = self.interval_starts.detach().cpu().tolist()
         ends = self.interval_ends.detach().cpu().tolist()
-        for segment, (query_start, query_end) in enumerate(
+        for segment, (segment_start, segment_end) in enumerate(
             zip(boundaries[:-1], boundaries[1:], strict=True)
         ):
-            if query_start >= query_end:
+            local_start = max(segment_start, query_start) - query_start
+            local_end = min(segment_end, query_end) - query_start
+            if local_start >= local_end:
                 continue
-            first_query_block = query_start // block_size
-            last_query_block = (query_end - 1) // block_size
+            first_query_block = local_start // block_size
+            last_query_block = (local_end - 1) // block_size
             key_blocks: set[int] = set()
             for key_start, key_end in zip(
                 starts[segment], ends[segment], strict=True
@@ -236,7 +243,7 @@ class Magi2RangeUnionMask:
             counts,
             indices,
             BLOCK_SIZE=block_size,
-            mask_mod=self.mask_mod(),
+            mask_mod=self.mask_mod(query_start=query_start),
             seq_lengths=(query_tokens, key_tokens),
         )
 
@@ -393,6 +400,14 @@ def _validate_attn_type_map(
         )
 
 
+def _query_block_masks(mask: Magi2RangeUnionMask, size: int) -> tuple[Any, ...]:
+    tokens = mask.segment_of.numel()
+    return tuple(
+        mask.block_mask(query_start=start, query_tokens=min(size, tokens - start))
+        for start in range(0, tokens, size)
+    )
+
+
 def flex_range_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -406,6 +421,7 @@ def flex_range_attention(
     compile_block_mask: bool | None = None,
     range_mask: Magi2RangeUnionMask | None = None,
     block_mask: Any | None = None,
+    query_chunk_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FlexAttention equivalent of MagiAttention's ``flex_flash_attn_func``.
 
@@ -466,31 +482,54 @@ def flex_range_attention(
     if compile_block_mask is None:
         compile_block_mask = device.type == "cuda"
 
-    # Construct sparse block metadata directly without evaluating a dense Q*K
-    # boolean matrix.
-    if block_mask is None:
-        block_mask = mask.block_mask(query_tokens=query_tokens)
-    flex = flex_attention_function(compiled=bool(compile_kernel))
-    attended, log_sum_exp = flex(
-        query.transpose(0, 1).unsqueeze(0),
-        key.transpose(0, 1).unsqueeze(0),
-        value.transpose(0, 1).unsqueeze(0),
-        block_mask=block_mask,
-        enable_gqa=heads_q != heads_kv,
-        return_lse=True,
-    )
-    out = attended.squeeze(0).transpose(0, 1)
-    lse = log_sum_exp.squeeze(0).transpose(0, 1).float()
+    if query_chunk_size < 0:
+        raise ValueError("Refiner query chunk size must be nonnegative.")
+    size = query_chunk_size or max(query_tokens, 1)
+    if query_tokens <= size:
+        masks = (mask.block_mask(query_tokens=query_tokens) if block_mask is None else block_mask,)
+    else:
+        masks = _query_block_masks(mask, size) if block_mask is None else block_mask
 
+    flex = flex_attention_function(compiled=bool(compile_kernel))
+    keys = key.transpose(0, 1).unsqueeze(0)
+    values = value.transpose(0, 1).unsqueeze(0)
     empty = ~mask.query_has_keys
-    if bool(empty.any()):
-        # A softmax over no keys is undefined; the vendored reference leaves
-        # these rows at zero, and their true log-sum-exp is -inf.
-        out = torch.where(empty.reshape(-1, 1, 1), torch.zeros_like(out), out)
-        lse = torch.where(
-            empty.reshape(-1, 1), torch.full_like(lse, float("-inf")), lse
+    has_empty = bool(empty.any())
+    assembled = None
+    if len(masks) > 1 and not torch.is_grad_enabled():
+        assembled = (
+            query.new_empty((query_tokens, heads_q, value.shape[-1])),
+            query.new_empty((query_tokens, heads_q), dtype=torch.float32),
         )
-    return out.to(query.dtype), lse
+    outputs, logs = [], []
+    for index, chunk_mask in enumerate(masks):
+        start = index * size
+        stop = min(start + size, query_tokens)
+        attended, log_sum_exp = flex(
+            query[start:stop].transpose(0, 1).unsqueeze(0),
+            keys,
+            values,
+            block_mask=chunk_mask,
+            enable_gqa=heads_q != heads_kv,
+            return_lse=True,
+        )
+        out = attended.squeeze(0).transpose(0, 1)
+        lse = log_sum_exp.squeeze(0).transpose(0, 1).float()
+        if has_empty:
+            invalid = empty[start:stop]
+            out = torch.where(invalid.reshape(-1, 1, 1), torch.zeros_like(out), out)
+            lse = torch.where(invalid.reshape(-1, 1), torch.full_like(lse, float("-inf")), lse)
+        if assembled is None:
+            outputs.append(out.to(query.dtype))
+            logs.append(lse)
+        else:
+            assembled[0][start:stop].copy_(out)
+            assembled[1][start:stop].copy_(lse)
+    if assembled is not None:
+        return assembled
+    if len(outputs) == 1:
+        return outputs[0], logs[0]
+    return torch.cat(outputs), torch.cat(logs)
 
 
 @torch.compiler.disable
@@ -533,7 +572,12 @@ def _resolve_cached_range_mask(
         query_tokens=int(query_tokens),
         key_tokens=int(key_tokens),
     )
-    block_mask = mask.block_mask(query_tokens=int(query_tokens))
+    size = backend.query_chunk_size
+    block_mask = (
+        _query_block_masks(mask, size)
+        if 0 < size < query_tokens
+        else mask.block_mask(query_tokens=int(query_tokens))
+    )
     object.__setattr__(backend, "_cached_q_ranges", q_cpu.clone())
     object.__setattr__(backend, "_cached_k_ranges", k_cpu.clone())
     object.__setattr__(backend, "_cached_q_source", q_ranges)
@@ -558,6 +602,7 @@ class Magi2RefinerFlexAttentionBackend:
 
     compile_kernel: bool | None = None
     compile_block_mask: bool | None = None
+    query_chunk_size: int = 0
     _cached_q_ranges: torch.Tensor | None = field(default=None, init=False, repr=False)
     _cached_k_ranges: torch.Tensor | None = field(default=None, init=False, repr=False)
     _cached_q_source: torch.Tensor | None = field(default=None, init=False, repr=False)
@@ -599,6 +644,7 @@ class Magi2RefinerFlexAttentionBackend:
             compile_block_mask=self.compile_block_mask,
             range_mask=range_mask,
             block_mask=block_mask,
+            query_chunk_size=self.query_chunk_size,
         )
 
 
@@ -626,6 +672,8 @@ def _magi_attention_hopper_kernel_available() -> bool:
 
 def resolve_magi2_refiner_attention(
     backend: Any = MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT,
+    *,
+    query_chunk_size: int = 0,
 ) -> Magi2RefinerFlexAttentionBackend | None:
     """Select the refiner attention path, or ``None`` to keep the vendored one.
 
@@ -641,13 +689,17 @@ def resolve_magi2_refiner_attention(
     )
 
     name = normalize_refiner_attention_backend(backend)
+    if query_chunk_size < 0:
+        raise ValueError("Refiner query chunk size must be nonnegative.")
+    if query_chunk_size and name != "native_flex":
+        raise ValueError("Refiner query chunking requires refiner_attention_backend='native_flex'.")
     if name == "vendor_eager":
         return None
     if name == "auto" and not missing_magi2_custom_ops((MAGI2_REFINER_FLEX_OP,)):
         return None
     if name == "auto" and _magi_attention_hopper_kernel_available():
         return None
-    return Magi2RefinerFlexAttentionBackend()
+    return Magi2RefinerFlexAttentionBackend(query_chunk_size=query_chunk_size)
 
 
 def attach_refiner_attention_backend(
