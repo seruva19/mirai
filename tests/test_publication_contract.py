@@ -319,9 +319,9 @@ class PublicationContractTests(unittest.TestCase):
 
     def test_user_documentation_boundary_is_explicit(self) -> None:
         self.assertFalse((ROOT / "docs").exists())
-        # AGENTS.md and CLAUDE.md are agent bootstrap adapters rather than user
-        # documentation; both resolve to the same contract in agent/AGENTS.md.
-        bootstrap = {"AGENTS.md", "CLAUDE.md"}
+        # AGENTS.md is the agent bootstrap adapter rather than user
+        # documentation; it resolves to the contract in agent/AGENTS.md.
+        bootstrap = {"AGENTS.md"}
         root_markdown = {
             path.name for path in ROOT.glob("*.md") if path.name not in bootstrap
         }
