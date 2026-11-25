@@ -2207,21 +2207,6 @@ def test_magi2_refine_loop_uses_paired_cfg_when_provider_exposes_it() -> None:
     ]
 
 
-def test_magi2_refiner_waits_before_releasing_cuda_workspace(monkeypatch) -> None:
-    from mirai.core.models.magi2_preview.refiner import _release_cuda_workspace
-
-    events: list[str] = []
-    monkeypatch.setattr(
-        torch.cuda, "synchronize", lambda device: events.append(f"sync:{device.type}")
-    )
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty"))
-    device = type("_Device", (), {"type": "cuda"})()
-
-    _release_cuda_workspace(device)
-
-    assert events == ["sync:cuda", "empty"]
-
-
 def test_magi2_refine_loop_reuses_adjacent_preview_context() -> None:
     from mirai.core.models.magi2_preview.refiner import (
         Magi2RefineSettings,

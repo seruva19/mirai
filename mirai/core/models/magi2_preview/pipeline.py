@@ -1405,12 +1405,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             return self.data_proxy.process_output(output)
 
         sampler.forward = resident_forward
-        def release_step_memory() -> None:
-            self.flush_runtime_offloads()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
-        sampler.step_callback = release_step_memory
+        sampler.step_callback = self.flush_runtime_offloads
         sampled_video, _sampled_audio = sampler.sample(
             SamplerInput(
                 video_t_list=video_scheduler.timesteps,

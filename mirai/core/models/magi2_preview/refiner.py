@@ -207,11 +207,6 @@ def _chunked_refiner_mlp_forward(
         group_sizes = [int(size) for size in modality_dispatcher.group_size_cpu]
     else:
         group_sizes = [int(value.shape[0])]
-    if value.is_cuda:
-        # Layer rotation produces allocator segments with different shapes.
-        # Flush at this full-output boundary so the next contiguous output can
-        # reuse them; chunk arithmetic and values are unchanged.
-        torch.cuda.empty_cache()
     output = torch.empty(
         (int(value.shape[0]), int(module.down_proj.out_features)),
         device=value.device,
@@ -949,15 +944,6 @@ class Magi2Refiner:
 # --------------------------------------------------------------------------- #
 # Refine policy loop (family-owned; model access via provider hooks only)
 # --------------------------------------------------------------------------- #
-def _release_cuda_workspace(device: torch.device) -> None:
-    """Make completed asynchronous work reclaimable at a memory boundary."""
-
-    if device.type != "cuda":
-        return
-    torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
-
-
 def run_refine(
     *,
     pipeline: Any,
@@ -1074,9 +1060,6 @@ def run_refine(
                         )
                     else:
                         v_cond = pipeline.refiner_forward(latents, context)
-                        # The forward is asynchronous, so synchronize before
-                        # returning its cached allocator segments for reuse.
-                        _release_cuda_workspace(compute_device)
                         v_uncond = pipeline.refiner_forward(latents, context_null)
                     velocity = v_uncond + scale * (v_cond - v_uncond)
                     del v_cond, v_uncond
@@ -1089,7 +1072,6 @@ def run_refine(
                     velocity, timestep, latents, return_dict=False
                 )[0]
                 del velocity
-                _release_cuda_workspace(compute_device)
     finally:
         refiner.release()
     refined = latents.squeeze(0) if latents.ndim == 5 else latents
