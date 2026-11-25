@@ -798,6 +798,7 @@ def stream_quantize_magi2_experts(
 
     weight_map = read_safetensors_weight_map(str(checkpoint_dir))
     stores = install_magi2_nf4_expert_stores(transformer, blocksize=blocksize, quant_format=quant_format)
+    pending = []
     for module_name, store in stores.items():
         for tensor_name in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             if store.is_loaded(tensor_name):
@@ -810,8 +811,10 @@ def stream_quantize_magi2_experts(
                     f"'{key}'; quantized expert loading requires the released "
                     "routed expert stack."
                 )
-            with safe_open(shard, framework="pt") as handle:
-                dense = handle.get_tensor(key)
-            store.quantize_dense(tensor_name, dense)
-            del dense
+            pending.append((store, tensor_name, key, shard))
+    for store, tensor_name, key, shard in pending:
+        with safe_open(shard, framework="pt") as handle:
+            dense = handle.get_tensor(key)
+        store.quantize_dense(tensor_name, dense)
+        del dense
     return stores

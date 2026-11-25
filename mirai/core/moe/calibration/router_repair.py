@@ -193,11 +193,13 @@ def router_target_tensors(
     }
 
 
-def router_tensor_fingerprint(tensors: Mapping[str, Any]) -> str:
-    _validate_tensor_mapping(tensors)
-    digest = hashlib.sha256()
-    for name, tensor in sorted(tensors.items()):
-        value = tensor.detach().to(device="cpu").contiguous()
+def update_router_tensor_fingerprints(
+    digests, name: str, tensor: Any,
+) -> None:
+    """Append one tensor to hashes whose callers supply keys in sorted order."""
+    _validate_tensor_mapping({name: tensor})
+    value = tensor.detach().to(device="cpu").contiguous()
+    for digest in digests:
         digest.update(str(name).encode("utf-8"))
         digest.update(b"\0")
         digest.update(str(value.dtype).encode("ascii"))
@@ -206,6 +208,14 @@ def router_tensor_fingerprint(tensors: Mapping[str, Any]) -> str:
         digest.update(b"\0")
         digest.update(memoryview(value.view(torch.uint8).numpy()))
         digest.update(b"\0")
+
+
+def router_tensor_fingerprint(tensors: Mapping[str, Any]) -> str:
+    if not tensors:
+        _validate_tensor_mapping(tensors)
+    digest = hashlib.sha256()
+    for name, tensor in sorted(tensors.items(), key=lambda item: str(item[0])):
+        update_router_tensor_fingerprints((digest,), name, tensor)
     return "sha256:" + digest.hexdigest()
 
 

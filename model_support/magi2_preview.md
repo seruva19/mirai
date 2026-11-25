@@ -755,8 +755,9 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   index for `expert_id` and `w1`, `w2`, `w3` for gate, down, and up.
   Assignments can use BF16, NF4, IQ2, IQ3, FP8, and NVFP4. The plan's
   source-weight fingerprint covers each `<layer>.W_gate`, `<layer>.W_down`,
-  and `<layer>.W_up` tensor. Load the original dense checkpoint with
-  `memory.quantize_experts_on_load = false` when applying the plan. The packed
+  and `<layer>.W_up` tensor. Apply the plan to the original checkpoint.
+  Set `memory.quantize_experts_on_load = true` to verify and pack one routed
+  projection at a time from the shards. The packed
   exporter saves the resolved assignments and plan lineage as a version 5
   artifact. Restore it with the same base quantization setting and
   `memory.frozen_weight_packed_state_path`, with the plan path unset.
@@ -867,7 +868,7 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `memory.expert_weight_access` | `auto`, `disabled`, and `full_dequant` dequantize the whole group axis per call; `chunked_dequant` dequantizes `memory.expert_dequant_chunk_size` groups at a time. `active_dequant` and `fused_kernel` are rejected — the flattened head-major axis carries one weight slice per `(head, expert)` pair, not a per-routed-expert operand. Any non-default value requires `frozen_weight_quantization = "nf4"`. |
 | `memory.expert_dequant_chunk_size` | Groups per dequantization on the flattened `head * num_experts + expert` axis, not experts of one head. Required to be positive with `chunked_dequant`. |
 | `memory.moe_activation_backend` | `torch` or `triton`. `triton` fuses the exact FP32 SwiGLU7 clamp, sigmoid, and backward operations and requires CUDA plus Triton. |
-| `memory.quantize_experts_on_load` | Packs each routed expert tensor as its shard is read, so the released BF16 expert stack is never held whole. Requires `frozen_weight_quantization = "nf4"`. |
+| `memory.quantize_experts_on_load` | Packs each routed expert tensor as its shard is read, avoiding dense routed-weight allocations. Requires a supported frozen expert format. With `memory.expert_precision_plan_path`, applies the verified per-group formats from the plan. |
 | `memory.moe_kernel_backend` | `auto`, `torch`, or `grouped`. With NF4 experts `torch` is rejected: the vendored per-expert reference loop reads dense expert tensors that packed storage replaces. |
 | `adapter.type` | `lora` only. |
 | `adapter.target_preset` | `attn_only` or `attn_router`. |

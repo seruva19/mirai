@@ -284,9 +284,8 @@ def _validate_nf4_bucket(key, fields, spec, shape, blocksize):
         raise ValueError("Invalid mixed MAGI-2 NF4 codebook size.")
 
 
-def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksize, rotation_group_size=0):
+def _prepare_mixed_stores(transformer, *, plan_path, base_format, blocksize, rotation_group_size):
     from mirai.core.moe.calibration.precision import TensorPrecisionPlan, load_precision_plan
-    from mirai.core.moe.calibration.router_repair import router_tensor_fingerprint
 
     plan = load_precision_plan(plan_path)
     if not isinstance(plan, TensorPrecisionPlan):
@@ -297,7 +296,6 @@ def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksi
     assignments = {name: {key: [] for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES} for name in layers}
     for entry in sorted(plan.assignments, key=lambda entry: entry.expert_id):
         assignments[entry.module_name][_PLAN_PROJECTIONS[entry.projection]].append(entry.quant_format)
-    source_tensors = {}
     for name, layer in layers.items():
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             source = getattr(layer, key)
@@ -305,17 +303,6 @@ def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksi
             formats = assignments[name][key]
             if len(formats) != source.shape[0] or not set(formats) <= _SUPPORTED_FORMATS:
                 raise ValueError(f"Invalid group coverage or format in MAGI-2 precision plan for {name}.{key}.")
-            if source.requires_grad:
-                raise ValueError(f"MAGI-2 precision plan requires frozen weights: {name}.{key}.")
-            source_tensors[f"{name}.{key}"] = source
-        source_tensors.update({
-            f"{name}.{key}": value for key, value in _rotation_fingerprint_fields(rotation_group_size).items()
-        })
-    if router_tensor_fingerprint(source_tensors) != plan.source_weight_fingerprint:
-        source_tensors.update({f"{name}.router": layer.gate for name, layer in layers.items()})
-        if router_tensor_fingerprint(source_tensors) != plan.source_weight_fingerprint:
-            raise ValueError("MAGI-2 precision plan does not match the source-weight fingerprint.")
-    del source_tensors
     plan_payload = plan.to_dict()
     lineage = {key: value for key, value in plan_payload.items() if key.endswith("_snapshot_id") or key == "source_weight_fingerprint"}
     lineage["plan_sha256"] = sha256(json.dumps(plan_payload, sort_keys=True).encode()).hexdigest()
@@ -327,9 +314,95 @@ def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksi
             base_format=base_format, formats=assignments[name], lineage=lineage,
             rotation_group_size=rotation_group_size,
         )
+        stores[name] = store
+    return plan, layers, stores
+
+
+def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksize, rotation_group_size=0):
+    from mirai.core.moe.calibration.router_repair import router_tensor_fingerprint
+
+    plan, layers, stores = _prepare_mixed_stores(
+        transformer, plan_path=plan_path, base_format=base_format, blocksize=blocksize,
+        rotation_group_size=rotation_group_size,
+    )
+    source_tensors = {}
+    for name, layer in layers.items():
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            source = layer._parameters[key]
+            if source.requires_grad:
+                raise ValueError(f"MAGI-2 precision plan requires frozen weights: {name}.{key}.")
+            source_tensors[f"{name}.{key}"] = source
+        source_tensors.update({
+            f"{name}.{key}": value for key, value in _rotation_fingerprint_fields(rotation_group_size).items()
+        })
+    if router_tensor_fingerprint(source_tensors) != plan.source_weight_fingerprint:
+        source_tensors.update({f"{name}.router": layer.gate for name, layer in layers.items()})
+        if router_tensor_fingerprint(source_tensors) != plan.source_weight_fingerprint:
+            raise ValueError("MAGI-2 precision plan does not match the source-weight fingerprint.")
+    del source_tensors, source
+    for name, layer in layers.items():
+        store = stores[name]
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             store.quantize_dense(key, layer._parameters[key])
             del layer._parameters[key]
         layer.add_module(MAGI2_NF4_STORE_ATTR, store)
-        stores[name] = store
     return stores
+
+
+def stream_quantize_magi2_mixed_experts(
+    transformer, *, checkpoint_dir, plan_path, base_format, blocksize, rotation_group_size=0,
+):
+    """Pack one source projection at a time and bind only the verified stores."""
+    from safetensors import safe_open
+
+    from mirai.core.moe.calibration.router_repair import update_router_tensor_fingerprints
+    from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import read_safetensors_weight_map
+
+    plan, layers, stores = _prepare_mixed_stores(
+        transformer, plan_path=plan_path, base_format=base_format, blocksize=blocksize,
+        rotation_group_size=rotation_group_size,
+    )
+    weight_map = read_safetensors_weight_map(checkpoint_dir)
+    inputs = {}
+    for name, layer in layers.items():
+        for key in (*MAGI2_ROUTED_EXPERT_TENSOR_NAMES, "gate"):
+            checkpoint_key = f"{name}.{key}"
+            if checkpoint_key not in weight_map:
+                raise ValueError(f"MAGI-2 checkpoint is missing mixed expert plan source {checkpoint_key!r}.")
+            fingerprint_key = f"{name}.router" if key == "gate" else checkpoint_key
+            target = layer._parameters[key]
+            inputs[fingerprint_key] = (name, key, checkpoint_key, target.shape, target.dtype)
+    del target
+    rotation = {
+        f"{name}.{key}": value
+        for name in layers
+        for key, value in _rotation_fingerprint_fields(rotation_group_size).items()
+    }
+    plain = sha256()
+    protected = sha256()
+    routers = {}
+    for fingerprint_key in sorted(inputs.keys() | rotation.keys()):
+        if fingerprint_key in rotation:
+            update_router_tensor_fingerprints((plain, protected), fingerprint_key, rotation[fingerprint_key])
+            continue
+        name, key, checkpoint_key, shape, dtype = inputs[fingerprint_key]
+        with safe_open(weight_map[checkpoint_key], framework="pt", device="cpu") as shard:
+            source = shard.get_tensor(checkpoint_key)
+        if source.shape != shape or not source.is_floating_point():
+            raise ValueError(f"MAGI-2 checkpoint tensor {checkpoint_key!r} has incompatible shape or dtype.")
+        source = source.to(dtype=dtype)
+        digests = (protected,) if key == "gate" else (plain, protected)
+        update_router_tensor_fingerprints(digests, fingerprint_key, source)
+        if key == "gate":
+            routers[name] = source
+        else:
+            stores[name].quantize_dense(key, source)
+        del source
+    if plan.source_weight_fingerprint not in {f"sha256:{plain.hexdigest()}", f"sha256:{protected.hexdigest()}"}:
+        raise ValueError("MAGI-2 precision plan does not match the source-weight fingerprint.")
+    for name, layer in layers.items():
+        layer.gate.detach().copy_(routers[name])
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            del layer._parameters[key]
+        layer.add_module(MAGI2_NF4_STORE_ATTR, stores[name])
+    return stores, {f"{name}.gate" for name in routers}

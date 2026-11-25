@@ -2629,7 +2629,7 @@ _magi2_moe_registry: dict[int, "CoreMultiHeadMoE"] = {}
 
 
 class CoreMultiHeadMoE(nn.Module):
-    def __init__(self, config: CoreMultiHeadMoEConfig) -> None:
+    def __init__(self, config: CoreMultiHeadMoEConfig, *, routed_weight_device=None) -> None:
         super().__init__()
         if config.hidden_size % config.num_heads != 0:
             raise ValueError("hidden_size must be divisible by num_heads")
@@ -2690,6 +2690,7 @@ class CoreMultiHeadMoE(nn.Module):
                 self.d_head,
                 self.d_expert,
                 dtype=config.params_dtype,
+                device=routed_weight_device,
             )
         )
         self.W_up = nn.Parameter(
@@ -2698,6 +2699,7 @@ class CoreMultiHeadMoE(nn.Module):
                 self.d_head,
                 self.d_expert,
                 dtype=config.params_dtype,
+                device=routed_weight_device,
             )
         )
         self.W_down = nn.Parameter(
@@ -2706,6 +2708,7 @@ class CoreMultiHeadMoE(nn.Module):
                 self.d_expert,
                 self.d_head,
                 dtype=config.params_dtype,
+                device=routed_weight_device,
             )
         )
         self.router = nn.Module()
@@ -2894,7 +2897,7 @@ class MultiHeadMoELayerConfig:
 
 
 class MultiHeadMoELayer(nn.Module):
-    def __init__(self, config: MultiHeadMoELayerConfig) -> None:
+    def __init__(self, config: MultiHeadMoELayerConfig, *, routed_weight_device=None) -> None:
         super().__init__()
         self.config = config
         moe_hidden_size = config.split_merge_intermediate_size or config.hidden_size
@@ -2910,7 +2913,8 @@ class MultiHeadMoELayer(nn.Module):
                 score_func=config.moe_config.score_func,
                 route_norm=config.moe_config.route_norm,
                 route_scale=config.moe_config.route_scale,
-            )
+            ),
+            routed_weight_device=routed_weight_device,
         )
         self.is_swiglu = config.activation_type in [MLPActivationType.SWIGLU7]
         self.activation_func = create_activation_func(config.activation_type)
@@ -3113,7 +3117,7 @@ class PostAdapter(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, model_config: ModelConfig, layer_idx: int) -> None:
+    def __init__(self, model_config: ModelConfig, layer_idx: int, *, routed_weight_device=None) -> None:
         super().__init__()
         num_modality = 3 if layer_idx in model_config.mm_layers else 1
         self.config_mhc = model_config.mhc_config
@@ -3150,7 +3154,8 @@ class TransformerLayer(nn.Module):
                     shared_expert_params_dtype=torch.bfloat16,
                     split_merge_intermediate_size=moe_cfg.split_merge_intermediate_size,
                     moe_config=moe_cfg,
-                )
+                ),
+                routed_weight_device=routed_weight_device,
             )
         else:
             intermediate_size = (
@@ -3338,10 +3343,11 @@ class TransformerLayer(nn.Module):
     }
 )
 class TransformerBlock(nn.Module):
-    def __init__(self, model_config: ModelConfig) -> None:
+    def __init__(self, model_config: ModelConfig, *, routed_weight_device=None) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            [TransformerLayer(model_config, i) for i in range(model_config.num_layers)]
+            TransformerLayer(model_config, i, routed_weight_device=routed_weight_device)
+            for i in range(model_config.num_layers)
         )
         self.gradient_checkpointing = False
 
@@ -3416,7 +3422,7 @@ def _validate_inference_model_config(model_config: ModelConfig) -> None:
 
 
 class Transformer(nn.Module):
-    def __init__(self, model_config: ModelConfig, ep_size: int = 1) -> None:
+    def __init__(self, model_config: ModelConfig, ep_size: int = 1, *, routed_weight_device=None) -> None:
         super().__init__()
         _validate_inference_model_config(model_config)
         self.config = model_config
@@ -3430,7 +3436,7 @@ class Transformer(nn.Module):
         )
         self.pre_adapter = PreAdapter(adapter_config)
         self.post_adapter = PostAdapter(adapter_config)
-        self.block = TransformerBlock(model_config)
+        self.block = TransformerBlock(model_config, routed_weight_device=routed_weight_device)
         # Mirai edit: upstream also fills synthetic weights here when the
         # environment sets SKIP_LOAD_MODEL. Skipping the checkpoint read is a
         # behavior change and must be requested in code, so callers that want

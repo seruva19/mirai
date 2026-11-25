@@ -277,10 +277,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._packed_expert_state_path = str(
             getattr(memory_config, "frozen_weight_packed_state_path", "") or ""
         ).strip()
-        if str(getattr(memory_config, "expert_precision_plan_path", "") or "").strip() and (
-            self._quantize_experts_on_load or self._packed_expert_state_path
-        ):
-            raise ValueError("MAGI-2 mixed precision requires dense checkpoint loading.")
+        self._expert_precision_plan_path = str(getattr(memory_config, "expert_precision_plan_path", "") or "").strip()
+        if self._expert_precision_plan_path and self._packed_expert_state_path:
+            raise ValueError("MAGI-2 precision plans require a source checkpoint without a packed expert artifact.")
         self._nf4_blocksize = int(
             getattr(memory_config, "quantization_block_size", MAGI2_NF4_BLOCKSIZE)
         )
@@ -305,14 +304,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("Invalid MAGI-2 expert Hadamard group size.")
         if self._expert_rotation_group_size and not (
             self._packed_expert_state_path
-            or str(getattr(memory_config, "expert_precision_plan_path", "") or "").strip()
+            or self._expert_precision_plan_path
             or str(getattr(model_config.params, "expert_precision_calibration", "off")).strip().lower() in {"imatrix", "alphaq"}
         ):
             raise ValueError("MAGI-2 expert rotation requires precision calibration, a mixed plan, or a rotated artifact.")
         self._expert_pruning_plan_path = str(family.get("expert_pruning_plan_path", "")).strip()
         if self._expert_pruning_plan_path and (
             self._quantize_experts_on_load or self._packed_expert_state_path
-            or str(getattr(memory_config, "expert_precision_plan_path", "") or "").strip()
+            or self._expert_precision_plan_path
         ):
             raise ValueError("MAGI-2 pruning requires loading the original dense experts before pruning.")
         default_config = (
@@ -423,9 +422,23 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         model_path = Path(str(self.model_config.path)).expanduser()
         checkpoint_dir = model_path / "preview" if (model_path / "preview").is_dir() else model_path
         config.engine_config.load = str(checkpoint_dir)
-        transformer = Transformer(config.arch_config, ep_size=1)
         packed_experts = self._quantizes_experts_on_load() or bool(self._packed_expert_state_path)
-        if packed_experts:
+        transformer = (
+            Transformer(config.arch_config, ep_size=1, routed_weight_device="meta")
+            if packed_experts else Transformer(config.arch_config, ep_size=1)
+        )
+        mixed_stream = self._quantizes_experts_on_load() and self._expert_precision_plan_path
+        preloaded_keys = set()
+        if mixed_stream:
+            from mirai.core.models.magi2_preview.mixed_experts import stream_quantize_magi2_mixed_experts
+
+            self._expert_stores, preloaded_keys = stream_quantize_magi2_mixed_experts(
+                transformer, checkpoint_dir=str(checkpoint_dir), plan_path=self._expert_precision_plan_path,
+                base_format=self._frozen_weight_quantization, blocksize=self._nf4_blocksize,
+                rotation_group_size=self._expert_rotation_group_size,
+            )
+            self._applied_expert_precision_plan = self._expert_precision_plan_path
+        elif packed_experts:
             # Remove the dense routed expert targets before reading checkpoint shards.
             from mirai.core.models.magi2_preview.quantized_experts import install_magi2_nf4_expert_stores
 
@@ -433,19 +446,19 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 transformer, blocksize=self._nf4_blocksize,
                 quant_format=self._frozen_weight_quantization,
             )
-        preloaded_keys = set()
         if self._companion_weight_quantization != "none":
             from mirai.core.models.magi2_preview.companion_weights import stream_pack_magi2_companion_weights
 
-            self._packed_companion_linears, preloaded_keys = stream_pack_magi2_companion_weights(
+            self._packed_companion_linears, companion_keys = stream_pack_magi2_companion_weights(
                 transformer, checkpoint_dir=str(checkpoint_dir),
                 quant_format=self._companion_weight_quantization, blocksize=self._nf4_blocksize,
             )
+            preloaded_keys.update(companion_keys)
         load_options = {"preloaded_keys": preloaded_keys} if preloaded_keys else {}
         state = load_magi2_model_state_dict(transformer, config.engine_config, **load_options)
         transformer.load_state_dict(state, strict=True)
         del state
-        if packed_experts:
+        if packed_experts and not mixed_stream:
             if self._packed_expert_state_path:
                 from mirai.core.models.magi2_preview.packed_experts import (
                     load_magi2_nf4_packed_state,

@@ -48,6 +48,7 @@ def _ensure_compressed_weights_config(config: TrainingConfig) -> None:
         "",
         "none",
         "int8",
+        "fp8",
         "nf4",
         "gguf_iq4",
         "gguf_iq3",
@@ -59,7 +60,7 @@ def _ensure_compressed_weights_config(config: TrainingConfig) -> None:
     }:
         raise ValueError(
             "Packed compressed_weights export requires memory.frozen_weight_quantization "
-            "to be 'none', 'int8', 'nf4', 'gguf_iq4', 'gguf_iq3', 'gguf_iq2', "
+            "to be 'none', 'int8', 'fp8', 'nf4', 'gguf_iq4', 'gguf_iq3', 'gguf_iq2', "
             "'mxfp8_e4m3', 'mxfp4', 'nvfp4', or expert-only 'w4a8'."
         )
     if strategy in {"", "disabled", "none"}:
@@ -132,6 +133,13 @@ def export_compressed_weights_packed_state_from_config(
                 "Learned rotation export requested CUDA, but CUDA is unavailable."
             )
     quant_kwargs: dict[str, Any] = {}
+    precision_plan_path = str(config.memory.expert_precision_plan_path).strip()
+    if precision_plan_path:
+        source_model = pipeline.get_training_model()
+        if source_model is None:
+            raise ValueError("Precision plan export requires access to the source model.")
+        source_model.requires_grad_(False)
+        quant_kwargs["precision_plan_path"] = precision_plan_path
     if scheme == "nf4":
         quant_kwargs["block_size"] = int(config.memory.quantization_block_size)
     if config.memory.frozen_weight_quantization_strategy not in {"", "auto", "disabled", "none"}:
@@ -170,6 +178,9 @@ def export_compressed_weights_packed_state_from_config(
         raise ValueError(
             f"model.type='{config.model.type}' did not produce quantized frozen weights."
         )
+    report = pipeline.get_quantized_frozen_weight_report() or {}
+    if precision_plan_path and report.get("mixed_precision") is False:
+        raise ValueError("The model produced uniform expert storage with a precision plan configured.")
     training_model = pipeline.get_training_model()
     if training_model is None:
         raise ValueError(
@@ -197,7 +208,6 @@ def export_compressed_weights_packed_state_from_config(
             ),
             metadata=artifact_metadata,
         )
-    report = pipeline.get_quantized_frozen_weight_report() or {}
     return {
         "status": "ok",
         "output": str(saved_path),

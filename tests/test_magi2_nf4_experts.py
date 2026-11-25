@@ -584,6 +584,7 @@ def _reduced_moe(
     num_heads: int = 2,
     num_experts: int = 4,
     top_k: int = 2,
+    routed_weight_device: str | None = None,
 ) -> torch.nn.Module:
     from mirai.vendors.magi2_preview.model.magi2_preview import (
         CoreMultiHeadMoE,
@@ -603,7 +604,8 @@ def _reduced_moe(
             score_func="sigmoid",
             route_norm=True,
             route_scale=4.9,
-        )
+        ),
+        routed_weight_device=routed_weight_device,
     )
     with torch.no_grad():
         for tensor in (module.gate, module.W_gate, module.W_up, module.W_down):
@@ -611,7 +613,7 @@ def _reduced_moe(
         module.router.expert_bias.normal_(std=0.05)
     for parameter in module.parameters():
         parameter.requires_grad_(False)
-    return module.to(device=device)
+    return module if routed_weight_device == "meta" else module.to(device=device)
 
 
 def _container(module: torch.nn.Module) -> torch.nn.Module:
@@ -788,10 +790,13 @@ def test_magi2_pruning_remaps_each_head_and_preserves_top_k(tmp_path, criterion)
 
 
 @pytest.mark.parametrize("rotation_group_size", [0, 4])
-def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rotation_group_size) -> None:
+def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rotation_group_size, monkeypatch) -> None:
+    from types import SimpleNamespace
+
     from mirai.core.models.magi2_preview.mixed_experts import (
         build_magi2_precision_calibration_targets,
         quantize_magi2_mixed_experts,
+        stream_quantize_magi2_mixed_experts,
     )
     from mirai.core.moe.calibration.imatrix import ExpertImportanceAccumulator
     from mirai.core.moe.calibration.precision import allocate_tensor_precision
@@ -825,9 +830,20 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rot
         rows, budget_bytes=sum(row.format_bytes["fp8"] for row in rows),
         allowed_formats=("fp8", "bf16"), dataset_snapshot_id="synthetic",
         model_snapshot_id="synthetic", config_snapshot_id="synthetic",
-        source_weight_fingerprint=router_tensor_fingerprint(_source_tensors(targets, include_router=True)),
+        source_weight_fingerprint=router_tensor_fingerprint(
+            _source_tensors(targets, include_router=bool(rotation_group_size)),
+        ),
     )
     path = plan.save(tmp_path / "plan.json")
+    from safetensors.torch import save_file
+
+    checkpoint = {key: value.double() for key, value in model.state_dict().items()}
+    save_file(checkpoint, str(tmp_path / "model.safetensors"))
+    streamed_model = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, hidden_size=32,
+        expert_intermediate_size=24, num_heads=2, num_experts=4, top_k=1,
+        routed_weight_device="meta",
+    ))
     if rotation_group_size:
         with pytest.raises(ValueError, match="fingerprint"):
             quantize_magi2_mixed_experts(model, plan_path=path, base_format="fp8", blocksize=64)
@@ -836,6 +852,60 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rot
         rotation_group_size=rotation_group_size,
     )[name]
     assert store.payload_bytes() == plan.estimated_bytes
+    options = dict(
+        checkpoint_dir=str(tmp_path), plan_path=path, base_format="fp8", blocksize=64,
+        rotation_group_size=rotation_group_size,
+    )
+    tampered = f"{name}.gate" if rotation_group_size else f"{name}.W_gate"
+    checkpoint[tampered].view(-1)[0] += 1
+    save_file(checkpoint, str(tmp_path / "model.safetensors"))
+    with pytest.raises(ValueError, match="fingerprint"):
+        stream_quantize_magi2_mixed_experts(streamed_model, **options)
+    assert hasattr(streamed_model.mlp.moe_mlp, "W_gate")
+    checkpoint[tampered].view(-1)[0] -= 1
+    save_file(checkpoint, str(tmp_path / "model.safetensors"))
+    from mirai.vendors.magi2_preview.common import magi2_config
+    from mirai.vendors.magi2_preview.model import magi2_preview as vendored_model
+    from mirai.vendors.magi2_preview.pipeline import preview_data_proxy
+
+    config = SimpleNamespace(
+        engine_config=SimpleNamespace(), arch_config=None,
+        evaluation_config=SimpleNamespace(data_proxy_config=None),
+    )
+    monkeypatch.setattr(magi2_config, "load_config", lambda _: config)
+    def build_transformer(_config, *, ep_size, routed_weight_device):
+        assert ep_size == 1
+        assert routed_weight_device == "meta"
+        assert streamed_model.mlp.moe_mlp.W_gate.device.type == routed_weight_device
+        return streamed_model
+
+    monkeypatch.setattr(vendored_model, "Transformer", build_transformer)
+    monkeypatch.setattr(preview_data_proxy, "Magi2DataProxy", lambda _: None)
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.model_config = SimpleNamespace(path=str(tmp_path))
+    pipeline.options = SimpleNamespace(config_path="")
+    pipeline._quantize_experts_on_load = True
+    pipeline._packed_expert_state_path = ""
+    pipeline._expert_precision_plan_path = str(path)
+    pipeline._expert_pruning_plan_path = ""
+    pipeline._expert_rotation_group_size = rotation_group_size
+    pipeline._nf4_blocksize = 64
+    pipeline._frozen_weight_quantization = "fp8"
+    pipeline._configure_attention_backend = lambda _: None
+    pipeline._attach_moe_execution = lambda: None
+    _, pipeline.transformer, _ = pipeline._build_model()
+    streamed = pipeline._expert_stores[name]
+    pipeline.enable_quantized_frozen_weights("fp8", precision_plan_path=str(path))
+    assert pipeline._expert_stores[name] is streamed
+    torch.testing.assert_close(pipeline.transformer.mlp.moe_mlp.gate, checkpoint[f"{name}.gate"].float())
+    assert streamed.lineage == store.lineage
+    for key in ("W_gate", "W_down", "W_up"):
+        torch.testing.assert_close(
+            streamed.materialize_segment(key, 0, 8, dtype=torch.float32, device="cpu"),
+            store.materialize_segment(key, 0, 8, dtype=torch.float32, device="cpu"),
+            rtol=0, atol=0,
+        )
     if rotation_group_size:
         artifact = save_magi2_nf4_packed_state(tmp_path / "packed", model)
         restored_model = _container(_reduced_moe(
