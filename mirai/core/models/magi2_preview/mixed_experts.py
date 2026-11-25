@@ -56,14 +56,16 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
             name = f"{key}_{fmt}"
             for position, index in enumerate(ids):
                 locations[index] = (name, position)
-            selected = source.index_select(0, torch.tensor(ids, device=source.device))
             if fmt == "bf16":
+                selected = torch.empty((len(ids), *source.shape[1:]), dtype=torch.bfloat16, device=source.device)
+                for row, index in enumerate(ids):
+                    selected[row].copy_(source[index])
                 bucket = _Bf16Groups(selected)
             else:
                 bucket = _new_expert_store(
                     num_groups=len(ids), blocksize=self.blocksize, quant_format=fmt
                 )
-                bucket.quantize_dense(key, selected)
+                bucket.quantize_dense(key, source, group_ids=ids)
             self.buckets[name] = bucket
         self._locations[key] = tuple(locations)
         self._shapes[key] = tuple(source.shape)

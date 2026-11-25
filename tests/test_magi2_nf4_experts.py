@@ -795,17 +795,17 @@ def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tm
     from mirai.core.moe.calibration.router_repair import router_tensor_fingerprint
 
     layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
-                        expert_intermediate_size=16, num_heads=1, num_experts=3, top_k=1)
+                        expert_intermediate_size=16, num_heads=1, num_experts=4, top_k=1)
     model = _container(layer)
     module_name = "mlp.moe_mlp"
     weights = {key: getattr(layer, key).detach().clone() for key in ("W_gate", "W_up", "W_down")}
     assignments = tuple(
         TensorPrecisionAssignment(module_name, group, role, fmt, 1, 0.0)
-        for group, fmt in enumerate(("nvfp4", "bf16", "fp8"))
+        for group, fmt in enumerate(("fp8", "bf16", "nvfp4", "fp8"))
         for role in ("w1", "w2", "w3")
     )
     plan = TensorPrecisionPlan(
-        2, assignments, 9, 0.0, 9, "dataset", "model", "config", "wrong",
+        2, assignments, 12, 0.0, 12, "dataset", "model", "config", "wrong",
     )
     path = tmp_path / "precision.json"
     path.write_text(json.dumps(plan.to_dict()))
@@ -816,16 +816,23 @@ def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tm
     path.write_text(json.dumps(dataclasses.replace(plan, source_weight_fingerprint=fingerprint).to_dict()))
     store = quantize_magi2_mixed_experts(model, plan_path=path, base_format="fp8", blocksize=64)[module_name]
     kwargs = dict(dtype=torch.float32, device=torch.device("cpu"))
-    whole = store.materialize_segment("W_gate", 0, 3, **kwargs)
+    whole = store.materialize_segment("W_gate", 0, 4, **kwargs)
     torch.testing.assert_close(whole[1], weights["W_gate"][1].bfloat16().float(), rtol=0, atol=0)
-    selection = torch.tensor([2, 0, 2])
+    from mirai.core.models.magi2_preview.quantized_experts import _new_expert_store
+
+    reference = _new_expert_store(num_groups=2, blocksize=64, quant_format="fp8")
+    reference.quantize_dense("W_gate", weights["W_gate"][[0, 3]])
+    torch.testing.assert_close(
+        whole[[0, 3]], reference.materialize_segment("W_gate", 0, 2, **kwargs), rtol=0, atol=0,
+    )
+    selection = torch.tensor([3, 0, 3])
     selected = store.materialize_segment("W_gate", 0, 3, group_ids=selection, **kwargs)
     torch.testing.assert_close(selected, whole[selection], rtol=0, atol=0)
     assert not hasattr(layer, "W_gate")
     artifact = save_magi2_nf4_packed_state(tmp_path / "packed", model)
     restored_model = _container(_reduced_moe(
         device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
-        expert_intermediate_size=16, num_heads=1, num_experts=3, top_k=1,
+        expert_intermediate_size=16, num_heads=1, num_experts=4, top_k=1,
     ))
     restored = load_magi2_nf4_packed_state(
         artifact, restored_model, blocksize=64, quant_format="fp8"
@@ -837,7 +844,7 @@ def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tm
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     manifest_path = artifact / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["layers"][module_name]["formats"]["W_gate"][0] = "bf16"
+    manifest["layers"][module_name]["formats"]["W_gate"][2] = "bf16"
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="bucket inventory"):
         load_magi2_nf4_packed_state(artifact, restored_model, blocksize=64, quant_format="fp8")

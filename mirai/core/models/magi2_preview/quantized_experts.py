@@ -23,7 +23,7 @@ rather than retaining a dense copy.
 from __future__ import annotations
 
 from math import prod
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import torch
 from torch import nn
@@ -341,7 +341,7 @@ class Magi2Nf4ExpertStore(nn.Module):
             )
         )
 
-    def quantize_dense(self, key: str, source: torch.Tensor) -> None:
+    def quantize_dense(self, key: str, source: torch.Tensor, *, group_ids: Sequence[int] | None = None) -> None:
         """Quantize one packed ``[groups, out, in]`` expert tensor to NF4.
 
         The payload is stored on ``source``'s device, so a host-resident
@@ -357,20 +357,22 @@ class Magi2Nf4ExpertStore(nn.Module):
                 f"MAGI-2 routed expert tensor {key} must be 3-D, got "
                 f"{tuple(source.shape)}."
             )
-        groups, out_features, in_features = (int(dim) for dim in source.shape)
+        indices = range(source.shape[0]) if group_ids is None else group_ids
+        groups, (out_features, in_features) = len(indices), source.shape[1:]
         if groups != self.num_groups:
             raise Magi2QuantizedExpertError(
                 f"MAGI-2 routed expert tensor {key} carries {groups} groups, "
                 f"expected {self.num_groups}."
             )
         storage_device = source.device
-        packed_stack: list[torch.Tensor] = []
-        absmax_stack: list[torch.Tensor] = []
-        nested_stack: list[torch.Tensor] = []
-        offset_stack: list[torch.Tensor] = []
+        field_names = {
+            "packed": "nf4", "absmax": "nf4_absmax",
+            "nested_absmax": "nf4_nabsmax", "offset": "nf4_offset",
+        }
+        payload: dict[str, torch.Tensor] = {}
         shared_codes: dict[str, torch.Tensor] | None = None
         with torch.no_grad():
-            for index in range(groups):
+            for row, index in enumerate(indices):
                 fields, codes, meta = _nf4_quantize_2d(
                     source[index], blocksize=self._blocksize
                 )
@@ -382,27 +384,16 @@ class Magi2Nf4ExpertStore(nn.Module):
                             "inconsistent NF4 metadata."
                         )
                     self._meta = meta
-                packed_stack.append(fields["packed"])
-                absmax_stack.append(fields["absmax"])
-                nested_stack.append(fields["nested_absmax"])
-                offset_stack.append(fields["offset"])
+                    payload = {
+                        field: fields[field].new_empty((groups, *fields[field].shape), device=storage_device)
+                        for field in field_names
+                    }
+                for field, output in payload.items():
+                    output[row].copy_(fields[field])
             if shared_codes is None:  # pragma: no cover - groups > 0 is validated
                 raise Magi2QuantizedExpertError("MAGI-2 expert tensor is empty.")
-            self._set_buffer(
-                f"{key}_nf4", torch.stack(packed_stack, dim=0).contiguous().to(storage_device)
-            )
-            self._set_buffer(
-                f"{key}_nf4_absmax",
-                torch.stack(absmax_stack, dim=0).contiguous().to(storage_device),
-            )
-            self._set_buffer(
-                f"{key}_nf4_nabsmax",
-                torch.stack(nested_stack, dim=0).contiguous().to(storage_device),
-            )
-            self._set_buffer(
-                f"{key}_nf4_offset",
-                torch.stack(offset_stack, dim=0).contiguous().to(storage_device),
-            )
+            for field, suffix in field_names.items():
+                self._set_buffer(f"{key}_{suffix}", payload[field])
             self._set_buffer(
                 f"{key}_nf4_code", shared_codes["code"].contiguous().to(storage_device)
             )
@@ -560,21 +551,28 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         return MicroscalingMeta("nvfp4", 16, shape, (-prod(shape)) % 16)
 
     @torch.no_grad()
-    def quantize_dense(self, key: str, source: torch.Tensor) -> None:
-        if key not in MAGI2_ROUTED_EXPERT_TENSOR_NAMES or source.ndim != 3 or source.shape[0] != self.num_groups:
+    def quantize_dense(self, key: str, source: torch.Tensor, *, group_ids: Sequence[int] | None = None) -> None:
+        indices = range(source.shape[0]) if source.ndim == 3 and group_ids is None else group_ids
+        if key not in MAGI2_ROUTED_EXPERT_TENSOR_NAMES or source.ndim != 3 or indices is None or len(indices) != self.num_groups:
             raise Magi2QuantizedExpertError("Invalid dense MAGI-2 packed expert input.")
-        payload = []
-        for group in source:
+        payload = None
+        for row, index in enumerate(indices):
+            group = source[index]
             if self.quant_format == "fp8":
                 values = quantize_blockwise_fp8_weight(group)[:2]
             elif self.quant_format == "nvfp4":
                 values = quantize_microscaling(self.quant_format, group)[:3]
             else:
                 values = (quantize_gguf(self.quant_format, group),)
-            payload.append(values)
-        for name, values in zip(self._buffer_names(key), zip(*payload, strict=True), strict=True):
-            self._set_buffer(name, torch.stack(values))
-        self._shapes[key] = tuple(source.shape)
+            if payload is None:
+                payload = tuple(value.new_empty((self.num_groups, *value.shape)) for value in values)
+            for output, value in zip(payload, values, strict=True):
+                output[row].copy_(value)
+        if payload is None:
+            raise Magi2QuantizedExpertError("MAGI-2 expert tensor is empty.")
+        for name, value in zip(self._buffer_names(key), payload, strict=True):
+            self._set_buffer(name, value)
+        self._shapes[key] = (self.num_groups, *source.shape[1:])
         self._dtypes[key] = source.dtype
 
     def packed_state_descriptor(self, *, keys=MAGI2_ROUTED_EXPERT_TENSOR_NAMES) -> dict[str, object]:
