@@ -288,6 +288,17 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        from mirai.core.models.magi2_preview.mixed_experts import MAGI2_EXPERT_ROTATION_SIZES
+
+        self._expert_rotation_group_size = family.get("expert_rotation_group_size", 0)
+        if type(self._expert_rotation_group_size) is not int or self._expert_rotation_group_size not in MAGI2_EXPERT_ROTATION_SIZES:
+            raise ValueError("Invalid MAGI-2 expert Hadamard group size.")
+        if self._expert_rotation_group_size and not (
+            self._packed_expert_state_path
+            or str(getattr(memory_config, "expert_precision_plan_path", "") or "").strip()
+            or str(getattr(model_config.params, "expert_precision_calibration", "off")).strip().lower() in {"imatrix", "alphaq"}
+        ):
+            raise ValueError("MAGI-2 expert rotation requires precision calibration, a mixed plan, or a rotated artifact.")
         self._expert_pruning_plan_path = str(family.get("expert_pruning_plan_path", "")).strip()
         if self._expert_pruning_plan_path and (
             self._quantize_experts_on_load or self._packed_expert_state_path
@@ -442,6 +453,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                         ),
                     },
                 )
+                if self._expert_rotation_group_size and any(
+                    getattr(store, "rotation_group_size", 0) != self._expert_rotation_group_size
+                    for store in self._expert_stores.values()
+                ):
+                    raise ValueError("MAGI-2 packed artifact does not match the requested expert rotation.")
             else:
                 self._expert_stores = stream_quantize_magi2_experts(
                     transformer,
@@ -974,6 +990,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 self._expert_stores = quantize_magi2_mixed_experts(
                     self.transformer, plan_path=precision_plan_path, base_format=scheme,
                     blocksize=block_size,
+                    rotation_group_size=self._expert_rotation_group_size,
                 )
             elif (
                 self._applied_expert_precision_plan != precision_plan_path
@@ -1953,6 +1970,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
         "nf4_fuse_gate_up",
         "expert_pruning_plan_path",
+        "expert_rotation_group_size",
         "config_path",
         "audio_tokens",
         "refiner_config_path",
@@ -1991,14 +2009,20 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         return build_magi2_precision_calibration_targets(
             pipeline.transformer, blocksize=pipeline._nf4_blocksize,
             audio_noise_generator=pipeline._audio_noise_generator,
+            rotation_group_size=pipeline._expert_rotation_group_size,
         )
 
     def expert_precision_candidate_formats(self) -> tuple[str, ...]:
         return (*MAGI2_PACKED_EXPERT_FORMATS, "bf16")
 
     def validate_family_params(self, params: dict[str, Any]) -> list[str]:
+        from mirai.core.models.magi2_preview.mixed_experts import MAGI2_EXPERT_ROTATION_SIZES
+
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        rotation = params.get("expert_rotation_group_size", 0)
+        if type(rotation) is not int or rotation not in MAGI2_EXPERT_ROTATION_SIZES:
+            errors.append("MAGI-2 expert_rotation_group_size must be 0, 4, 16, 64, or 256.")
         if not isinstance(params.get("nf4_fuse_gate_up", False), bool):
             errors.append("MAGI-2 family_params.nf4_fuse_gate_up must be a boolean.")
         if "audio_tokens" in params and int(params["audio_tokens"]) < -1:

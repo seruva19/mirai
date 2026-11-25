@@ -787,7 +787,8 @@ def test_magi2_pruning_remaps_each_head_and_preserves_top_k(tmp_path, criterion)
     assert torch.isfinite(hidden.grad).all()
 
 
-def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path) -> None:
+@pytest.mark.parametrize("rotation_group_size", [0, 4])
+def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rotation_group_size) -> None:
     from mirai.core.models.magi2_preview.mixed_experts import (
         build_magi2_precision_calibration_targets,
         quantize_magi2_mixed_experts,
@@ -800,7 +801,9 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path) -> 
     layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32, hidden_size=32,
                         expert_intermediate_size=24, num_heads=2, num_experts=4, top_k=1)
     model = _container(layer)
-    targets = build_magi2_precision_calibration_targets(model, blocksize=64)
+    targets = build_magi2_precision_calibration_targets(
+        model, blocksize=64, rotation_group_size=rotation_group_size,
+    )
     name, target = next(iter(targets.items()))
     observer = ExpertImportanceAccumulator(
         num_experts=8, input_dims={"w1": 16, "w2": 24, "w3": 16},
@@ -825,8 +828,48 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path) -> 
         source_weight_fingerprint=router_tensor_fingerprint(_source_tensors(targets, include_router=True)),
     )
     path = plan.save(tmp_path / "plan.json")
-    store = quantize_magi2_mixed_experts(model, plan_path=path, base_format="fp8", blocksize=64)[name]
+    if rotation_group_size:
+        with pytest.raises(ValueError, match="fingerprint"):
+            quantize_magi2_mixed_experts(model, plan_path=path, base_format="fp8", blocksize=64)
+    store = quantize_magi2_mixed_experts(
+        model, plan_path=path, base_format="fp8", blocksize=64,
+        rotation_group_size=rotation_group_size,
+    )[name]
     assert store.payload_bytes() == plan.estimated_bytes
+    if rotation_group_size:
+        artifact = save_magi2_nf4_packed_state(tmp_path / "packed", model)
+        restored_model = _container(_reduced_moe(
+            device=torch.device("cpu"), dtype=torch.float32, hidden_size=32,
+            expert_intermediate_size=24, num_heads=2, num_experts=4, top_k=1,
+        ))
+        restored = load_magi2_nf4_packed_state(artifact, restored_model, blocksize=64, quant_format="fp8")[name]
+        assert restored.rotation_group_size == rotation_group_size
+        kwargs = dict(dtype=torch.float32, device="cpu", group_ids=torch.tensor([4, 0, 4]))
+        for key in ("W_gate", "W_down", "W_up"):
+            torch.testing.assert_close(
+                restored.materialize_segment(key, 0, 3, **kwargs),
+                store.materialize_segment(key, 0, 3, **kwargs),
+                rtol=0, atol=0,
+            )
+            normal = restored.materialize_segment(key, 0, 3, **kwargs)
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                autocast = restored.materialize_segment(key, 0, 3, **kwargs)
+            torch.testing.assert_close(autocast, normal, rtol=0, atol=0)
+        gate, up, down = (
+            store.materialize_segment(key, 0, 1, dtype=torch.float32, device="cpu")[0]
+            for key in ("W_gate", "W_up", "W_down")
+        )
+        x = torch.randn(3, 16, requires_grad=True)
+        gate_values = (x @ gate).clamp(max=7.0)
+        up_values = (x @ up).clamp(min=-7.0, max=7.0)
+        expected = (gate_values * torch.sigmoid(1.702 * gate_values) * (up_values + 1.0)) @ down
+        actual = grouped_moe._SegmentedQuantizedExpertMlp.apply(
+            x, torch.tensor([3], dtype=torch.int32), restored, "bmm", "bmm", "torch",
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(actual.sum(), x)[0], torch.autograd.grad(expected.sum(), x)[0],
+        )
 
 
 def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tmp_path) -> None:

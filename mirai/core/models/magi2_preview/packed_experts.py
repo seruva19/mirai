@@ -26,6 +26,7 @@ MAGI2_PACKED_EXPERT_SCHEMA = "mirai.magi2_preview.nf4_experts"
 MAGI2_PACKED_EXPERT_SCHEMA_VERSION = 3
 _MULTIFORMAT_SCHEMA_VERSION = 4
 _MIXED_SCHEMA_VERSION = 5
+_ROTATED_MIXED_SCHEMA_VERSION = 6
 _MANIFEST_FILE = "manifest.json"
 
 
@@ -54,6 +55,7 @@ def save_magi2_nf4_packed_state(
     quant_format = None
     mixed = None
     mixed_lineage = None
+    rotation_group_size = 0
     for layer_index, (module_name, module) in enumerate(
         iter_magi2_moe_layers(transformer)
     ):
@@ -66,12 +68,13 @@ def save_magi2_nf4_packed_state(
             quant_format = store.quant_format
             mixed = isinstance(store, Magi2MixedExpertStore)
             mixed_lineage = store.lineage if mixed else None
+            rotation_group_size = store.rotation_group_size if mixed else 0
         if (
             quant_format != store.quant_format or mixed != isinstance(store, Magi2MixedExpertStore)
             or (fuse_gate_up and (mixed or quant_format != "nf4"))
         ):
             raise Magi2PackedExpertStateError("Incompatible gate/up or packed format across expert layers.")
-        if mixed and store.lineage != mixed_lineage:
+        if mixed and (store.lineage != mixed_lineage or store.rotation_group_size != rotation_group_size):
             raise Magi2PackedExpertStateError("Mixed MAGI-2 layers must share one precision plan.")
         descriptor = store.packed_state_descriptor()
         tensors: dict[str, torch.Tensor] = {}
@@ -94,6 +97,7 @@ def save_magi2_nf4_packed_state(
     manifest = {
         "schema": MAGI2_PACKED_EXPERT_SCHEMA,
         "schema_version": (
+            _ROTATED_MIXED_SCHEMA_VERSION if rotation_group_size else
             _MIXED_SCHEMA_VERSION if mixed else _MULTIFORMAT_SCHEMA_VERSION
             if quant_format != "nf4"
             else (MAGI2_PACKED_EXPERT_SCHEMA_VERSION if any(layer["fused_gate_up"] for layer in layers.values()) else 2)
@@ -133,13 +137,13 @@ def load_magi2_nf4_packed_state(
     if (
         manifest.get("schema") != MAGI2_PACKED_EXPERT_SCHEMA
         or type(version) is not int
-        or version not in (2, MAGI2_PACKED_EXPERT_SCHEMA_VERSION, _MULTIFORMAT_SCHEMA_VERSION, _MIXED_SCHEMA_VERSION)
+        or version not in (2, MAGI2_PACKED_EXPERT_SCHEMA_VERSION, _MULTIFORMAT_SCHEMA_VERSION, _MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION)
     ):
         raise Magi2PackedExpertStateError(
             "Packed MAGI-2 expert state has an unsupported schema or version."
         )
     if manifest.get("quant_format") != quant_format or (
-        version != _MIXED_SCHEMA_VERSION
+        version not in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION}
         and (version == _MULTIFORMAT_SCHEMA_VERSION) != (quant_format != "nf4")
     ):
         raise Magi2PackedExpertStateError(
@@ -156,7 +160,10 @@ def load_magi2_nf4_packed_state(
                 f"Packed MAGI-2 expert state has incompatible {key}."
             )
     stores = install_magi2_nf4_expert_stores(transformer, blocksize=blocksize, quant_format=quant_format)
-    mixed_layers = dict(iter_magi2_moe_layers(transformer)) if version == _MIXED_SCHEMA_VERSION else {}
+    mixed_layers = (
+        dict(iter_magi2_moe_layers(transformer))
+        if version in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION} else {}
+    )
     layer_specs = manifest.get("layers")
     if not isinstance(layer_specs, dict) or set(layer_specs) != set(stores):
         raise Magi2PackedExpertStateError(
@@ -166,6 +173,12 @@ def load_magi2_nf4_packed_state(
         lineage = next(iter(layer_specs.values())).get("lineage")
         if any(spec.get("lineage") != lineage for spec in layer_specs.values()):
             raise Magi2PackedExpertStateError("Mixed MAGI-2 layers declare different precision plans.")
+        rotations = [spec.get("hadamard_input_group_size", 0) for spec in layer_specs.values()]
+        if (
+            any(type(size) is not int or size != rotations[0] for size in rotations)
+            or bool(rotations[0]) != (version == _ROTATED_MIXED_SCHEMA_VERSION)
+        ):
+            raise Magi2PackedExpertStateError("Mixed MAGI-2 artifact has inconsistent rotation metadata.")
     for module_name, store in stores.items():
         spec = layer_specs[module_name]
         fused = spec.get("fused_gate_up", False)

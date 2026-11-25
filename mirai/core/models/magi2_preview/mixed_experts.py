@@ -9,6 +9,7 @@ from math import prod
 
 import torch
 from torch import nn
+from mirai.core.models.compressed_weights.quantization.quant import _rotate_last_dim
 
 from .quantized_experts import (
     MAGI2_PACKED_EXPERT_FORMATS,
@@ -24,21 +25,50 @@ from .quantized_experts import (
 
 _PLAN_PROJECTIONS = {"w1": "W_gate", "w2": "W_down", "w3": "W_up"}
 _SUPPORTED_FORMATS = {*MAGI2_PACKED_EXPERT_FORMATS, "bf16"}
+MAGI2_EXPERT_ROTATION_SIZES = (0, 4, 16, 64, 256)
+_ROTATION_LINEAGE_KEY = "hadamard_input_group_size"
 
 
-def _reconstruct_projection(source, quant_format, projection, *, blocksize):
+def _validate_rotation_size(size, input_features):
+    if type(size) is not int or size not in MAGI2_EXPERT_ROTATION_SIZES:
+        raise ValueError("Invalid MAGI-2 expert Hadamard group size.")
+    if size and input_features % size:
+        raise ValueError(f"MAGI-2 Hadamard group size {size} does not divide input width {input_features}.")
+
+
+def _rotate_native_projection(weight, *, group_size, inverse=False):
+    rows = weight.transpose(-1, -2)
+    with torch.autocast(device_type=weight.device.type, enabled=False):
+        rotated = _rotate_last_dim(rows.reshape(-1, rows.shape[-1]).float(), group_size, inverse=inverse)
+    return rotated.reshape(rows.shape).transpose(-1, -2).contiguous()
+
+
+def _rotation_fingerprint_fields(group_size):
+    if not group_size:
+        return {}
+    return {_ROTATION_LINEAGE_KEY: torch.tensor([group_size], dtype=torch.int32)}
+
+
+def _reconstruct_projection(source, quant_format, projection, *, blocksize, rotation_group_size=0):
     if quant_format == "bf16":
         return source.to(torch.bfloat16), source.numel() * 2
     if quant_format not in MAGI2_PACKED_EXPERT_FORMATS:
         raise ValueError(f"MAGI-2 mixed precision does not support {quant_format!r}.")
     key = _PLAN_PROJECTIONS[projection]
     store = _new_expert_store(num_groups=1, blocksize=blocksize, quant_format=quant_format)
-    store.quantize_dense(key, source.transpose(0, 1).contiguous().unsqueeze(0))
+    native = source.transpose(0, 1).contiguous()
+    if rotation_group_size:
+        native = _rotate_native_projection(native, group_size=rotation_group_size).to(native.dtype)
+    store.quantize_dense(key, native.unsqueeze(0))
     restored = store.materialize_segment(key, 0, 1, dtype=torch.float32, device=source.device)
+    if rotation_group_size:
+        restored = _rotate_native_projection(restored, group_size=rotation_group_size, inverse=True)
     return restored[0].transpose(0, 1), store.payload_bytes()
 
 
-def build_magi2_precision_calibration_targets(transformer, *, blocksize, audio_noise_generator=None):
+def build_magi2_precision_calibration_targets(
+    transformer, *, blocksize, audio_noise_generator=None, rotation_group_size=0,
+):
     from mirai.core.moe.calibration.imatrix import ExpertImportanceCalibrationTarget
 
     targets = {}
@@ -46,13 +76,17 @@ def build_magi2_precision_calibration_targets(transformer, *, blocksize, audio_n
         if layer.ep_size != 1 or any(key not in layer._parameters for key in _PLAN_PROJECTIONS.values()):
             raise ValueError("MAGI-2 precision calibration requires dense single-device expert weights.")
         native = {key: getattr(layer, key) for key in _PLAN_PROJECTIONS.values()}
+        for tensor in native.values():
+            _validate_rotation_size(rotation_group_size, tensor.shape[-2])
         targets[name] = ExpertImportanceCalibrationTarget(
             name=name,
             host=layer,
             weights={role: native[key].transpose(-1, -2) for role, key in _PLAN_PROJECTIONS.items()},
             router_weight=layer.gate,
-            source_weights=native,
-            reconstruct_projection=partial(_reconstruct_projection, blocksize=blocksize),
+            source_weights={**native, **_rotation_fingerprint_fields(rotation_group_size)},
+            reconstruct_projection=partial(
+                _reconstruct_projection, blocksize=blocksize, rotation_group_size=rotation_group_size,
+            ),
             supported_formats=frozenset(_SUPPORTED_FORMATS),
             replay_generators=(audio_noise_generator,) if audio_noise_generator is not None else (),
         ).validate()
@@ -73,16 +107,18 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
     """Compact format buckets with a stable mapping to the logical group IDs."""
     is_mixed_precision = True
 
-    def __init__(self, *, num_groups: int, blocksize: int, base_format: str, formats, lineage) -> None:
+    def __init__(self, *, num_groups: int, blocksize: int, base_format: str, formats, lineage, rotation_group_size=0) -> None:
         super().__init__(num_groups=num_groups, blocksize=blocksize)
         self.quant_format = base_format
         self.buckets = nn.ModuleDict()
         self._formats = {key: tuple(value) for key, value in formats.items()}
         self.lineage = dict(lineage)
+        self.rotation_group_size = rotation_group_size
         self._locations: dict[str, tuple[tuple[str, int], ...]] = {}
 
     @torch.no_grad()
     def quantize_dense(self, key: str, source: torch.Tensor) -> None:
+        _validate_rotation_size(self.rotation_group_size, source.shape[-2])
         assignments = self._formats[key]
         locations = [None] * len(assignments)
         for fmt in sorted(set(assignments)):
@@ -99,7 +135,12 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
                 bucket = _new_expert_store(
                     num_groups=len(ids), blocksize=self.blocksize, quant_format=fmt
                 )
-                bucket.quantize_dense(key, source, group_ids=ids)
+                def rotate(group):
+                    return _rotate_native_projection(group, group_size=self.rotation_group_size).to(group.dtype)
+
+                bucket.quantize_dense(
+                    key, source, group_ids=ids, transform=rotate if self.rotation_group_size else None,
+                )
             self.buckets[name] = bucket
         self._locations[key] = tuple(locations)
         self._shapes[key] = tuple(source.shape)
@@ -120,10 +161,15 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
             sources.append(local_index)
         output = torch.empty((group_stop - group_start, *self._shapes[key][1:]), dtype=dtype, device=device)
         for name, (destinations, sources) in by_bucket.items():
+            rotated = self.rotation_group_size and not isinstance(self.buckets[name], _Bf16Groups)
             selected = self.buckets[name].materialize_segment(
-                key, 0, len(sources), dtype=dtype, device=device,
+                key, 0, len(sources), dtype=torch.float32 if rotated else dtype, device=device,
                 group_ids=torch.tensor(sources),
             )
+            if rotated:
+                selected = _rotate_native_projection(
+                    selected, group_size=self.rotation_group_size, inverse=True,
+                ).to(dtype)
             output.index_copy_(0, torch.tensor(destinations, device=device), selected)
         return output
 
@@ -146,6 +192,7 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
             "formats": self._formats,
             "bucket_specs": specs,
             "lineage": self.lineage,
+            _ROTATION_LINEAGE_KEY: self.rotation_group_size,
         }
 
     @classmethod
@@ -172,7 +219,13 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
             raise ValueError("Invalid mixed MAGI-2 format assignments.")
         if set(specs) != {f"{key}_{fmt}" for key, values in formats.items() for fmt in set(values)}:
             raise ValueError("Invalid mixed MAGI-2 bucket inventory.")
-        store = cls(num_groups=groups, blocksize=blocksize, base_format=base_format, formats=formats, lineage=lineage)
+        rotation_group_size = descriptor.get(_ROTATION_LINEAGE_KEY, 0)
+        for shape in group_shapes.values():
+            _validate_rotation_size(rotation_group_size, shape[-2])
+        store = cls(
+            num_groups=groups, blocksize=blocksize, base_format=base_format, formats=formats,
+            lineage=lineage, rotation_group_size=rotation_group_size,
+        )
         consumed = set()
         for key, values in formats.items():
             shape = group_shapes[key]
@@ -231,7 +284,7 @@ def _validate_nf4_bucket(key, fields, spec, shape, blocksize):
         raise ValueError("Invalid mixed MAGI-2 NF4 codebook size.")
 
 
-def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksize):
+def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksize, rotation_group_size=0):
     from mirai.core.moe.calibration.precision import TensorPrecisionPlan, load_precision_plan
     from mirai.core.moe.calibration.router_repair import router_tensor_fingerprint
 
@@ -248,12 +301,16 @@ def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksi
     for name, layer in layers.items():
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             source = getattr(layer, key)
+            _validate_rotation_size(rotation_group_size, source.shape[-2])
             formats = assignments[name][key]
             if len(formats) != source.shape[0] or not set(formats) <= _SUPPORTED_FORMATS:
                 raise ValueError(f"Invalid group coverage or format in MAGI-2 precision plan for {name}.{key}.")
             if source.requires_grad:
                 raise ValueError(f"MAGI-2 precision plan requires frozen weights: {name}.{key}.")
             source_tensors[f"{name}.{key}"] = source
+        source_tensors.update({
+            f"{name}.{key}": value for key, value in _rotation_fingerprint_fields(rotation_group_size).items()
+        })
     if router_tensor_fingerprint(source_tensors) != plan.source_weight_fingerprint:
         source_tensors.update({f"{name}.router": layer.gate for name, layer in layers.items()})
         if router_tensor_fingerprint(source_tensors) != plan.source_weight_fingerprint:
@@ -268,6 +325,7 @@ def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksi
         store = Magi2MixedExpertStore(
             num_groups=int(layer.local_flatten_num_experts), blocksize=blocksize,
             base_format=base_format, formats=assignments[name], lineage=lineage,
+            rotation_group_size=rotation_group_size,
         )
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             store.quantize_dense(key, layer._parameters[key])

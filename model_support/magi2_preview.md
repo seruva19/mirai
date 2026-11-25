@@ -760,6 +760,13 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   statistics. Router-norm protection also binds the plan to the router weights.
   NF4 estimates include a codebook allowance per group. Packed groups in a
   format bucket share the stored codebooks.
+  Set `model.params.family_params.expert_rotation_group_size` to `4`, `16`,
+  `64`, or `256` to apply a block Hadamard transform along the expert input
+  axis before packing. The size must divide all routed projections' input
+  widths. Use the same setting when generating and applying a plan. The
+  runtime inverts the transform during dequantization for both forward
+  and backward. BF16 groups keep their original basis. Rotated packed
+  artifacts use version 6 and carry the group size for direct restoration.
 - **Additional MAGI-2 packed expert formats** — Experimental IQ2, IQ3, FP8,
   and NVFP4 storage for frozen routed experts. These formats use version 4
   packed artifacts and the same segmented dequantization and frozen-weight

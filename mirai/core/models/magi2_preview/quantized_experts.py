@@ -23,7 +23,7 @@ rather than retaining a dense copy.
 from __future__ import annotations
 
 from math import prod
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 import torch
 from torch import nn
@@ -341,7 +341,10 @@ class Magi2Nf4ExpertStore(nn.Module):
             )
         )
 
-    def quantize_dense(self, key: str, source: torch.Tensor, *, group_ids: Sequence[int] | None = None) -> None:
+    def quantize_dense(
+        self, key: str, source: torch.Tensor, *, group_ids: Sequence[int] | None = None,
+        transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
         """Quantize one packed ``[groups, out, in]`` expert tensor to NF4.
 
         The payload is stored on ``source``'s device, so a host-resident
@@ -373,8 +376,11 @@ class Magi2Nf4ExpertStore(nn.Module):
         shared_codes: dict[str, torch.Tensor] | None = None
         with torch.no_grad():
             for row, index in enumerate(indices):
+                group = source[index]
+                if transform is not None:
+                    group = transform(group)
                 fields, codes, meta = _nf4_quantize_2d(
-                    source[index], blocksize=self._blocksize
+                    group, blocksize=self._blocksize
                 )
                 if shared_codes is None:
                     shared_codes = codes
@@ -551,13 +557,18 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         return MicroscalingMeta("nvfp4", 16, shape, (-prod(shape)) % 16)
 
     @torch.no_grad()
-    def quantize_dense(self, key: str, source: torch.Tensor, *, group_ids: Sequence[int] | None = None) -> None:
+    def quantize_dense(
+        self, key: str, source: torch.Tensor, *, group_ids: Sequence[int] | None = None,
+        transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
         indices = range(source.shape[0]) if source.ndim == 3 and group_ids is None else group_ids
         if key not in MAGI2_ROUTED_EXPERT_TENSOR_NAMES or source.ndim != 3 or indices is None or len(indices) != self.num_groups:
             raise Magi2QuantizedExpertError("Invalid dense MAGI-2 packed expert input.")
         payload = None
         for row, index in enumerate(indices):
             group = source[index]
+            if transform is not None:
+                group = transform(group)
             if self.quant_format == "fp8":
                 values = quantize_blockwise_fp8_weight(group)[:2]
             elif self.quant_format == "nvfp4":
