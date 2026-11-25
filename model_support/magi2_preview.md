@@ -92,6 +92,14 @@ snapshot and point `model.path` at its root, which must contain:
 
 ## Presets
 
+The experimental 32 GiB profiles enable flat-ring transfers and Triton routed
+GEMM for [training](../configs/magi2_preview/train_offload_32gb_experimental.toml)
+and [inference](../configs/magi2_preview/inference_offload_32gb_experimental.toml).
+The inference profile requests three resident denoiser blocks and enables
+approximate expert-feature reuse. The experimental profiles require a
+compatible BF16 CUDA and Triton runtime. Their memory headroom and output
+quality require measurement on the intended clip geometry.
+
 ### [`magi2_preview_offload.toml`](../mirai/config/presets/magi2_preview_offload.toml)
 
 The single shipped preset. It is deep-merged over

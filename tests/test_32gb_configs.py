@@ -29,12 +29,14 @@ _CONFIGS = _ROOT / "configs"
 
 MAGI2_TRAIN = _CONFIGS / "magi2_preview" / "train_offload_32gb.toml"
 MAGI2_INFER = _CONFIGS / "magi2_preview" / "inference_offload_32gb.toml"
+MAGI2_TRAIN_EXPERIMENTAL = MAGI2_TRAIN.with_stem("train_offload_32gb_experimental")
+MAGI2_INFER_EXPERIMENTAL = MAGI2_INFER.with_stem("inference_offload_32gb_experimental")
 LINGBOT_TRAIN = _CONFIGS / "lingbot_video" / "train_nf4_32gb.toml"
 LINGBOT_INFER = _CONFIGS / "lingbot_video" / "inference_nf4_32gb.toml"
 LINGBOT_REFINER = _CONFIGS / "lingbot_video" / "inference_nf4_refiner_32gb.toml"
 
-_TRAIN_CONFIGS = (MAGI2_TRAIN, LINGBOT_TRAIN)
-_INFER_CONFIGS = (MAGI2_INFER, LINGBOT_INFER, LINGBOT_REFINER)
+_TRAIN_CONFIGS = (MAGI2_TRAIN, MAGI2_TRAIN_EXPERIMENTAL, LINGBOT_TRAIN)
+_INFER_CONFIGS = (MAGI2_INFER, MAGI2_INFER_EXPERIMENTAL, LINGBOT_INFER, LINGBOT_REFINER)
 _ALL_CONFIGS = _TRAIN_CONFIGS + _INFER_CONFIGS
 
 PROFILE_HOST_MEMORY_GIB = 128.0
@@ -136,6 +138,28 @@ class ThirtyTwoGibProfileConfigTests(unittest.TestCase):
         self.assertEqual(config.memory.frozen_weight_quantization, "nf4")
         self.assertEqual(config.memory.moe_activation_backend, "triton")
         self.assertEqual(config.memory.cuda_memory_fraction, 1.0)
+
+    def test_magi2_experimental_profiles_select_grouped_routed_execution(self) -> None:
+        from mirai.core.models.magi2_preview.grouped_moe import resolve_magi2_moe_execution
+        from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
+
+        for path, entrypoint in (
+            (MAGI2_TRAIN_EXPERIMENTAL, "train"),
+            (MAGI2_INFER_EXPERIMENTAL, "infer"),
+        ):
+            with self.subTest(entrypoint=entrypoint):
+                cfg = _resolved(path, entrypoint=entrypoint)
+                policy = MoEOptimizationPolicy.from_memory_config(cfg.memory)
+                plan = resolve_magi2_moe_execution(policy, quantized_experts=True)
+                self.assertEqual(plan.routed_gemm, "triton")
+                self.assertEqual(cfg.memory.block_swap_transfer_strategy, "flat_ring")
+                self.assertEqual(cfg.memory.block_swap_prefetch_depth, 1)
+        cfg = _resolved(MAGI2_INFER_EXPERIMENTAL, entrypoint="infer")
+        self.assertEqual(int(Magi2ModelConfig().num_layers) - cfg.inference.blocks_to_swap, 3)
+        self.assertEqual(cfg.inference.cfg_mode, "batched")
+        self.assertEqual(cfg.inference.expert_feature_cache, "branch")
+        self.assertEqual(cfg.inference.expert_feature_cache_max_reuse_span, 1)
+        self.assertEqual(cfg.inference.expert_feature_cache_slots, 1)
 
     def test_lingbot_training_profile_uses_bounded_async_residency(self) -> None:
         config = _resolved(LINGBOT_TRAIN, entrypoint="train")

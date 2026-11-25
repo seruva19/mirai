@@ -1,0 +1,50 @@
+# Experimental MAGI-2 Preview profile for a 32 GiB device and 128 GiB host.
+preset = "magi2_preview_offload"
+
+[model]
+path = "./models/MAGI-2-preview"
+attention_backend = "flex"
+hash_snapshot_contents = false
+
+# The optional refiner stage reads these only when `--refine` is passed. The
+# refiner is a second model load and a second denoise; on this device it is a
+# separate decision from the preview run.
+[model.params.family_params]
+refiner_config_path = ""
+refiner_subfolder = "refiner"
+refiner_attention_backend = "auto"
+
+[inference]
+task = "text_to_video"
+# The native sampler packs the conditional and unconditional branches into one
+# B=2 forward; `sequential` is rejected rather than applied.
+cfg_mode = "batched"
+expert_feature_cache = "branch"
+expert_feature_cache_drift_threshold = 0.02
+expert_feature_cache_max_reuse_span = 1
+expert_feature_cache_slots = 1
+# Qwen3.5 does not co-reside with the denoiser at this capacity.
+stage_text_encoder_before_denoiser = true
+text_encoder_weight_quantization = "int8"
+keep_text_encoder_resident = false
+keep_vae_resident = false
+blocks_to_swap = 37
+block_swap_mode = "async"
+
+[memory]
+frozen_weight_quantization = "nf4"
+frozen_weight_quantization_strategy = "compressed_weights"
+quantize_experts_on_load = true
+moe_kernel_backend = "grouped"
+expert_weight_access = "chunked_dequant"
+expert_dequant_chunk_size = 512
+moe_activation_backend = "triton"
+weight_residency_strategy = "block_swap"
+block_swap_prefetch_depth = 1
+block_swap_transfer_strategy = "flat_ring"
+moe_routed_gemm = "triton"
+minimum_system_memory_gib = 12.0
+max_pinned_host_gib = 48.0
+
+[logging]
+output_dir = "./outputs/magi2_preview_inference_32gb_experimental"
