@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from mirai.config.schema import TrainingConfig
 from mirai.core.builtins import register_builtin_components
 from mirai.core.dataset.registration import enforce_dataset_compliance
+from mirai.core.models.providers import get_model_family_provider
 from mirai.core.training.calibration.expert_precision import (
     run_expert_precision_calibration_session,
 )
@@ -35,13 +36,25 @@ def calibrate_expert_precision(
     calibration_steps: int,
     max_accumulator_gib: float,
     budget_gib: float,
-    allowed_formats: tuple[str, ...],
+    allowed_formats: tuple[str, ...] | None,
     spectral_gamma: float | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Run an isolated leased calibration session and write a schema-v2 plan."""
 
     validate_training_runtime_config(config)
+    provider = get_model_family_provider(str(config.model.type))
+    candidates = provider.expert_precision_candidate_formats() if provider is not None else None
+    if allowed_formats is None:
+        defaults = ("gguf_iq2", "gguf_iq3", "gguf_iq4", "int8", "bf16")
+        allowed_formats = (
+            tuple(value for value in defaults if value in candidates) or candidates
+            if candidates else defaults
+        )
+    if candidates is not None:
+        unsupported = {str(value).strip().lower() for value in allowed_formats} - set(candidates)
+        if unsupported:
+            raise ValueError(f"Unsupported expert precision candidate formats: {sorted(unsupported)}.")
     output_path = Path(output)
     if output_path.exists() and not bool(overwrite):
         raise ValueError(
@@ -116,12 +129,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--formats",
-        default="gguf_iq2,gguf_iq3,gguf_iq4,int8,bf16",
         help="Comma-separated candidate formats.",
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
-    formats = tuple(
+    formats = None if args.formats is None else tuple(
         value.strip().lower() for value in str(args.formats).split(",") if value.strip()
     )
     register_builtin_components()

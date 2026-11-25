@@ -3198,7 +3198,8 @@
         "documentation"
       ],
       "symbols": [
-        "Magi2MixedExpertStore"
+        "Magi2MixedExpertStore",
+        "build_magi2_precision_calibration_targets"
       ],
       "config_keys": [
         "memory.expert_precision_plan_path"

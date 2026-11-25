@@ -1070,6 +1070,7 @@ class TrainingConfig:
             "router_quantization_calibration",
             "expert_factorization_calibration",
             "expert_precision_calibration",
+            "expert_precision_alphaq_gamma",
             "expert_precision_router_norm_fraction",
             "expert_precision_router_norm_min_format",
             "text_encoder_path",

@@ -116,9 +116,9 @@ def _source_tensors(
     include_router: bool = False,
 ) -> dict[str, Any]:
     tensors = {
-        f"{name}.{projection}": target.weights[projection]
+        f"{name}.{projection}": weight
         for name, target in targets.items()
-        for projection in ("w1", "w2", "w3")
+        for projection, weight in (target.source_weights or target.weights).items()
     }
     if include_router:
         tensors.update(
@@ -177,8 +177,11 @@ def _measurement_evidence(
                     f"Importance calibration observed no {name}.{projection} inputs."
                 )
             source = torch.as_tensor(target.weights[projection]).detach()
+            sums = torch.as_tensor(evidence.input_sum_squares[projection])
+            pooled_importance = sums.sum(dim=0) / total_count
             for expert_id in range(target.num_experts):
-                importance = evidence.mean_squares(projection, expert_id)
+                count = int(counts[expert_id].item())
+                importance = sums[expert_id] / count if count > 0 else pooled_importance
                 format_error: dict[str, float] = {}
                 format_bytes: dict[str, int] = {}
                 for quant_format in formats:
@@ -187,6 +190,7 @@ def _measurement_evidence(
                         importance,
                         quant_format=quant_format,
                         projection=projection,
+                        reconstruct_projection=target.reconstruct_projection,
                     )
                     format_error[quant_format] = measurement.weighted_mse
                     format_bytes[quant_format] = measurement.stored_bytes
@@ -199,7 +203,7 @@ def _measurement_evidence(
                         format_error=format_error,
                         format_bytes=format_bytes,
                         routing_frequency=(
-                            float(counts[expert_id].item()) / float(total_count)
+                            float(count) / float(total_count)
                         ),
                     )
                 )
@@ -232,6 +236,7 @@ def _spectral_measurement_evidence(
                 unit_importance,
                 quant_format=quant_format,
                 projection=spectral_row.projection,
+                reconstruct_projection=targets[spectral_row.module_name].reconstruct_projection,
             )
             format_error[quant_format] = measurement.weighted_mse
             format_bytes[quant_format] = measurement.stored_bytes
@@ -327,6 +332,11 @@ def run_expert_precision_calibration_session(
     targets = _normalize_targets(
         provider.build_expert_precision_calibration_targets(session.trainer.pipeline)
     )
+    for target in targets.values():
+        if target.supported_formats is not None:
+            unsupported = set(formats) - target.supported_formats
+            if unsupported:
+                raise ValueError(f"Expert precision target {target.name!r} does not support {sorted(unsupported)}.")
     protected_fraction = float(
         getattr(
             config.model.params,
@@ -366,28 +376,31 @@ def run_expert_precision_calibration_session(
         else []
     )
 
-    observations: dict[str, ExpertImportanceEvidence] = {}
+    rows: list[TensorPrecisionEvidence] = []
     if gate == "imatrix":
         trainer = session.trainer
         rng = getattr(session, "rng", None)
         rng_state = rng.getstate() if rng is not None else None
-        torch_rng_state = torch.get_rng_state()
-        cuda_rng_state = (
-            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
-        )
-        validation_state = trainer.begin_validation()
+        generators = {
+            generator: generator.get_state()
+            for target in targets.values()
+            for generator in target.replay_generators
+        }
         sampling_context = resolve_step_sampling_context(session)
         build_batch = _build_training_batch_factory(
             session=session,
             sampling_context=sampling_context,
         )
+        validation_state = trainer.begin_validation()
         try:
-            for group in groups:
+            for pass_index, group in enumerate(groups):
                 if rng is not None and rng_state is not None:
                     rng.setstate(rng_state)
-                torch.set_rng_state(torch_rng_state)
-                if cuda_rng_state:
-                    torch.cuda.set_rng_state_all(cuda_rng_state)
+                for generator, state in generators.items():
+                    generator.set_state(state)
+                if pass_index:
+                    trainer.end_validation(validation_state)
+                    validation_state = trainer.begin_validation()
                 accumulators = {
                     target.name: ExpertImportanceAccumulator(
                         num_experts=target.num_experts,
@@ -412,23 +425,23 @@ def run_expert_precision_calibration_session(
                     for target in reversed(attached):
                         target.host.clear_importance_calibration_observer()
                 for target in group:
-                    observations[target.name] = accumulators[target.name].evidence()
-                del accumulators
+                    evidence = accumulators.pop(target.name).evidence(copy=False)
+                    rows.extend(_measurement_evidence(
+                        {target.name: target}, {target.name: evidence}, formats=formats,
+                    ))
+                    del evidence
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         finally:
             if rng is not None and rng_state is not None:
                 rng.setstate(rng_state)
-            torch.set_rng_state(torch_rng_state)
-            if cuda_rng_state:
-                torch.cuda.set_rng_state_all(cuda_rng_state)
+            for generator, state in generators.items():
+                generator.set_state(state)
             trainer.end_validation(validation_state)
 
     resolved_gamma = 0.0
     spectral_alphas: dict[tuple[str, int, str], float] = {}
-    if gate == "imatrix":
-        rows = _measurement_evidence(targets, observations, formats=formats)
-    else:
+    if gate != "imatrix":
         rows, resolved_gamma, spectral_alphas = _spectral_measurement_evidence(
             targets,
             formats=formats,

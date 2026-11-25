@@ -9,7 +9,7 @@ expert. See https://github.com/ggml-org/llama.cpp/tree/master/tools/imatrix.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 try:
     import torch
@@ -90,6 +90,10 @@ class ExpertImportanceCalibrationTarget:
     host: Any
     weights: Mapping[str, Any]
     router_weight: Any | None = None
+    source_weights: Mapping[str, Any] | None = None
+    reconstruct_projection: Callable[[Any, str, str], tuple[Any, int]] | None = None
+    supported_formats: frozenset[str] | None = None
+    replay_generators: tuple[Any, ...] = ()
 
     def validate(self) -> "ExpertImportanceCalibrationTarget":
         if not str(self.name).strip():
@@ -191,17 +195,24 @@ class ExpertImportanceAccumulator:
         self._values[group][index].add_(update)
         self._counts[group][index] += int(flat.shape[0])
 
-    def evidence(self) -> ExpertImportanceEvidence:
+    def evidence(self, *, copy: bool = True) -> ExpertImportanceEvidence:
+        w13 = self._values["w13"]
+        down = self._values["w2"]
+        count_w13 = self._counts["w13"]
+        count_down = self._counts["w2"]
+        if copy:
+            w13, down = w13.clone(), down.clone()
+            count_w13, count_down = count_w13.clone(), count_down.clone()
         return ExpertImportanceEvidence(
             input_sum_squares={
-                "w1": self._values["w13"].clone(),
-                "w2": self._values["w2"].clone(),
-                "w3": self._values["w13"].clone(),
+                "w1": w13,
+                "w2": down,
+                "w3": w13.clone() if copy else w13,
             },
             observation_counts={
-                "w1": self._counts["w13"].clone(),
-                "w2": self._counts["w2"].clone(),
-                "w3": self._counts["w13"].clone(),
+                "w1": count_w13,
+                "w2": count_down,
+                "w3": count_w13.clone() if copy else count_w13,
             },
         ).validate()
 

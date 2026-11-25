@@ -46,6 +46,7 @@ def measure_projection_format(
     quant_format: str,
     projection: str,
     group_sizes: str | int | tuple[int, ...] | None = None,
+    reconstruct_projection: Any | None = None,
 ) -> ProjectionFormatMeasurement:
     """Quantize once and measure diagonal-Hessian output error.
 
@@ -76,7 +77,9 @@ def measure_projection_format(
         raise ValueError(f"Unsupported expert tensor precision format {fmt!r}.")
     if str(projection) not in {"w1", "w2", "w3"}:
         raise ValueError("Projection precision measurement requires w1, w2, or w3.")
-    if fmt == "bf16":
+    if reconstruct_projection is not None:
+        reconstructed, stored_bytes = reconstruct_projection(source, fmt, str(projection))
+    elif fmt == "bf16":
         reconstructed = source.to(torch.bfloat16).to(torch.float32)
         stored_bytes = int(source.numel()) * 2
     else:

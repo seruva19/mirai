@@ -787,6 +787,48 @@ def test_magi2_pruning_remaps_each_head_and_preserves_top_k(tmp_path, criterion)
     assert torch.isfinite(hidden.grad).all()
 
 
+def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path) -> None:
+    from mirai.core.models.magi2_preview.mixed_experts import (
+        build_magi2_precision_calibration_targets,
+        quantize_magi2_mixed_experts,
+    )
+    from mirai.core.moe.calibration.imatrix import ExpertImportanceAccumulator
+    from mirai.core.moe.calibration.precision import allocate_tensor_precision
+    from mirai.core.moe.calibration.router_repair import router_tensor_fingerprint
+    from mirai.core.training.calibration.expert_precision import _measurement_evidence, _source_tensors
+
+    layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32, hidden_size=32,
+                        expert_intermediate_size=24, num_heads=2, num_experts=4, top_k=1)
+    model = _container(layer)
+    targets = build_magi2_precision_calibration_targets(model, blocksize=64)
+    name, target = next(iter(targets.items()))
+    observer = ExpertImportanceAccumulator(
+        num_experts=8, input_dims={"w1": 16, "w2": 24, "w3": 16},
+    )
+    layer.set_importance_calibration_observer(observer)
+    try:
+        inputs = torch.ones(2, 2, 16)
+        layer._torch_forward(inputs, torch.ones(2, 2, 1), torch.zeros(2, 2, 1, dtype=torch.long))
+    finally:
+        layer.clear_importance_calibration_observer()
+    observation = observer.evidence()
+    assert observation.observation_counts["w2"].tolist() == [2, 0, 0, 0, 2, 0, 0, 0]
+    assert _source_tensors(targets, include_router=True)[f"{name}.W_gate"] is layer.W_gate
+    assert target.weights["w2"].shape == (8, 16, 24)
+    rows = _measurement_evidence(targets, {name: observation}, formats=("fp8", "bf16"))
+    assert len(rows) == 24
+    assert any(row.routing_frequency == 0.0 and row.format_bytes["fp8"] > 0 for row in rows)
+    plan = allocate_tensor_precision(
+        rows, budget_bytes=sum(row.format_bytes["fp8"] for row in rows),
+        allowed_formats=("fp8", "bf16"), dataset_snapshot_id="synthetic",
+        model_snapshot_id="synthetic", config_snapshot_id="synthetic",
+        source_weight_fingerprint=router_tensor_fingerprint(_source_tensors(targets, include_router=True)),
+    )
+    path = plan.save(tmp_path / "plan.json")
+    store = quantize_magi2_mixed_experts(model, plan_path=path, base_format="fp8", blocksize=64)[name]
+    assert store.payload_bytes() == plan.estimated_bytes
+
+
 def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tmp_path) -> None:
     import json
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from random import Random
+from types import SimpleNamespace
 import tempfile
 
 from mirai.core.models.compressed_weights.execution.mixed_precision import (
@@ -31,6 +33,71 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     torch = None
     nn = None
+
+
+def test_imatrix_replays_dedicated_generators_with_multiple_passes(tmp_path, monkeypatch) -> None:
+    from mirai.core.training.calibration import expert_precision as calibration
+
+    class Host:
+        observer = None
+
+        def set_importance_calibration_observer(self, observer):
+            self.observer = observer
+
+        def clear_importance_calibration_observer(self):
+            self.observer = None
+
+    hosts = {"first": Host(), "second": Host()}
+    audio = torch.Generator().manual_seed(17)
+    sampler = torch.Generator().manual_seed(19)
+    rng = Random(23)
+    states = (audio.get_state(), sampler.get_state(), rng.getstate())
+    targets = {
+        name: ExpertImportanceCalibrationTarget(
+            name, host, {key: torch.ones(2, 2, 2) for key in ("w1", "w2", "w3")},
+            replay_generators=(audio,),
+        )
+        for name, host in hosts.items()
+    }
+    seen = {name: [] for name in targets}
+
+    def compute_loss(batch, *, training):
+        row = torch.rand((1, 2), generator=audio) + torch.rand((1, 2), generator=sampler) + batch
+        for name, host in hosts.items():
+            if host.observer is not None:
+                seen[name].append(row)
+                host.observer.record(0, ("w1", "w3"), row)
+                host.observer.record(0, "w2", row)
+
+    trainer = SimpleNamespace(
+        pipeline=None, begin_validation=sampler.get_state, end_validation=sampler.set_state,
+        compute_loss=compute_loss,
+    )
+    session = SimpleNamespace(
+        trainer=trainer, rng=rng,
+        config=SimpleNamespace(
+            model=SimpleNamespace(type="fixture", params=SimpleNamespace(expert_precision_calibration="imatrix")),
+            memory=SimpleNamespace(frozen_weight_quantization="none", frozen_weight_packed_state_path="", expert_precision_plan_path=""),
+        ),
+        manifest=SimpleNamespace(dataset_snapshot_id="fixture", model_snapshot_id="fixture", config_snapshot_id="fixture"),
+    )
+    provider = SimpleNamespace(
+        supports_expert_precision_calibration=lambda _: True,
+        build_expert_precision_calibration_targets=lambda _: targets,
+    )
+    monkeypatch.setattr(calibration, "get_model_family_provider", lambda _: provider)
+    monkeypatch.setattr(calibration, "resolve_step_sampling_context", lambda _: None)
+    monkeypatch.setattr(calibration, "_build_training_batch_factory", lambda **_: lambda step: rng.random())
+    report = calibration.run_expert_precision_calibration_session(
+        session, output_path=tmp_path / "plan.json", calibration_steps=2,
+        max_accumulator_gib=targets["first"].accumulator_bytes / (1024**3),
+        budget_bytes=512, allowed_formats=("bf16",),
+    )
+    assert report.passes == 2
+    torch.testing.assert_close(torch.stack(seen["first"]), torch.stack(seen["second"]), rtol=0, atol=0)
+    assert torch.equal(audio.get_state(), states[0])
+    assert torch.equal(sampler.get_state(), states[1])
+    assert rng.getstate() == states[2]
 
 
 def test_importance_accumulator_separates_experts_and_projection_inputs() -> None:

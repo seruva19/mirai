@@ -584,6 +584,9 @@ class ModelFamilyProvider:
         _ = pipeline
         return {}
 
+    def expert_precision_candidate_formats(self) -> tuple[str, ...] | None:
+        return None
+
     def supports_routing_mode_agreement_evidence(
         self, cfg: "TrainingConfig | None" = None
     ) -> bool:

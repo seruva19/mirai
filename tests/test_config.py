@@ -1775,6 +1775,12 @@ class ConfigTests(unittest.TestCase):
             )
 
     def test_expert_precision_calibration_config_contract(self) -> None:
+        spectral = load_config(self._write("""
+            [model.params]
+            expert_precision_calibration = "alphaq"
+            expert_precision_alphaq_gamma = 0.5
+            """))
+        self.assertEqual(spectral.model.params.expert_precision_alphaq_gamma, 0.5)
         collection = load_config(
             self._write(
                 """

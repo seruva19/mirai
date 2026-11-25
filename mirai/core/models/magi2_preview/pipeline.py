@@ -1974,6 +1974,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             strict_native_assets_by_default=True,
             batched_cfg_inference=True,
             paired_cfg_inference=True,
+            expert_precision_calibration=True,
             # Raw media is encoded by the family-owned Qwen3.5/Wan2.2 encoder
             # returned from build_native_cache_encoder(); no generic pixel
             # projection is a valid MAGI-2 latent.
@@ -1983,6 +1984,17 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             dataset_caption_formats=("raw",),
             pipeline_type=Magi2PreviewPipeline,
         )
+
+    def build_expert_precision_calibration_targets(self, pipeline: Any):
+        from mirai.core.models.magi2_preview.mixed_experts import build_magi2_precision_calibration_targets
+
+        return build_magi2_precision_calibration_targets(
+            pipeline.transformer, blocksize=pipeline._nf4_blocksize,
+            audio_noise_generator=pipeline._audio_noise_generator,
+        )
+
+    def expert_precision_candidate_formats(self) -> tuple[str, ...]:
+        return (*MAGI2_PACKED_EXPERT_FORMATS, "bf16")
 
     def validate_family_params(self, params: dict[str, Any]) -> list[str]:
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)

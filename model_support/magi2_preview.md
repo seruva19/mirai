@@ -751,6 +751,15 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   exporter saves the resolved assignments and plan lineage as a version 5
   artifact. Restore it with the same base quantization setting and
   `memory.frozen_weight_packed_state_path`, with the plan path unset.
+  Generate a plan with `scripts/tools/calibrate_expert_precision.py` on a
+  dense checkpoint. Select `model.params.expert_precision_calibration =
+  "imatrix"` for routed activation measurements or `"alphaq"` for spectral
+  ranking. Pass an explicit candidate list such as
+  `--formats gguf_iq2,gguf_iq3,nvfp4,fp8,bf16`. Imatrix calibration uses the
+  reference expert loop and estimates unobserved groups from pooled layer
+  statistics. Router-norm protection also binds the plan to the router weights.
+  NF4 estimates include a codebook allowance per group. Packed groups in a
+  format bucket share the stored codebooks.
 - **Additional MAGI-2 packed expert formats** — Experimental IQ2, IQ3, FP8,
   and NVFP4 storage for frozen routed experts. These formats use version 4
   packed artifacts and the same segmented dequantization and frozen-weight

@@ -2770,6 +2770,7 @@ class CoreMultiHeadMoE(nn.Module):
         topk_probs: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
+        observer = getattr(self, "_mirai_importance_observer", None)
         output = torch.zeros_like(x_heads)
         for head in range(int(x_heads.shape[1])):
             head_input = x_heads[:, head]
@@ -2786,7 +2787,11 @@ class CoreMultiHeadMoE(nn.Module):
                 gate = gate.float().clamp(max=7.0)
                 up = up.float().clamp(min=-7.0, max=7.0)
                 hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
-                expert_output = hidden.to(self.W_down.dtype) @ self.W_down[flat_expert]
+                down_input = hidden.to(self.W_down.dtype)
+                if observer is not None:
+                    observer.record(flat_expert, ("w1", "w3"), values)
+                    observer.record(flat_expert, "w2", down_input)
+                expert_output = down_input @ self.W_down[flat_expert]
                 weights = topk_probs[head, token_indices, slots].to(expert_output.dtype)
                 head_output.index_add_(0, token_indices, expert_output * weights[:, None])
             output[:, head] = head_output
@@ -2815,7 +2820,9 @@ class CoreMultiHeadMoE(nn.Module):
             # when no backend is attached, and it needs CUDA and no autograd
             # graph; otherwise the vendored per-expert loop is the reference.
             kernel_backend = self._mirai_moe_kernel_backend
-            if kernel_backend is not None:
+            if getattr(self, "_mirai_importance_observer", None) is not None:
+                out = self._torch_forward(x_heads, topk_probs, topk_indices)
+            elif kernel_backend is not None:
                 out = kernel_backend.execute(self, x_heads, topk_probs, topk_indices)
             else:
                 out = self._native_expert_forward(x_heads, topk_probs, topk_indices)
@@ -2834,6 +2841,12 @@ class CoreMultiHeadMoE(nn.Module):
         if getattr(self, "_mirai_experts_pruned", False) or torch.is_grad_enabled() or x_heads.device.type != "cuda":
             return self._torch_forward(x_heads, topk_probs, topk_indices)
         return self._flash_forward(x_heads, topk_probs, topk_indices)
+
+    def set_importance_calibration_observer(self, observer) -> None:
+        self._mirai_importance_observer = observer
+
+    def clear_importance_calibration_observer(self) -> None:
+        self._mirai_importance_observer = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return magi2_mh_moe(x, self._moe_key)

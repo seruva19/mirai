@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from functools import partial
 import json
 from math import prod
 
@@ -23,6 +24,39 @@ from .quantized_experts import (
 
 _PLAN_PROJECTIONS = {"w1": "W_gate", "w2": "W_down", "w3": "W_up"}
 _SUPPORTED_FORMATS = {*MAGI2_PACKED_EXPERT_FORMATS, "bf16"}
+
+
+def _reconstruct_projection(source, quant_format, projection, *, blocksize):
+    if quant_format == "bf16":
+        return source.to(torch.bfloat16), source.numel() * 2
+    if quant_format not in MAGI2_PACKED_EXPERT_FORMATS:
+        raise ValueError(f"MAGI-2 mixed precision does not support {quant_format!r}.")
+    key = _PLAN_PROJECTIONS[projection]
+    store = _new_expert_store(num_groups=1, blocksize=blocksize, quant_format=quant_format)
+    store.quantize_dense(key, source.transpose(0, 1).contiguous().unsqueeze(0))
+    restored = store.materialize_segment(key, 0, 1, dtype=torch.float32, device=source.device)
+    return restored[0].transpose(0, 1), store.payload_bytes()
+
+
+def build_magi2_precision_calibration_targets(transformer, *, blocksize, audio_noise_generator=None):
+    from mirai.core.moe.calibration.imatrix import ExpertImportanceCalibrationTarget
+
+    targets = {}
+    for name, layer in iter_magi2_moe_layers(transformer):
+        if layer.ep_size != 1 or any(key not in layer._parameters for key in _PLAN_PROJECTIONS.values()):
+            raise ValueError("MAGI-2 precision calibration requires dense single-device expert weights.")
+        native = {key: getattr(layer, key) for key in _PLAN_PROJECTIONS.values()}
+        targets[name] = ExpertImportanceCalibrationTarget(
+            name=name,
+            host=layer,
+            weights={role: native[key].transpose(-1, -2) for role, key in _PLAN_PROJECTIONS.items()},
+            router_weight=layer.gate,
+            source_weights=native,
+            reconstruct_projection=partial(_reconstruct_projection, blocksize=blocksize),
+            supported_formats=frozenset(_SUPPORTED_FORMATS),
+            replay_generators=(audio_noise_generator,) if audio_noise_generator is not None else (),
+        ).validate()
+    return targets
 
 
 class _Bf16Groups(nn.Module):
@@ -221,7 +255,9 @@ def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksi
                 raise ValueError(f"MAGI-2 precision plan requires frozen weights: {name}.{key}.")
             source_tensors[f"{name}.{key}"] = source
     if router_tensor_fingerprint(source_tensors) != plan.source_weight_fingerprint:
-        raise ValueError("MAGI-2 precision plan does not match the source-weight fingerprint.")
+        source_tensors.update({f"{name}.router": layer.gate for name, layer in layers.items()})
+        if router_tensor_fingerprint(source_tensors) != plan.source_weight_fingerprint:
+            raise ValueError("MAGI-2 precision plan does not match the source-weight fingerprint.")
     del source_tensors
     plan_payload = plan.to_dict()
     lineage = {key: value for key, value in plan_payload.items() if key.endswith("_snapshot_id") or key == "source_weight_fingerprint"}
