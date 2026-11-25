@@ -222,8 +222,6 @@ configuration and compatibility rules are documented in
   checkpoint-bound stochastic few-step sampling where declared by a provider.
 - **Classifier-free guidance** — Sequential execution and a capability-gated
   batched path with explicit variable-length prefix masks.
-- **Paired MAGI-2 Preview CFG** — Experimental per-layer execution of separate
-  conditional and unconditional batches with shared weight residency.
 - **Batch inference sessions** — Per-request negative prompts, seeds, FPS, and
   decoding of saved latent outputs.
 - **Conditioned inference** — Provider-owned T2I, text-plus-image-to-video, and

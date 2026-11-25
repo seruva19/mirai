@@ -708,6 +708,9 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 
 ## Model-specific features
 
+- **Paired MAGI-2 Preview CFG** — Experimental per-layer execution of separate
+  conditional and unconditional batches with shared weight residency.
+
 - **MAGI-2 Preview single-GPU adapter training** — Adapter-only optimization
   with native preview-transformer weights and gradients.
   [(repo)](https://github.com/SandAI-org/MAGI-2-preview)
