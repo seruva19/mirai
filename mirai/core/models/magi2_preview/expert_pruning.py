@@ -10,8 +10,10 @@ from pathlib import Path
 import torch
 from torch import nn
 
+from mirai.core.moe.calibration.projection import ExpertProjectionSpec
 from mirai.core.moe.calibration.pruning import (
     ExpertPruningCalibrationTarget,
+    aimer_expert_scores,
     normalize_expert_pruning_criterion,
     select_pruned_experts,
 )
@@ -25,21 +27,49 @@ _PARAMETERS = ("gate", *MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
 _ROUTER_BUFFERS = ("expert_bias", "expert_bias_ema")
 
 
-def build_magi2_pruning_calibration_targets(
-    transformer: nn.Module,
-) -> dict[str, ExpertPruningCalibrationTarget]:
-    targets = {}
-    for name, layer in iter_magi2_moe_layers(transformer):
+def _dense_pruning_layers(transformer: nn.Module) -> dict[str, nn.Module]:
+    layers = dict(iter_magi2_moe_layers(transformer))
+    for layer in layers.values():
         if (
             layer.ep_size != 1
             or getattr(layer, "_mirai_experts_pruned", False)
             or any(layer._parameters.get(key) is None for key in _PARAMETERS)
         ):
-            raise ValueError("MAGI-2 pruning calibration requires native dense single-device experts.")
-        targets[name] = ExpertPruningCalibrationTarget(
+            raise ValueError("MAGI-2 pruning requires native dense single-device experts.")
+    return layers
+
+
+def build_magi2_pruning_calibration_targets(
+    transformer: nn.Module,
+) -> dict[str, ExpertPruningCalibrationTarget]:
+    return {
+        name: ExpertPruningCalibrationTarget(
             name, layer, layer.num_heads * layer.num_experts,
         )
-    return targets
+        for name, layer in _dense_pruning_layers(transformer).items()
+    }
+
+
+@dataclass(frozen=True)
+class _DenseMagi2ExpertProjections:
+    layer: nn.Module
+
+    @property
+    def num_experts(self) -> int:
+        return self.layer.num_heads * self.layer.num_experts
+
+    def prototype_projection_specs(self) -> tuple[ExpertProjectionSpec, ...]:
+        return tuple(
+            ExpertProjectionSpec(name, tuple(getattr(self.layer, name).shape[1:]))
+            for name in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+        )
+
+    def load_prototype_projection_block(
+        self, projection_name: str, start_expert: int, stop_expert: int, *,
+        device: torch.device, dtype: torch.dtype,
+    ) -> torch.Tensor:
+        weight = getattr(self.layer, projection_name).detach()
+        return weight[start_expert:stop_expert].to(device=device, dtype=dtype)
 
 
 @dataclass(frozen=True)
@@ -128,6 +158,23 @@ def build_magi2_diet_pruning_plan(
         raise ValueError("MAGI-2 DIET survivors must identify routed layers.")
     fingerprint = _source_fingerprint({name: layers[name] for name in kept_by_head})
     return Magi2ExpertPruningPlan("diet", fingerprint, dict(kept_by_head))
+
+
+def build_magi2_aimer_pruning_plan(
+    transformer: nn.Module, *, keep_fraction: float,
+    max_block_elements: int = 4_194_304, device: str | torch.device = "cpu",
+) -> Magi2ExpertPruningPlan:
+    """Score dense expert projections in bounded blocks before head-local pruning."""
+    scores = {
+        name: aimer_expert_scores(
+            _DenseMagi2ExpertProjections(layer),
+            max_block_elements=max_block_elements, device=device,
+        ).scores
+        for name, layer in _dense_pruning_layers(transformer).items()
+    }
+    return build_magi2_expert_pruning_plan(
+        transformer, scores, criterion="aimer", keep_fraction=keep_fraction,
+    )
 
 
 def _validated_pruning_source(transformer: nn.Module, plan: Magi2ExpertPruningPlan):

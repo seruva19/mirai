@@ -3165,7 +3165,8 @@
       "symbols": [
         "apply_magi2_expert_pruning",
         "verify_magi2_pruning_source",
-        "build_magi2_pruning_calibration_targets"
+        "build_magi2_pruning_calibration_targets",
+        "build_magi2_aimer_pruning_plan"
       ],
       "config_keys": [
         "model.params.family_params"

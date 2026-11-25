@@ -788,6 +788,29 @@ def test_magi2_pruning_remaps_each_head_and_preserves_top_k(tmp_path, criterion)
     assert torch.isfinite(hidden.grad).all()
 
 
+def test_aimer_pruning_ranks_dense_projections_within_each_head() -> None:
+    from mirai.core.models.magi2_preview.expert_pruning import (
+        build_magi2_aimer_pruning_plan, verify_magi2_pruning_source,
+    )
+
+    layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    transformer = _container(layer)
+    nonzeros = (1, 2, 4, 8, 8, 4, 2, 1)
+    with torch.no_grad():
+        for weight in (layer.W_gate, layer.W_up, layer.W_down):
+            weight.zero_()
+            for group, count in enumerate(nonzeros):
+                weight[group].view(-1)[:count] = 1
+    plan = build_magi2_aimer_pruning_plan(transformer, keep_fraction=0.5, max_block_elements=1)
+    assert plan.criterion == "aimer"
+    assert plan.kept_by_head == {"mlp.moe_mlp": ((0, 1), (2, 3))}
+    assert verify_magi2_pruning_source(transformer, plan) == plan.topology_digest()
+    with torch.no_grad():
+        layer.W_down[0, 0, 0] = 2
+    with pytest.raises(ValueError, match="fingerprint"):
+        verify_magi2_pruning_source(transformer, plan)
+
+
 def test_pruning_calibration_keeps_head_local_route_ids(monkeypatch) -> None:
     from mirai.core.models.magi2_preview.expert_pruning import (
         build_magi2_expert_pruning_plan, build_magi2_pruning_calibration_targets,
