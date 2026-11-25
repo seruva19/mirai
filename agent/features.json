@@ -3082,6 +3082,40 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_mixed_expert_precision",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/magi2_preview/mixed_experts.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "Magi2MixedExpertStore"
+      ],
+      "config_keys": [
+        "memory.expert_precision_plan_path"
+      ],
+      "disabled_config": {
+        "memory.expert_precision_plan_path": ""
+      },
+      "contract_paths": [
+        "tests/test_magi2_nf4_experts.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Mixed MAGI-2 expert precision",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_nf4_routed_experts",
       "kind": "compressed_weight",
       "owner": "mirai/core/models/magi2_preview/quantized_experts.py",

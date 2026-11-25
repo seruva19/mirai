@@ -273,10 +273,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._packed_expert_state_path = str(
             getattr(memory_config, "frozen_weight_packed_state_path", "") or ""
         ).strip()
+        if str(getattr(memory_config, "expert_precision_plan_path", "") or "").strip() and (
+            self._quantize_experts_on_load or self._packed_expert_state_path
+        ):
+            raise ValueError("MAGI-2 mixed precision requires dense checkpoint loading.")
         self._nf4_blocksize = int(
             getattr(memory_config, "quantization_block_size", MAGI2_NF4_BLOCKSIZE)
         )
         self._expert_stores: dict[str, Magi2Nf4ExpertStore] = {}
+        self._applied_expert_precision_plan = ""
         self._moe_optimization_policy = MoEOptimizationPolicy()
         self._moe_token_chunk_policy: Any | None = None
         # Armed only by inference.expert_feature_cache; None keeps the MoE seam
@@ -931,6 +936,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 "'compressed_weights'."
             )
         block_size = int(kwargs.pop("block_size", self._nf4_blocksize))
+        precision_plan_path = str(kwargs.pop("precision_plan_path", "") or "").strip()
         if kwargs:
             raise ValueError(
                 "Unsupported MAGI-2 frozen-weight quantization options: "
@@ -941,7 +947,24 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("MAGI-2 expert storage already contains a different packed format.")
         self._frozen_weight_quantization = scheme
         self._nf4_blocksize = block_size
-        if not self.has_quantized_frozen_weights():
+        if precision_plan_path:
+            from mirai.core.models.magi2_preview.mixed_experts import (
+                Magi2MixedExpertStore,
+                quantize_magi2_mixed_experts,
+            )
+
+            if not self.has_quantized_frozen_weights():
+                self._expert_stores = quantize_magi2_mixed_experts(
+                    self.transformer, plan_path=precision_plan_path, base_format=scheme,
+                    blocksize=block_size,
+                )
+            elif (
+                self._applied_expert_precision_plan != precision_plan_path
+                or not all(isinstance(store, Magi2MixedExpertStore) for store in self._expert_stores.values())
+            ):
+                raise ValueError("A MAGI-2 precision plan cannot replace an existing packed store.")
+            self._applied_expert_precision_plan = precision_plan_path
+        elif not self.has_quantized_frozen_weights():
             from mirai.core.models.magi2_preview.quantized_experts import (
                 quantize_magi2_experts_in_place,
             )
@@ -961,6 +984,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return {
             "strategy": "compressed_weights",
             "quant_format": stores[0].quant_format,
+            "mixed_precision": bool(getattr(self, "_applied_expert_precision_plan", "")),
             "linear_modules": 0,
             "grouped_expert_modules": len(stores),
             "quantized_tensors": sum(

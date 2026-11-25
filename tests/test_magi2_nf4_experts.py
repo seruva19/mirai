@@ -722,6 +722,43 @@ def _dense_from_store(store: Magi2Nf4ExpertStore, key: str) -> torch.Tensor:
     )
 
 
+def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tmp_path) -> None:
+    import json
+
+    from mirai.core.models.magi2_preview.mixed_experts import quantize_magi2_mixed_experts
+    from mirai.core.moe.calibration.precision import TensorPrecisionAssignment, TensorPrecisionPlan
+    from mirai.core.moe.calibration.router_repair import router_tensor_fingerprint
+
+    layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
+                        expert_intermediate_size=16, num_heads=1, num_experts=3, top_k=1)
+    model = _container(layer)
+    module_name = "mlp.moe_mlp"
+    weights = {key: getattr(layer, key).detach().clone() for key in ("W_gate", "W_up", "W_down")}
+    assignments = tuple(
+        TensorPrecisionAssignment(module_name, group, role, fmt, 1, 0.0)
+        for group, fmt in enumerate(("nvfp4", "bf16", "fp8"))
+        for role in ("w1", "w2", "w3")
+    )
+    plan = TensorPrecisionPlan(
+        2, assignments, 9, 0.0, 9, "dataset", "model", "config", "wrong",
+    )
+    path = tmp_path / "precision.json"
+    path.write_text(json.dumps(plan.to_dict()))
+    with pytest.raises(ValueError, match="fingerprint"):
+        quantize_magi2_mixed_experts(model, plan_path=path, base_format="fp8", blocksize=64)
+    assert hasattr(layer, "W_gate")
+    fingerprint = router_tensor_fingerprint({f"{module_name}.{key}": value for key, value in weights.items()})
+    path.write_text(json.dumps(dataclasses.replace(plan, source_weight_fingerprint=fingerprint).to_dict()))
+    store = quantize_magi2_mixed_experts(model, plan_path=path, base_format="fp8", blocksize=64)[module_name]
+    kwargs = dict(dtype=torch.float32, device=torch.device("cpu"))
+    whole = store.materialize_segment("W_gate", 0, 3, **kwargs)
+    torch.testing.assert_close(whole[1], weights["W_gate"][1].bfloat16().float(), rtol=0, atol=0)
+    selection = torch.tensor([2, 0, 2])
+    selected = store.materialize_segment("W_gate", 0, 3, group_ids=selection, **kwargs)
+    torch.testing.assert_close(selected, whole[selection], rtol=0, atol=0)
+    assert not hasattr(layer, "W_gate")
+
+
 @pytest.mark.parametrize("fmt", ["gguf_iq2", "gguf_iq3", "fp8", "nvfp4"])
 def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -> None:
     def model():
