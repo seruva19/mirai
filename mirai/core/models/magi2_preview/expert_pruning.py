@@ -17,7 +17,10 @@ from mirai.core.moe.calibration.pruning import (
     normalize_expert_pruning_criterion,
     select_pruned_experts,
 )
-from mirai.core.moe.calibration.router_repair import router_tensor_fingerprint
+from mirai.core.moe.calibration.router_repair import (
+    router_tensor_fingerprint,
+    update_router_tensor_fingerprints,
+)
 
 from .quantized_experts import MAGI2_ROUTED_EXPERT_TENSOR_NAMES, iter_magi2_moe_layers
 
@@ -70,6 +73,24 @@ class _DenseMagi2ExpertProjections:
     ) -> torch.Tensor:
         weight = getattr(self.layer, projection_name).detach()
         return weight[start_expert:stop_expert].to(device=device, dtype=dtype)
+
+
+@dataclass(frozen=True)
+class _ShardMagi2ExpertProjections(_DenseMagi2ExpertProjections):
+    name: str
+    weight_map: dict[str, str]
+
+    def load_prototype_projection_block(
+        self, projection_name: str, start_expert: int, stop_expert: int, *,
+        device: torch.device, dtype: torch.dtype,
+    ) -> torch.Tensor:
+        from safetensors import safe_open
+
+        key = f"{self.name}.{projection_name}"
+        target = getattr(self.layer, projection_name)
+        with safe_open(self.weight_map[key], framework="pt", device="cpu") as shard:
+            block = shard.get_slice(key)[start_expert:stop_expert]
+        return block.to(dtype=target.dtype).to(device=device, dtype=dtype)
 
 
 @dataclass(frozen=True)
@@ -134,6 +155,11 @@ def build_magi2_expert_pruning_plan(
     layers = dict(iter_magi2_moe_layers(transformer))
     if not scores or set(scores) - set(layers):
         raise ValueError("MAGI-2 pruning scores must identify routed layers.")
+    kept = _select_head_local_experts(layers, scores, criterion=criterion, keep_fraction=keep_fraction)
+    return Magi2ExpertPruningPlan(criterion, _source_fingerprint({name: layers[name] for name in kept}), kept)
+
+
+def _select_head_local_experts(layers, scores, *, criterion, keep_fraction):
     kept = {}
     for name, values in scores.items():
         layer = layers[name]
@@ -146,7 +172,7 @@ def build_magi2_expert_pruning_plan(
             keep_fraction=keep_fraction, top_k=layer.topk, keep_largest=criterion != "aimer",
         )
         kept[name] = tuple(selected[str(index)] for index in range(layer.num_heads))
-    return Magi2ExpertPruningPlan(criterion, _source_fingerprint({name: layers[name] for name in kept}), kept)
+    return kept
 
 
 def build_magi2_diet_pruning_plan(
@@ -175,6 +201,51 @@ def build_magi2_aimer_pruning_plan(
     return build_magi2_expert_pruning_plan(
         transformer, scores, criterion="aimer", keep_fraction=keep_fraction,
     )
+
+
+def build_magi2_aimer_pruning_plan_from_shards(
+    transformer: nn.Module, checkpoint_dir: str | Path, *, keep_fraction: float,
+    max_block_elements: int = 4_194_304, device: str | torch.device = "cpu",
+) -> Magi2ExpertPruningPlan:
+    """Score checkpoint shards using the shapes and dtypes of a native model skeleton."""
+    from safetensors import safe_open
+
+    from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import read_safetensors_weight_map
+
+    layers = _dense_pruning_layers(transformer)
+    if not layers:
+        raise ValueError("MAGI-2 AIMER requires routed layers.")
+    weight_map = read_safetensors_weight_map(str(checkpoint_dir))
+    inputs = {}
+    for name, layer in layers.items():
+        for key in _PARAMETERS:
+            qualified = f"{name}.{key}"
+            inputs[qualified] = (qualified, getattr(layer, key))
+        for key in _ROUTER_BUFFERS:
+            qualified = f"{name}.router.{key}"
+            inputs[qualified] = (f"{name}.router.expert_bias_ema", getattr(layer.router, key))
+    required = set(inputs) | {key for key, _ in inputs.values()}
+    missing = sorted(required - weight_map.keys())
+    if missing:
+        raise ValueError(f"MAGI-2 checkpoint is missing AIMER source tensors: {missing[:4]}.")
+
+    source = hashlib.sha256()
+    for key, (checkpoint_key, target) in sorted(inputs.items()):
+        with safe_open(weight_map[checkpoint_key], framework="pt", device="cpu") as shard:
+            value = shard.get_tensor(checkpoint_key)
+            if value.shape != target.shape or not value.is_floating_point():
+                raise ValueError(f"MAGI-2 AIMER source tensor {checkpoint_key!r} has incompatible shape or dtype.")
+            update_router_tensor_fingerprints((source,), key, value.to(dtype=target.dtype))
+            del value
+    scores = {
+        name: aimer_expert_scores(
+            _ShardMagi2ExpertProjections(layer, name, weight_map),
+            max_block_elements=max_block_elements, device=device,
+        ).scores
+        for name, layer in layers.items()
+    }
+    kept = _select_head_local_experts(layers, scores, criterion="aimer", keep_fraction=keep_fraction)
+    return Magi2ExpertPruningPlan("aimer", f"sha256:{source.hexdigest()}", kept)
 
 
 def _validated_pruning_source(transformer: nn.Module, plan: Magi2ExpertPruningPlan):

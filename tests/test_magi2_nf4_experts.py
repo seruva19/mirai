@@ -788,9 +788,15 @@ def test_magi2_pruning_remaps_each_head_and_preserves_top_k(tmp_path, criterion)
     assert torch.isfinite(hidden.grad).all()
 
 
-def test_aimer_pruning_ranks_dense_projections_within_each_head() -> None:
+def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> None:
+    from copy import deepcopy
+    import json
+
+    from safetensors.torch import save_file
+
     from mirai.core.models.magi2_preview.expert_pruning import (
-        build_magi2_aimer_pruning_plan, verify_magi2_pruning_source,
+        build_magi2_aimer_pruning_plan, build_magi2_aimer_pruning_plan_from_shards,
+        verify_magi2_pruning_source,
     )
 
     layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
@@ -801,7 +807,24 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head() -> None:
             weight.zero_()
             for group, count in enumerate(nonzeros):
                 weight[group].view(-1)[:count] = 1
+        layer.router.expert_bias.fill_(-2)
+        layer.router.expert_bias_ema.fill_(3)
+    tensors = transformer.state_dict()
+    save_file({key: value.double() for key, value in tensors.items() if key.endswith("W_up")},
+              str(tmp_path / "a.safetensors"))
+    save_file({key: value for key, value in tensors.items() if not key.endswith("W_up")},
+              str(tmp_path / "b.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {key: "a.safetensors" if key.endswith("W_up") else "b.safetensors" for key in tensors},
+    }), encoding="utf-8")
+    skeleton = deepcopy(transformer).to("meta")
+    with torch.no_grad():
+        layer.router.expert_bias.copy_(layer.router.expert_bias_ema)
     plan = build_magi2_aimer_pruning_plan(transformer, keep_fraction=0.5, max_block_elements=1)
+    sharded = build_magi2_aimer_pruning_plan_from_shards(
+        skeleton, tmp_path, keep_fraction=0.5, max_block_elements=1,
+    )
+    assert sharded == plan
     assert plan.criterion == "aimer"
     assert plan.kept_by_head == {"mlp.moe_mlp": ((0, 1), (2, 3))}
     assert verify_magi2_pruning_source(transformer, plan) == plan.topology_digest()

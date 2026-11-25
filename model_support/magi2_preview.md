@@ -766,6 +766,9 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   on the loaded dense source transformer. It computes scores from the three
   expert projections in blocks and ranks the experts independently in each
   head. AIMER requires no calibration dataset.
+  Use `build_magi2_aimer_pruning_plan_from_shards(transformer, checkpoint_dir, keep_fraction=...)`
+  with a matching native transformer skeleton on the meta device to score
+  a sharded safetensors checkpoint directly.
   To collect REAP scores on a training dataset, use
   `python scripts/tools/calibrate_expert_pruning.py --config <config> --output <scores.safetensors> --steps <count>`
   with `model.params.expert_pruning="prune"`,
