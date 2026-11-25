@@ -42,6 +42,7 @@ are ``[1, tokens, heads_kv, head_dim]``, packed across samples and delimited by
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -83,6 +84,38 @@ def _sink_log_denominator(sink: torch.Tensor, *, heads: int) -> torch.Tensor:
     return torch.logsumexp(sink.float(), dim=0)
 
 
+@lru_cache(maxsize=16)
+def _document_block_mask(
+    query_offsets: tuple[int, ...],
+    key_offsets: tuple[int, ...],
+    query_tokens: int,
+    key_tokens: int,
+    device: torch.device,
+    compile_mask: bool,
+    stream: torch.cuda.Stream | None,
+) -> Any:
+    for offsets, tokens in ((query_offsets, query_tokens), (key_offsets, key_tokens)):
+        if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != tokens:
+            raise ValueError(
+                "Packed cumulative sequence lengths must start at 0 and end at the token count."
+            )
+        if any(left > right for left, right in zip(offsets, offsets[1:])):
+            raise ValueError("Packed cumulative sequence lengths must be nondecreasing.")
+    if len(query_offsets) == len(key_offsets) == 2:
+        return None
+
+    # Match the producing stream on cache hits, and share across grad modes.
+    with torch.inference_mode(False):
+        return flex_document_block_mask(
+            torch.tensor(query_offsets, dtype=torch.int64, device=device),
+            torch.tensor(key_offsets, dtype=torch.int64, device=device),
+            query_tokens=query_tokens,
+            key_tokens=key_tokens,
+            device=device,
+            compile_mask=compile_mask,
+        )
+
+
 def flex_varlen_attention_with_sink(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -113,13 +146,22 @@ def flex_varlen_attention_with_sink(
     if compile_block_mask is None:
         compile_block_mask = device.type == "cuda"
 
-    block_mask = flex_document_block_mask(
-        cu_seqlens_q,
-        cu_seqlens_k,
-        query_tokens=int(q.shape[0]),
-        key_tokens=int(k.shape[0]),
-        device=device,
-        compile_mask=bool(compile_block_mask),
+    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
+        raise ValueError("Packed cumulative sequence lengths must be one-dimensional.")
+    query_offsets = tuple(cu_seqlens_q.to(dtype=torch.int64).tolist())
+    key_offsets = (
+        query_offsets
+        if cu_seqlens_q is cu_seqlens_k
+        else tuple(cu_seqlens_k.to(dtype=torch.int64).tolist())
+    )
+    block_mask = _document_block_mask(
+        query_offsets,
+        key_offsets,
+        int(q.shape[0]),
+        int(k.shape[0]),
+        device,
+        bool(compile_block_mask),
+        torch.cuda.current_stream(device) if device.type == "cuda" else None,
     )
 
     score_mod = None

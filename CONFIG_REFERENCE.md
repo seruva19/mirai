@@ -142,8 +142,10 @@ backend; `flash3` and `flash4` require the official optional packages and
 compatible CUDA capability. `flex` selects PyTorch FlexAttention, which has a
 backward pass and therefore serves training as well as inference; packed
 variable-length execution builds a document block mask so samples stay
-isolated, and MAGI-2 additionally reproduces its per-head attention sinks on
-that path ([`flex_attention.py`](mirai/core/models/magi2_preview/flex_attention.py)).
+isolated. MAGI-2 retains its per-head attention sinks, reuses document masks
+for matching packed layouts, and omits the document mask when one document
+covers all query and key tokens
+([`flex_attention.py`](mirai/core/models/magi2_preview/flex_attention.py)).
 Explicit backends accept maskless attention only and fail rather than silently
 falling back.
 

@@ -17,6 +17,7 @@ from mirai.core.models.attention_backends import (
     flex_document_ids,
     normalize_attention_backend,
 )
+from mirai.core.models.magi2_preview import flex_attention as flex_module
 from mirai.core.models.magi2_preview.flex_attention import (
     Magi2FlexAttentionBackend,
     Magi2FlexAttentionUnsupported,
@@ -60,23 +61,24 @@ def _cloned(tensors: tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
 
 @pytest.mark.parametrize("sink_tokens", (1, 2))
 @pytest.mark.parametrize("softcap", (-1.0, 8.0))
+@pytest.mark.parametrize("offsets", (CU_SEQLENS, torch.tensor([0, 12])))
 def test_flex_matches_reference_outputs_and_every_gradient(
-    softcap: float, sink_tokens: int
+    softcap: float, sink_tokens: int, offsets: torch.Tensor
 ) -> None:
     inputs = _packed_inputs(sink_tokens=sink_tokens)
     references = _cloned(inputs)
 
     observed = flex_varlen_attention_with_sink(
         *inputs[:3],
-        cu_seqlens_q=CU_SEQLENS,
-        cu_seqlens_k=CU_SEQLENS,
+        cu_seqlens_q=offsets,
+        cu_seqlens_k=offsets,
         softcap=softcap,
         sink=inputs[3],
     )
     expected = _torch_varlen_attention_with_sink(
         *references[:3],
-        cu_seqlens_q=CU_SEQLENS,
-        cu_seqlens_k=CU_SEQLENS,
+        cu_seqlens_q=offsets,
+        cu_seqlens_k=offsets,
         softcap=softcap,
         sink=references[3],
     )
@@ -87,6 +89,31 @@ def test_flex_matches_reference_outputs_and_every_gradient(
     for name, value, reference in zip("qkvs", inputs, references):
         assert value.grad is not None, f"{name} received no gradient"
         torch.testing.assert_close(value.grad, reference.grad, rtol=1e-5, atol=1e-5)
+
+
+def test_document_mask_cache_tracks_offsets_and_accepts_grad_after_inference() -> None:
+    cache = flex_module._document_block_mask
+    cache.cache_clear()
+    inputs = _packed_inputs()
+    offsets = CU_SEQLENS.clone()
+
+    def run(cu: torch.Tensor) -> torch.Tensor:
+        return flex_varlen_attention_with_sink(
+            *inputs[:3], cu_seqlens_q=cu, cu_seqlens_k=cu, softcap=8.0, sink=inputs[3]
+        )
+
+    with torch.inference_mode():
+        expected = run(offsets)
+    observed = run(offsets.clone())
+    assert cache.cache_info().hits == 1
+    torch.testing.assert_close(observed, expected)
+    observed.sum().backward()
+    offsets[1] = 7
+    assert not torch.allclose(run(offsets), expected)
+    assert cache.cache_info().misses == 2
+    offsets = torch.tensor([0, 11])
+    with pytest.raises(ValueError, match="end at the token count"):
+        run(offsets)
 
 
 def test_flex_matches_reference_in_bfloat16() -> None:
