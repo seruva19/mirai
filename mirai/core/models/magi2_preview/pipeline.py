@@ -456,6 +456,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             validate_flex_attention_support,
         )
 
+        if str(getattr(self.model_config, "attention_backend", "auto")).strip().lower() in {"sage", "sage2"}:
+            raise ValueError("MAGI-2 attention requires sink logits, which SageAttention does not support.")
         backend = resolve_magi2_flex_attention(self.model_config)
         if backend is not None:
             validate_flex_attention_support()

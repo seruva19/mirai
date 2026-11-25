@@ -15,6 +15,8 @@ def test_attention_backend_registry_and_cpu_probe_are_explicit() -> None:
         "flash",
         "flash3",
         "flash4",
+        "sage",
+        "sage2",
         "flex",
     )
     statuses = {
@@ -22,12 +24,77 @@ def test_attention_backend_registry_and_cpu_probe_are_explicit() -> None:
         for status in attention.probe_attention_backends(device=torch.device("cpu"))
     }
     assert statuses["auto"].available
-    for name in ("cudnn", "flash", "flash3", "flash4"):
+    for name in ("cudnn", "flash", "flash3", "flash4", "sage", "sage2"):
         assert not statuses[name].available
         assert statuses[name].reason == "CUDA device required"
     # FlexAttention carries an eager lowering, so it is device-portable.
     assert statuses["flex"].available
     assert statuses["flex"].reason == "PyTorch FlexAttention"
+
+
+@pytest.mark.parametrize("backend", ["sage", "sage2"])
+def test_sage_packed_dispatch_preserves_document_boundaries(monkeypatch, backend) -> None:
+    monkeypatch.setattr(attention, "_cuda_capability", lambda _device: (8, 9))
+    calls = []
+
+    def dense(q, k, v, *, tensor_layout, is_causal):
+        assert tensor_layout == "NHD" and not is_causal
+        calls.append((q.shape[1], k.shape[1]))
+        return F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), enable_gqa=True
+        ).transpose(1, 2)
+
+    def packed(q, k, v, cq, ck, mq, mk, *, is_causal):
+        assert (mq, mk, is_causal) == (3, 4, False)
+        return torch.cat([
+            dense(q[qs:qe][None], k[ks:ke][None], v[ks:ke][None],
+                  tensor_layout="NHD", is_causal=False)[0]
+            for qs, qe, ks, ke in zip(cq.tolist(), cq.tolist()[1:], ck.tolist(), ck.tolist()[1:])
+        ])
+
+    monkeypatch.setattr(attention, "_load_external_function", lambda _name, *, varlen: packed if varlen else dense)
+    torch.manual_seed(47)
+    q = torch.randn(5, 2, 16, dtype=torch.float16)
+    k, v = [torch.randn(7, 1, 16, dtype=torch.float16) for _ in range(2)]
+    cq, ck = torch.tensor([0, 2, 5]), torch.tensor([0, 4, 7])
+    kwargs = dict(cu_seqlens_q=cq, cu_seqlens_k=ck, max_seqlen_q=3, max_seqlen_k=4, backend=backend)
+    observed = attention.dispatch_varlen_attention(q, k, v, **kwargs)
+    assert calls == [(2, 4), (3, 3)]
+    expected = torch.cat([
+        dense(q[:2][None], k[:4][None], v[:4][None], tensor_layout="NHD", is_causal=False)[0],
+        dense(q[2:][None], k[4:][None], v[4:][None], tensor_layout="NHD", is_causal=False)[0],
+    ])
+    torch.testing.assert_close(observed, expected)
+    assert not attention.varlen_attention_backward_status(backend, device=q.device).available
+    with pytest.raises(ValueError, match="inference-only"):
+        attention.dispatch_varlen_attention(q.requires_grad_(), k, v, **kwargs)
+    with pytest.raises(ValueError, match="nonempty"):
+        attention.dispatch_varlen_attention(q.detach(), k, v, **{**kwargs, "max_seqlen_q": 2})
+
+
+@pytest.mark.parametrize("backend", ["sage", "sage2"])
+def test_sage_cuda_matches_sdpa_on_synthetic_packed_inputs(backend) -> None:
+    device = torch.device("cuda")
+    status = attention.attention_backend_status(backend, device=device, varlen=True)
+    if not status.available:
+        pytest.skip(status.reason)
+    torch.manual_seed(61)
+    q, k, v = [torch.randn(48, 2, 64, device=device, dtype=torch.bfloat16) for _ in range(3)]
+    offsets = torch.tensor([0, 19, 48], device=device, dtype=torch.int32)
+    observed = attention.dispatch_varlen_attention(
+        q, k, v, cu_seqlens_q=offsets, cu_seqlens_k=offsets,
+        max_seqlen_q=29, max_seqlen_k=29, backend=backend,
+    )
+    expected = torch.cat([
+        F.scaled_dot_product_attention(
+            q[start:stop].transpose(0, 1)[None],
+            k[start:stop].transpose(0, 1)[None],
+            v[start:stop].transpose(0, 1)[None],
+        )[0].transpose(0, 1)
+        for start, stop in ((0, 19), (19, 48))
+    ])
+    assert torch.isfinite(observed).all()
+    assert F.cosine_similarity(observed.float().flatten(), expected.float().flatten(), dim=0) > 0.99
 
 
 def test_flex_dispatch_matches_sdpa_outputs_and_gradients() -> None:

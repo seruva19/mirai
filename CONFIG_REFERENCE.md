@@ -149,6 +149,13 @@ covers all query and key tokens
 Explicit backends accept maskless attention only and fail rather than silently
 falling back.
 
+`sage` and `sage2` are experimental, inference-only options for models using
+the shared attention dispatch. Both require the optional upstream SageAttention
+package and FP16 or BF16 Q/K/V. `sage` uses its Triton INT8/FP16 kernels on
+SM80, SM86, SM89, and SM90. `sage2` uses upstream hardware dispatch on SM89,
+SM90, SM120, and SM121 and evaluates packed documents separately. These
+backends require maskless attention and reject execution during CUDA graph capture.
+
 ### `hash_snapshot_contents`
 
 - **Type:** bool

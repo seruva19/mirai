@@ -66,6 +66,18 @@ ATTENTION_BACKEND_SPECS = {
         function="flash_attn_func",
         varlen_function="flash_attn_varlen_func",
     ),
+    # Public APIs from https://github.com/thu-ml/SageAttention.
+    "sage": AttentionBackendSpec(
+        "sage", "sage", minimum_cuda_capability=(8, 0),
+        modules=("sageattention",),
+        function="sageattn_qk_int8_pv_fp16_triton",
+        varlen_function="sageattn_varlen",
+    ),
+    "sage2": AttentionBackendSpec(
+        "sage2", "sage", minimum_cuda_capability=(8, 9),
+        modules=("sageattention",),
+        function="sageattn",
+    ),
     "flex": AttentionBackendSpec(
         "flex",
         "flex",
@@ -75,6 +87,10 @@ ATTENTION_BACKEND_SPECS = {
     ),
 }
 ALLOWED_ATTENTION_BACKENDS = frozenset(ATTENTION_BACKEND_SPECS)
+_SAGE_CAPABILITIES = {
+    "sage": {(8, 0), (8, 6), (8, 9), (9, 0)},
+    "sage2": {(8, 9), (9, 0), (12, 0), (12, 1)},
+}
 
 
 def normalize_attention_backend(value: str) -> str:
@@ -188,6 +204,10 @@ def attention_backend_status(
             f"requires compute capability {minimum[0]}.{minimum[1]} or newer",
             capability,
         )
+    if resolved in _SAGE_CAPABILITIES and capability not in _SAGE_CAPABILITIES[resolved]:
+        return AttentionBackendStatus(
+            resolved, False, "CUDA architecture is outside the supported Sage kernel set", capability
+        )
     if spec.engine == "sdpa":
         if sdpa_kernel is None or SDPBackend is None:
             return AttentionBackendStatus(
@@ -212,7 +232,7 @@ def attention_backend_status(
             )
         return AttentionBackendStatus(resolved, True, "PyTorch SDPA backend", capability)
     try:
-        _load_external_function(resolved, varlen=varlen)
+        _load_external_function(resolved, varlen=varlen and resolved != "sage2")
     except RuntimeError as exc:
         return AttentionBackendStatus(resolved, False, str(exc), capability)
     return AttentionBackendStatus(resolved, True, "external kernel available", capability)
@@ -280,6 +300,8 @@ def varlen_attention_backward_status(
     status = attention_backend_status(name, device=device, varlen=True)
     if not status.available:
         return status
+    if status.name in _SAGE_CAPABILITIES:
+        return AttentionBackendStatus(status.name, False, "SageAttention is inference-only", status.cuda_capability)
     if ATTENTION_BACKEND_SPECS[status.name].engine != "external":
         return status
     resolved = torch.device(device)
@@ -400,6 +422,49 @@ def flex_document_block_mask(
     )
 
 
+def _validate_sage_inputs(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *, ndim: int
+) -> None:
+    tensors = (query, key, value)
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
+        raise ValueError("SageAttention is inference-only.")
+    if query.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("SageAttention dispatch requires CUDA graph capture to be off.")
+    if any(tensor.ndim != ndim or tensor.device != query.device for tensor in tensors):
+        raise ValueError("SageAttention requires Q/K/V with the same rank and device.")
+    if query.dtype not in {torch.float16, torch.bfloat16} or any(
+        tensor.dtype != query.dtype for tensor in tensors
+    ):
+        raise ValueError("SageAttention requires matching FP16 or BF16 Q/K/V tensors.")
+    if (
+        key.shape != value.shape
+        or key.shape[-2] == 0
+        or query.shape[-2] == 0
+        or query.shape[-2] % key.shape[-2]
+        or query.shape[-1] != key.shape[-1]
+        or not 0 < query.shape[-1] <= 128
+        or (ndim == 4 and query.shape[0] != key.shape[0])
+        or min(query.shape[-3], key.shape[-3]) == 0
+    ):
+        raise ValueError("SageAttention requires compatible Q/K/V head, batch, and token dimensions.")
+
+
+def _sage_offsets(offsets: torch.Tensor, tensor: torch.Tensor, maximum: int) -> list[int]:
+    if (
+        offsets.ndim != 1
+        or offsets.numel() < 2
+        or offsets.device != tensor.device
+        or offsets.dtype not in {torch.int32, torch.int64}
+    ):
+        raise ValueError("SageAttention needs integer cumulative lengths on the Q/K/V device.")
+    values = offsets.tolist()
+    if values[0] != 0 or values[-1] != tensor.shape[0] or any(
+        not 0 < right - left <= maximum for left, right in zip(values, values[1:])
+    ):
+        raise ValueError("SageAttention packed lengths must describe nonempty sequences within max_seqlen.")
+    return values
+
+
 def dispatch_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -414,6 +479,14 @@ def dispatch_attention(
         raise ValueError(
             "Explicit attention backends require maskless input; use 'auto' for "
             "masked attention."
+        )
+    if name in _SAGE_CAPABILITIES:
+        _require_backend(name, device=query.device)
+        _validate_sage_inputs(query, key, value, ndim=4)
+        function = _load_external_function(name, varlen=False)
+        return function(
+            query.contiguous(), key.contiguous(), value.contiguous(),
+            tensor_layout="NHD", is_causal=False,
         )
     if name in {"flash3", "flash4"}:
         _require_backend(name, device=query.device)
@@ -461,8 +534,32 @@ def dispatch_varlen_attention(
     max_seqlen_k: int,
     backend: str,
 ) -> torch.Tensor:
-    """Execute packed THD attention through FA3/FA4 or an SDPA reference path."""
+    """Execute packed THD attention through the selected backend."""
     name = normalize_attention_backend(backend)
+    if name in _SAGE_CAPABILITIES:
+        _require_backend(name, device=query.device, varlen=True)
+        _validate_sage_inputs(query, key, value, ndim=3)
+        q_offsets = _sage_offsets(cu_seqlens_q, query, max_seqlen_q)
+        k_offsets = _sage_offsets(cu_seqlens_k, key, max_seqlen_k)
+        if len(q_offsets) != len(k_offsets):
+            raise ValueError("SageAttention packed query and key batches must have equal size.")
+        if name == "sage":
+            function = _load_external_function(name, varlen=True)
+            return function(
+                query.contiguous(), key.contiguous(), value.contiguous(),
+                cu_seqlens_q.contiguous(), cu_seqlens_k.contiguous(),
+                int(max_seqlen_q), int(max_seqlen_k), is_causal=False,
+            )
+        function = _load_external_function(name, varlen=False)
+        return torch.cat([
+            function(
+                query[qs:qe].unsqueeze(0).contiguous(),
+                key[ks:ke].unsqueeze(0).contiguous(),
+                value[ks:ke].unsqueeze(0).contiguous(),
+                tensor_layout="NHD", is_causal=False,
+            ).squeeze(0)
+            for qs, qe, ks, ke in zip(q_offsets, q_offsets[1:], k_offsets, k_offsets[1:])
+        ])
     if name == "flex":
         _require_backend(name, device=query.device, varlen=True)
         flex, _ = _flex_attention_api()

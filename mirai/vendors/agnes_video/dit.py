@@ -252,7 +252,7 @@ class Attention(nn.Module):
                     if status_for(candidate).available:
                         selected = candidate
                         break
-            elif backend in {"flash3", "flash4", "flex"} and needs_backward:
+            elif backend in {"flash3", "flash4", "flex", "sage", "sage2"} and needs_backward:
                 status = status_for(backend)
                 if not status.available:
                     raise RuntimeError(f"attention backend {backend!r} cannot backpropagate: {status.reason}.")
@@ -283,7 +283,7 @@ class Attention(nn.Module):
                                                            is_causal=False).transpose(1, 2)
                 outputs.append(output.squeeze(0))
             return torch.cat(outputs)
-        if selected in {"flash3", "flash4", "flex"}:
+        if selected in {"flash3", "flash4", "flex", "sage", "sage2"}:
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             maximum = int(lengths.max())
             return dispatch_varlen_attention(query, key, value,
