@@ -1650,6 +1650,7 @@ _CONSUMED_POLICY_FIELDS = frozenset(
         "moe_routed_gemm_tuning",
         "moe_routed_gemm_cache_path",
         "moe_routed_gemm_architecture",
+        "router_quantization",
     }
 )
 

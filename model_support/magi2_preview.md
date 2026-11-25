@@ -200,10 +200,10 @@ described in [`CONFIG_REFERENCE.md`](../CONFIG_REFERENCE.md).
 NF4 instead of BF16. Exactly three tensors per MoE layer are packed —
 `moe_mlp.W_gate`, `moe_mlp.W_up`, and `moe_mlp.W_down` — because they are the
 only tensors addressed on the flattened `head * num_experts + expert` axis. The
-router projection (`moe_mlp.gate`), router bias buffers, hyper-connection
-state, and norms keep their released dtype. The independent
-`companion_weight_quantization` option controls attention and shared-expert
-projection storage.
+router bias buffers, hyper-connection state, and norms keep their released
+dtype. Separate options control storage for the router projection
+(`memory.router_quantization`) and attention and shared-expert projections
+(`companion_weight_quantization`).
 
 Storage is one NF4 quantization per group, stacked along the group axis, which
 is what makes a contiguous group range independently dequantizable. NF4 requires
@@ -725,12 +725,19 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 
 ## Model-specific features
 
+- **Packed MAGI-2 router weights** — Set `memory.router_quantization` to
+  `"int8_per_channel"` to store an INT8 row and FP32 scale per head-local
+  expert. The router reconstructs FP32 weights for the logits and input
+  gradients. Router LoRA factors and bias buffers retain their existing
+  storage. Packed expert artifacts carry routed projections, and the router
+  packs again from the source checkpoint. Router calibration artifacts are
+  unavailable for this model.
+
 - **Packed MAGI-2 companion projections** — Set
   `model.params.family_params.companion_weight_quantization` to `"fp8"` or
   `"nf4"` to pack the denoiser's attention, shared-expert, and dense MLP
   projections. The grouped projection keeps modality dispatch and supports
-  the existing attention LoRA targets. Router and normalization weights
-  retain their original storage. Companion projections pack one tensor at a
+  the existing attention LoRA targets. Companion projections pack one tensor at a
   time from checkpoint shards before the remaining dense state is loaded.
 
 - **Intra-block routed expert offload** — Set

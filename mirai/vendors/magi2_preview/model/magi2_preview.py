@@ -2730,11 +2730,14 @@ class CoreMultiHeadMoE(nn.Module):
 
     def _route(self, x_heads: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_heads = x_heads.size(1)
-        if self._mirai_router_lora_executor is None:
+        int8_router = getattr(self, "_mirai_int8_router_executor", None)
+        if self._mirai_router_lora_executor is not None:
+            router_logits = self._mirai_router_lora_executor(self, x_heads)
+        elif int8_router is not None:
+            router_logits = int8_router(self, x_heads)
+        else:
             gate = self.gate.view(num_heads, self.num_experts, self.d_head).float()
             router_logits = torch.einsum("shd,hed->hse", x_heads.float(), gate)
-        else:
-            router_logits = self._mirai_router_lora_executor(self, x_heads)
         expert_bias = self.router.expert_bias.view(num_heads, self.num_experts)
         topk_probs, topk_indices = _mh_moe_compute_topk(
             router_logits=router_logits,

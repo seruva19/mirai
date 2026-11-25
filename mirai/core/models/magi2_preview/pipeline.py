@@ -201,7 +201,7 @@ class LowRankWeight(nn.Module):
 
     def forward(self, base: torch.Tensor) -> torch.Tensor:
         if base.numel() == 0:
-            raise RuntimeError("Packed MAGI-2 companion adapters use activation-space execution.")
+            raise RuntimeError("Packed MAGI-2 adapters use activation-space execution.")
         delta = (self.lora_b @ self.lora_a).reshape(self.shape)
         return base + delta.to(dtype=base.dtype) * self.scale * self.runtime_scale
 
@@ -253,6 +253,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     _expert_stores: "dict[str, Magi2Nf4ExpertStore]" = {}
     _packed_companion_linears: tuple[nn.Module, ...] = ()
     _companion_weight_quantization = "none"
+    _router_int8_enabled = False
     _routing_collapse: Any | None = None
     _last_diagnostics: "dict[str, float]" = {}
 
@@ -763,6 +764,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             expert_weight_access_policy=True,
             quantize_experts_on_load=True,
             expert_on_load_formats=MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS,
+            router_quantization_policy=True,
             moe_kernel_backend=True,
         )
 
@@ -809,7 +811,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         specs: list[ExpertTensorSpec] = []
         for module_name, module in iter_magi2_moe_layers(self.transformer):
             store = magi2_expert_store(module)
-            gate = module.gate
+            packed_gate = getattr(module, "_mirai_router_weight_int8", None)
+            gate = module.gate if packed_gate is None else packed_gate
             specs.append(
                 ExpertTensorSpec(
                     name=f"{module_name}.gate",
@@ -819,7 +822,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     layout=("out", "in"),
                     shape=tuple(int(dim) for dim in gate.shape),
                     dtype=str(gate.dtype),
-                    quantizable=False,
+                    quantizable=True,
                     adapter_targetable=True,
                     routed=False,
                     router=True,
@@ -852,6 +855,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return list(validate_expert_tensor_specs(specs))
 
     def configure_moe_optimization_policy(self, policy: Any) -> None:
+        router_mode = str(getattr(policy, "router_quantization", "disabled"))
+        if self._router_int8_enabled and router_mode != "int8_per_channel":
+            raise ValueError("Changing MAGI-2 router storage requires reloading the source model.")
+        if router_mode == "int8_per_channel":
+            params = self.model_config.params
+            if getattr(params, "router_fp32_master", False):
+                raise ValueError("MAGI-2 INT8 router storage is incompatible with an FP32 router master.")
+            if str(getattr(params, "expert_precision_calibration", "off")).strip().lower() in {"imatrix", "alphaq"}:
+                raise ValueError("MAGI-2 precision calibration requires the original router weights.")
         self._moe_optimization_policy = policy
         self._attach_moe_execution()
 
@@ -929,6 +941,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     "memory.moe_kernel_backend='grouped'."
                 )
             backend = CachedExpertExecution(inner=backend, cache=cache)
+        if (
+            getattr(policy, "router_quantization", "disabled") == "int8_per_channel"
+            and not self._router_int8_enabled
+            and (quantized or not getattr(self, "_expert_precision_plan_path", ""))
+        ):
+            from mirai.core.models.magi2_preview.router_weights import pack_magi2_router_weights
+
+            pack_magi2_router_weights(self.transformer)
+            self._router_int8_enabled = True
         attach_grouped_moe_backend(self.transformer, backend)
         # The grouped attach rebinds the execution seam this family's routing
         # telemetry rides on, so the tap is re-wrapped around whatever backend
@@ -1036,7 +1057,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._attach_moe_execution()
 
     def has_quantized_frozen_weights(self) -> bool:
-        return bool(self._expert_stores or self._packed_companion_linears)
+        return bool(self._expert_stores or self._packed_companion_linears or self._router_int8_enabled)
 
     def get_quantized_frozen_weight_report(self) -> dict[str, Any] | None:
         if not self.has_quantized_frozen_weights():
@@ -1051,24 +1072,41 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             buffer.numel() * buffer.element_size()
             for projection in companion_projections for buffer in projection.buffers()
         )
+        routers = [
+            module for _, module in iter_magi2_moe_layers(self.transformer)
+            if hasattr(module, "_mirai_router_weight_int8")
+        ] if self._router_int8_enabled else []
+        router_numel = sum(module._mirai_router_weight_int8.numel() for module in routers)
+        router_bytes = router_numel + sum(
+            module._mirai_router_weight_scale.numel() * module._mirai_router_weight_scale.element_size()
+            for module in routers
+        )
         return {
             "strategy": "compressed_weights",
-            "quant_format": stores[0].quant_format if stores else self._companion_weight_quantization,
+            "quant_format": (
+                stores[0].quant_format if stores else
+                self._companion_weight_quantization if companion_projections else "int8"
+            ),
             "companion_quant_format": self._companion_weight_quantization,
             "mixed_precision": bool(stores and getattr(stores[0], "is_mixed_precision", False)),
             "linear_modules": len(self._packed_companion_linears),
             "grouped_expert_modules": len(stores),
-            "quantized_tensors": len(MAGI2_ROUTED_EXPERT_TENSORS) * len(stores) + len(companion_projections),
-            "quantized_numel": sum(store.quantized_numel() for store in stores) + sum(
+            "router_modules": len(routers),
+            "router_quantization": "int8_per_channel" if routers else "disabled",
+            "quantized_tensors": len(MAGI2_ROUTED_EXPERT_TENSORS) * len(stores) + len(companion_projections) + len(routers),
+            "quantized_numel": router_numel + sum(store.quantized_numel() for store in stores) + sum(
                 projection.frozen_quantized_numel() for projection in companion_projections
             ),
-            "packed_bytes": sum(store.payload_bytes() for store in stores) + companion_bytes,
+            "packed_bytes": sum(store.payload_bytes() for store in stores) + companion_bytes + router_bytes,
             "expert_weight_access": stores[0].expert_weight_access if stores else None,
             "expert_dequant_chunk_size": stores[0].expert_dequant_chunk_size if stores else None,
         }
 
     def preserves_native_parameter_dtypes(self) -> bool:
         return True
+
+    def casts_trainable_tensors_for_quantized_base(self) -> bool:
+        return bool(self._expert_stores or self._packed_companion_linears)
 
     def get_sparse_moe_capabilities(self) -> SparseMoECapabilities:
         arch = self.runtime_config.arch_config
@@ -1120,14 +1158,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     continue
                 if parametrize.is_parametrized(module, tensor_name):
                     continue
-                packed = tensor_name == "weight" and hasattr(module, "_mirai_companion_projections")
-                shape = (module.num_experts * module.out_features, module.in_features) if packed else tuple(parameter.shape)
+                packed_linear = tensor_name == "weight" and hasattr(module, "_mirai_companion_projections")
+                packed_router = tensor_name == "gate" and hasattr(module, "_mirai_router_weight_int8")
+                if packed_linear:
+                    shape = (module.num_experts * module.out_features, module.in_features)
+                elif packed_router:
+                    shape = tuple(module._mirai_router_weight_int8.shape)
+                else:
+                    shape = tuple(parameter.shape)
                 parameter.requires_grad_(False)
                 parametrize.register_parametrization(
                     module,
                     tensor_name,
                     LowRankWeight(shape, rank=rank, alpha=alpha),
-                    unsafe=packed,
+                    unsafe=packed_linear or packed_router,
                 )
                 module.parametrizations[tensor_name].original.requires_grad_(False)
                 from mirai.core.models.magi2_preview.lora_execution import (

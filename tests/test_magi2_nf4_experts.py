@@ -353,7 +353,6 @@ def test_quantized_storage_adds_exactly_four_consumed_policy_fields() -> None:
 _QUANTIZED_NON_DEFAULT_POLICY_VALUES: dict[str, dict[str, object]] = {
     "expert_device_cache_gib": {"expert_device_cache_gib": 1.0},
     "device_residency_budget_gib": {"device_residency_budget_gib": 1.0},
-    "router_quantization": {"router_quantization": "int8_per_channel"},
     "router_quantization_calibration_path": {
         "router_quantization": "int8_per_channel",
         "router_quantization_calibration_path": "calibration.pt",
@@ -660,7 +659,7 @@ def test_expert_tensor_specs_describe_the_router_and_three_routed_tensors() -> N
         "mlp.moe_mlp.W_down",
     }
     router = specs["mlp.moe_mlp.gate"]
-    assert router.router and not router.routed and not router.quantizable
+    assert router.router and not router.routed and router.quantizable
     assert router.adapter_targetable
     assert router.dtype == str(torch.float32)
     groups = int(module.local_flatten_num_experts)

@@ -275,7 +275,7 @@ def place_pipeline_on_device(
     if not quantized and not preserve_native_dtypes:
         # Cast precision first (cheap on CPU, avoids a transient fp32 copy on GPU).
         model.to(dtype=dtype)
-    elif quantized:
+    elif quantized and pipeline.casts_trainable_tensors_for_quantized_base():
         cast_trainable_tensors(model, dtype=dtype)
 
     if (

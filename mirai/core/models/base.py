@@ -650,6 +650,10 @@ class BasePipeline(ABC):
         """Return whether model-owned mixed parameter dtypes must remain intact."""
         return False
 
+    def casts_trainable_tensors_for_quantized_base(self) -> bool:
+        """Return whether placement casts trainable tensors on a packed model."""
+        return True
+
     def get_training_model(self) -> Any | None:
         """Return the module-like object that owns training weights, if any."""
         return getattr(self, "model", None)

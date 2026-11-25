@@ -3341,7 +3341,7 @@ Quantize routed experts while checkpoint tensors are loaded, avoiding a persiste
 - **Default:** `"disabled"`
 - **Allowed / range:** `disabled`, `int8_per_channel`
 
-Frozen-router storage policy. `int8_per_channel` replaces each router matrix with symmetric per-output-channel INT8 values and FP32 scales after adapter configuration. Router-targeted adapters, direct router training, and FP32 router masters fail explicitly because quantized router weights are immutable.
+Frozen-router storage policy. `int8_per_channel` replaces the frozen router matrix with symmetric per-output-channel INT8 values and FP32 scales. The model provider defines compatibility with router adapters and calibration artifacts.
 
 ### `router_quantization_calibration_path`
 

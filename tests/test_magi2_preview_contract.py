@@ -305,14 +305,26 @@ def test_magi2_packed_companion_preserves_grouped_lora_output_and_gradients(tmp_
     pipeline.load_adapter_state(state)
 
 
-def test_magi2_router_lora_executes_without_dense_delta() -> None:
+@pytest.mark.parametrize("packed", [False, True])
+def test_magi2_router_lora_executes_without_dense_delta(packed) -> None:
     module, adapter = _build_reduced_moe(
         device=torch.device("cpu"), dtype=torch.float32
     )
     torch.manual_seed(43)
     reference_input = torch.randn(6, 2, 8, requires_grad=True)
     actual_input = reference_input.detach().clone().requires_grad_(True)
-    gate = module.gate.view(2, 4, 8).float()
+    if packed:
+        from mirai.core.models.magi2_preview.router_weights import pack_magi2_router_weights
+
+        holder = torch.nn.Module()
+        holder.moe_mlp = module
+        pack_magi2_router_weights(holder)
+        assert module.parametrizations.gate.original.numel() == 0
+        base = module._mirai_router_weight_int8.float() * module._mirai_router_weight_scale
+        gate = base + (adapter.lora_b @ adapter.lora_a) * adapter.scale
+    else:
+        gate = module.gate
+    gate = gate.view(2, 4, 8).float()
     reference = torch.einsum("shd,hed->hse", reference_input.float(), gate)
     reference.square().mean().backward()
     reference_grads = (
@@ -384,6 +396,60 @@ def _build_reduced_moe(
         adapter.lora_b.normal_(std=0.1)
     module.to(device=device)
     return module, adapter
+
+
+def test_magi2_pipeline_packs_router_and_can_attach_lora_afterward() -> None:
+    from types import SimpleNamespace
+
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+    from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
+    from mirai.core.training.residency.device_placement import place_pipeline_on_device
+    from mirai.vendors.magi2_preview.model.magi2_preview import _mh_moe_compute_topk
+
+    module, _ = _build_reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    parametrize.remove_parametrizations(module, "gate", leave_parametrized=False)
+    holder = torch.nn.Module()
+    holder.layer = torch.nn.Module()
+    holder.layer.mlp = torch.nn.Module()
+    holder.layer.mlp.moe_mlp = module
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.model_config = SimpleNamespace(params=SimpleNamespace())
+    pipeline.transformer = holder
+    pipeline.configure_moe_optimization_policy(MoEOptimizationPolicy(router_quantization="int8_per_channel"))
+    bias = module.router.expert_bias.clone()
+    x = torch.randn(5, 2, 8, requires_grad=True)
+    base = (module._mirai_router_weight_int8.float() * module._mirai_router_weight_scale).view(2, 4, 8)
+    logits = torch.einsum("shd,hed->hse", x, base)
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(lambda value: saved.append(value) or value, lambda value: value):
+        packed_logits = module._mirai_int8_router_executor(module, x)
+        got_dx = torch.autograd.grad(packed_logits.sum(), x)[0]
+    assert not saved
+    torch.testing.assert_close(got_dx, torch.autograd.grad(logits.sum(), x, retain_graph=True)[0])
+    expected, expected_ids = _mh_moe_compute_topk(
+        router_logits=logits, top_k=module.topk, score_func=module.config.score_func,
+        expert_bias=bias.view(2, 4), route_norm=module.config.route_norm,
+    )
+    actual, actual_ids = module._route(x)
+    torch.testing.assert_close(actual, expected * module.config.route_scale)
+    torch.testing.assert_close(actual_ids, expected_ids)
+    assert module.gate.numel() == 0
+    report = pipeline.get_quantized_frozen_weight_report()
+    assert report["router_modules"] == 1
+    assert report["packed_bytes"] == 8 * (8 + 4)
+    pipeline.set_adapter_config(SimpleNamespace(type="lora", target_preset="attn_router", rank=2, alpha=2.0))
+    place_pipeline_on_device(
+        pipeline, device=torch.device("cpu"), dtype=torch.bfloat16, residency_strategy="disabled",
+    )
+    assert module.parametrizations.gate[0].lora_a.dtype == torch.float32
+    assert module._mirai_router_weight_scale.dtype == torch.float32
+    adapted, adapted_ids = module._route(x)
+    torch.testing.assert_close(adapted, actual)
+    torch.testing.assert_close(adapted_ids, actual_ids)
+    assert set(pipeline.state_dict()) == {
+        "layer.mlp.moe_mlp.parametrizations.gate.0.lora_a", "layer.mlp.moe_mlp.parametrizations.gate.0.lora_b",
+    }
 
 
 def _run_reduced_moe(
@@ -832,7 +898,6 @@ _NON_DEFAULT_POLICY_VALUES: dict[str, dict[str, object]] = {
     "expert_device_cache_gib": {"expert_device_cache_gib": 1.0},
     "device_residency_budget_gib": {"device_residency_budget_gib": 1.0},
     "quantize_experts_on_load": {"quantize_experts_on_load": True},
-    "router_quantization": {"router_quantization": "int8_per_channel"},
     "router_quantization_calibration_path": {
         "router_quantization": "int8_per_channel",
         "router_quantization_calibration_path": "calibration.pt",
@@ -919,7 +984,7 @@ def test_magi2_provider_declares_moe_kernel_backend_capability() -> None:
     assert capabilities.quantize_experts_on_load
     assert "gguf_iq1" in capabilities.expert_on_load_formats
     assert capabilities.packed_frozen_weight_state
-    assert not capabilities.router_quantization_policy
+    assert capabilities.router_quantization_policy
     assert not capabilities.trainable_parameter_offload
 
 

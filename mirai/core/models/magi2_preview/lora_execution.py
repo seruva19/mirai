@@ -115,9 +115,13 @@ def execute_router_lora(module: Any, x_heads: torch.Tensor) -> torch.Tensor:
     heads = int(x_heads.shape[1])
     experts = int(module.num_experts)
     d_head = int(module.d_head)
-    base_gate = original.view(heads, experts, d_head).float()
     values = x_heads.float()
-    base = torch.einsum("shd,hed->hse", values, base_gate)
+    int8_router = getattr(module, "_mirai_int8_router_executor", None)
+    if int8_router is None:
+        base_gate = original.view(heads, experts, d_head).float()
+        base = torch.einsum("shd,hed->hse", values, base_gate)
+    else:
+        base = int8_router(module, values)
     low_rank = torch.einsum("shd,rd->shr", values, adapter.lora_a.float())
     lora_b = adapter.lora_b.view(heads, experts, adapter.rank).float()
     delta = torch.einsum("shr,her->hse", low_rank, lora_b)

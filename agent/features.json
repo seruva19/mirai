@@ -3184,6 +3184,40 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_int8_router_weights",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/magi2_preview/router_weights.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "pack_magi2_router_weights"
+      ],
+      "config_keys": [
+        "memory.router_quantization"
+      ],
+      "disabled_config": {
+        "memory.router_quantization": "disabled"
+      },
+      "contract_paths": [
+        "tests/test_magi2_preview_contract.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Packed MAGI-2 router weights",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_mixed_expert_precision",
       "kind": "compressed_weight",
       "owner": "mirai/core/models/magi2_preview/mixed_experts.py",
