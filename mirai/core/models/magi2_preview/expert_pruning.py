@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 
 _SCHEMA = "mirai.magi2_preview.head_expert_pruning"
+_MERGE_SCHEMA = "mirai.magi2_preview.head_expert_consolidation"
 _PARAMETERS = ("gate", *MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
 _ROUTER_BUFFERS = ("expert_bias", "expert_bias_ema")
 
@@ -164,6 +165,71 @@ class Magi2ExpertConsolidationPlan:
     source_weight_fingerprint: str
     heads_by_layer: dict[str, tuple[HierarchicalOutputMergePlan, ...]]
 
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "schema": _MERGE_SCHEMA,
+            "version": 1,
+            "source_weight_fingerprint": self.source_weight_fingerprint,
+            "heads_by_layer": {
+                name: [
+                    {
+                        "logical_to_prototype": head.consolidation.logical_to_prototype,
+                        "merge_weights": head.merge_weights,
+                    }
+                    for head in heads
+                ]
+                for name, heads in self.heads_by_layer.items()
+            },
+        }
+
+    def topology_digest(self) -> bytes:
+        return hashlib.sha256(
+            json.dumps(self._payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).digest()
+
+    def save(self, path: str | Path) -> None:
+        Path(path).write_text(
+            json.dumps(self._payload(), indent=2, sort_keys=True) + "\n", encoding="utf-8",
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> Magi2ExpertConsolidationPlan:
+        from mirai.core.moe.calibration.prototypes import HierarchicalOutputMergePlan
+        from mirai.core.moe.storage.aliases import build_prototype_plan
+
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema") != _MERGE_SCHEMA or type(payload.get("version")) is not int or payload["version"] != 1:
+            raise ValueError("Unsupported MAGI-2 expert consolidation schema.")
+        fingerprint = payload.get("source_weight_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint.startswith("sha256:") or len(fingerprint) != 71 or any(
+            character not in "0123456789abcdef" for character in fingerprint[7:]
+        ):
+            raise ValueError("MAGI-2 consolidation plan requires a SHA-256 source fingerprint.")
+        raw_layers = payload.get("heads_by_layer")
+        if not isinstance(raw_layers, dict) or not raw_layers:
+            raise ValueError("MAGI-2 consolidation plan requires layer assignments.")
+        layers = {}
+        for name, raw_heads in raw_layers.items():
+            if not name or not isinstance(raw_heads, list) or not raw_heads:
+                raise ValueError("MAGI-2 consolidation plan requires per-head assignments.")
+            heads = []
+            for raw in raw_heads:
+                if not isinstance(raw, dict):
+                    raise ValueError("Malformed MAGI-2 consolidation head.")
+                aliases = raw.get("logical_to_prototype")
+                weights = raw.get("merge_weights")
+                if (
+                    not isinstance(aliases, list) or any(type(value) is not int for value in aliases)
+                    or not isinstance(weights, list) or any(type(value) not in {int, float} for value in weights)
+                ):
+                    raise ValueError("Malformed MAGI-2 consolidation aliases or weights.")
+                heads.append(HierarchicalOutputMergePlan(
+                    build_prototype_plan(aliases, num_logical_experts=len(aliases)),
+                    tuple(float(weight) for weight in weights),
+                ).validate())
+            layers[name] = tuple(heads)
+        return cls(fingerprint, layers)
+
 
 def build_magi2_hierarchical_merge_plan(
     transformer: nn.Module, evidence: dict[str, tuple[PrototypeCalibrationEvidence, ...]],
@@ -183,6 +249,27 @@ def build_magi2_hierarchical_merge_plan(
     return Magi2ExpertConsolidationPlan(
         _source_fingerprint({name: layers[name] for name in heads_by_layer}), heads_by_layer,
     )
+
+
+def observe_magi2_hierarchical_merge_head(
+    layer: nn.Module, head: int, sampled_tokens: torch.Tensor, accumulator: Any,
+) -> None:
+    """Accumulate mean outputs and route frequencies on the same sampled tokens."""
+    capture = capture_magi2_diet_head(layer, head, sampled_tokens)
+    scores = capture.router_scores
+    outputs = capture.expert_outputs
+    if accumulator.num_experts != capture.topology.num_experts:
+        raise ValueError("MAGI-2 hierarchical merge accumulator has incompatible expert count.")
+    routes = (scores + capture.choice_bias).topk(capture.topology.top_k, dim=-1).indices
+    weights = scores.gather(1, routes)
+    if capture.topology.normalize_topk_prob:
+        weights = torch.nn.functional.normalize(weights, p=1, dim=-1, eps=capture.topology.normalization_epsilon)
+    weights = weights * capture.topology.route_scale
+    for expert in range(capture.topology.num_experts):
+        accumulator.record_all_expert_output(expert, outputs[:, expert])
+        token_ids, slots = (routes == expert).nonzero(as_tuple=True)
+        if token_ids.numel():
+            accumulator.record(expert, weights[token_ids, slots], outputs[token_ids, expert])
 
 
 @torch.no_grad()

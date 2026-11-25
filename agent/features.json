@@ -3205,7 +3205,9 @@
       ],
       "symbols": [
         "build_magi2_hierarchical_merge_plan",
-        "apply_magi2_hierarchical_merge"
+        "apply_magi2_hierarchical_merge",
+        "observe_magi2_hierarchical_merge_head",
+        "Magi2ExpertConsolidationPlan"
       ],
       "config_keys": [],
       "disabled_config": {},

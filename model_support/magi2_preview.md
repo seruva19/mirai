@@ -804,6 +804,9 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   Pass one mean-output calibration evidence item per head to
   `build_magi2_hierarchical_merge_plan` and apply the plan with
   `apply_magi2_hierarchical_merge` on the original frozen dense model.
+  `observe_magi2_hierarchical_merge_head` records sampled activations into
+  the shared mean-output accumulator. Save or load the resulting plan
+  with `Magi2ExpertConsolidationPlan`.
   Clustering and weight averaging operate within each head while routing
   retains the original expert IDs. The merged model uses reference execution.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,

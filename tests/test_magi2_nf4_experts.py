@@ -835,13 +835,14 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
         verify_magi2_pruning_source(transformer, plan)
 
 
-def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head() -> None:
+def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(tmp_path) -> None:
     from copy import deepcopy
 
     from mirai.core.models.magi2_preview.expert_pruning import (
-        apply_magi2_hierarchical_merge, build_magi2_hierarchical_merge_plan,
+        Magi2ExpertConsolidationPlan, apply_magi2_hierarchical_merge,
+        build_magi2_hierarchical_merge_plan, observe_magi2_hierarchical_merge_head,
     )
-    from mirai.core.moe.calibration.prototypes import PrototypeCalibrationEvidence
+    from mirai.core.moe.calibration.prototypes import MeanExpertOutputAccumulator, PrototypeCalibrationEvidence
 
     layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
     reference = deepcopy(layer)
@@ -858,7 +859,18 @@ def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head()
     )
     tokens = torch.randn(5, 2, layer.d_head)
     before = layer._route(tokens)
-    apply_magi2_hierarchical_merge(transformer, plan)
+    for head in range(2):
+        accumulator = MeanExpertOutputAccumulator(layer.num_experts)
+        observe_magi2_hierarchical_merge_head(layer, head, tokens[:, head], accumulator)
+        observation = accumulator.evidence()
+        torch.testing.assert_close(observation.selected_count, before[1][head].flatten().bincount(minlength=4))
+        assert observation.distance_metric == "mean_output_euclidean"
+    path = tmp_path / "merge.json"
+    plan.save(path)
+    restored = Magi2ExpertConsolidationPlan.load(path)
+    assert restored == plan
+    assert restored.topology_digest() == plan.topology_digest()
+    apply_magi2_hierarchical_merge(transformer, restored)
     assert layer.num_experts == 4
     assert layer._mirai_expert_aliases == (0, 0, 1, 1, 2, 3, 2, 3)
     for current, prior in zip(layer._route(tokens), before, strict=True):
