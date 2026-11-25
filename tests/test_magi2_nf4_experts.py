@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch.nn.utils import parametrize
 
+from mirai.core.models.magi2_preview import grouped_moe
 from mirai.core.models.magi2_preview.grouped_moe import (
     _CONSUMED_POLICY_FIELDS,
     _MemoryBoundedSwiGlu7,
@@ -110,6 +111,42 @@ def _sorted_layout(*, groups: int, rows_per_group: list[int], columns: int, dtyp
     total = int(offsets[-1])
     x_sorted = torch.randn(total, columns, dtype=dtype)
     return x_sorted, offsets, [int(value) for value in offsets.tolist()], groups
+
+
+def test_segmented_backward_releases_weights_after_their_last_use(monkeypatch) -> None:
+    weights = {
+        "W_gate": torch.randn(1, 8, 16),
+        "W_up": torch.randn(1, 8, 16),
+        "W_down": torch.randn(1, 16, 8),
+    }
+    materialized = {}
+
+    class Store:
+        def segment_group_span(self):
+            return 1
+
+        def materialize_segment(self, key, start, stop, *, dtype, device):
+            weight = weights[key][start:stop].to(dtype=dtype, device=device).clone()
+            materialized[key] = weakref.ref(weight)
+            return weight
+
+    linear_dx = grouped_moe._grouped_linear_dx
+
+    def check_lifetimes(rows, weight, offsets, backend):
+        if weight is materialized["W_gate"]():
+            assert materialized["W_down"]() is None
+        if weight is materialized["W_up"]():
+            assert materialized["W_gate"]() is None
+        return linear_dx(rows, weight, offsets, backend)
+
+    monkeypatch.setattr(grouped_moe, "_grouped_linear_dx", check_lifetimes)
+    x = torch.randn(3, 8, requires_grad=True)
+    output = grouped_moe._SegmentedQuantizedExpertMlp.apply(
+        x, torch.tensor([3], dtype=torch.int32), Store(), "bmm", "bmm", "torch"
+    )
+    output.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert all(reference() is None for reference in materialized.values())
 
 
 def test_segmented_grouped_linear_reproduces_the_unsegmented_result() -> None:

@@ -1075,6 +1075,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
                 device=rows.device,
             )
             grad_hidden = _grouped_linear_dx(grad_rows, w_down, local_offsets, ctx.dx_backend)
+            del w_down
             grad_gate, grad_up = _swiglu7_backward(
                 gate,
                 up,
@@ -1082,9 +1083,10 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
                 backend=ctx.activation_backend,
             )
             grad_x = _grouped_linear_dx(grad_gate, w_gate, local_offsets, ctx.dx_backend)
+            del w_gate
             grad_x.add_(_grouped_linear_dx(grad_up, w_up, local_offsets, ctx.dx_backend))
             grad_segments.append(grad_x)
-            del w_gate, w_up, w_down, gate, up, grad_hidden, grad_gate, grad_up
+            del w_up, gate, up, grad_hidden, grad_gate, grad_up
         if not grad_segments:
             grad_input = torch.empty_like(x_sorted)
         elif len(grad_segments) == 1:
