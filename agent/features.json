@@ -2871,6 +2871,34 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_audio_token_ablation",
+      "kind": "tooling",
+      "owner": "mirai/core/models/magi2_preview/audio_ab.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "default_path",
+        "documentation",
+        "resource_bound"
+      ],
+      "symbols": [
+        "run_audio_ab"
+      ],
+      "config_keys": [],
+      "disabled_config": {},
+      "contract_paths": [
+        "tests/test_magi2_preview_contract.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "MAGI-2 audio-token ablation",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_flex_attention_training",
       "kind": "generic",
       "owner": "mirai/core/models/magi2_preview/flex_attention.py",

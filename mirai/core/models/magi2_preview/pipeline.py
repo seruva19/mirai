@@ -89,6 +89,10 @@ MAGI2_VAE_MAX_WINDOW_VOLUME = 32_640
 # of each other's shapes and call counts.
 MAGI2_AUDIO_NOISE_SEED_OFFSET = 20_011
 
+
+def resolve_magi2_audio_tokens(configured: int, latent_frames: int) -> int:
+    return (latent_frames - 1) * 8 + 1 if configured < 0 else configured
+
 # The preview transformer is positioned on a 25 fps timeline sampled at
 # temporal stride 8 (``vae_stride[0] = 8``, ``time_pos_fps = 25 / 8 = 3.125``),
 # so a frame request is expressed on that 25 fps timeline. The preview-only
@@ -1295,11 +1299,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         batch = int(latents.shape[0])
         text, text_lengths = self._text_features(text_embeds, batch=batch, like=latents)
         configured_audio_tokens = int(self.options.audio_tokens)
-        audio_tokens = (
-            (int(latents.shape[2]) - 1) * 8 + 1
-            if configured_audio_tokens < 0
-            else configured_audio_tokens
-        )
+        audio_tokens = resolve_magi2_audio_tokens(configured_audio_tokens, int(latents.shape[2]))
         # MAGI-2 ships without an audio encoder, so the audio track carries no
         # user signal; the reference engine feeds it Gaussian noise
         # (`pipeline/inference_engine.py`), once per generation. Those tokens
@@ -1396,11 +1396,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
         device = noise.device
         latent = noise.unsqueeze(0)
-        audio_tokens = (
-            (int(noise.shape[1]) - 1) * 8 + 1
-            if int(self.options.audio_tokens) < 0
-            else int(self.options.audio_tokens)
-        )
+        audio_tokens = resolve_magi2_audio_tokens(int(self.options.audio_tokens), int(noise.shape[1]))
         audio_latent = torch.randn(
             1,
             audio_tokens,

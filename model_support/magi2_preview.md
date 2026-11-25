@@ -708,6 +708,12 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 
 ## Model-specific features
 
+- **MAGI-2 audio-token ablation** — Paired seeded video runs compare automatic
+  and zero audio-token counts with identical inference settings. Run
+  `python -m mirai.core.models.magi2_preview.audio_ab --config configs/magi2_preview/inference_offload.toml --output audio-ab --prompt "A kite over the sea" --seed 17 --seed 23`.
+  The output directory contains both videos and latents per seed and a JSON
+  report with token counts, stage timing, generation peak allocated VRAM, and
+  latent RMSE. Use the videos to inspect visual differences.
 - **Spatial TurboVAE decoding** — Experimental overlapping latent tiles
   with weighted blending on CPU.
 - **Packed MAGI-2 Refiner projections** — Experimental FP8 or NF4 storage

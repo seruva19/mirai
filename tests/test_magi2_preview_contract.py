@@ -1202,6 +1202,36 @@ def test_magi2_native_sampler_rejects_policies_it_does_not_implement() -> None:
         pipeline.sample_native_preview(**call, cfg_mode="paired")
 
 
+def test_magi2_audio_ab_reuses_seeds_and_restores_options(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from mirai.core.models.magi2_preview.audio_ab import run_audio_ab
+    from mirai.core.models.magi2_preview.pipeline import Magi2RuntimeOptions
+
+    pipeline = _bare_pipeline()
+    original = Magi2RuntimeOptions(config_path="", audio_tokens=7)
+    pipeline.options = original
+    calls = []
+
+    def generate(*, seed, prompt, out_path, timings):
+        mode = pipeline.options.audio_tokens
+        calls.append((seed, prompt, mode))
+        torch.save(torch.full((1, 3, 2, 2), float(mode)), out_path.with_suffix(".pt"))
+        timings["denoise_s"] = 1.0
+        return {"status": "ok"}
+
+    session = SimpleNamespace(
+        pipeline=pipeline, use_native=True, _compute_device="cpu",
+        checkpoint="synthetic", generate=generate,
+    )
+    report = run_audio_ab(session, output=tmp_path / "ab", seeds=[17, 23], prompt="test")
+    assert calls == [(17, "test", -1), (17, "test", 0), (23, "test", 0), (23, "test", -1)]
+    assert pipeline.options is original
+    assert [case["audio_tokens"] for case in report["pairs"][0]["cases"]] == [17, 0]
+    assert report["pairs"][0]["video_latent_rmse"] == 1.0
+    assert (tmp_path / "ab" / "report.json").is_file()
+
+
 def test_magi2_shipped_examples_ask_for_implemented_sampling_policies() -> None:
     config = load_config("configs/magi2_preview/inference_offload.toml")
     assert config.inference.cfg_mode == "batched"
