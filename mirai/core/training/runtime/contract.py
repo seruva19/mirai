@@ -413,20 +413,20 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
         "memory.moe_dispatch='triton_persistent' or "
         "memory.moe_gemm_backend='persistent'.",
     )
-    _gemm_backends = {"auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4"}
+    _gemm_backends = {"auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4", "triton_nf4_w4a16"}
     _check(
         str(config.memory.moe_gemm_backend).strip().lower() in _gemm_backends,
         "memory.moe_gemm_backend must be one of: auto, bmm, persistent, "
-        "torch_grouped, deepgemm_fp8, scaled_mm_fp8, scaled_mm_fp4.",
+        "torch_grouped, deepgemm_fp8, scaled_mm_fp8, scaled_mm_fp4, triton_nf4_w4a16.",
     )
     for _role in ("forward", "dx", "dw"):
         _value = str(getattr(config.memory, f"moe_gemm_backend_{_role}")).strip().lower()
         _check(
             _value in ({""} | _gemm_backends),
             f"memory.moe_gemm_backend_{_role} must be '' (inherit) or one of: "
-            "auto, bmm, persistent, torch_grouped, deepgemm_fp8, scaled_mm_fp8, scaled_mm_fp4.",
+            "auto, bmm, persistent, torch_grouped, deepgemm_fp8, scaled_mm_fp8, scaled_mm_fp4, triton_nf4_w4a16.",
         )
-    forward_only = {"deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4"}
+    forward_only = {"deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4", "triton_nf4_w4a16"}
     forward_backend = str(config.memory.moe_gemm_backend_forward).strip().lower()
     _check(
         str(config.memory.moe_gemm_backend).strip().lower() not in forward_only,
@@ -451,6 +451,11 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
         forward_backend != "scaled_mm_fp4"
         or str(config.memory.frozen_weight_quantization).strip().lower() in {"nvfp4", "mxfp4"},
         "memory.moe_gemm_backend_forward='scaled_mm_fp4' requires NVFP4 or MXFP4 frozen weights.",
+    )
+    _check(
+        forward_backend != "triton_nf4_w4a16"
+        or str(config.memory.frozen_weight_quantization).strip().lower() == "nf4",
+        "memory.moe_gemm_backend_forward='triton_nf4_w4a16' requires NF4 frozen weights.",
     )
     if (
         str(config.memory.moe_dispatch_preprocess).strip().lower()

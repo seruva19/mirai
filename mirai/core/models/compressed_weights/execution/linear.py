@@ -765,6 +765,20 @@ class CompressedLinear(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._quant_format == "nf4":
+            from mirai.core.moe.runtime.gemm import resolve_moe_gemm_backend
+
+            if resolve_moe_gemm_backend("forward") == "triton_nf4_w4a16":
+                from ..quantization.nf4_w4a16 import fused_nf4_linear
+
+                output = fused_nf4_linear(
+                    x, packed=self.weight_nf4, absmax=self.weight_nf4_absmax,
+                    nested_absmax=self.weight_nf4_nabsmax, offset=self.weight_nf4_offset,
+                    code=self.weight_nf4_code, nested_code=self.weight_nf4_ncode,
+                    meta=self._nf4_meta, shape=(self.out_features, self.in_features),
+                )
+                bias = self.bias.to(device=x.device, dtype=x.dtype) if self.bias is not None else None
+                return output if bias is None else output + bias
         if self._quant_format in {"nvfp4", "mxfp4"}:
             from mirai.core.moe.runtime.gemm import resolve_moe_gemm_backend
 

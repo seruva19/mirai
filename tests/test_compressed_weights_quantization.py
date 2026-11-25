@@ -471,6 +471,29 @@ class CompressedWeightQuantizationTests(unittest.TestCase):
         torch.testing.assert_close(observed, expected, rtol=0.0, atol=0.0)
         torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0.0, atol=0.0)
 
+    def test_fused_nf4_w4a16_cuda_matches_decoded_weights(self) -> None:
+        from mirai.core.moe.runtime.gemm import probe_backend
+
+        device = torch.device("cuda")
+        status = probe_backend("triton_nf4_w4a16", device=device)
+        if not status.available:
+            self.skipTest(status.reason)
+        from mirai.core.models.compressed_weights.quantization.nf4_w4a16 import fused_nf4_linear
+        from mirai.core.models.compressed_weights.quantization.quant import _nf4_quantize_2d, _nf4_dequantize
+
+        torch.manual_seed(149)
+        weight = torch.randn(37, 131, device=device, dtype=torch.bfloat16)
+        x = torch.randn(5, 131, device=device, dtype=torch.bfloat16, requires_grad=True)
+        fields, codes, meta = _nf4_quantize_2d(weight, blocksize=64)
+        decoded = _nf4_dequantize(fields, codes, meta, shape=weight.shape, dtype=x.dtype, device=device)
+        observed = fused_nf4_linear(x, **fields, **codes, meta=meta, shape=weight.shape)
+        expected = (x.float() @ decoded.float().t()).to(x.dtype)
+        torch.testing.assert_close(observed, expected, rtol=0.015, atol=0.02)
+        grad = torch.randn_like(observed)
+        expected_input_grad = (grad.float() @ decoded.float()).to(x.dtype)
+        observed.backward(grad)
+        torch.testing.assert_close(x.grad, expected_input_grad, rtol=0, atol=0)
+
     def test_native_nvfp4_preserves_packed_layout_and_reference_dgrad(self) -> None:
         from types import SimpleNamespace
 

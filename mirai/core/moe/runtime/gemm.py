@@ -48,7 +48,10 @@ except ModuleNotFoundError:  # pragma: no cover - torch-less static analysis
     torch = None  # type: ignore[assignment]
 
 
-MOE_GEMM_BACKENDS = ("auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4")
+MOE_GEMM_BACKENDS = (
+    "auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8",
+    "scaled_mm_fp8", "scaled_mm_fp4", "triton_nf4_w4a16",
+)
 MOE_GEMM_ROLES = ("forward", "dx", "dw")
 
 # Accepted spellings that normalize onto a canonical backend name. Kept small and
@@ -190,15 +193,18 @@ def probe_backend(name: str, *, device=None) -> BackendProbe:
         )
     if name == "bmm":
         return BackendProbe("bmm", True, "torch.bmm padded primitive (device-agnostic)")
-    if name == "persistent":
+    if name in {"persistent", "triton_nf4_w4a16"}:
         probe = _requires_cuda_sm80(
-            name, device, label="vendored sorted-contiguous persistent grouped GEMM"
+            name, device, label=(
+                "fused Triton NF4 W4A16" if name == "triton_nf4_w4a16"
+                else "vendored sorted-contiguous persistent grouped GEMM"
+            )
         )
         if not probe.available:
             return probe
         if not _triton_importable():
             return BackendProbe(
-                name, False, "persistent grouped GEMM requires an importable triton"
+                name, False, f"{name} requires an importable triton"
             )
         return probe
     if name == "deepgemm_fp8":
@@ -554,7 +560,7 @@ def resolve_moe_gemm_backend(role: str, *, device=None) -> str:
     backend = _role_backend(role)
     if backend == "":
         backend = _main_backend()
-    if backend in {"deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4"} and role != "forward":
+    if backend in {"deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4", "triton_nf4_w4a16"} and role != "forward":
         raise RuntimeError(
             f"{backend} is a forward-only backend; frozen-weight Dgrad remains "
             "high precision and adapter gradients remain in the adapter path."

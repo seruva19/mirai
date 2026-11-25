@@ -3480,7 +3480,7 @@ Grouped-GEMM primitive below `moe_dispatch`. `auto` inherits dispatch selection;
 
 - **Type:** str
 - **Default:** `""`
-- **Allowed / range:** `""` (inherit), `auto`, `bmm`, `persistent`, `torch_grouped`, `deepgemm_fp8`, `scaled_mm_fp8`, `scaled_mm_fp4`
+- **Allowed / range:** `""` (inherit), `auto`, `bmm`, `persistent`, `torch_grouped`, `deepgemm_fp8`, `scaled_mm_fp8`, `scaled_mm_fp4`, `triton_nf4_w4a16`
 
 Forward matmul override. `deepgemm_fp8` uses stored 128×128 FP8 weights and online 1×128 activation scales; it requires `frozen_weight_quantization="fp8"`, DeepGEMM, CUDA SM90, and expert widths divisible by 128. Routed execution accepts stable unequal group boundaries, including empty groups, gathers token rows before the role-specific FP8 projection, and combines grouped output rows directly into weighted token results without an assignment-order output buffer. Input gradients remain high precision, and routing-coefficient and adapter gradients remain differentiable through the adjacent combine and adapter seams.
 
@@ -3495,6 +3495,11 @@ weights, Blackwell CUDA, and PyTorch support for the requested scale recipe.
 It quantizes activations to the matching FP4 format at execution time,
 reorders block scales for the native kernel, and retains reference input
 gradients. Input channels must align to the stored scale block.
+
+`triton_nf4_w4a16` is experimental for double-quantized NF4 compressed
+linear layers and routed experts. It requires Triton, CUDA SM80 or newer, and
+FP16 or BF16 input. Forward decodes weight tiles inside the matmul and
+accumulates in FP32. Frozen-weight input gradients use the reference decoder.
 
 ### `moe_gemm_backend_dx`
 

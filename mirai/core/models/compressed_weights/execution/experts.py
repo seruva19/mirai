@@ -1972,7 +1972,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         if self._flexmoe_taylor_observer is not None:
             chunk_size = 1
         forward_backend = resolve_moe_gemm_backend("forward", device=tokens.device)
-        native_quantized = forward_backend in {"deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4"}
+        native_quantized = forward_backend in {"deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4", "triton_nf4_w4a16"}
         if native_quantized and self._whitening_calibration_observer is not None:
             raise RuntimeError("Native quantized routed execution does not support whitening calibration.")
         if (chunk_size > 1 or native_quantized) and self._whitening_calibration_observer is None:
@@ -2209,7 +2209,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         # forward role selects (independent per-role wiring is a documented
         # backend contract in moe/runtime/gemm.py).
         forward_backend = resolve_moe_gemm_backend("forward", device=tokens.device)
-        if forward_backend in {"bmm", "scaled_mm_fp8", "scaled_mm_fp4"}:
+        if forward_backend in {"bmm", "scaled_mm_fp8", "scaled_mm_fp4", "triton_nf4_w4a16"}:
             runner = self._run_direct_routed_batched_vectorized
         elif forward_backend == "persistent":
             runner = self._run_direct_routed_batched_persistent
@@ -3580,6 +3580,22 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             for row, index in enumerate(active)
         ])
 
+    def _native_nf4_batched(self, key: str, x: torch.Tensor, active: list[int]) -> torch.Tensor:
+        from ..quantization.nf4_w4a16 import fused_nf4_linear
+
+        packed, absmax, nested, offsets = self._nf4_gather_buffers(key, tuple(active), x.device)
+        _, output_width, input_width = self._nf4_shapes[key]
+        code = getattr(self, f"{key}_nf4_code")
+        nested_code = getattr(self, f"{key}_nf4_ncode")
+        return torch.stack([
+            fused_nf4_linear(
+                rows, packed=packed[index], absmax=absmax[index], nested_absmax=nested[index],
+                offset=offsets[index], code=code, nested_code=nested_code, meta=self._nf4_meta,
+                shape=(output_width, input_width),
+            )
+            for index, rows in enumerate(x)
+        ])
+
     def _expert_linear_batched_requant(
         self,
         key: str,
@@ -3587,7 +3603,10 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         active: list[int],
         expert_indices: torch.Tensor,
     ) -> torch.Tensor:
-        if self._quant_format in {"nvfp4", "mxfp4"} and resolve_moe_gemm_backend("forward") == "scaled_mm_fp4":
+        forward_backend = resolve_moe_gemm_backend("forward")
+        if self._quant_format == "nf4" and forward_backend == "triton_nf4_w4a16":
+            output = self._native_nf4_batched(key, x, active)
+        elif self._quant_format in {"nvfp4", "mxfp4"} and forward_backend == "scaled_mm_fp4":
             output = self._native_fp4_batched(key, x, active)
         elif self._quant_format in BLOCKWISE_FP8_FORMATS:
             output = self._blockwise_fp8_linear(key, x, tuple(active))
@@ -3612,7 +3631,11 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         weights are dequantized once for both keys (see
         ``_FrozenDequantBatchedLinearPair`` / ``_dequant_expert_pair``). LoRA
         adapters remain per-key on top of the shared frozen linear."""
-        if self._quant_format in {"nvfp4", "mxfp4"} and resolve_moe_gemm_backend("forward") == "scaled_mm_fp4":
+        forward_backend = resolve_moe_gemm_backend("forward")
+        if self._quant_format == "nf4" and forward_backend == "triton_nf4_w4a16":
+            out_a = self._native_nf4_batched(key_a, x, active)
+            out_b = self._native_nf4_batched(key_b, x, active)
+        elif self._quant_format in {"nvfp4", "mxfp4"} and forward_backend == "scaled_mm_fp4":
             out_a = self._native_fp4_batched(key_a, x, active)
             out_b = self._native_fp4_batched(key_b, x, active)
         elif self._quant_format in BLOCKWISE_FP8_FORMATS:
