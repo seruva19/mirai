@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -30,6 +31,9 @@ from .quantized_experts import (
     _new_expert_store,
     iter_magi2_moe_layers,
 )
+
+if TYPE_CHECKING:
+    from mirai.core.moe.calibration.diet import DietCalibrationEvidence, DietGroupTopology, DietLayerCapture, DietODLConfig
 
 
 _SCHEMA = "mirai.magi2_preview.head_expert_pruning"
@@ -191,6 +195,77 @@ def build_magi2_diet_pruning_plan(
         raise ValueError("MAGI-2 DIET survivors must identify routed layers.")
     fingerprint = _source_fingerprint({name: layers[name] for name in kept_by_head})
     return Magi2ExpertPruningPlan("diet", fingerprint, dict(kept_by_head))
+
+
+def _diet_head_topology(layer: nn.Module) -> DietGroupTopology:
+    from mirai.core.moe.calibration.diet import DietGroupTopology
+
+    if layer.config.score_func != "sigmoid" or layer.topk >= layer.num_experts:
+        raise ValueError("MAGI-2 DIET requires sigmoid routing with room to delete one expert.")
+    return DietGroupTopology(
+        num_experts=layer.num_experts, top_k=layer.topk, num_groups=1,
+        topk_group=1, group_score_topk=1, normalize_topk_prob=layer.config.route_norm,
+        route_scale=layer.config.route_scale, normalization_epsilon=1e-12,
+    ).validate()
+
+
+@torch.no_grad()
+def capture_magi2_diet_head(
+    layer: nn.Module, head: int, sampled_tokens: torch.Tensor,
+) -> DietLayerCapture:
+    """Capture all experts for sampled tokens of one dense MAGI-2 routed head."""
+    from mirai.core.moe.calibration.diet import DietLayerCapture
+
+    topology = _diet_head_topology(layer)
+    if not 0 <= head < layer.num_heads or sampled_tokens.ndim != 2 or (
+        sampled_tokens.shape[0] == 0 or sampled_tokens.shape[1] != layer.d_head
+    ):
+        raise ValueError("MAGI-2 DIET needs a valid head and nonempty [tokens, head width] input.")
+    if layer.ep_size != 1 or getattr(layer, "_mirai_experts_pruned", False) or any(
+        layer._parameters.get(key) is None for key in _PARAMETERS
+    ) or getattr(layer, "_mirai_router_lora_executor", None) is not None:
+        raise ValueError("MAGI-2 DIET capture requires the original dense expert pool and router.")
+    start = head * layer.num_experts
+    rows = slice(start, start + layer.num_experts)
+    scores = (sampled_tokens.float() @ layer.gate[rows].float().T).sigmoid()
+    outputs = []
+    for index in range(rows.start, rows.stop):
+        gate = (sampled_tokens @ layer.W_gate[index]).float().clamp(max=7.0)
+        up = (sampled_tokens @ layer.W_up[index]).float().clamp(min=-7.0, max=7.0)
+        hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+        outputs.append(hidden.to(layer.W_down.dtype) @ layer.W_down[index])
+    return DietLayerCapture(
+        expert_outputs=torch.stack(outputs, dim=1).cpu(),
+        router_scores=scores.cpu(),
+        choice_bias=layer.router.expert_bias[rows].detach().to(device="cpu", copy=True),
+        topology=topology,
+    ).validate()
+
+
+def select_magi2_diet_pruning_plan(
+    transformer: nn.Module, evidence: dict[str, tuple[DietCalibrationEvidence, ...]],
+    *, keep_fraction: float, config: DietODLConfig | None = None,
+) -> Magi2ExpertPruningPlan:
+    """Select equal-size survivor sets independently within each captured head."""
+    from mirai.core.moe.calibration.diet import select_odl_survivors, uniform_layer_counts
+
+    layers = _dense_pruning_layers(transformer)
+    if not evidence or set(evidence) - set(layers):
+        raise ValueError("MAGI-2 DIET evidence must identify routed layers.")
+    counts = uniform_layer_counts({name: layers[name].num_experts for name in evidence}, keep_fraction)
+    kept = {}
+    for name, heads in sorted(evidence.items()):
+        layer = layers[name]
+        topology = _diet_head_topology(layer)
+        if len(heads) != layer.num_heads or any(item.validate().topology != topology for item in heads):
+            raise ValueError(f"MAGI-2 DIET evidence has incompatible head topology for {name!r}.")
+        if counts[name] < topology.top_k:
+            raise ValueError(f"MAGI-2 DIET expert budget is below top-k for {name!r}.")
+        kept[name] = tuple(
+            select_odl_survivors(item.signatures, counts[name], topology, config=config)
+            for item in heads
+        )
+    return build_magi2_diet_pruning_plan(transformer, kept)
 
 
 def build_magi2_aimer_pruning_plan(

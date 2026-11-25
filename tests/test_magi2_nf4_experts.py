@@ -835,6 +835,49 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
         verify_magi2_pruning_source(transformer, plan)
 
 
+def test_magi2_diet_head_replay_matches_native_expert_deletion() -> None:
+    from copy import deepcopy
+
+    from mirai.core.models.magi2_preview.expert_pruning import (
+        apply_magi2_expert_pruning, build_magi2_diet_pruning_plan,
+        capture_magi2_diet_head, select_magi2_diet_pruning_plan,
+    )
+    from mirai.core.moe.calibration.diet import (
+        DietODLConfig, DietPairedCapture, derive_diet_signatures, replay_deletion_responses,
+    )
+
+    model = _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32))
+    layer = model.mlp.moe_mlp
+    tokens = torch.randn(3, 2, layer.d_head)
+    captures = tuple(capture_magi2_diet_head(layer, head, tokens[:, head]) for head in range(2))
+    original = layer._forward_impl(tokens.flatten(1)).view_as(tokens)
+    pruned = deepcopy(model)
+    name = "mlp.moe_mlp"
+    deletion = build_magi2_diet_pruning_plan(pruned, {name: ((0, 2, 3), (0, 1, 3))})
+    apply_magi2_expert_pruning(pruned, deletion)
+    observed = pruned.mlp.moe_mlp._forward_impl(tokens.flatten(1)).view_as(tokens) - original
+    for head, deleted in enumerate((1, 2)):
+        replay = replay_deletion_responses(captures[head])[deleted]
+        torch.testing.assert_close(replay.float(), observed[:, head], rtol=1e-4, atol=1e-5)
+    evidence = tuple(
+        derive_diet_signatures(
+            DietPairedCapture(
+                capture, capture_magi2_diet_head(layer, head, -tokens[:, head]),
+                pair_ids=torch.zeros(3, dtype=torch.long), token_positions=torch.arange(3),
+            ),
+            guidance_scale=3.0,
+        )
+        for head, capture in enumerate(captures)
+    )
+    plan = select_magi2_diet_pruning_plan(
+        model, {name: evidence}, keep_fraction=0.5,
+        config=DietODLConfig(random_restarts=0, anneal_steps=0),
+    )
+    assert plan.criterion == "diet"
+    assert plan.source_weight_fingerprint == deletion.source_weight_fingerprint
+    assert [len(ids) for ids in plan.kept_by_head[name]] == [2, 2]
+
+
 def test_pruning_calibration_keeps_head_local_route_ids(monkeypatch) -> None:
     from mirai.core.models.magi2_preview.expert_pruning import (
         build_magi2_expert_pruning_plan, build_magi2_pruning_calibration_targets,

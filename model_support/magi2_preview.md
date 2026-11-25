@@ -771,6 +771,10 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   original checkpoint, and expert format.
   The Python plan builder accepts per-head REAP and AIMER scores. DIET plans
   carry explicit externally selected survivors.
+  For DIET with sampled pre-expert activations, use `capture_magi2_diet_head`
+  to replay one-expert deletions for a dense sigmoid-routed head. Derive DIET
+  evidence from aligned conditional and unconditional captures, then pass one
+  evidence item per head to `select_magi2_diet_pruning_plan`.
   For AIMER, call `build_magi2_aimer_pruning_plan(transformer, keep_fraction=...)`
   on the loaded dense source transformer. It computes scores from the three
   expert projections in blocks and ranks the experts independently in each

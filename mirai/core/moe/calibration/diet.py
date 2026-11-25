@@ -44,6 +44,7 @@ class DietGroupTopology:
     normalize_topk_prob: bool = True
     route_scale: float = 1.0
     expert_to_group: tuple[int, ...] = ()
+    normalization_epsilon: float = 0.0
 
     def validate(self) -> "DietGroupTopology":
         if self.num_experts < 2 or not 1 <= self.top_k <= self.num_experts:
@@ -58,6 +59,8 @@ class DietGroupTopology:
             raise ValueError("Every DIET router group must contain enough experts.")
         if not math.isfinite(self.route_scale) or self.route_scale <= 0:
             raise ValueError("DIET route scale must be positive and finite.")
+        if not math.isfinite(self.normalization_epsilon) or self.normalization_epsilon < 0:
+            raise ValueError("DIET normalization epsilon must be finite and non-negative.")
         return self
 
     def groups(self) -> tuple[int, ...]:
@@ -165,7 +168,9 @@ def _route(capture: DietLayerCapture, retained: torch.Tensor) -> torch.Tensor:
     gates = scores.gather(1, routed)
     if topology.normalize_topk_prob:
         denominator = gates.sum(dim=1, keepdim=True)
-        if bool((denominator <= 0).any().item()):
+        if topology.normalization_epsilon:
+            denominator = denominator.clamp_min(topology.normalization_epsilon)
+        elif bool((denominator <= 0).any().item()):
             raise ValueError("DIET replay encountered a zero unbiased gate sum.")
         gates = gates / denominator
     gates = gates * topology.route_scale
@@ -517,7 +522,10 @@ class DietLineage:
 
 
 def _topology_dict(value: DietGroupTopology) -> dict[str, Any]:
-    return dataclasses.asdict(value.validate())
+    payload = dataclasses.asdict(value.validate())
+    if not value.normalization_epsilon:
+        del payload["normalization_epsilon"]
+    return payload
 
 
 def save_diet_evidence(path: str | Path, evidence_by_module: Mapping[str, DietCalibrationEvidence], *, lineage: DietLineage) -> None:
