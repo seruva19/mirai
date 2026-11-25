@@ -3167,7 +3167,8 @@
         "verify_magi2_pruning_source",
         "build_magi2_pruning_calibration_targets",
         "build_magi2_aimer_pruning_plan",
-        "build_magi2_aimer_pruning_plan_from_shards"
+        "build_magi2_aimer_pruning_plan_from_shards",
+        "stream_prune_magi2_experts"
       ],
       "config_keys": [
         "model.params.family_params"

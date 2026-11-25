@@ -327,7 +327,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             self._quantize_experts_on_load or self._packed_expert_state_path
             or self._expert_precision_plan_path
         ):
-            raise ValueError("MAGI-2 pruning requires loading the original dense experts before pruning.")
+            raise ValueError("MAGI-2 pruning requires an original dense expert checkpoint.")
         default_config = (
             Path(__file__).resolve().parents[3]
             / "vendors"
@@ -437,13 +437,23 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         checkpoint_dir = model_path / "preview" if (model_path / "preview").is_dir() else model_path
         config.engine_config.load = str(checkpoint_dir)
         packed_experts = self._quantizes_experts_on_load() or bool(self._packed_expert_state_path)
+        pruning_plan_path = self._expert_pruning_plan_path
         transformer = (
             Transformer(config.arch_config, ep_size=1, routed_weight_device="meta")
-            if packed_experts else Transformer(config.arch_config, ep_size=1)
+            if packed_experts or pruning_plan_path else Transformer(config.arch_config, ep_size=1)
         )
         mixed_stream = self._quantizes_experts_on_load() and self._expert_precision_plan_path
         preloaded_keys = set()
-        if mixed_stream:
+        if pruning_plan_path:
+            from mirai.core.models.magi2_preview.expert_pruning import (
+                Magi2ExpertPruningPlan,
+                stream_prune_magi2_experts,
+            )
+
+            pruning_plan = Magi2ExpertPruningPlan.load(pruning_plan_path)
+            preloaded_keys = stream_prune_magi2_experts(transformer, pruning_plan, checkpoint_dir)
+            self._expert_pruning_digest = pruning_plan.topology_digest()
+        elif mixed_stream:
             from mirai.core.models.magi2_preview.mixed_experts import stream_quantize_magi2_mixed_experts
 
             self._expert_stores, preloaded_keys = stream_quantize_magi2_mixed_experts(
@@ -513,15 +523,6 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     blocksize=self._nf4_blocksize,
                     quant_format=self._frozen_weight_quantization,
                 )
-        elif self._expert_pruning_plan_path:
-            from mirai.core.models.magi2_preview.expert_pruning import (
-                Magi2ExpertPruningPlan,
-                apply_magi2_expert_pruning,
-            )
-
-            pruning_plan = Magi2ExpertPruningPlan.load(self._expert_pruning_plan_path)
-            apply_magi2_expert_pruning(transformer, pruning_plan)
-            self._expert_pruning_digest = pruning_plan.topology_digest()
         elif getattr(self, "_expert_pruning_adapter_source_plan_path", ""):
             from mirai.core.models.magi2_preview.expert_pruning import (
                 Magi2ExpertPruningPlan,

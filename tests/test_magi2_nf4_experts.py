@@ -869,13 +869,15 @@ def test_pruning_calibration_keeps_head_local_route_ids(monkeypatch) -> None:
 
 
 def test_pruned_attention_adapter_restores_only_to_verified_source(tmp_path, monkeypatch) -> None:
+    from dataclasses import replace
     from types import SimpleNamespace
 
     from safetensors.torch import save_file
     from mirai.core.training.adapters import load_adapter_payload, normalize_adapter_state, save_kohya_adapter_safetensors
     from mirai.core.training.optim.ema import init_ema_state, update_ema_state
     from mirai.core.models.magi2_preview.expert_pruning import (
-        apply_magi2_expert_pruning, build_magi2_expert_pruning_plan, verify_magi2_pruning_source,
+        apply_magi2_expert_pruning, build_magi2_expert_pruning_plan,
+        stream_prune_magi2_experts, verify_magi2_pruning_source,
     )
     from mirai.vendors.magi2_preview.common import magi2_config
     from mirai.vendors.magi2_preview.model import magi2_preview as vendored_model
@@ -930,6 +932,38 @@ def test_pruned_attention_adapter_restores_only_to_verified_source(tmp_path, mon
     monkeypatch.setattr(preview_data_proxy, "Magi2DataProxy", lambda _: None)
     target.options = SimpleNamespace(config_path="")
     target.model_config = SimpleNamespace(path=str(tmp_path))
+    streamed = fixture()
+    streamed.options = target.options
+    streamed.model_config = target.model_config
+    streamed._expert_pruning_plan_path = str(path)
+    streamed._quantize_experts_on_load = False
+    streamed._packed_expert_state_path = ""
+    streamed._configure_attention_backend = lambda _: None
+
+    def build_skeleton(*args, **kwargs):
+        assert kwargs["routed_weight_device"] == "meta"
+        layer = streamed.transformer.layer.mlp.moe_mlp
+        for key in ("W_gate", "W_up", "W_down"):
+            setattr(layer, key, torch.nn.Parameter(getattr(layer, key).to("meta")))
+        return streamed.transformer
+
+    monkeypatch.setattr(vendored_model, "Transformer", build_skeleton)
+    skeleton = build_skeleton(routed_weight_device="meta")
+    with pytest.raises(ValueError, match="fingerprint"):
+        stream_prune_magi2_experts(
+            skeleton, replace(plan, source_weight_fingerprint="sha256:wrong"), tmp_path,
+        )
+    assert skeleton.layer.mlp.moe_mlp.W_gate.is_meta
+    assert skeleton.layer.mlp.moe_mlp.num_experts == 4
+    _, streamed.transformer, _ = streamed._build_model()
+    assert streamed._expert_pruning_digest == plan.topology_digest()
+    expected_routed = source.transformer.layer.mlp.moe_mlp
+    actual_routed = streamed.transformer.layer.mlp.moe_mlp
+    assert actual_routed.num_experts == expected_routed.num_experts == 2
+    for key, value in expected_routed.state_dict().items():
+        torch.testing.assert_close(actual_routed.state_dict()[key], value, rtol=0, atol=0)
+
+    monkeypatch.setattr(vendored_model, "Transformer", lambda *args, **kwargs: target.transformer)
     target._expert_pruning_adapter_source_plan_path = str(path)
     target._expert_pruning_plan_path = ""
     target._quantize_experts_on_load = False

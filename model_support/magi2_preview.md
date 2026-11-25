@@ -757,8 +757,9 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 - **Head-local MAGI-2 expert pruning** — Experimental deletion from a
   versioned, source-weight-bound plan. Set
   `model.params.family_params.expert_pruning_plan_path` and load the
-  source dense checkpoint so the plan can remap router rows, bias buffers,
-  and expert weights together. Keep sets must retain the same count in each
+  original checkpoint. The loader verifies the source fingerprint and retains
+  the selected router rows, bias entries, and expert weights as it reads the
+  shards. Keep sets must retain the same count in each
   head of a layer and preserve top-k. For training, select `attn_only`.
   The Python plan builder accepts per-head REAP and AIMER scores. DIET plans
   carry explicit externally selected survivors.

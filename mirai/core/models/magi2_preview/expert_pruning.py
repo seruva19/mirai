@@ -248,8 +248,7 @@ def build_magi2_aimer_pruning_plan_from_shards(
     return Magi2ExpertPruningPlan("aimer", f"sha256:{source.hexdigest()}", kept)
 
 
-def _validated_pruning_source(transformer: nn.Module, plan: Magi2ExpertPruningPlan):
-    layers = dict(iter_magi2_moe_layers(transformer))
+def _pruning_indices(layers, plan: Magi2ExpertPruningPlan):
     if not plan.kept_by_head or set(plan.kept_by_head) - set(layers):
         raise ValueError("MAGI-2 expert pruning plan does not match model topology.")
     selected = {}
@@ -270,9 +269,27 @@ def _validated_pruning_source(transformer: nn.Module, plan: Magi2ExpertPruningPl
                 raise ValueError(f"Invalid or unequal keep counts for '{name}', or a head falls below top-k.")
             indices.extend(head * layer.num_experts + index for index in sorted(ids))
         selected[name] = (keep_count, indices)
-    if _source_fingerprint({name: layers[name] for name in selected}) != plan.source_weight_fingerprint:
-        raise ValueError("MAGI-2 expert pruning plan source-weight fingerprint mismatch.")
+    return selected
+
+
+def _validated_pruning_source(transformer: nn.Module, plan: Magi2ExpertPruningPlan):
+    layers = _dense_pruning_layers(transformer)
+    selected = _pruning_indices(layers, plan)
+    _check_pruning_fingerprint(plan, _source_fingerprint({name: layers[name] for name in selected}))
     return layers, selected
+
+
+def _check_pruning_fingerprint(plan: Magi2ExpertPruningPlan, fingerprint: str) -> None:
+    if fingerprint != plan.source_weight_fingerprint:
+        raise ValueError("MAGI-2 expert pruning plan source-weight fingerprint mismatch.")
+
+
+def _resize_expert_pool(layer, keep_count: int) -> None:
+    layer.num_experts = keep_count
+    layer.config = replace(layer.config, num_experts=keep_count)
+    layer.flatten_num_experts = layer.num_heads * keep_count
+    layer.local_flatten_num_experts = layer.local_num_heads * keep_count
+    layer._mirai_experts_pruned = True
 
 
 def verify_magi2_pruning_source(transformer: nn.Module, plan: Magi2ExpertPruningPlan) -> bytes:
@@ -293,8 +310,48 @@ def apply_magi2_expert_pruning(transformer: nn.Module, plan: Magi2ExpertPruningP
         for key in _ROUTER_BUFFERS:
             buffer = getattr(layer.router, key)
             setattr(layer.router, key, buffer.index_select(0, torch.tensor(ids, device=buffer.device)))
-        layer.num_experts = keep_count
-        layer.config = replace(layer.config, num_experts=keep_count)
-        layer.flatten_num_experts = layer.num_heads * keep_count
-        layer.local_flatten_num_experts = layer.local_num_heads * keep_count
-        layer._mirai_experts_pruned = True
+        _resize_expert_pool(layer, keep_count)
+
+
+def stream_prune_magi2_experts(
+    transformer: nn.Module, plan: Magi2ExpertPruningPlan, checkpoint_dir: str | Path,
+) -> set[str]:
+    """Validate source tensors and materialize the retained rows from each shard."""
+    from safetensors import safe_open
+
+    from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import read_safetensors_weight_map
+
+    layers = _dense_pruning_layers(transformer)
+    selected = _pruning_indices(layers, plan)
+    weight_map = read_safetensors_weight_map(str(checkpoint_dir))
+    inputs = {}
+    for name, layer in layers.items():
+        for key in _PARAMETERS if name in selected else MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            qualified = f"{name}.{key}"
+            inputs[qualified] = (name, layer, key, qualified, layer._parameters[key])
+        if name in selected:
+            for key in _ROUTER_BUFFERS:
+                qualified = f"{name}.router.{key}"
+                inputs[qualified] = (name, layer.router, key, f"{name}.router.expert_bias_ema", getattr(layer.router, key))
+    missing = sorted((inputs.keys() | {entry[3] for entry in inputs.values()}) - weight_map.keys())
+    if missing:
+        raise ValueError(f"MAGI-2 checkpoint is missing pruning source tensors: {missing[:4]}.")
+    indices = {name: torch.tensor(ids) for name, (_, ids) in selected.items()}
+    digest = hashlib.sha256()
+    retained = {}
+    for qualified, (name, owner, key, source_key, target) in sorted(inputs.items()):
+        with safe_open(weight_map[source_key], framework="pt", device="cpu") as shard:
+            value = shard.get_tensor(source_key)
+            if value.shape != target.shape or not value.is_floating_point():
+                raise ValueError(f"MAGI-2 pruning source tensor {source_key!r} has incompatible shape or dtype.")
+            value = value.to(dtype=target.dtype)
+            if name in selected:
+                update_router_tensor_fingerprints((digest,), qualified, value)
+                value = value.index_select(0, indices[name])
+            retained[qualified] = nn.Parameter(value, requires_grad=target.requires_grad) if isinstance(target, nn.Parameter) else value
+    _check_pruning_fingerprint(plan, f"sha256:{digest.hexdigest()}")
+    for qualified, (_, owner, key, _, _) in inputs.items():
+        setattr(owner, key, retained[qualified])
+    for name, (keep_count, _) in selected.items():
+        _resize_expert_pool(layers[name], keep_count)
+    return set(retained)
