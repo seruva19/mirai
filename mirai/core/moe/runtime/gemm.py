@@ -48,7 +48,7 @@ except ModuleNotFoundError:  # pragma: no cover - torch-less static analysis
     torch = None  # type: ignore[assignment]
 
 
-MOE_GEMM_BACKENDS = ("auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8", "scaled_mm_fp8")
+MOE_GEMM_BACKENDS = ("auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4")
 MOE_GEMM_ROLES = ("forward", "dx", "dw")
 
 # Accepted spellings that normalize onto a canonical backend name. Kept small and
@@ -226,6 +226,15 @@ def probe_backend(name: str, *, device=None) -> BackendProbe:
         if capability is None or capability < (8, 9):
             return BackendProbe(name, False, "scaled_mm_fp8 requires CUDA SM89 or newer")
         return BackendProbe(name, True, "PyTorch FP8 scaled matmul with FP32 accumulation")
+    if name == "scaled_mm_fp4":
+        if not callable(getattr(torch, "_scaled_mm", None)) or not hasattr(torch, "float4_e2m1fn_x2"):
+            return BackendProbe(name, False, "scaled_mm_fp4 requires PyTorch packed E2M1 support")
+        if device is not None and getattr(device, "type", None) != "cuda":
+            return BackendProbe(name, False, "scaled_mm_fp4 requires a CUDA device")
+        capability = _cuda_capability(device)
+        if capability is None or capability[0] not in {10, 12}:
+            return BackendProbe(name, False, "scaled_mm_fp4 requires Blackwell CUDA (SM10x or SM12x)")
+        return BackendProbe(name, True, "Blackwell block-scaled FP4 matmul")
     # torch_grouped
     if grouped_mm_op() is None:
         return BackendProbe(
@@ -545,7 +554,7 @@ def resolve_moe_gemm_backend(role: str, *, device=None) -> str:
     backend = _role_backend(role)
     if backend == "":
         backend = _main_backend()
-    if backend in {"deepgemm_fp8", "scaled_mm_fp8"} and role != "forward":
+    if backend in {"deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4"} and role != "forward":
         raise RuntimeError(
             f"{backend} is a forward-only backend; frozen-weight Dgrad remains "
             "high precision and adapter gradients remain in the adapter path."
@@ -569,7 +578,7 @@ def describe(*, device=None) -> dict:
         "roles": {role: resolve_moe_gemm_backend(role) for role in MOE_GEMM_ROLES},
         "backends": {
             name: {"available": probe.available, "reason": probe.reason}
-            for name in ("bmm", "persistent", "torch_grouped", "deepgemm_fp8", "scaled_mm_fp8")
+            for name in MOE_GEMM_BACKENDS if name != "auto"
             for probe in (probe_backend(name, device=device),)
         },
         "grouped_mm": {

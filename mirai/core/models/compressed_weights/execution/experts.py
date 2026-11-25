@@ -1971,15 +1971,11 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             chunk_size = 1
         if self._flexmoe_taylor_observer is not None:
             chunk_size = 1
-        use_routed_deepgemm = (
-            resolve_moe_gemm_backend("forward", device=tokens.device)
-            == "deepgemm_fp8"
-        )
-        if use_routed_deepgemm and self._whitening_calibration_observer is not None:
-            raise RuntimeError(
-                "DeepGEMM FP8 routed execution does not support whitening calibration."
-            )
-        if (chunk_size > 1 or use_routed_deepgemm) and self._whitening_calibration_observer is None:
+        forward_backend = resolve_moe_gemm_backend("forward", device=tokens.device)
+        native_quantized = forward_backend in {"deepgemm_fp8", "scaled_mm_fp8", "scaled_mm_fp4"}
+        if native_quantized and self._whitening_calibration_observer is not None:
+            raise RuntimeError("Native quantized routed execution does not support whitening calibration.")
+        if (chunk_size > 1 or native_quantized) and self._whitening_calibration_observer is None:
             if self._prototype_calibration_observer is not None:
                 raise RuntimeError(
                     "Prototype calibration does not support batched expert dispatch."
@@ -2213,7 +2209,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         # forward role selects (independent per-role wiring is a documented
         # backend contract in moe/runtime/gemm.py).
         forward_backend = resolve_moe_gemm_backend("forward", device=tokens.device)
-        if forward_backend in {"bmm", "scaled_mm_fp8"}:
+        if forward_backend in {"bmm", "scaled_mm_fp8", "scaled_mm_fp4"}:
             runner = self._run_direct_routed_batched_vectorized
         elif forward_backend == "persistent":
             runner = self._run_direct_routed_batched_persistent
@@ -3573,6 +3569,17 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         weight_b = self._dequant_expert_stack(key_b, expert_indices, dtype=dtype, device=device)
         return weight_a, weight_b
 
+    def _native_fp4_batched(self, key: str, x: torch.Tensor, active: list[int]) -> torch.Tensor:
+        from ..quantization.native_fp4 import native_fp4_linear
+
+        codes = getattr(self, f"{key}_mx")
+        scales = getattr(self, f"{key}_mx_scale")
+        global_scales = getattr(self, f"{key}_mx_global")
+        return torch.stack([
+            native_fp4_linear(x[row], codes[index], scales[index], global_scales[index], self._microscaling_meta[key])
+            for row, index in enumerate(active)
+        ])
+
     def _expert_linear_batched_requant(
         self,
         key: str,
@@ -3580,11 +3587,12 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         active: list[int],
         expert_indices: torch.Tensor,
     ) -> torch.Tensor:
-        output = (
-            self._blockwise_fp8_linear(key, x, tuple(active))
-            if self._quant_format in BLOCKWISE_FP8_FORMATS
-            else _FrozenDequantBatchedLinear.apply(x, self, key, tuple(active))
-        )
+        if self._quant_format in {"nvfp4", "mxfp4"} and resolve_moe_gemm_backend("forward") == "scaled_mm_fp4":
+            output = self._native_fp4_batched(key, x, active)
+        elif self._quant_format in BLOCKWISE_FP8_FORMATS:
+            output = self._blockwise_fp8_linear(key, x, tuple(active))
+        else:
+            output = _FrozenDequantBatchedLinear.apply(x, self, key, tuple(active))
         adapter = self.expert_lora[key] if key in self.expert_lora else None
         if adapter is not None:
             output = output + adapter.batched_subset_forward(x, expert_indices=expert_indices)
@@ -3604,7 +3612,10 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         weights are dequantized once for both keys (see
         ``_FrozenDequantBatchedLinearPair`` / ``_dequant_expert_pair``). LoRA
         adapters remain per-key on top of the shared frozen linear."""
-        if self._quant_format in BLOCKWISE_FP8_FORMATS:
+        if self._quant_format in {"nvfp4", "mxfp4"} and resolve_moe_gemm_backend("forward") == "scaled_mm_fp4":
+            out_a = self._native_fp4_batched(key_a, x, active)
+            out_b = self._native_fp4_batched(key_b, x, active)
+        elif self._quant_format in BLOCKWISE_FP8_FORMATS:
             out_a = self._blockwise_fp8_linear(key_a, x, tuple(active))
             out_b = self._blockwise_fp8_linear(key_b, x, tuple(active))
         else:

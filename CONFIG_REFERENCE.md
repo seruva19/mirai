@@ -3480,7 +3480,7 @@ Grouped-GEMM primitive below `moe_dispatch`. `auto` inherits dispatch selection;
 
 - **Type:** str
 - **Default:** `""`
-- **Allowed / range:** `""` (inherit), `auto`, `bmm`, `persistent`, `torch_grouped`, `deepgemm_fp8`, `scaled_mm_fp8`
+- **Allowed / range:** `""` (inherit), `auto`, `bmm`, `persistent`, `torch_grouped`, `deepgemm_fp8`, `scaled_mm_fp8`, `scaled_mm_fp4`
 
 Forward matmul override. `deepgemm_fp8` uses stored 128×128 FP8 weights and online 1×128 activation scales; it requires `frozen_weight_quantization="fp8"`, DeepGEMM, CUDA SM90, and expert widths divisible by 128. Routed execution accepts stable unequal group boundaries, including empty groups, gathers token rows before the role-specific FP8 projection, and combines grouped output rows directly into weighted token results without an assignment-order output buffer. Input gradients remain high precision, and routing-coefficient and adapter gradients remain differentiable through the adjacent combine and adapter seams.
 
@@ -3489,6 +3489,12 @@ compressed linear layers and routed experts on CUDA SM89 or newer. It
 computes native FP8 products per input tile, applies the existing block
 scales, and accumulates in FP32. Frozen-weight input gradients use the
 high-precision reference path.
+
+`scaled_mm_fp4` is experimental and requires NVFP4 or MXFP4 compressed
+weights, Blackwell CUDA, and PyTorch support for the requested scale recipe.
+It quantizes activations to the matching FP4 format at execution time,
+reorders block scales for the native kernel, and retains reference input
+gradients. Input channels must align to the stored scale block.
 
 ### `moe_gemm_backend_dx`
 

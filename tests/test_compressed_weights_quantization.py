@@ -471,6 +471,79 @@ class CompressedWeightQuantizationTests(unittest.TestCase):
         torch.testing.assert_close(observed, expected, rtol=0.0, atol=0.0)
         torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0.0, atol=0.0)
 
+    def test_native_nvfp4_preserves_packed_layout_and_reference_dgrad(self) -> None:
+        from types import SimpleNamespace
+
+        from mirai.core.models.compressed_weights.quantization.microscaling_quant import (
+            _decode_e2m1, _unpack_nibbles, dequantize_microscaling, quantize_microscaling,
+        )
+        from mirai.core.models.compressed_weights.quantization.native_fp4 import native_fp4_linear
+
+        if not hasattr(torch, "float4_e2m1fn_x2"):
+            self.skipTest("PyTorch has no packed FP4 dtype")
+        torch.manual_seed(97)
+        x = torch.randn(7, 144, requires_grad=True)
+        weight = torch.randn(35, 144)
+        codes, scales, global_scale, meta = quantize_microscaling("nvfp4", weight)
+        x_codes, x_scales, x_global, x_meta = quantize_microscaling("nvfp4", x)
+        x_dense = dequantize_microscaling(x_codes, x_scales, x_global, x_meta, dtype=x.dtype, device=x.device)
+        weight_dense = dequantize_microscaling(codes, scales, global_scale, meta, dtype=x.dtype, device=x.device)
+
+        def decode(matrix, scales):
+            rows, packed_columns = matrix.shape
+            blocks = packed_columns // 8
+            row_ids = torch.arange(rows)[:, None]
+            block_ids = torch.arange(blocks)[None, :]
+            address = (
+                (row_ids // 128) * (blocks // 4) * 512 + (block_ids // 4) * 512
+                + (row_ids % 32) * 16 + ((row_ids % 128) // 32) * 4 + block_ids % 4
+            )
+            local = scales.float()[address]
+            decoded = _decode_e2m1(_unpack_nibbles(matrix.contiguous().view(torch.uint8)))
+            return decoded * local.repeat_interleave(16, dim=1)
+
+        def scaled_mm(a, b, sa, sb, *, out_dtype, use_fast_accum):
+            self.assertEqual(out_dtype, torch.float32)
+            self.assertFalse(use_fast_accum)
+            self.assertEqual((a.shape, b.shape), (torch.Size([32, 128]), torch.Size([128, 64])))
+            return decode(a, sa) @ decode(b.t(), sb).t()
+
+        with patch("mirai.core.moe.runtime.gemm.probe_backend", return_value=SimpleNamespace(available=True)), patch.object(
+            torch, "_scaled_mm", side_effect=scaled_mm
+        ):
+            result = native_fp4_linear(x, codes, scales, global_scale, meta)
+        torch.testing.assert_close(result, x_dense @ weight_dense.t(), rtol=1e-4, atol=1e-4)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        torch.testing.assert_close(x.grad, grad @ weight_dense, rtol=0, atol=0)
+
+    def test_native_fp4_cuda_matches_decoded_reference(self) -> None:
+        from mirai.core.models.compressed_weights.quantization.microscaling_quant import (
+            dequantize_microscaling, quantize_microscaling,
+        )
+        from mirai.core.models.compressed_weights.quantization.native_fp4 import native_fp4_linear
+        from mirai.core.moe.runtime.gemm import probe_backend
+
+        device = torch.device("cuda")
+        status = probe_backend("scaled_mm_fp4", device=device)
+        if not status.available:
+            self.skipTest(status.reason)
+        formats = ["nvfp4"]
+        if hasattr(torch.nn.functional, "scaled_mm") and hasattr(torch, "float8_e8m0fnu"):
+            formats.append("mxfp4")
+        torch.manual_seed(107)
+        for fmt in formats:
+            with self.subTest(format=fmt):
+                x = torch.randn(7, 128, device=device)
+                w = torch.randn(35, 128, device=device)
+                x_payload = quantize_microscaling(fmt, x)
+                w_payload = quantize_microscaling(fmt, w)
+                a = dequantize_microscaling(*x_payload, dtype=x.dtype, device=device)
+                b = dequantize_microscaling(*w_payload, dtype=x.dtype, device=device)
+                torch.testing.assert_close(
+                    native_fp4_linear(x, *w_payload), a @ b.t(), rtol=1e-4, atol=1e-3
+                )
+
     def test_scaled_mm_fp8_preserves_block_scaling_and_reference_dgrad(self) -> None:
         from types import SimpleNamespace
 
