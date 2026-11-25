@@ -963,6 +963,34 @@ def test_pruned_attention_adapter_restores_only_to_verified_source(tmp_path, mon
     for key, value in expected_routed.state_dict().items():
         torch.testing.assert_close(actual_routed.state_dict()[key], value, rtol=0, atol=0)
 
+    from mirai.core.models.magi2_preview.quantized_experts import _new_expert_store
+
+    streamed = fixture()
+    streamed.options = target.options
+    streamed.model_config = target.model_config
+    streamed._expert_pruning_plan_path = str(path)
+    streamed._quantize_experts_on_load = True
+    streamed._frozen_weight_quantization = "fp8"
+    streamed._expert_precision_plan_path = ""
+    streamed._packed_expert_state_path = ""
+    streamed._configure_attention_backend = lambda _: None
+    _, streamed.transformer, _ = streamed._build_model()
+    packed_layer = streamed.transformer.layer.mlp.moe_mlp
+    store = streamed._expert_stores[name]
+    assert packed_layer.num_experts == 2
+    assert not hasattr(packed_layer, "W_gate")
+    assert streamed._expert_pruning_digest == plan.topology_digest()
+    torch.testing.assert_close(packed_layer.gate, expected_routed.gate, rtol=0, atol=0)
+    reference = _new_expert_store(num_groups=4, blocksize=64, quant_format="fp8")
+    for key in ("W_gate", "W_up", "W_down"):
+        reference.quantize_dense(key, getattr(expected_routed, key))
+        kwargs = dict(device=torch.device("cpu"), dtype=torch.float32)
+        torch.testing.assert_close(
+            store.materialize_segment(key, 0, 4, **kwargs),
+            reference.materialize_segment(key, 0, 4, **kwargs),
+            rtol=0, atol=0,
+        )
+
     monkeypatch.setattr(vendored_model, "Transformer", lambda *args, **kwargs: target.transformer)
     target._expert_pruning_adapter_source_plan_path = str(path)
     target._expert_pruning_plan_path = ""

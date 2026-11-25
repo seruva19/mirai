@@ -324,8 +324,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         ):
             raise ValueError("MAGI-2 pruned-adapter source verification requires the dense checkpoint.")
         if self._expert_pruning_plan_path and (
-            self._quantize_experts_on_load or self._packed_expert_state_path
-            or self._expert_precision_plan_path
+            self._packed_expert_state_path or self._expert_precision_plan_path
         ):
             raise ValueError("MAGI-2 pruning requires an original dense expert checkpoint.")
         default_config = (
@@ -451,7 +450,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
 
             pruning_plan = Magi2ExpertPruningPlan.load(pruning_plan_path)
-            preloaded_keys = stream_prune_magi2_experts(transformer, pruning_plan, checkpoint_dir)
+            preloaded_keys, self._expert_stores = stream_prune_magi2_experts(
+                transformer, pruning_plan, checkpoint_dir,
+                quant_format=self._frozen_weight_quantization if self._quantizes_experts_on_load() else None,
+                blocksize=getattr(self, "_nf4_blocksize", MAGI2_NF4_BLOCKSIZE),
+            )
             self._expert_pruning_digest = pruning_plan.topology_digest()
         elif mixed_stream:
             from mirai.core.models.magi2_preview.mixed_experts import stream_quantize_magi2_mixed_experts
@@ -486,7 +489,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             from mirai.core.models.magi2_preview.companion_weights import pack_magi2_norm_weights
 
             self._packed_norms = pack_magi2_norm_weights(transformer)
-        if packed_experts and not mixed_stream:
+        if packed_experts and not mixed_stream and not pruning_plan_path:
             if self._packed_expert_state_path:
                 from mirai.core.models.magi2_preview.packed_experts import (
                     load_magi2_nf4_packed_state,

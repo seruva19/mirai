@@ -22,7 +22,14 @@ from mirai.core.moe.calibration.router_repair import (
     update_router_tensor_fingerprints,
 )
 
-from .quantized_experts import MAGI2_ROUTED_EXPERT_TENSOR_NAMES, iter_magi2_moe_layers
+from .quantized_experts import (
+    MAGI2_NF4_STORE_ATTR,
+    MAGI2_ROUTED_EXPERT_TENSOR_NAMES,
+    NF4_BLOCKSIZE,
+    Magi2Nf4ExpertStore,
+    _new_expert_store,
+    iter_magi2_moe_layers,
+)
 
 
 _SCHEMA = "mirai.magi2_preview.head_expert_pruning"
@@ -315,8 +322,9 @@ def apply_magi2_expert_pruning(transformer: nn.Module, plan: Magi2ExpertPruningP
 
 def stream_prune_magi2_experts(
     transformer: nn.Module, plan: Magi2ExpertPruningPlan, checkpoint_dir: str | Path,
-) -> set[str]:
-    """Validate source tensors and materialize the retained rows from each shard."""
+    *, quant_format: str | None = None, blocksize: int = NF4_BLOCKSIZE,
+) -> tuple[set[str], dict[str, Magi2Nf4ExpertStore]]:
+    """Validate source tensors and materialize or pack the retained rows."""
     from safetensors import safe_open
 
     from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import read_safetensors_weight_map
@@ -337,6 +345,11 @@ def stream_prune_magi2_experts(
     if missing:
         raise ValueError(f"MAGI-2 checkpoint is missing pruning source tensors: {missing[:4]}.")
     indices = {name: torch.tensor(ids) for name, (_, ids) in selected.items()}
+    stores = {}
+    if quant_format is not None:
+        for name, layer in layers.items():
+            groups = len(selected[name][1]) if name in selected else layer.local_flatten_num_experts
+            stores[name] = _new_expert_store(num_groups=groups, blocksize=blocksize, quant_format=quant_format)
     digest = hashlib.sha256()
     retained = {}
     for qualified, (name, owner, key, source_key, target) in sorted(inputs.items()):
@@ -347,11 +360,24 @@ def stream_prune_magi2_experts(
             value = value.to(dtype=target.dtype)
             if name in selected:
                 update_router_tensor_fingerprints((digest,), qualified, value)
+            if name in stores and key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+                stores[name].quantize_dense(
+                    key, value, group_ids=selected[name][1] if name in selected else None,
+                )
+                del value
+                continue
+            if name in selected:
                 value = value.index_select(0, indices[name])
             retained[qualified] = nn.Parameter(value, requires_grad=target.requires_grad) if isinstance(target, nn.Parameter) else value
     _check_pruning_fingerprint(plan, f"sha256:{digest.hexdigest()}")
-    for qualified, (_, owner, key, _, _) in inputs.items():
+    for qualified in retained:
+        _, owner, key, _, _ = inputs[qualified]
         setattr(owner, key, retained[qualified])
     for name, (keep_count, _) in selected.items():
         _resize_expert_pool(layers[name], keep_count)
-    return set(retained)
+    for name, store in stores.items():
+        layer = layers[name]
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            del layer._parameters[key]
+        layer.add_module(MAGI2_NF4_STORE_ATTR, store)
+    return set(retained), stores
