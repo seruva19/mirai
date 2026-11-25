@@ -753,7 +753,7 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group
   index for `expert_id` and `w1`, `w2`, `w3` for gate, down, and up.
-  Assignments can use BF16, NF4, IQ2, IQ3, FP8, and NVFP4. The plan's
+  Assignments can use BF16, NF4, IQ1_M, IQ2, IQ3, FP8, and NVFP4. The plan's
   source-weight fingerprint covers each `<layer>.W_gate`, `<layer>.W_down`,
   and `<layer>.W_up` tensor. Apply the plan to the original checkpoint.
   Set `memory.quantize_experts_on_load = true` to verify and pack one routed
@@ -765,7 +765,7 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   dense checkpoint. Select `model.params.expert_precision_calibration =
   "imatrix"` for routed activation measurements or `"alphaq"` for spectral
   ranking. Pass an explicit candidate list such as
-  `--formats gguf_iq2,gguf_iq3,nvfp4,fp8,bf16`. Imatrix calibration uses the
+  `--formats gguf_iq1,gguf_iq2,gguf_iq3,nvfp4,fp8,bf16`. Imatrix calibration uses the
   reference expert loop and estimates unobserved groups from pooled layer
   statistics. Router-norm protection also binds the plan to the router weights.
   NF4 estimates include a codebook allowance per group. Packed groups in a
@@ -777,11 +777,14 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   runtime inverts the transform during dequantization for both forward
   and backward. BF16 groups keep their original basis. Rotated packed
   artifacts use version 6 and carry the group size for direct restoration.
-- **Additional MAGI-2 packed expert formats** — Experimental IQ2, IQ3, FP8,
+- **Additional MAGI-2 packed expert formats** — Experimental IQ1_M, IQ2, IQ3, FP8,
   and NVFP4 storage for frozen routed experts. These formats use version 4
   packed artifacts and the same segmented dequantization and frozen-weight
   input-gradient paths as NF4. Set `memory.frozen_weight_quantization` to
-  `gguf_iq2`, `gguf_iq3`, `fp8`, or `nvfp4`.
+  `gguf_iq1`, `gguf_iq2`, `gguf_iq3`, `fp8`, or `nvfp4`.
+  IQ1_M uses canonical 56-byte blocks for 256 weights, or 1.75 bits per
+  weight. Its encoder uses uniform code assignment. Calibration can use
+  routed activation evidence to choose formats.
 - **MAGI-2 audio-token ablation** — Paired seeded video runs compare automatic
   and zero audio-token counts with identical inference settings. Run
   `python -m mirai.core.models.magi2_preview.audio_ab --config configs/magi2_preview/inference_offload.toml --output audio-ab --prompt "A kite over the sea" --seed 17 --seed 23`.
@@ -864,8 +867,8 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.family_params.vae_decode_tile_overlap` | Overlap in latent cells between adjacent tiles. Defaults to `4`. It must be positive and smaller than an enabled tile size. Tile boundaries change the decoder context and can affect pixel values. |
 | `model.params.family_params.audio_tokens` | Length of the audio track the multimodal forward requires. MAGI-2 ships no audio encoder, so the track carries no user signal: as in the reference engine it is Gaussian noise, and it takes part in attention and MoE routing. The training forward redraws it on every call from a family-owned generator seeded from `training.seed`, so a step is reproducible under its seed and the track length never perturbs the process RNG stream; native sampling draws it once per generation from the generation generator. `-1` derives the length from the latent frame count; a non-negative value fixes it. |
 | `model.params.moe_routing_health` | Arms the family's routing-collapse tap. MAGI-2 emits no router statistic without it, so this is the only way `emits_router_metrics` becomes true and the only routing signal an `attn_router` run has. Default off; when off no tap is attached and no diagnostic key appears. |
-| `memory.frozen_weight_quantization` | `none` or `nf4`. `nf4` packs only the three routed expert tensors of each MoE layer and requires bitsandbytes; every other format is rejected. |
-| `memory.expert_weight_access` | `auto`, `disabled`, and `full_dequant` dequantize the whole group axis per call; `chunked_dequant` dequantizes `memory.expert_dequant_chunk_size` groups at a time. `active_dequant` and `fused_kernel` are rejected — the flattened head-major axis carries one weight slice per `(head, expert)` pair, not a per-routed-expert operand. Any non-default value requires `frozen_weight_quantization = "nf4"`. |
+| `memory.frozen_weight_quantization` | `none`, `nf4`, `gguf_iq1`, `gguf_iq2`, `gguf_iq3`, `fp8`, or `nvfp4`. This controls the three routed expert tensors per MoE layer. NF4 packing requires bitsandbytes. |
+| `memory.expert_weight_access` | `auto`, `disabled`, and `full_dequant` use the full group axis. `chunked_dequant` limits dequantization to `memory.expert_dequant_chunk_size` consecutive groups. `active_group_dequant` selects the flattened head-major groups used by the current routes. Explicit access policies require packed expert weights. |
 | `memory.expert_dequant_chunk_size` | Groups per dequantization on the flattened `head * num_experts + expert` axis, not experts of one head. Required to be positive with `chunked_dequant`. |
 | `memory.moe_activation_backend` | `torch` or `triton`. `triton` fuses the exact FP32 SwiGLU7 clamp, sigmoid, and backward operations and requires CUDA plus Triton. |
 | `memory.quantize_experts_on_load` | Packs each routed expert tensor as its shard is read, avoiding dense routed-weight allocations. Requires a supported frozen expert format. With `memory.expert_precision_plan_path`, applies the verified per-group formats from the plan. |

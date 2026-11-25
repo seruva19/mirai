@@ -80,7 +80,7 @@ MAGI2_EXPERT_ACCESS_POLICIES = ("full_dequant", "chunked_dequant", "active_group
 MAGI2_FUSED_GATE_UP = "W_gate_up"
 MAGI2_NF4_GROUP_FIELDS = ("nf4", "nf4_absmax", "nf4_nabsmax", "nf4_offset")
 MAGI2_NF4_CODE_FIELDS = ("nf4_code", "nf4_ncode")
-MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4")
+MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq1", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4")
 
 
 class Magi2QuantizedExpertError(ValueError):

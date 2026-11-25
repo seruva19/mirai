@@ -106,6 +106,30 @@ except ModuleNotFoundError:  # pragma: no cover
 
 @unittest.skipIf(torch is None, "torch not installed")
 class CompressedWeightQuantizationTests(unittest.TestCase):
+    def test_iq1_m_layout_and_reference_decode(self) -> None:
+        self.assertEqual(gguf_stored_bytes("iq1_m", 256), 56)
+        block = torch.zeros((1, 56), dtype=torch.uint8)
+        # FP16 1.0 = 0x3c00. The low three bits set the first local scale to 3.
+        block[0, 48:56] = torch.tensor([1, 0, 0, 0, 0, 0xc0, 0, 0x30])
+        block[0, 0] = 1  # grid row one starts with +1, then seven -1 values
+        block[0, 32] = 0x80  # negative grid shift on the second group
+        kwargs = dict(shape=(16, 16), dtype=torch.float32, device=torch.device("cpu"))
+        decoded = dequantize_gguf("iq1_m", block, **kwargs).flatten()
+        torch.testing.assert_close(
+            decoded,
+            torch.tensor([3.375] + [-2.625] * 7 + [-3.375] * 8 + [-0.875] * 240),
+            rtol=0, atol=0,
+        )
+        zero = quantize_gguf("gguf_iq1", torch.zeros((16, 16)))
+        self.assertEqual(tuple(zero.shape), (1, 56))
+        self.assertEqual(dequantize_gguf("gguf_iq1", zero, **kwargs).count_nonzero().item(), 0)
+        source = torch.randn(16, 256, generator=torch.Generator().manual_seed(104))
+        packed = quantize_gguf("gguf_iq1", source)
+        restored = dequantize_gguf(
+            "gguf_iq1", packed, shape=source.shape, dtype=source.dtype, device=source.device,
+        )
+        self.assertLess(float((source - restored).square().mean() / source.square().mean()), 0.4)
+
     def test_iq2_xs_canonical_layout_and_reference_decode(self) -> None:
         self.assertEqual(gguf_stored_bytes("gguf_iq2", 256), 74)
         self.assertEqual(normalize_gguf_format("iq2_xs"), "gguf_iq2")

@@ -923,6 +923,7 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
             "gguf_iq4",
             "gguf_iq3",
             "gguf_iq2",
+            "gguf_iq1",
             "mxfp8_e4m3",
             "mxfp4",
             "nvfp4",

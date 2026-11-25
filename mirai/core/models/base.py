@@ -54,6 +54,7 @@ class MemoryFeatureCapabilities:
     router_quantization_policy: bool = False
     moe_kernel_backend: bool = False
     trainable_parameter_offload: bool = False
+    expert_on_load_formats: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

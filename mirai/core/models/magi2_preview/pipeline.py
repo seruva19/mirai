@@ -762,6 +762,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             expert_tensor_specs=True,
             expert_weight_access_policy=True,
             quantize_experts_on_load=True,
+            expert_on_load_formats=MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS,
             moe_kernel_backend=True,
         )
 

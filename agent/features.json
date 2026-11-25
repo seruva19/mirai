@@ -3042,7 +3042,7 @@
       "reference_path": "",
       "readme_claim": "Additional MAGI-2 packed expert formats",
       "readme_claims": [],
-      "provenance": "",
+      "provenance": "https://github.com/ggml-org/llama.cpp/blob/9c003a97ab34a69cc49243f9b02014038205ffae/ggml/src/ggml-common.h",
       "promotion_evidence": ""
     },
     {

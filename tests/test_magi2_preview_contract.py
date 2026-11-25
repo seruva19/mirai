@@ -88,6 +88,31 @@ def test_magi2_offload_example_loads() -> None:
     assert config.adapter.target_preset == "attn_router"
 
 
+def test_magi2_training_accepts_provider_iq1_on_load_format() -> None:
+    from unittest.mock import Mock
+
+    from mirai.core.models.base import ModelExtensionCapabilities
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+    from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
+    from mirai.core.training.runtime.trainer import _configure_pipeline_runtime
+
+    config = load_config("configs/magi2_preview/train_offload.toml")
+    pipeline = Mock()
+    pipeline.get_memory_feature_capabilities.return_value = (
+        Magi2PreviewPipeline.__new__(Magi2PreviewPipeline).get_memory_feature_capabilities()
+    )
+    pipeline.get_model_extension_capabilities.return_value = ModelExtensionCapabilities()
+    policy = MoEOptimizationPolicy(quantize_experts_on_load=True)
+    _configure_pipeline_runtime(
+        pipeline=pipeline, config=config, weight_residency_strategy="block_swap",
+        frozen_weight_quantization="gguf_iq1", frozen_weight_quantization_strategy="auto",
+        frozen_weight_packed_state_path="", fp8_frozen_weights_enabled=False,
+        moe_optimization_policy=policy, trainable_parameter_offload=False,
+    )
+    pipeline.configure_moe_optimization_policy.assert_called_once_with(policy)
+    pipeline.enable_quantized_frozen_weights.assert_called_once_with("gguf_iq1")
+
+
 def test_magi2_low_rank_weight_preserves_default_and_gradients() -> None:
     base = torch.randn(2, 3, 5)
     adapter = LowRankWeight(tuple(base.shape), rank=2, alpha=2.0)
@@ -892,6 +917,7 @@ def test_magi2_provider_declares_moe_kernel_backend_capability() -> None:
     assert capabilities.expert_tensor_specs
     assert capabilities.expert_weight_access_policy
     assert capabilities.quantize_experts_on_load
+    assert "gguf_iq1" in capabilities.expert_on_load_formats
     assert capabilities.packed_frozen_weight_state
     assert not capabilities.router_quantization_policy
     assert not capabilities.trainable_parameter_offload

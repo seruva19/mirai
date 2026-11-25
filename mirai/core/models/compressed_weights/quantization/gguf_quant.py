@@ -1,6 +1,6 @@
 """GGUF k-quant / IQ sub-4-bit dequant primitives for frozen expert weights.
 
-This is the owner seam for ``gguf_iq4`` / ``gguf_iq3`` / ``gguf_iq2`` quant
+This is the owner seam for ``gguf_iq4`` / ``gguf_iq3`` / ``gguf_iq2`` / ``gguf_iq1`` quant
 formats. It parallels the NF4 path in ``quant.py`` but stores each expert as the
 canonical GGUF *packed block* byte layout (one ``uint8`` buffer per weight), so
 bytes-per-expert equal the on-wire GGUF footprint exactly:
@@ -8,6 +8,7 @@ bytes-per-expert equal the on-wire GGUF footprint exactly:
   * IQ4_XS  -> 136 bytes / 256 weights = 4.25 bits/weight
   * IQ3_XXS ->  98 bytes / 256 weights = 3.0625 bits/weight
   * IQ2_XS  ->  74 bytes / 256 weights = 2.3125 bits/weight
+  * IQ1_M   ->  56 bytes / 256 weights = 1.75 bits/weight
 
 On-the-fly dequant reconstructs bf16 for the existing GEMM (no compute-path
 change). Quantize runs offline (CPU) at export; dequant runs on any device.
@@ -48,16 +49,17 @@ except ModuleNotFoundError:  # pragma: no cover
 
 QK_K = 256  # GGUF super-block size (elements per super-block)
 
-GGUF_FORMATS = ("gguf_iq4", "gguf_iq3", "gguf_iq2")
+GGUF_FORMATS = ("gguf_iq4", "gguf_iq3", "gguf_iq2", "gguf_iq1")
 
 # type_size = bytes per super-block (block struct size in ggml-common.h).
 #   block_iq4_xs  = d(fp16,2) + scales_h(u16,2) + scales_l[QK_K/64=4] + qs[QK_K/2=128] = 136
 #   block_iq3_xxs = d(fp16,2) + qs[3*QK_K/8=96 -> 64 grid idx + 32 scale/sign]         = 98
-GGUF_TYPE_SIZE = {"gguf_iq4": 136, "gguf_iq3": 98, "gguf_iq2": 74}
+GGUF_TYPE_SIZE = {"gguf_iq4": 136, "gguf_iq3": 98, "gguf_iq2": 74, "gguf_iq1": 56}
 GGUF_BLOCK_FORMAT = {
     "gguf_iq4": "iq4_xs",
     "gguf_iq3": "iq3_xxs",
     "gguf_iq2": "iq2_xs",
+    "gguf_iq1": "iq1_m",
 }
 
 # Canonical published bits-per-weight (format constants, imatrix-independent).
@@ -65,6 +67,7 @@ BITS_PER_WEIGHT = {
     "gguf_iq4": 4.25,
     "gguf_iq3": 3.0625,
     "gguf_iq2": 2.3125,
+    "gguf_iq1": 1.75,
     "nf4": 4.5,  # canonical QLoRA NF4 (4-bit codes + fp32 absmax / 64-block)
     "nf4_double_quant": 4.0 + 8.0 / 64.0 + 32.0 / (64.0 * 256.0),  # ~4.127
 }
@@ -213,6 +216,8 @@ def normalize_gguf_format(value: str | None) -> str:
         "gguf_iq2_xs": "gguf_iq2",
         "iq2_xs": "gguf_iq2",
         "iq2": "gguf_iq2",
+        "gguf_iq1_m": "gguf_iq1",
+        "iq1_m": "gguf_iq1",
     }
     normalized = aliases.get(text, text)
     if normalized not in GGUF_FORMATS:
@@ -562,6 +567,10 @@ def quantize_gguf(fmt: str, weight_2d: "torch.Tensor") -> "torch.Tensor":
         return quantize_iq4_xs(weight_2d)
     if fmt == "gguf_iq3":
         return quantize_iq3_xxs(weight_2d)
+    if fmt == "gguf_iq1":
+        from .iq1_m import quantize_iq1_m
+
+        return quantize_iq1_m(weight_2d)
     return quantize_iq2_xs(weight_2d)
 
 
@@ -578,4 +587,8 @@ def dequantize_gguf(
         return dequantize_iq4_xs(blocks, shape=shape, dtype=dtype, device=device)
     if fmt == "gguf_iq3":
         return dequantize_iq3_xxs(blocks, shape=shape, dtype=dtype, device=device)
+    if fmt == "gguf_iq1":
+        from .iq1_m import dequantize_iq1_m
+
+        return dequantize_iq1_m(blocks, shape=shape, dtype=dtype, device=device)
     return dequantize_iq2_xs(blocks, shape=shape, dtype=dtype, device=device)

@@ -942,7 +942,8 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rot
         )
 
 
-def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tmp_path) -> None:
+@pytest.mark.parametrize("alternate_format", ["nvfp4", "gguf_iq1"])
+def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tmp_path, alternate_format) -> None:
     import json
 
     from mirai.core.models.magi2_preview.mixed_experts import quantize_magi2_mixed_experts
@@ -956,7 +957,7 @@ def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tm
     weights = {key: getattr(layer, key).detach().clone() for key in ("W_gate", "W_up", "W_down")}
     assignments = tuple(
         TensorPrecisionAssignment(module_name, group, role, fmt, 1, 0.0)
-        for group, fmt in enumerate(("fp8", "bf16", "nvfp4", "fp8"))
+        for group, fmt in enumerate(("fp8", "bf16", alternate_format, "fp8"))
         for role in ("w1", "w2", "w3")
     )
     plan = TensorPrecisionPlan(
@@ -1005,7 +1006,7 @@ def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tm
         load_magi2_nf4_packed_state(artifact, restored_model, blocksize=64, quant_format="fp8")
 
 
-@pytest.mark.parametrize("fmt", ["gguf_iq2", "gguf_iq3", "fp8", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["gguf_iq1", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4"])
 def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -> None:
     def model():
         return _container(_reduced_moe(

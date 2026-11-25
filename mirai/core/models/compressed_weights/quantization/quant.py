@@ -31,6 +31,7 @@ QUANT_FORMATS = (
     "gguf_iq4",
     "gguf_iq3",
     "gguf_iq2",
+    "gguf_iq1",
     "mxfp8_e4m3",
     "mxfp4",
     "nvfp4",
@@ -283,6 +284,8 @@ def normalize_quant_format(value: str | None) -> str:
         "iq3_xxs": "gguf_iq3",
         "gguf_iq2_xs": "gguf_iq2",
         "iq2_xs": "gguf_iq2",
+        "gguf_iq1_m": "gguf_iq1",
+        "iq1_m": "gguf_iq1",
     }
     normalized = aliases.get(text, text)
     if normalized not in QUANT_FORMATS:

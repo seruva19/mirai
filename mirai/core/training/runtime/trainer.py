@@ -380,11 +380,13 @@ def _configure_pipeline_runtime(
     if moe_optimization_policy.requests_runtime_behavior():
         if (
             moe_optimization_policy.quantize_experts_on_load
-            and frozen_weight_quantization not in expert_quantization_formats()
+            and frozen_weight_quantization not in (
+                memory_caps.expert_on_load_formats or expert_quantization_formats()
+            )
         ):
             raise ValueError(
                 "memory.quantize_experts_on_load requires "
-                "a registered expert-capable frozen-weight quantization format."
+                "a frozen-weight quantization format supported by the model."
             )
         if (
             moe_optimization_policy.expert_weight_access not in {"", "auto", "disabled"}
@@ -462,6 +464,7 @@ def _configure_pipeline_runtime(
         "gguf_iq4",
         "gguf_iq3",
         "gguf_iq2",
+        "gguf_iq1",
         "mxfp8_e4m3",
         "mxfp4",
         "nvfp4",
@@ -470,7 +473,7 @@ def _configure_pipeline_runtime(
         raise ValueError(
             "memory.frozen_weight_packed_state_path requires "
             "memory.frozen_weight_quantization='fp8', 'int8', 'nf4', 'gguf_iq4', "
-            "'gguf_iq3', 'gguf_iq2', 'mxfp8_e4m3', 'mxfp4', 'nvfp4', or 'w4a8'."
+            "'gguf_iq3', 'gguf_iq2', 'gguf_iq1', 'mxfp8_e4m3', 'mxfp4', 'nvfp4', or 'w4a8'."
         )
     if frozen_weight_packed_state_path and not memory_caps.packed_frozen_weight_state:
         raise ValueError(
