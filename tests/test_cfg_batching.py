@@ -111,6 +111,9 @@ class CfgBatchingContractTests(unittest.TestCase):
 
     def test_variable_length_masked_forward_matches_sequential_cfg(self) -> None:
         from mirai.core.training.preview.preview import run_native_denoise_loop
+        from mirai.core.inference.cfg_schedule import CfgSchedule
+
+        batch_sizes = []
 
         class MaskAwarePipeline:
             def __init__(self) -> None:
@@ -142,6 +145,7 @@ class CfgBatchingContractTests(unittest.TestCase):
 
             def forward(self, sample, timestep, text_embeds):
                 _ = timestep
+                batch_sizes.append(sample.shape[0])
                 context = text_embeds["t5"]
                 mask = text_embeds.get("text_mask")
                 if mask is None:
@@ -167,6 +171,18 @@ class CfgBatchingContractTests(unittest.TestCase):
         sequential, _ = run_native_denoise_loop(cfg_mode="sequential", **kwargs)
         batched, _ = run_native_denoise_loop(cfg_mode="batched", **kwargs)
         self.assertTrue(torch.allclose(sequential, batched, atol=1e-6, rtol=1e-6))
+        batch_sizes.clear()
+        defaults, _ = run_native_denoise_loop(cfg_mode="batched", cfg_schedule=CfgSchedule(), **kwargs)
+        torch.testing.assert_close(defaults, batched, rtol=0, atol=0)
+        self.assertEqual(batch_sizes, [2, 2])
+        batch_sizes.clear()
+        kwargs["denoise_steps"] = 5
+        policy = CfgSchedule((0.25, 0.75), 2)
+        run_native_denoise_loop(cfg_mode="batched", cfg_schedule=policy, **kwargs)
+        self.assertEqual(batch_sizes, [1, 2, 1, 2, 1])
+        batch_sizes.clear()
+        run_native_denoise_loop(cfg_mode="batched", cfg_schedule=policy, **kwargs)
+        self.assertEqual(batch_sizes, [1, 2, 1, 2, 1])
 
 
 if __name__ == "__main__":

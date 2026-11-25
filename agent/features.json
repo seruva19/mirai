@@ -2656,6 +2656,44 @@
       "promotion_evidence": ""
     },
     {
+      "name": "inference_cfg_schedule",
+      "kind": "inference",
+      "owner": "mirai/core/inference/cfg_schedule.py",
+      "check": "inference",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "native_execution",
+        "documentation"
+      ],
+      "symbols": [
+        "CfgSchedule"
+      ],
+      "config_keys": [
+        "inference.cfg_interval",
+        "inference.uncond_reuse_stride"
+      ],
+      "disabled_config": {
+        "inference.cfg_interval": [
+          0.0,
+          1.0
+        ],
+        "inference.uncond_reuse_stride": 1
+      },
+      "contract_paths": [
+        "tests/test_cfg_batching.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "CFG scheduling and unconditional reuse",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "latent_wavelet_supervision",
       "kind": "generic",
       "owner": "mirai/core/training/objectives/latent_wavelet.py",

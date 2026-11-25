@@ -49,6 +49,7 @@ def agnes_default_negative_prompt() -> str:
 
 
 class AgnesVideoPipeline(nn.Module, NativeVideoPipeline):
+    owns_native_conditioned_sampling = True
     REQUIRED_BATCH_KEYS_BY_STRATEGY = {"text_to_video": ["audio_latents"], "image_to_video": ["audio_latents"]}
 
     def __init__(self, model_config: Any, memory_config: Any = None, *, seed: int = 0,

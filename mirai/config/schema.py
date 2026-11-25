@@ -341,6 +341,8 @@ class InferenceConfig:
     denoising_strength: float = 1.0
     prompt_rewriter: str = "none"
     cfg_mode: str = "sequential"
+    cfg_interval: list[float] = field(default_factory=lambda: [0.0, 1.0])
+    uncond_reuse_stride: int = 1
     keep_text_encoder_resident: bool = False
     stage_text_encoder_before_denoiser: bool = False
     text_encoder_weight_quantization: str = "none"
@@ -757,6 +759,8 @@ class TrainingConfig:
                 "denoising_strength",
                 "prompt_rewriter",
                 "cfg_mode",
+                "cfg_interval",
+                "uncond_reuse_stride",
                 "keep_text_encoder_resident",
                 "stage_text_encoder_before_denoiser",
                 "text_encoder_weight_quantization",
@@ -899,6 +903,17 @@ class TrainingConfig:
             inference_table.get("prompt_rewriter", "none")
         ).strip().lower() or "none"
         cfg_mode = str(inference_table.get("cfg_mode", "sequential")).strip().lower()
+        cfg_interval = inference_table.get("cfg_interval", (0.0, 1.0))
+        if (
+            not isinstance(cfg_interval, (list, tuple))
+            or len(cfg_interval) != 2
+            or any(type(value) not in {float, int} for value in cfg_interval)
+            or not 0 <= cfg_interval[0] <= cfg_interval[1] <= 1
+        ):
+            raise ValueError("inference.cfg_interval must be [start, end] within [0, 1].")
+        reuse_stride = inference_table.get("uncond_reuse_stride", 1)
+        if type(reuse_stride) is not int or reuse_stride < 1:
+            raise ValueError("inference.uncond_reuse_stride must be a positive integer.")
         if cfg_mode not in {"sequential", "batched", "paired"}:
             raise ConfigError(
                 "inference.cfg_mode must be 'sequential', 'batched', or 'paired'; "
@@ -3549,6 +3564,8 @@ class TrainingConfig:
                 denoising_strength=denoising_strength,
                 prompt_rewriter=prompt_rewriter,
                 cfg_mode=cfg_mode,
+                cfg_interval=list(map(float, cfg_interval)),
+                uncond_reuse_stride=reuse_stride,
                 keep_text_encoder_resident=bool(
                     inference_table.get("keep_text_encoder_resident", False)
                 ),

@@ -585,6 +585,10 @@ The experimental `paired` mode packs two separate `B=1` branches and evaluates
 both before the next layer is staged. A training run that emits previews sets
 `logging.sample_solver = "unipc"`.
 
+The native sampler supports `inference.cfg_interval` and
+`inference.uncond_reuse_stride` with batched or paired CFG. These controls
+require `inference.expert_feature_cache = "off"`.
+
 Prompt-to-video output requires the official Qwen3.5 text encoder and the
 TurboVAE decoder from the same snapshot; both are validated before use and a
 missing asset fails with the expected path named. Throughput and peak-memory

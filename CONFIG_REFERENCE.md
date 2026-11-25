@@ -1058,6 +1058,26 @@ Optional audio source path used by `audio_to_video`, or as an additional source 
 separately and runs both through each loaded transformer layer before advancing.
 It requires the native inference runtime and `expert_feature_cache = "off"`.
 
+### `cfg_interval`
+
+- **Type:** two-number array
+- **Default:** `[0.0, 1.0]`
+
+Inclusive fraction of executed denoising steps where classifier-free guidance
+applies. Zero is the first step and one is the last. A single-step run uses
+zero. Outside the interval, the sampler uses only the conditional prediction.
+
+### `uncond_reuse_stride`
+
+- **Type:** positive integer
+- **Default:** `1`
+
+Within the CFG interval, refresh the unconditional prediction every N steps.
+Intermediate steps evaluate the conditional branch and reuse the latest
+unconditional prediction. Values above one approximate CFG. The cache is
+local to the generation. Family-owned samplers may reject scheduling when
+they do not implement it.
+
 ### `keep_text_encoder_resident`
 
 - **Type:** bool

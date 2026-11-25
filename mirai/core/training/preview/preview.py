@@ -25,6 +25,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     Image = None  # type: ignore[assignment]
 
+from mirai.core.inference.cfg_schedule import CfgSchedule
+
 try:
     import torch
 except ModuleNotFoundError as exc:  # pragma: no cover
@@ -59,6 +61,7 @@ def run_cfg_denoise_loop(
     step: int,
     denoise_steps: int,
     scheduler: str,
+    cfg_schedule: CfgSchedule | None = None,
 ) -> tuple[torch.Tensor, list[dict[str, float]]]:
     # Place validation-fixture tensors on the model's compute device. Block-swap /
     # residency may have materialised the model on CUDA while the preview inputs
@@ -77,14 +80,24 @@ def run_cfg_denoise_loop(
     uncond_embed = {"t5": torch.tensor([_prompt_embed(negative_prompt)], dtype=dtype, device=device)}
     extra_forward_kwargs: dict[str, Any] = dict(pipeline.preview_extra_forward_kwargs())
     stats: list[dict[str, float]] = []
+    cached_uncond = None
+    last_uncond_step = -1
+    reuse_stride = cfg_schedule.uncond_reuse_stride if cfg_schedule is not None else 1
     with torch.no_grad():
         for idx in range(steps):
             t = torch.tensor([1.0 - (idx / float(steps))], dtype=torch.float32)
-            if scale <= 1.0:
+            if scale <= 1.0 or (cfg_schedule is not None and not cfg_schedule.applies(idx, steps)):
+                cached_uncond = None
                 v_out = pipeline.forward(latent, t, cond_embed, **extra_forward_kwargs)
             else:
                 v_cond = pipeline.forward(latent, t, cond_embed, **extra_forward_kwargs)
-                v_uncond = pipeline.forward(latent, t, uncond_embed, **extra_forward_kwargs)
+                if cached_uncond is None or idx - last_uncond_step >= reuse_stride:
+                    v_uncond = pipeline.forward(latent, t, uncond_embed, **extra_forward_kwargs)
+                    if reuse_stride > 1:
+                        cached_uncond = v_uncond.detach().clone()
+                        last_uncond_step = idx
+                else:
+                    v_uncond = cached_uncond
                 v_out = v_uncond + scale * (v_cond - v_uncond)
             if schedule_key == "euler":
                 latent = latent - (v_out * dt)
@@ -185,6 +198,7 @@ def run_native_denoise_loop(
     width: int = 832,
     solver_name: str = "euler",
     cfg_mode: str | None = None,
+    cfg_schedule: CfgSchedule | None = None,
     forward_fn: Any = None,
     conditioning: Any | None = None,
     encoded_context: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -284,8 +298,15 @@ def run_native_denoise_loop(
     # Generate initial noise
     noise = torch.randn(target_shape, dtype=torch.float32, device=device, generator=g)
 
+    schedule_kwargs = {}
+    if cfg_schedule is not None and cfg_schedule.enabled:
+        if getattr(pipeline, "supports_native_cfg_schedule", False):
+            schedule_kwargs["cfg_schedule"] = cfg_schedule
+
     conditioned_sampler = getattr(pipeline, "sample_native_conditioned_media", None)
     if callable(conditioned_sampler):
+        if getattr(pipeline, "owns_native_conditioned_sampling", False) and cfg_schedule is not None and cfg_schedule.enabled and not schedule_kwargs:
+            raise ValueError("This native conditioned sampler does not support CFG scheduling.")
         sampled = conditioned_sampler(
             request=request,
             prepared=prepared,
@@ -296,6 +317,7 @@ def run_native_denoise_loop(
             guidance_scale=float(scale),
             generator=g,
             solver_name=str(solver_name),
+            **schedule_kwargs,
             **({} if requested_cfg_mode is None else {"cfg_mode": requested_cfg_mode}),
         )
         if sampled is not None:
@@ -303,6 +325,8 @@ def run_native_denoise_loop(
 
     native_sampler = getattr(pipeline, "sample_native_preview", None)
     if callable(native_sampler) and request.task == TEXT_TO_VIDEO:
+        if cfg_schedule is not None and cfg_schedule.enabled and not schedule_kwargs:
+            raise ValueError("This native sampler does not support CFG scheduling.")
         sampled = native_sampler(
             noise=noise,
             context=context,
@@ -311,6 +335,7 @@ def run_native_denoise_loop(
             guidance_scale=float(scale),
             generator=g,
             solver_name=str(solver_name),
+            **schedule_kwargs,
             **({} if requested_cfg_mode is None else {"cfg_mode": requested_cfg_mode}),
         )
         return sampled, []
@@ -372,6 +397,9 @@ def run_native_denoise_loop(
         and model_dtype in {torch.float16, torch.bfloat16}
         else contextlib.nullcontext()
     )
+    cached_uncond = None
+    last_uncond_step = -1
+    reuse_stride = cfg_schedule.uncond_reuse_stride if cfg_schedule is not None else 1
     with torch.no_grad(), autocast_ctx:
         for idx, t_val in enumerate(solver.timesteps):
             prepared.pin_condition(latents[0])
@@ -382,7 +410,11 @@ def run_native_denoise_loop(
                 saliency_guidance = sample_a.detach()
 
             text_cond = {"t5": context}
-            if scale <= 1.0:
+            guided = scale > 1.0 and (
+                cfg_schedule is None or cfg_schedule.applies(idx, len(solver.timesteps))
+            )
+            if not guided:
+                cached_uncond = None
                 v_out = fwd(
                     sample_a,
                     timestep,
@@ -394,7 +426,8 @@ def run_native_denoise_loop(
                     ),
                 )
             else:
-                if cfg_mode_key == "batched":
+                refresh = cached_uncond is None or idx - last_uncond_step >= reuse_stride
+                if cfg_mode_key == "batched" and refresh:
                     from mirai.core.inference.cfg_batching import (
                         build_batched_cfg_inputs,
                         split_batched_cfg_output,
@@ -431,7 +464,13 @@ def run_native_denoise_loop(
                         else {}
                     )
                     v_cond = fwd(sample_a, timestep, text_cond, **guidance_kwargs)
-                    v_uncond = fwd(sample_a, timestep, text_uncond, **guidance_kwargs)
+                    v_uncond = (
+                        fwd(sample_a, timestep, text_uncond, **guidance_kwargs)
+                        if refresh else cached_uncond
+                    )
+                if refresh and reuse_stride > 1:
+                    cached_uncond = v_uncond.detach().clone()
+                    last_uncond_step = idx
                 v_out = v_uncond + scale * (v_cond - v_uncond)
 
             if uses_saliency_guidance:

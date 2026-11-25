@@ -1202,6 +1202,28 @@ def test_magi2_native_sampler_rejects_policies_it_does_not_implement() -> None:
         pipeline.sample_native_preview(**call, cfg_mode="paired")
 
 
+def test_magi2_scheduled_prediction_preserves_branch_order_and_refreshes() -> None:
+    from mirai.core.inference.cfg_schedule import CfgSchedule
+    from mirai.vendors.magi2_preview.pipeline.preview_data_proxy import ModelInput
+
+    value = torch.tensor([[10.0], [2.0]])
+    batch = ModelInput(value, value, [1, 1], value, [1, 1], value)
+    calls = []
+
+    def forward(data):
+        calls.append(len(data.txt_feat))
+        predictions = data.txt_feat + len(calls)
+        return predictions, predictions
+
+    predict = _bare_pipeline()._scheduled_preview_prediction(
+        CfgSchedule((0.25, 0.75), 2), 5, forward, forward
+    )
+    results = [predict(index, batch) for index in range(5)]
+    assert calls == [1, 2, 1, 2, 1]
+    assert [only_cond for _, only_cond in results] == [True, False, False, False, True]
+    torch.testing.assert_close(results[2][0][0], torch.tensor([[13.0], [4.0]]))
+
+
 def test_magi2_audio_ab_reuses_seeds_and_restores_options(tmp_path) -> None:
     from types import SimpleNamespace
 

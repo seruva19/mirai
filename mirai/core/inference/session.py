@@ -699,6 +699,13 @@ class InferenceSession:
         loaded (VRAM realism).
         """
         output_fps = resolve_output_fps(pipeline=self.pipeline, requested=fps)
+        from mirai.core.inference.cfg_schedule import CfgSchedule
+
+        cfg_schedule = CfgSchedule(
+            tuple(getattr(self.cfg.inference, "cfg_interval", (0.0, 1.0))),
+            getattr(self.cfg.inference, "uncond_reuse_stride", 1),
+        )
+        schedule_kwargs = {"cfg_schedule": cfg_schedule} if cfg_schedule.enabled else {}
         decode_latent_path = str(decode_latent or "").strip()
         discard_refiner_context = getattr(
             self.pipeline, "discard_refiner_context", None
@@ -891,6 +898,7 @@ class InferenceSession:
                     forward_fn=self._forward_fn,
                     conditioning=conditioning,
                     encoded_context=encoded_context,
+                    **schedule_kwargs,
                 )
             else:
                 if task_key != TEXT_TO_VIDEO:
@@ -906,6 +914,7 @@ class InferenceSession:
                     step=0,
                     denoise_steps=int(steps),
                     scheduler=str(scheduler),
+                    **schedule_kwargs,
                 )
             if timings is not None:
                 timings["denoise_s"] = _sync_perf_counter() - _denoise_t0
@@ -999,6 +1008,9 @@ class InferenceSession:
             payload["original_negative_prompt"] = original_negative_prompt
         if cfg_mode_key != "sequential":
             payload["cfg_mode"] = cfg_mode_key
+        if cfg_schedule.enabled and ran_denoise_loop:
+            payload["cfg_interval"] = list(cfg_schedule.interval)
+            payload["uncond_reuse_stride"] = cfg_schedule.uncond_reuse_stride
         if self._expert_feature_cache is not None:
             payload["expert_feature_cache"] = {
                 "mode": self._expert_feature_cache.policy.mode,

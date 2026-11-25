@@ -73,7 +73,7 @@ class Magi2PreviewSampler:
             total=len(sampler_input.video_t_list),
             disable=psm.get_global_rank() != 0,
         )
-        for t, video_cfg, audio_cfg in progress:
+        for index, (t, video_cfg, audio_cfg) in enumerate(progress):
             model_input = self.prepare_model_input(
                 latent=latent,
                 audio_latent=audio_latent,
@@ -87,7 +87,12 @@ class Magi2PreviewSampler:
                 t=t,
                 cfg_config=sampler_input.cfg_config,
             )
-            model_pred = self.forward(model_input)
+            prediction_step = getattr(self, "prediction_step", None)
+            if prediction_step is None:
+                model_pred = self.forward(model_input)
+                conditional_only = False
+            else:
+                model_pred, conditional_only = prediction_step(index, model_input)
 
             latent, audio_latent, v_cfg_video, v_cfg_audio = self.step(
                 model_pred,
@@ -99,6 +104,7 @@ class Magi2PreviewSampler:
                 sampler_input.audio_scheduler,
                 t,
                 cfg_config=sampler_input.cfg_config,
+                **({"conditional_only": True} if conditional_only else {}),
             )
             step_callback = getattr(self, "step_callback", None)
             if callable(step_callback):
@@ -417,15 +423,20 @@ class Magi2PreviewSampler:
         audio_scheduler: "FlowUniPCMultistepScheduler",
         t: torch.Tensor,
         cfg_config: Optional[CFGConfig] = None,
+        *,
+        conditional_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        cfg_video, cfg_audio = self.cfg_velocity(
-            model_output,
-            video_txt_guidance_scale,
-            audio_txt_guidance_scale,
-            cfg_config,
-            latent,
-            audio_latent,
-        )
+        if conditional_only:
+            cfg_video, cfg_audio = (prediction if prediction.numel() else None for prediction in model_output)
+        else:
+            cfg_video, cfg_audio = self.cfg_velocity(
+                model_output,
+                video_txt_guidance_scale,
+                audio_txt_guidance_scale,
+                cfg_config,
+                latent,
+                audio_latent,
+            )
         if cfg_video is not None:
             latent = video_scheduler.step(cfg_video, t, latent, return_dict=False)[0]
         if cfg_audio is not None:

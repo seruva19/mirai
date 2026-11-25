@@ -15,6 +15,8 @@ import torch
 from torch import nn
 from torch.nn.utils import parametrize
 
+from mirai.core.inference.cfg_schedule import CfgSchedule
+
 from mirai.core.models.base import (
     MemoryFeatureCapabilities,
     ModelExtensionCapabilities,
@@ -237,6 +239,7 @@ class Magi2ResidencyRequest:
 class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     """Native MAGI-2 denoiser with host-resident block streaming."""
 
+    supports_native_cfg_schedule = True
     # Class-level defaults so every policy seam answers identically before
     # __init__ has run, which is how the weightless contract probes reach them.
     _refiner: Any | None = None
@@ -1366,6 +1369,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         generator: torch.Generator,
         solver_name: str = MAGI2_NATIVE_SOLVER,
         cfg_mode: str = MAGI2_NATIVE_CFG_MODE,
+        cfg_schedule: CfgSchedule | None = None,
     ) -> torch.Tensor:
         """Run the shipping joint video/audio Flow-UniPC sampler.
 
@@ -1446,6 +1450,12 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
         else:
             sampler.forward = resident_forward
+        if cfg_schedule is not None and cfg_schedule.enabled:
+            if getattr(self, "_expert_feature_cache", None) is not None:
+                raise ValueError("Scheduled MAGI-2 CFG requires inference.expert_feature_cache='off'.")
+            sampler.prediction_step = self._scheduled_preview_prediction(
+                cfg_schedule, len(video_scheduler.timesteps), sampler.forward, resident_forward
+            )
         sampler.step_callback = self.flush_runtime_offloads
         sampled_video, _sampled_audio = sampler.sample(
             SamplerInput(
@@ -1468,16 +1478,40 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         )
         return sampled_video[0]
 
-    def _paired_preview_forward(self, model_input, first_proxy, second_proxy):
-        def select(index):
-            return replace(model_input, **{
-                field.name: value[index : index + 1]
-                for field in fields(model_input)
-                if (value := getattr(model_input, field.name)) is not None
-            })
+    @staticmethod
+    def _preview_branch_input(model_input, index):
+        return replace(model_input, **{
+            field.name: value[index : index + 1]
+            for field in fields(model_input)
+            if (value := getattr(model_input, field.name)) is not None
+        })
 
+    def _scheduled_preview_prediction(self, policy, steps, pair_forward, single_forward):
+        cached = None
+        last_step = -1
+
+        def predict(index, model_input):
+            nonlocal cached, last_step
+            if not policy.applies(index, steps):
+                cached = None
+                return single_forward(self._preview_branch_input(model_input, 0)), True
+            if cached is None or index - last_step >= policy.uncond_reuse_stride:
+                predictions = pair_forward(model_input)
+                if policy.uncond_reuse_stride > 1:
+                    cached = tuple(value[1:2].clone() for value in predictions)
+                    last_step = index
+                return predictions, False
+            conditional = single_forward(self._preview_branch_input(model_input, 0))
+            return tuple(
+                torch.cat((cond, uncond)) for cond, uncond in zip(conditional, cached, strict=True)
+            ), False
+
+        return predict
+
+    def _paired_preview_forward(self, model_input, first_proxy, second_proxy):
         first, second = self.transformer.forward_pair(
-            first_proxy.process_input(select(0)), second_proxy.process_input(select(1))
+            first_proxy.process_input(Magi2PreviewPipeline._preview_branch_input(model_input, 0)),
+            second_proxy.process_input(Magi2PreviewPipeline._preview_branch_input(model_input, 1)),
         )
         first_video, first_audio = first_proxy.process_output(first)
         second_video, second_audio = second_proxy.process_output(second)
