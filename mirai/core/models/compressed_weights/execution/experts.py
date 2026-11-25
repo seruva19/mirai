@@ -781,6 +781,9 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             )
         self._physical_weight_provider = provider
 
+    def has_external_weight_storage(self) -> bool:
+        return self._packed_source is not None or self._physical_weight_provider is not None
+
     def has_ragged_intermediate_widths(self) -> bool:
         return bool(
             self._physical_weight_provider is not None

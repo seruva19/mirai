@@ -2763,6 +2763,40 @@
       "promotion_evidence": ""
     },
     {
+      "name": "intra_block_routed_expert_offload",
+      "kind": "residency",
+      "owner": "mirai/core/training/residency/block_swap.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "RoutedSwapRegion"
+      ],
+      "config_keys": [
+        "memory.block_swap_transfer_strategy"
+      ],
+      "disabled_config": {
+        "memory.block_swap_transfer_strategy": "per_tensor"
+      },
+      "contract_paths": [
+        "mirai/core/training/residency/contracts/pinned_host_budget.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/core/training/residency/block_swap.py",
+      "readme_claim": "Intra-block routed expert offload",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "latent_wavelet_supervision",
       "kind": "generic",
       "owner": "mirai/core/training/objectives/latent_wavelet.py",

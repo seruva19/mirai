@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -17,6 +18,31 @@ def _config() -> SimpleNamespace:
         dataset=SimpleNamespace(frame_buckets=[3]),
         model=SimpleNamespace(params=SimpleNamespace(latent_channels=4, patch_size=2)),
     )
+
+
+def test_routed_preview_preserves_bound_manager() -> None:
+    from mirai.core.training.preview.preview_runtime import (
+        begin_preview_runtime,
+        restore_preview_runtime,
+    )
+
+    pipeline = Mock()
+    pipeline.get_block_swap_state.return_value = {"block_swap_transfer_strategy": "routed_experts"}
+    pipeline.get_vae_scaling_factor.return_value = 1.0
+    pipeline.supports_preview_latent_decode.return_value = False
+    pipeline.supports_adapter_merge_unmerge.return_value = False
+    options = dict(
+        pipeline=pipeline, training_blocks_to_swap=4, block_swap_mode="async",
+        block_swap_backward=True,
+    )
+    with pytest.raises(ValueError, match="reuse the training swap count"):
+        begin_preview_runtime(sample_blocks_to_swap=2, **options)
+    pipeline.eval.assert_not_called()
+    context = begin_preview_runtime(sample_blocks_to_swap=4, **options)
+    restore_preview_runtime(context)
+    pipeline.set_weight_residency_strategy.assert_not_called()
+    pipeline.set_block_swap.assert_not_called()
+    pipeline.train.assert_called_once()
 
 
 def test_synthetic_batch_merges_family_owned_audio_fields() -> None:

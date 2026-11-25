@@ -61,6 +61,23 @@ _REFERENCE_SCHEDULES: dict[tuple[int, float, float, int], list[float]] = {
 }
 
 
+def test_explicit_dense_refiner_override_uses_whole_block_transfers() -> None:
+    from mirai.core.models.lingbot_video.pipeline import LingBotVideoPipeline
+
+    pipeline = LingBotVideoPipeline.__new__(LingBotVideoPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.set_refiner_weight_residency_strategy(
+        strategy="block_swap", blocks_to_swap=2, mode="sync", offload_dir=None,
+        block_swap_prefetch_depth=1, block_residency_priority="index",
+        block_swap_transfer_strategy="routed_experts",
+    )
+    request = pipeline.refiner_residency_request()
+    assert request is not None
+    assert request.block_swap_transfer_strategy == "per_tensor"
+    assert request.mode == "sync"
+    assert request.blocks_to_swap == 2
+
+
 def test_refiner_sigma_schedule_matches_the_reference_construction() -> None:
     for (steps, shift, t_thresh, tail), expected in _REFERENCE_SCHEDULES.items():
         sigmas = compute_refiner_sigmas(

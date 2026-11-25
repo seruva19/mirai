@@ -35,11 +35,17 @@ def begin_preview_runtime(
     previous_training = True
     if hasattr(pipeline, "_is_training"):
         previous_training = bool(getattr(pipeline, "_is_training"))
+    original_state = _snapshot_block_swap_state(pipeline)
+    if (
+        original_state.get("block_swap_transfer_strategy") == "routed_experts"
+        and 0 <= int(sample_blocks_to_swap) < int(training_blocks_to_swap)
+    ):
+        raise ValueError("Training previews with routed_experts must reuse the training swap count.")
     pipeline.eval()
     context = PreviewRuntimeContext(
         pipeline=pipeline,
         previous_training=previous_training,
-        original_block_swap_state=_snapshot_block_swap_state(pipeline),
+        original_block_swap_state=original_state,
         scaling_factor=float(pipeline.get_vae_scaling_factor()),
     )
     context.block_swap_overridden = _override_preview_block_swap(
@@ -71,7 +77,8 @@ def restore_preview_runtime(context: PreviewRuntimeContext) -> None:
         torch.cuda.empty_cache()
     if bool(pipeline.supports_adapter_merge_unmerge()):
         context.adapter_unmerged = bool(pipeline.unmerge_adapter()) or bool(context.adapter_merged)
-    _restore_block_swap_state(pipeline, context.original_block_swap_state)
+    if context.block_swap_overridden:
+        _restore_block_swap_state(pipeline, context.original_block_swap_state)
     if context.previous_training:
         pipeline.train()
 

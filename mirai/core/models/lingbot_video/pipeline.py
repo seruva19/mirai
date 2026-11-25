@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -294,7 +294,7 @@ from mirai.core.moe.monitoring.drift import router_drift_checkpoint_state
 from mirai.core.moe.adaptation.router_training import RouterAdapterBinding
 from mirai.core.moe.adaptation.router_training import RouterTrainingPolicy
 from mirai.core.moe.artifacts.verification import verify_downloaded_snapshot
-from mirai.core.training.residency.block_swap import BlockSwapManager
+from mirai.core.training.residency.block_swap import BlockSwapManager, RoutedSwapRegion
 from mirai.core.training.residency.device_placement import WeightResidencyExecutionMode
 from mirai.core.training.residency.device_residency import DeviceResidencyPlanner
 from mirai.core.training.residency.residency_plan import block_scores_from_router_loads
@@ -2252,14 +2252,17 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
         self._refiner_assets().load(
             device=device,
             dtype=dtype,
-            residency=self._refiner_residency_request,
+            residency=self.refiner_residency_request(),
             transformer_loader=self.load_refiner_transformer,
         )
 
     def refiner_residency_request(self) -> LingBotRefinerResidencyRequest | None:
         """Return the explicit inference residency policy for the refiner stage."""
 
-        return self._refiner_residency_request
+        request = self._refiner_residency_request
+        if request is not None and request.block_swap_transfer_strategy.strip().lower() == "routed_experts":
+            return replace(request, block_swap_transfer_strategy="per_tensor")
+        return request
 
     def set_refiner_weight_residency_strategy(
         self,
@@ -5292,7 +5295,34 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
                 "no block count was resolved (training.blocks_to_swap for a "
                 "training run, inference.blocks_to_swap for an inference run)."
             )
-        blocks = list(self.transformer.blocks)
+        block_units = self.get_block_swap_units()
+        manager.set_block_scores(self._block_residency_scores())
+        routed = None
+        if manager.uses_routed_experts:
+            if torch.device(device).type != "cuda":
+                raise ValueError("routed_experts block swap requires CUDA.")
+            if self._trainable_parameter_offload or self._moe_optimization_policy.expert_device_cache_gib:
+                raise ValueError("routed_experts cannot share LingBot expert residency with trainable offload or an expert cache.")
+            if self._runtime_options.moe_expert_backend in {
+                "sglang_triton", "triton", "sglang", "sglang_triton_fp8", "triton_fp8", "sglang_fp8",
+            }:
+                raise ValueError("routed_experts cannot share LingBot expert residency with SGLang weight caches.")
+            routed = {
+                index: RoutedSwapRegion(block.ffn.experts, block.ffn)
+                for index, block in block_units if isinstance(block.ffn, LingBotVideoSparseMoeBlock)
+            }
+            if any(
+                isinstance(module, CompressedGroupedExperts) and module.has_external_weight_storage()
+                for index, region in routed.items() if index not in manager.plan.resident_set
+                for module in region.weights.modules()
+            ):
+                raise ValueError("routed_experts requires registered expert weight buffers in swapped LingBot blocks.")
+        reservations = manager.estimate_device_residency_reservations(block_units, routed_units=routed)
+        self._device_residency_planner.replace_many(reservations)
+        excluded = (
+            [region.weights for region in routed.values()]
+            if routed is not None else [module for _, module in block_units]
+        )
         self._optimizer_compute_device = torch.device(device)
         if self._trainable_parameter_offload:
             cast_trainable_tensors(
@@ -5307,15 +5337,10 @@ class LingBotVideoPipeline(nn.Module, AdaptiveRankPlanLineageHost, NativeVideoPi
             )
         move_tensors_outside_modules(
             self.transformer,
-            excluded_modules=blocks,
+            excluded_modules=excluded,
             device=device,
         )
-        manager.set_block_scores(self._block_residency_scores())
-        block_units = self.get_block_swap_units()
-        self._device_residency_planner.replace_many(
-            manager.estimate_device_residency_reservations(block_units)
-        )
-        manager.bind(block_units, device=device)
+        manager.bind(block_units, device=device, routed_units=routed)
         self._device_residency_planner.replace_many(
             manager.device_residency_reservations()
         )

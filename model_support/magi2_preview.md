@@ -724,6 +724,14 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 
 ## Model-specific features
 
+- **Intra-block routed expert offload** — Set
+  `memory.block_swap_transfer_strategy = "routed_experts"` with async CUDA
+  block swap. The denoiser starts transfers at block entry and waits before
+  the routed MoE call, keeping attention and shared experts resident.
+  Training uses standard gradient checkpointing with backward swapping.
+  Training previews reuse the training swap count. The dense Refiner uses
+  whole-block transfers.
+
 - **Head-local MAGI-2 expert pruning** — Experimental deletion from a
   versioned, source-weight-bound plan. Set
   `model.params.family_params.expert_pruning_plan_path` and load the

@@ -19,6 +19,7 @@ from unittest import mock
 from mirai.config.schema import MemoryConfig
 from mirai.core.training.residency.block_swap import (
     BlockSwapManager,
+    RoutedSwapRegion,
     bounded_pin_budget_bytes,
 )
 from mirai.core.training.residency.memory_safety import configure_memory_safety
@@ -127,6 +128,110 @@ class PinAmountIsNumericallyInvariantTests(unittest.TestCase):
         for parameter in module.parameters():
             parameter.requires_grad_(False)
         return module
+
+    def test_routed_swap_reserves_companion_weights_as_resident(self) -> None:
+        attention, experts = nn.Linear(4, 4, bias=False), nn.Linear(4, 8, bias=False)
+        entry = nn.Sequential(experts)
+        block = nn.Sequential(attention, entry).requires_grad_(False)
+        dense = nn.Linear(4, 4, bias=False).requires_grad_(False)
+        manager = BlockSwapManager(
+            total_blocks=2, blocks_to_swap=2, mode="async",
+            block_swap_transfer_strategy="routed_experts",
+        )
+        units = [(0, block), (1, dense)]
+        self.assertEqual(
+            manager.estimate_device_residency_reservations(
+                units, routed_units={0: RoutedSwapRegion(experts, entry)},
+            ),
+            {"block_resident_set": 128, "block_transfer_window": 128},
+        )
+        with self.assertRaisesRegex(ValueError, "descendant"):
+            manager.estimate_device_residency_reservations(
+                units, routed_units={0: RoutedSwapRegion(dense, entry)},
+            )
+
+    def test_routed_swap_waits_at_expert_entry_after_attention(self) -> None:
+        calls = []
+
+        class Unit:
+            device = "cpu"
+
+            def load(self, device, *, stream):
+                calls.append(("load", stream))
+                self.device = device.type
+                return "ready"
+
+            def record_stream(self, stream):
+                calls.append(("retain", stream))
+
+            def offload(self):
+                calls.append(("offload",))
+                self.device = "cpu"
+
+        manager = BlockSwapManager(
+            total_blocks=2, blocks_to_swap=2, mode="async",
+            block_swap_transfer_strategy="routed_experts",
+        )
+        manager._device = torch.device("cuda")
+        manager._transfer_stream = "transfer"
+        manager._units = {0: Unit(), 1: Unit()}
+        consumer = mock.Mock()
+        consumer.wait_event.side_effect = lambda event: calls.append(("wait", event))
+        retirement = mock.Mock()
+        retirement.record.side_effect = lambda stream: calls.append(("retire", stream))
+        retirement.synchronize.side_effect = lambda: calls.append(("released",))
+        with mock.patch.object(torch.cuda, "current_stream", return_value=consumer), mock.patch.object(
+            torch.cuda, "Event", return_value=retirement,
+        ):
+            manager.before_block(0)
+            calls.append(("attention",))
+            manager._wait_for_block(0)
+            calls.append(("experts",))
+            manager.after_block(0)
+            self.assertEqual(manager._units[1].device, "cpu")
+            manager.before_block(1)
+        self.assertEqual(calls, [
+            ("load", "transfer"), ("attention",), ("wait", "ready"),
+            ("retain", consumer), ("experts",), ("retire", consumer), ("offload",),
+            ("released",), ("load", "transfer"),
+        ])
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "requires CUDA")
+    def test_routed_swap_checkpoint_recompute_matches_resident_gradients(self) -> None:
+        import copy
+        from torch.utils.checkpoint import checkpoint
+
+        block = nn.Sequential(nn.Linear(8, 8), nn.SiLU(), nn.Linear(8, 8)).cuda()
+        block[-1].requires_grad_(False)
+        reference = copy.deepcopy(block)
+        manager = BlockSwapManager(
+            total_blocks=1, blocks_to_swap=1, mode="async",
+            block_swap_transfer_strategy="routed_experts",
+        )
+        manager.bind([(0, block)], device="cuda", routed_units={0: RoutedSwapRegion(block[-1], block[-1])})
+        try:
+            self.assertEqual(block[0].weight.device.type, "cuda")
+            self.assertEqual(block[-1].weight.device.type, "cpu")
+
+            def run(value):
+                manager.before_block(0)
+                return block(value)
+
+            source = torch.randn(3, 8, device="cuda", requires_grad=True)
+            expected_input = source.detach().clone().requires_grad_()
+            actual = checkpoint(run, source, use_reentrant=False)
+            manager.after_block(0)
+            expected = reference(expected_input)
+            actual.square().sum().backward()
+            expected.square().sum().backward()
+            manager.finish_backward()
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(source.grad, expected_input.grad)
+            torch.testing.assert_close(block[0].weight.grad, reference[0].weight.grad)
+            self.assertEqual(block[-1].weight.device.type, "cpu")
+        finally:
+            manager.release_device()
+        self.assertFalse(block[-1]._forward_pre_hooks)
 
     @unittest.skipUnless(
         torch is not None and torch.cuda.is_available(),

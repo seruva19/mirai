@@ -57,7 +57,7 @@ from mirai.core.moe.runtime.expert_transfer_profile import (
     load_expert_transfer_profile,
     validate_expert_transfer_profile_identity,
 )
-from mirai.core.training.residency.block_swap import BlockSwapManager
+from mirai.core.training.residency.block_swap import BlockSwapManager, RoutedSwapRegion
 from mirai.core.training.residency.device_placement import WeightResidencyExecutionMode
 from mirai.core.training.residency.tensor_residency import (
     move_tensors_outside_modules,
@@ -1281,17 +1281,31 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 "requires training.gradient_checkpointing='standard'; without "
                 "recompute the backward pass reads host-resident block weights."
             )
-        layers = [module for _, module in self.get_block_swap_units()]
+        units = self.get_block_swap_units()
+        routed = None
+        if manager is not None and manager.uses_routed_experts:
+            if torch.device(device).type != "cuda":
+                raise ValueError("routed_experts block swap requires CUDA.")
+            routed = {
+                index: RoutedSwapRegion(experts, experts)
+                for index, layer in units
+                if (experts := getattr(layer.mlp, "moe_mlp", None)) is not None
+            }
+            manager.estimate_device_residency_reservations(units, routed_units=routed)
+        excluded = (
+            [region.weights for region in routed.values()]
+            if routed is not None else [module for _, module in units]
+        )
         move_trainable_tensors(self.transformer, device=device)
-        move_tensors_outside_modules(self.transformer, excluded_modules=layers, device=device)
+        move_tensors_outside_modules(self.transformer, excluded_modules=excluded, device=device)
         if self._block_swap_manager is None:
             self.transformer.to(device)
             return
-        self._block_swap_manager.bind(self.get_block_swap_units(), device=device)
+        manager.bind(units, device=device, routed_units=routed)
         for handle in self._block_hook_handles:
             handle.remove()
         self._block_hook_handles.clear()
-        for index, layer in self.get_block_swap_units():
+        for index, layer in units:
             self._block_hook_handles.append(
                 layer.register_forward_pre_hook(
                     lambda _module, _args, idx=index: self._block_swap_manager.before_block(idx)
@@ -1637,7 +1651,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         if request is None:
             return None
         mode = str(getattr(self.options, "refiner_block_swap_mode", "sync"))
-        return replace(request, mode=mode)
+        transfer = request.block_swap_transfer_strategy
+        if transfer.strip().lower() == "routed_experts":
+            transfer = "per_tensor"
+        return replace(request, mode=mode, block_swap_transfer_strategy=transfer)
 
     def discard_refiner_context(self) -> None:
         """Drop prompt embeddings retained only for the adjacent refiner stage."""

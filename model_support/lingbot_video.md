@@ -400,6 +400,15 @@ and Apache-2.0
 
 ## Model-specific features
 
+- **Intra-block routed expert offload** — Set
+  `memory.block_swap_transfer_strategy = "routed_experts"` with async CUDA
+  block swap. Attention, the router, and shared experts stay resident while
+  routed weights transfer. This mode requires exclusive block-swap ownership.
+  Trainable parameter offload, the expert device cache, and SGLang expert
+  backends are incompatible. Swapped experts must use registered weight
+  buffers. Training previews reuse the training swap count. The Refiner
+  uses whole-block transfers.
+
 - **Native sparse-MoE pipeline** — Family-owned loading, latent validation,
   conditioning, forward loss, adapter injection, and inference hooks.
   [(paper)](https://arxiv.org/abs/2607.07675)

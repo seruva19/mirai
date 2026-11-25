@@ -26,6 +26,12 @@ class BlockSwapEvent:
     block_idx: int
 
 
+@dataclass(frozen=True)
+class RoutedSwapRegion:
+    weights: Any
+    entrypoint: Any
+
+
 def bounded_pin_budget_bytes(
     available: int, floor_bytes: int, cap_bytes: int | None
 ) -> int:
@@ -71,14 +77,14 @@ class BlockSwapManager:
         self._disk_offload_dir = (
             Path(disk_offload_dir) if str(disk_offload_dir or "").strip() else None
         )
-        if self._transfer_strategy not in {"per_tensor", "flat_ring", "pinned_staging"}:
+        if self._transfer_strategy not in {"per_tensor", "flat_ring", "pinned_staging", "routed_experts"}:
             raise ValueError(
-                "block_swap_transfer_strategy must be one of: per_tensor, flat_ring, pinned_staging."
+                "block_swap_transfer_strategy must be one of: per_tensor, flat_ring, pinned_staging, routed_experts."
             )
-        if self._transfer_strategy == "pinned_staging" and (
+        if self._transfer_strategy in {"pinned_staging", "routed_experts"} and (
             self.mode != "async" or self._disk_offload_dir is not None
         ):
-            raise ValueError("pinned_staging requires asynchronous RAM-backed block swap.")
+            raise ValueError(f"{self._transfer_strategy} requires asynchronous RAM-backed block swap.")
         self._plan = self._build_plan()
         # ``gpu_blocks`` is the count of blocks that remain resident; the plan
         # owns their concrete indices.
@@ -90,9 +96,12 @@ class BlockSwapManager:
         self._transfer_stream: Any | None = None
         self._prefetch_events: dict[int, Any] = {}
         self._backward_hooks: list[Any] = []
+        self._routed_entry_hooks: list[Any] = []
         self._backward_active = False
         self._flat_ring: FlatRingResidencyPool | None = None
         self._host_staging_pool: PinnedHostStagingPool | None = None
+        self._routed_companion_bytes = 0
+        self._routed_retirement_events: list[Any] = []
         self._memory_check_policy = None
         self._last_memory_check = float("-inf")
 
@@ -122,6 +131,10 @@ class BlockSwapManager:
     def plan(self) -> ResidencyPlan:
         return self._plan
 
+    @property
+    def uses_routed_experts(self) -> bool:
+        return self._transfer_strategy == "routed_experts"
+
     def set_block_scores(
         self, block_scores: Mapping[int, float] | Sequence[float] | None
     ) -> None:
@@ -149,11 +162,23 @@ class BlockSwapManager:
         floor = int(policy.minimum_system_memory_gib * (1024**3))
         return bounded_pin_budget_bytes(available, floor, cap_bytes)
 
-    def bind(self, units: list[tuple[int, Any]], *, device: Any) -> None:
+    def bind(
+        self, units: list[tuple[int, Any]], *, device: Any,
+        routed_units: Mapping[int, RoutedSwapRegion] | None = None,
+    ) -> None:
+        if self.uses_routed_experts:
+            if torch.device(device).type != "cuda":
+                raise ValueError("routed_experts block swap requires CUDA.")
+            companion_bytes = self._routed_companions(units, routed_units)
+        else:
+            companion_bytes = 0
         if current_memory_safety_policy().block_swap_memory_check_interval_seconds:
             self._check_memory_headroom("block swap bind", force=True)
         if self._device is not None or self._units or self._flat_ring is not None:
             self.release_device()
+        self._routed_companion_bytes = companion_bytes
+        if self.uses_routed_experts and routed_units is not None:
+            units = [(index, region.weights) for index, region in routed_units.items()]
         for handle in self._backward_hooks:
             handle.remove()
         self._backward_hooks.clear()
@@ -224,7 +249,10 @@ class BlockSwapManager:
                 unit.load(self._device)
             else:
                 unit.offload()
-                module = unit.module
+                module = (
+                    routed_units[index].entrypoint
+                    if self.uses_routed_experts and routed_units is not None else unit.module
+                )
 
                 def offload_after_backward(
                     _module: Any,
@@ -243,8 +271,7 @@ class BlockSwapManager:
                     if managed is not None and managed.device != "cpu":
                         if self._device.type == "cuda" and hasattr(managed, "mark_consumed"):
                             managed.mark_consumed(torch.cuda.current_stream(self._device))
-                        self._discard_prefetch_event(block_index)
-                        managed.offload()
+                        self._offload_unit(block_index, managed)
                         self.events.append(
                             BlockSwapEvent(kind="backward_swap_out", block_idx=block_index)
                         )
@@ -252,6 +279,10 @@ class BlockSwapManager:
                 self._backward_hooks.append(
                     module.register_full_backward_hook(offload_after_backward)
                 )
+                if self.uses_routed_experts:
+                    self._routed_entry_hooks.append(module.register_forward_pre_hook(
+                        lambda _module, _args, idx=index: self._wait_for_block(idx)
+                    ))
 
     def reset_step(self) -> None:
         self.finish_backward()
@@ -264,8 +295,7 @@ class BlockSwapManager:
             # Head pins stay resident across the step turn for the next forward.
             if index in self._plan.backward_pin_set:
                 continue
-            self._discard_prefetch_event(index)
-            unit.offload()
+            self._offload_unit(index, unit)
         self._prefetch_q.clear()
         # A pinned block that is still resident may carry an unconsumed
         # transfer; its event is the only thing that will order the next
@@ -295,6 +325,9 @@ class BlockSwapManager:
         for handle in self._backward_hooks:
             handle.remove()
         self._backward_hooks.clear()
+        for handle in self._routed_entry_hooks:
+            handle.remove()
+        self._routed_entry_hooks.clear()
         for unit in self._units.values():
             unit.offload()
         if self._flat_ring is not None:
@@ -306,6 +339,8 @@ class BlockSwapManager:
         self._units.clear()
         self._flat_ring = None
         self._host_staging_pool = None
+        self._routed_companion_bytes = 0
+        self._routed_retirement_events.clear()
         self._transfer_stream = None
         self._device = None
         self._backward_active = False
@@ -325,6 +360,25 @@ class BlockSwapManager:
 
         self._prefetch_events.pop(idx, None)
 
+    def _offload_unit(self, idx: int, unit: Any) -> None:
+        if self.uses_routed_experts and unit.device != "cpu":
+            # Dropping the last reference only makes a transfer allocation
+            # reusable after its consumer stream finishes reading it.
+            stream = torch.cuda.current_stream(self._device)
+            pending = self._prefetch_events.get(idx)
+            if pending is not None:
+                stream.wait_event(pending)
+            retired = torch.cuda.Event()
+            retired.record(stream)
+            self._routed_retirement_events.append(retired)
+        self._discard_prefetch_event(idx)
+        unit.offload()
+
+    def _finish_routed_retirements(self) -> None:
+        for retired in self._routed_retirement_events:
+            retired.synchronize()
+        self._routed_retirement_events.clear()
+
     def _prefetch_one(self, nxt: int) -> None:
         if not (0 <= nxt < self.total_blocks) or self._is_resident(nxt):
             return
@@ -334,6 +388,7 @@ class BlockSwapManager:
         self.events.append(BlockSwapEvent(kind="prefetch", block_idx=nxt))
         next_unit = self._units.get(nxt)
         if next_unit is not None and next_unit.device == "cpu":
+            self._finish_routed_retirements()
             event = next_unit.load(self._device, stream=self._transfer_stream)
             if event is not None:
                 self._prefetch_events[nxt] = event
@@ -345,6 +400,18 @@ class BlockSwapManager:
             raise IndexError(idx)
         if self._is_resident(idx):
             return
+        if self.uses_routed_experts:
+            unit = self._units.get(idx)
+            if unit is not None and unit.device == "cpu":
+                self._prefetch_one(idx)
+            return
+        self._wait_for_block(idx)
+        if self.mode == "async":
+            step = -1 if self._backward_active else 1
+            for depth in range(1, self._prefetch_depth + 1):
+                self._prefetch_one(idx + step * depth)
+
+    def _wait_for_block(self, idx: int) -> None:
         unit = self._units.get(idx)
         if unit is not None:
             event = self._prefetch_events.pop(idx, None)
@@ -361,6 +428,7 @@ class BlockSwapManager:
             # forward runs, and the compute that follows must not read host
             # tensors.
             if unit.device == "cpu":
+                self._finish_routed_retirements()
                 if self._host_staging_pool is None:
                     unit.load(self._device)
                 else:
@@ -369,14 +437,10 @@ class BlockSwapManager:
                     current.wait_event(event)
                     unit.record_stream(current)
         self.events.append(BlockSwapEvent(kind="swap_in", block_idx=idx))
-        if self.mode == "async":
-            step = -1 if self._backward_active else 1
-            for depth in range(1, self._prefetch_depth + 1):
-                self._prefetch_one(idx + step * depth)
 
     def after_block(self, block_idx: int) -> None:
         idx = int(block_idx)
-        if self._is_resident(idx):
+        if self._is_resident(idx) or (self.uses_routed_experts and idx not in self._units):
             return
         self.events.append(BlockSwapEvent(kind="swap_out", block_idx=idx))
         # Tail swap blocks are needed FIRST in backward; keep them resident
@@ -393,8 +457,7 @@ class BlockSwapManager:
         if unit is not None and self.block_swap_backward and not pin_hold:
             if self._device.type == "cuda" and hasattr(unit, "mark_consumed"):
                 unit.mark_consumed(torch.cuda.current_stream(self._device))
-            self._discard_prefetch_event(idx)
-            unit.offload()
+            self._offload_unit(idx, unit)
         if self.mode == "async" and self._prefetch_q:
             done = self._prefetch_q.popleft()
             self.events.append(BlockSwapEvent(kind="prefetch_done", block_idx=done))
@@ -425,7 +488,7 @@ class BlockSwapManager:
             "backward_to_forward_pins": list(self._plan.backward_to_forward_pins),
             "resident_bytes": sum(
                 unit.bytes for unit in self._units.values() if unit.device != "cpu"
-            ),
+            ) + self._routed_companion_bytes,
             "offloaded_bytes": sum(
                 unit.bytes for unit in self._units.values() if unit.device == "cpu"
             ),
@@ -438,22 +501,45 @@ class BlockSwapManager:
     def device_residency_reservations(self) -> dict[str, int]:
         """Return the conservative steady/transient VRAM promises of this manager."""
         sizes = {index: int(unit.bytes) for index, unit in self._units.items()}
-        return self._device_residency_reservations_from_sizes(sizes)
+        return self._device_residency_reservations_from_sizes(sizes, self._routed_companion_bytes)
 
     def estimate_device_residency_reservations(
-        self, units: Sequence[tuple[int, Any]]
+        self, units: Sequence[tuple[int, Any]], *, routed_units: Mapping[int, RoutedSwapRegion] | None = None,
     ) -> dict[str, int]:
         """Estimate the same promises without moving or pinning module tensors."""
-        sizes = {
-            int(index): _immutable_module_bytes(module)
-            for index, module in units
-        }
-        return self._device_residency_reservations_from_sizes(sizes)
+        companions = self._routed_companions(units, routed_units) if self.uses_routed_experts else 0
+        selected = (
+            [(index, region.weights) for index, region in routed_units.items()]
+            if self.uses_routed_experts and routed_units is not None else units
+        )
+        sizes = {int(index): _immutable_module_bytes(module) for index, module in selected}
+        return self._device_residency_reservations_from_sizes(sizes, companions)
+
+    def _routed_companions(
+        self, units: Sequence[tuple[int, Any]], routed_units: Mapping[int, RoutedSwapRegion] | None,
+    ) -> int:
+        parents = dict(units)
+        if not routed_units or not any(not self._is_resident(index) for index in routed_units):
+            raise ValueError("routed_experts block swap requires a provider expert region in a swapped block.")
+        if len({id(region.weights) for region in routed_units.values()}) != len(routed_units):
+            raise ValueError("Each block must own its routed expert region.")
+        for index, region in routed_units.items():
+            parent = parents.get(index)
+            if (
+                parent is None or region.entrypoint is parent
+                or region.entrypoint not in parent.modules()
+                or region.weights not in region.entrypoint.modules()
+            ):
+                raise ValueError("A routed expert region must be reached through a descendant of its block.")
+        return sum(
+            _immutable_module_bytes(parent, exclude=routed_units[index].weights if index in routed_units else None)
+            for index, parent in parents.items()
+        )
 
     def _device_residency_reservations_from_sizes(
-        self, sizes: Mapping[int, int]
+        self, sizes: Mapping[int, int], companion_bytes: int = 0,
     ) -> dict[str, int]:
-        resident_bytes = sum(
+        resident_bytes = companion_bytes + sum(
             int(size) for index, size in sizes.items() if self._is_resident(index)
         )
         if self._flat_ring is not None:
@@ -467,14 +553,14 @@ class BlockSwapManager:
                 ),
                 reverse=True,
             )
-            slots = min(
-                len(swap_sizes),
-                max(
-                    1 + self._prefetch_depth,
-                    len(self._plan.forward_to_backward_pins),
-                    len(self._plan.backward_to_forward_pins),
-                ),
+            phase_pins = max(
+                len(self._plan.forward_to_backward_pins),
+                len(self._plan.backward_to_forward_pins),
             )
+            if self.uses_routed_experts:
+                slots = 1 + phase_pins if self.block_swap_backward else len(swap_sizes)
+            else:
+                slots = max(1 + self._prefetch_depth, phase_pins)
             transfer_bytes = sum(swap_sizes[:slots])
         return {
             "block_resident_set": int(resident_bytes),
@@ -482,10 +568,13 @@ class BlockSwapManager:
         }
 
 
-def _immutable_module_bytes(module: Any) -> int:
+def _immutable_module_bytes(module: Any, *, exclude: Any | None = None) -> int:
     seen: set[int] = set()
     total = 0
+    excluded = set(exclude.modules()) if exclude is not None else set()
     for owner in module.modules():
+        if owner in excluded:
+            continue
         for parameter in owner._parameters.values():
             if parameter is None or bool(parameter.requires_grad):
                 continue
