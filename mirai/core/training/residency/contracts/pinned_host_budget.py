@@ -12,6 +12,7 @@ These CPU-only tests enforce two invariants without allocating CUDA memory:
 from __future__ import annotations
 
 import types
+import threading
 import unittest
 from unittest import mock
 
@@ -163,6 +164,71 @@ class PinAmountIsNumericallyInvariantTests(unittest.TestCase):
             torch.testing.assert_close(
                 value, pinned.module.state_dict()[key], rtol=0, atol=0
             )
+
+    def test_staging_ring_reuses_slots_after_transfer_events(self) -> None:
+        from mirai.core.training.residency.tensor_residency import PinnedHostStagingPool
+
+        class Event:
+            def record(self, stream):
+                self.stream = stream
+
+            def synchronize(self):
+                waits.append((self.stream, threading.get_ident()))
+
+        waits = []
+        owner = threading.get_ident()
+        allocate = torch.empty
+        with mock.patch.object(torch, "empty", side_effect=lambda *args, **kwargs: allocate(
+            *args, **{key: value for key, value in kwargs.items() if key != "pin_memory"}
+        )), mock.patch.object(torch.cuda, "Event", Event), torch.inference_mode():
+            pool = PinnedHostStagingPool(11, slots=2)
+            self.assertEqual(pool.pinned_bytes, 8)
+            try:
+                sources = [torch.arange(7, dtype=torch.bfloat16), torch.tensor(42), torch.empty(0)]
+                copies = pool.copy_to_device(sources, device="cpu", stream="transfer")
+                for source, copied in zip(sources, copies, strict=True):
+                    torch.testing.assert_close(source, copied, rtol=0, atol=0)
+                self.assertEqual(len(waits), 4)
+                self.assertTrue(all(stream == "transfer" and thread != owner for stream, thread in waits))
+            finally:
+                pool.close()
+            self.assertEqual(pool.pinned_bytes, 0)
+            self.assertEqual(len(waits), 6)
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "requires CUDA")
+    def test_block_swap_staging_matches_resident_output_and_gradients(self) -> None:
+        import copy
+
+        block = self._module()
+        reference = copy.deepcopy(block).to("cuda")
+        block[0].bias.requires_grad_(True)
+        reference[0].bias.requires_grad_(True)
+        manager = BlockSwapManager(
+            total_blocks=1, blocks_to_swap=1, mode="async",
+            block_swap_transfer_strategy="pinned_staging",
+        )
+        manager.bind([(0, block)], device="cuda")
+        try:
+            with torch.no_grad():
+                block[0].bias.data = block[0].bias.data.to("cuda")
+            self.assertGreater(manager.snapshot()["host_staging_pinned_bytes"], 0)
+            self.assertEqual(manager._units[0].pinned_bytes, 0)
+            for _ in range(2):
+                source = torch.randn(3, 8, device="cuda", requires_grad=True)
+                expected_input = source.detach().clone().requires_grad_()
+                manager.before_block(0)
+                result = block(source)
+                expected = reference(expected_input)
+                result.square().sum().backward()
+                expected.square().sum().backward()
+                torch.testing.assert_close(result, expected)
+                torch.testing.assert_close(source.grad, expected_input.grad)
+                torch.testing.assert_close(block[0].bias.grad, reference[0].bias.grad)
+                manager.after_block(0)
+                manager.finish_backward()
+        finally:
+            manager.release_device()
+        self.assertEqual(manager.snapshot()["host_staging_pinned_bytes"], 0)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Mapping, Sequence
 
-from mirai.core.training.residency.tensor_residency import ImmutableModuleResidency
+from mirai.core.training.residency.tensor_residency import ImmutableModuleResidency, PinnedHostStagingPool
 from mirai.core.training.residency.h2d_ring_residency import FlatRingResidencyPool
 from mirai.core.training.residency.memory_safety import assert_system_memory_headroom
 from mirai.core.training.residency.memory_safety import current_memory_safety_policy
@@ -71,10 +71,14 @@ class BlockSwapManager:
         self._disk_offload_dir = (
             Path(disk_offload_dir) if str(disk_offload_dir or "").strip() else None
         )
-        if self._transfer_strategy not in {"per_tensor", "flat_ring"}:
+        if self._transfer_strategy not in {"per_tensor", "flat_ring", "pinned_staging"}:
             raise ValueError(
-                "block_swap_transfer_strategy must be one of: per_tensor, flat_ring."
+                "block_swap_transfer_strategy must be one of: per_tensor, flat_ring, pinned_staging."
             )
+        if self._transfer_strategy == "pinned_staging" and (
+            self.mode != "async" or self._disk_offload_dir is not None
+        ):
+            raise ValueError("pinned_staging requires asynchronous RAM-backed block swap.")
         self._plan = self._build_plan()
         # ``gpu_blocks`` is the count of blocks that remain resident; the plan
         # owns their concrete indices.
@@ -88,6 +92,7 @@ class BlockSwapManager:
         self._backward_hooks: list[Any] = []
         self._backward_active = False
         self._flat_ring: FlatRingResidencyPool | None = None
+        self._host_staging_pool: PinnedHostStagingPool | None = None
         self._memory_check_policy = None
         self._last_memory_check = float("-inf")
 
@@ -163,13 +168,28 @@ class BlockSwapManager:
             else None
         )
         remaining = self._host_pin_budget_bytes()
+        staging = self._transfer_strategy == "pinned_staging"
+        if staging:
+            if self._transfer_stream is None:
+                raise ValueError("pinned_staging block swap requires a CUDA device.")
+            largest = max((
+                _immutable_module_bytes(module)
+                for idx, module in units if not self._is_resident(int(idx))
+            ), default=0)
+            if largest:
+                budget = min(3 * 1024**3, 3 * largest)
+                if remaining is not None:
+                    budget = min(budget, remaining)
+                if budget < 3:
+                    raise RuntimeError("Pinned host budget is too small for the block staging pool.")
+                self._host_staging_pool = PinnedHostStagingPool(budget)
         self._units = {}
         swap_modules: list[tuple[int, Any]] = []
         for index, module in units:
             idx = int(index)
             resident = self._is_resident(idx)
-            if resident or self._transfer_strategy == "per_tensor":
-                unit_budget = 0 if resident else remaining
+            if resident or self._transfer_strategy != "flat_ring":
+                unit_budget = 0 if resident or staging else remaining
                 disk_path = (
                     self._disk_offload_dir / f"block_{idx:04d}.safetensors"
                     if self._disk_offload_dir is not None and not resident
@@ -179,6 +199,7 @@ class BlockSwapManager:
                     module,
                     pin_budget_bytes=unit_budget,
                     disk_path=disk_path,
+                    staging_pool=None if resident else self._host_staging_pool,
                 )
                 if remaining is not None and not resident:
                     remaining = max(0, remaining - unit.pinned_bytes)
@@ -278,10 +299,13 @@ class BlockSwapManager:
             unit.offload()
         if self._flat_ring is not None:
             self._flat_ring.release_device()
+        if self._host_staging_pool is not None:
+            self._host_staging_pool.close()
         self._prefetch_q.clear()
         self._prefetch_events.clear()
         self._units.clear()
         self._flat_ring = None
+        self._host_staging_pool = None
         self._transfer_stream = None
         self._device = None
         self._backward_active = False
@@ -337,7 +361,13 @@ class BlockSwapManager:
             # forward runs, and the compute that follows must not read host
             # tensors.
             if unit.device == "cpu":
-                unit.load(self._device)
+                if self._host_staging_pool is None:
+                    unit.load(self._device)
+                else:
+                    event = unit.load(self._device, stream=self._transfer_stream)
+                    current = torch.cuda.current_stream(self._device)
+                    current.wait_event(event)
+                    unit.record_stream(current)
         self.events.append(BlockSwapEvent(kind="swap_in", block_idx=idx))
         if self.mode == "async":
             step = -1 if self._backward_active else 1
@@ -384,6 +414,9 @@ class BlockSwapManager:
             "ring_slots": 0 if self._flat_ring is None else self._flat_ring.ring_size,
             "ring_buffer_bytes": (
                 0 if self._flat_ring is None else self._flat_ring.ring_buffer_bytes
+            ),
+            "host_staging_pinned_bytes": (
+                0 if self._host_staging_pool is None else self._host_staging_pool.pinned_bytes
             ),
             "h2d_copies": 0 if self._flat_ring is None else self._flat_ring.h2d_copies,
             "h2d_bytes": 0 if self._flat_ring is None else self._flat_ring.h2d_bytes,

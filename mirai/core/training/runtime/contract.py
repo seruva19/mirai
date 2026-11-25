@@ -493,8 +493,8 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
     )
     _check(
         str(config.memory.block_swap_transfer_strategy).strip().lower()
-        in {"per_tensor", "flat_ring"},
-        "memory.block_swap_transfer_strategy must be one of: per_tensor, flat_ring.",
+        in {"per_tensor", "flat_ring", "pinned_staging"},
+        "memory.block_swap_transfer_strategy must be one of: per_tensor, flat_ring, pinned_staging.",
     )
     _balance_mode = str(config.model.params.moe_balance_mode).strip().lower()
     _check(

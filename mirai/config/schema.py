@@ -701,7 +701,7 @@ class MemoryConfig:
     block_residency_planner: str = "uniform"  # uniform | phase_aware
     block_swap_prefetch_depth: int = 1  # async prefetch ring depth (1-4)
     block_residency_priority: str = "index"  # index | routing_hot
-    block_swap_transfer_strategy: str = "per_tensor"  # per_tensor | flat_ring
+    block_swap_transfer_strategy: str = "per_tensor"  # per_tensor | flat_ring | pinned_staging
 
 
 @dataclass

@@ -3681,9 +3681,11 @@ Selects the resident block set ([`block_swap.py`](mirai/core/training/residency/
 
 - **Type:** str
 - **Default:** `"per_tensor"`
-- **Allowed / range:** `per_tensor`, `flat_ring`
+- **Allowed / range:** `per_tensor`, `flat_ring`, `pinned_staging`
 
 Frozen-block H2D transfer owner. `per_tensor` preserves the established allocation path. `flat_ring` packs each immutable CPU block into one contiguous master and streams it through `block_swap_prefetch_depth + 1` reusable CUDA slots, reducing copy launches and allocator churn. CUDA-only, opt-in, and compatible only with frozen-base residency.
+
+`pinned_staging` keeps frozen weights in pageable RAM and copies chunks through three reusable pinned host buffers. A CPU worker prepares the next chunk while CUDA transfers the previous one. The pool uses up to 3 GiB within the block-swap host pin budget and system RAM headroom. It requires async CUDA block swapping with RAM backing.
 
 ---
 

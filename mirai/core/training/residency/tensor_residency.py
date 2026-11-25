@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -30,6 +31,85 @@ class _TensorSlot:
             self.owner._buffers[self.name] = tensor
 
 
+class PinnedHostStagingPool:
+    """Stage contiguous CPU tensor bytes in a bounded, reusable host ring."""
+
+    def __init__(self, budget_bytes: int, *, slots: int = 3) -> None:
+        if slots < 2 or int(budget_bytes) < slots:
+            raise ValueError("Pinned staging requires at least two nonempty slots.")
+        # The CUDA host allocator can round each allocation up to a power of
+        # two. Size each slot accordingly before applying the aggregate cap.
+        capacity = 1 << ((int(budget_bytes) // slots).bit_length() - 1)
+        self._buffers = [
+            torch.empty(capacity, dtype=torch.uint8, device="cpu", pin_memory=True)
+            for _ in range(slots)
+        ]
+        self._events = [None] * slots
+        self._next_slot = 0
+        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mirai-host-staging")
+
+    @property
+    def pinned_bytes(self) -> int:
+        return sum(buffer.numel() for buffer in self._buffers)
+
+    def _stage_chunk(self, index: int, source: Any) -> Any:
+        event = self._events[index]
+        if event is not None:
+            event.synchronize()
+        staged = self._buffers[index][:source.numel()]
+        with torch.inference_mode():
+            staged.copy_(source)
+        return staged
+
+    def copy_to_device(self, sources: list[Any], *, device: Any, stream: Any) -> list[Any]:
+        # The caller owns CUDA allocation and submission. A single CPU worker
+        # prepares the next chunk while the transfer stream reads the previous one.
+        copies = [torch.empty_like(source, device=device) for source in sources]
+        capacity = self._buffers[0].numel()
+
+        def chunks():
+            for source, target in zip(sources, copies, strict=True):
+                source_bytes = source.view(-1).view(torch.uint8)
+                target_bytes = target.view(-1).view(torch.uint8)
+                for start in range(0, source_bytes.numel(), capacity):
+                    yield source_bytes[start:start + capacity], target_bytes[start:start + capacity]
+
+        iterator = iter(chunks())
+        pending = None
+        try:
+            current = next(iterator, None)
+            while current is not None:
+                source, target = current
+                index = self._next_slot
+                future = pending if pending is not None else self._worker.submit(self._stage_chunk, index, source)
+                pending = None
+                staged = future.result()
+                self._next_slot = (index + 1) % len(self._buffers)
+                current = next(iterator, None)
+                if current is not None:
+                    pending = self._worker.submit(self._stage_chunk, self._next_slot, current[0])
+                target.copy_(staged, non_blocking=True)
+                event = self._events[index]
+                if event is None:
+                    event = torch.cuda.Event()
+                event.record(stream)
+                self._events[index] = event
+        except BaseException:
+            stream.synchronize()
+            if pending is not None:
+                pending.exception()
+            raise
+        return copies
+
+    def close(self) -> None:
+        self._worker.shutdown(wait=True)
+        for event in self._events:
+            if event is not None:
+                event.synchronize()
+        self._buffers.clear()
+        self._events.clear()
+
+
 class ImmutableModuleResidency:
     """Keep immutable tensors on CPU and materialize device copies on demand."""
 
@@ -39,6 +119,7 @@ class ImmutableModuleResidency:
         *,
         pin_budget_bytes: int | None = None,
         disk_path: str | Path | None = None,
+        staging_pool: PinnedHostStagingPool | None = None,
     ) -> None:
         if torch is None:  # pragma: no cover
             raise RuntimeError("torch is required for tensor residency.")
@@ -49,7 +130,8 @@ class ImmutableModuleResidency:
         self._pin_budget_bytes = pin_budget_bytes
         self._pinned_bytes = 0
         self._disk_path = Path(disk_path) if disk_path is not None else None
-        self._pinning_enabled = self._disk_path is None
+        self._staging_pool = staging_pool
+        self._pinning_enabled = self._disk_path is None and staging_pool is None
         for owner in module.modules():
             for name, parameter in owner._parameters.items():
                 if parameter is None or bool(parameter.requires_grad):
@@ -99,6 +181,10 @@ class ImmutableModuleResidency:
         the module budget is exhausted.
         """
 
+        if self._staging_pool is not None:
+            if tensor.is_pinned():
+                return torch.empty_like(tensor, pin_memory=False).copy_(tensor)
+            return tensor
         if not self._pinning_enabled:
             return tensor
         nbytes = int(tensor.numel()) * int(tensor.element_size())
@@ -152,10 +238,15 @@ class ImmutableModuleResidency:
             self._device = target
             return None
         with torch.cuda.stream(stream):
-            copies = [
-                slot.cpu_tensor.to(device=target, non_blocking=True)
-                for slot in self._slots
-            ]
+            if self._staging_pool is None:
+                copies = [
+                    slot.cpu_tensor.to(device=target, non_blocking=True)
+                    for slot in self._slots
+                ]
+            else:
+                copies = self._staging_pool.copy_to_device(
+                    [slot.cpu_tensor for slot in self._slots], device=target, stream=stream,
+                )
             for slot, value in zip(self._slots, copies, strict=True):
                 slot.assign(value)
             event = torch.cuda.Event()

@@ -375,6 +375,8 @@ configuration and compatibility rules are documented in
   training runs and for sampling runs that stream an uncompressed base.
 - **Block-swap host-memory check interval** — Training can configure how often
   block-swap hooks sample available host RAM.
+- **Pinned host staging for block swap** — Async CUDA block swapping can keep
+  frozen weights in pageable RAM and reuse a bounded pool of pinned buffers.
 - **Explicit disk-backed block streaming** — Frozen tensors from non-resident
   transformer blocks are held in atomic safetensors-backed mappings and loaded
   through the same bounded residency schedule; trainable adapter state remains
