@@ -678,7 +678,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         )
 
         return save_magi2_nf4_packed_state(
-            path, self.transformer, metadata=metadata
+            path, self.transformer, metadata=metadata,
+            fuse_gate_up=(getattr(self.model_config.params, "family_params", None) or {}).get(
+                "nf4_fuse_gate_up", False
+            ),
         )
 
     def _quantizes_experts_on_load(self) -> bool:
@@ -1743,6 +1746,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
 class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
+        "nf4_fuse_gate_up",
         "config_path",
         "audio_tokens",
         "refiner_config_path",
@@ -1772,6 +1776,8 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     def validate_family_params(self, params: dict[str, Any]) -> list[str]:
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        if not isinstance(params.get("nf4_fuse_gate_up", False), bool):
+            errors.append("MAGI-2 family_params.nf4_fuse_gate_up must be a boolean.")
         if "audio_tokens" in params and int(params["audio_tokens"]) < -1:
             errors.append("MAGI-2 family_params.audio_tokens must be -1 (auto) or >= 0.")
         for name in (

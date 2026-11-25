@@ -9,6 +9,9 @@ from typing import Any
 import torch
 from mirai.core.models.magi2_preview.quantized_experts import (
     MAGI2_ROUTED_EXPERT_TENSOR_NAMES,
+    MAGI2_FUSED_GATE_UP,
+    MAGI2_NF4_GROUP_FIELDS,
+    MAGI2_NF4_CODE_FIELDS,
     Magi2Nf4ExpertStore,
     install_magi2_nf4_expert_stores,
     iter_magi2_moe_layers,
@@ -17,7 +20,7 @@ from mirai.core.models.magi2_preview.quantized_experts import (
 
 
 MAGI2_PACKED_EXPERT_SCHEMA = "mirai.magi2_preview.nf4_experts"
-MAGI2_PACKED_EXPERT_SCHEMA_VERSION = 2
+MAGI2_PACKED_EXPERT_SCHEMA_VERSION = 3
 _MANIFEST_FILE = "manifest.json"
 
 
@@ -30,6 +33,7 @@ def save_magi2_nf4_packed_state(
     transformer: torch.nn.Module,
     *,
     metadata: dict[str, str] | None = None,
+    fuse_gate_up: bool = False,
 ) -> Path:
     """Write the already-quantized expert stores without dense reconstruction."""
 
@@ -52,8 +56,15 @@ def save_magi2_nf4_packed_state(
             )
         descriptor = store.packed_state_descriptor()
         tensors: dict[str, torch.Tensor] = {}
-        for buffer_name, value in store.named_buffers(recurse=False):
+        buffers = (
+            store.fused_gate_up_buffers().items()
+            if fuse_gate_up and not store.has_fused_gate_up
+            else store.named_buffers(recurse=False)
+        )
+        for buffer_name, value in buffers:
             tensors[buffer_name] = value.detach().cpu().contiguous()
+        descriptor["buffers"] = sorted(tensors)
+        descriptor["fused_gate_up"] = f"{MAGI2_FUSED_GATE_UP}_nf4" in tensors
         shard_name = f"layer_{layer_index:03d}.safetensors"
         save_file(tensors, str(target / shard_name))
         layers[module_name] = {"shard": shard_name, **descriptor}
@@ -63,7 +74,11 @@ def save_magi2_nf4_packed_state(
         )
     manifest = {
         "schema": MAGI2_PACKED_EXPERT_SCHEMA,
-        "schema_version": MAGI2_PACKED_EXPERT_SCHEMA_VERSION,
+        "schema_version": (
+            MAGI2_PACKED_EXPERT_SCHEMA_VERSION
+            if any(layer["fused_gate_up"] for layer in layers.values())
+            else 2
+        ),
         "quant_format": "nf4",
         "layers": layers,
         "metadata": dict(metadata or {}),
@@ -95,9 +110,12 @@ def load_magi2_nf4_packed_state(
             "Packed MAGI-2 expert state has no versioned manifest."
         )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != MAGI2_PACKED_EXPERT_SCHEMA or int(
-        manifest.get("schema_version", -1)
-    ) != MAGI2_PACKED_EXPERT_SCHEMA_VERSION:
+    version = manifest.get("schema_version")
+    if (
+        manifest.get("schema") != MAGI2_PACKED_EXPERT_SCHEMA
+        or type(version) is not int
+        or version not in (2, MAGI2_PACKED_EXPERT_SCHEMA_VERSION)
+    ):
         raise Magi2PackedExpertStateError(
             "Packed MAGI-2 expert state has an unsupported schema or version."
         )
@@ -122,6 +140,9 @@ def load_magi2_nf4_packed_state(
         )
     for module_name, store in stores.items():
         spec = layer_specs[module_name]
+        fused = spec.get("fused_gate_up", False)
+        if not isinstance(fused, bool) or (version == 2 and fused):
+            raise Magi2PackedExpertStateError("Packed MAGI-2 layer has an invalid gate/up layout.")
         shard_name = str(spec.get("shard", ""))
         if not shard_name or Path(shard_name).name != shard_name:
             raise Magi2PackedExpertStateError(
@@ -136,15 +157,10 @@ def load_magi2_nf4_packed_state(
             expected_buffers = set(spec.get("buffers", []))
             expected_from_keys = {
                 f"{key}_{suffix}"
-                for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
-                for suffix in (
-                    "nf4",
-                    "nf4_absmax",
-                    "nf4_nabsmax",
-                    "nf4_offset",
-                    "nf4_code",
-                    "nf4_ncode",
+                for key in (
+                    (MAGI2_FUSED_GATE_UP, "W_down") if fused else MAGI2_ROUTED_EXPERT_TENSOR_NAMES
                 )
+                for suffix in (*MAGI2_NF4_GROUP_FIELDS, *MAGI2_NF4_CODE_FIELDS)
             }
             if expected_buffers != expected_from_keys:
                 raise Magi2PackedExpertStateError(

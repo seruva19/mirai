@@ -139,6 +139,8 @@ def test_segmented_backward_releases_weights_after_their_last_use(monkeypatch) -
     materialized = {}
 
     class Store:
+        has_fused_gate_up = False
+
         def segment_group_span(self):
             return 1
 
@@ -468,11 +470,16 @@ def test_packed_experts_admit_default_off_routed_fusion_policy() -> None:
 @pytest.mark.parametrize("expert_autograd", ["standard", "segmented_recompute"])
 @pytest.mark.parametrize("training", [False, True])
 def test_active_groups_decode_only_routed_weights_and_preserve_backward(
-    monkeypatch, expert_autograd, training
+    monkeypatch, expert_autograd, training, tmp_path
 ) -> None:
+    from mirai.core.models.magi2_preview import packed_experts
+
     generator = torch.Generator().manual_seed(29)
     store = Magi2Nf4ExpertStore(num_groups=5)
-    store._meta = object()
+    store._meta = quantized_experts._Nf4Meta(
+        blocksize=64, nested_blocksize=256,
+        nested_dtype=torch.float32, weight_dtype=torch.float32,
+    )
     decoded = []
 
     def dequantize(fields, *args, **kwargs):
@@ -517,6 +524,38 @@ def test_active_groups_decode_only_routed_weights_and_preserve_backward(
     assert sorted(decoded) == [1] * visits + [4] * visits
     for observed, reference in zip(actual, expected):
         torch.testing.assert_close(observed, reference)
+
+    source = store
+    model = torch.nn.Module()
+    monkeypatch.setattr(packed_experts, "iter_magi2_moe_layers", lambda _: [("layer", model)])
+    monkeypatch.setattr(packed_experts, "magi2_expert_store", lambda _: source)
+    monkeypatch.setattr(
+        packed_experts, "install_magi2_nf4_expert_stores",
+        lambda *args, **kwargs: {"layer": Magi2Nf4ExpertStore(num_groups=5)},
+    )
+    legacy_path = save_magi2_nf4_packed_state(tmp_path / "separate", model)
+    store = load_magi2_nf4_packed_state(legacy_path, model, blocksize=64)["layer"]
+    assert not store.has_fused_gate_up
+    for observed, reference in zip(run("active_group_dequant"), expected):
+        torch.testing.assert_close(observed, reference)
+
+    path = save_magi2_nf4_packed_state(tmp_path / "packed", model, fuse_gate_up=True)
+    store = load_magi2_nf4_packed_state(path, model, blocksize=64)["layer"]
+    assert store.has_fused_gate_up
+    assert not hasattr(store, "W_gate_nf4")
+    materialize = store.materialize_segment
+    requested = []
+
+    def record_materialization(key, *args, **kwargs):
+        requested.append(key)
+        return materialize(key, *args, **kwargs)
+
+    monkeypatch.setattr(store, "materialize_segment", record_materialization)
+    for observed, reference in zip(run("active_group_dequant"), expected):
+        torch.testing.assert_close(observed, reference)
+    assert requested[:2] == ["W_gate_up", "W_down"]
+    passes = 2 if training else 1
+    assert sorted(requested) == ["W_down"] * passes + ["W_gate_up"] * passes
 
 
 def test_store_rejects_access_policies_it_has_no_operand_for() -> None:

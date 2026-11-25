@@ -101,7 +101,7 @@ host-resident single-GPU path:
 
 - `[model]`: type, dtype
 - `[model.params]`: variant, strict_native_assets, flow_shift
-- `[model.params.family_params]`: audio_tokens
+- `[model.params.family_params]`: audio_tokens, nf4_fuse_gate_up
 - `[training]`: gradient_checkpointing, blocks_to_swap, block_swap_mode
 - `[adapter]`: type, target_preset, rank, alpha
 - `[memory]`: weight_residency_strategy, block_swap_prefetch_depth,
@@ -228,6 +228,13 @@ per routed-expert layer. Restore checks model variant, denoiser subfolder,
 topology, group count, block size, shapes, dtypes, and the complete buffer
 inventory. Layer shards are copied and unmapped one at a time, so direct restore
 does not retain a second file-backed copy of the 53 GB payload.
+
+Set `model.params.family_params.nf4_fuse_gate_up = true` in the export config
+to write a version 3 artifact with interleaved gate and up NF4 lanes. This
+experimental format preserves the original NF4 payloads and their independent
+scales. The loader detects the layout from the manifest and runs a combined
+projection. The exporter defaults to separate projections, and the loader
+accepts version 2 artifacts.
 
 ```bash
 python scripts/tools/export_compressed_weights_packed_state.py \

@@ -57,6 +57,9 @@ MAGI2_NF4_STORE_ATTR = "mirai_nf4_experts"
 # and ``fused_kernel`` describe per-routed-expert operations that the flattened
 # head-major group axis does not expose.
 MAGI2_EXPERT_ACCESS_POLICIES = ("full_dequant", "chunked_dequant", "active_group_dequant")
+MAGI2_FUSED_GATE_UP = "W_gate_up"
+MAGI2_NF4_GROUP_FIELDS = ("nf4", "nf4_absmax", "nf4_nabsmax", "nf4_offset")
+MAGI2_NF4_CODE_FIELDS = ("nf4_code", "nf4_ncode")
 
 
 class Magi2QuantizedExpertError(ValueError):
@@ -164,6 +167,34 @@ class Magi2Nf4ExpertStore(nn.Module):
             "buffers": sorted(name for name, _value in self.named_buffers(recurse=False)),
         }
 
+    def fused_gate_up_buffers(self) -> dict[str, torch.Tensor]:
+        """Pack two independently scaled NF4 projections as interleaved lanes."""
+        if not self.is_fully_loaded():
+            raise Magi2QuantizedExpertError("Fused gate/up requires a complete NF4 store.")
+        if self.expert_weight_shape("W_gate") != self.expert_weight_shape("W_up"):
+            raise Magi2QuantizedExpertError("Fused gate/up requires equal projection shapes.")
+        if self.expert_weight_dtype("W_gate") != self.expert_weight_dtype("W_up"):
+            raise Magi2QuantizedExpertError("Fused gate/up requires equal projection dtypes.")
+
+        result = {}
+        for suffix in MAGI2_NF4_GROUP_FIELDS:
+            gate = getattr(self, f"W_gate_{suffix}")
+            up = getattr(self, f"W_up_{suffix}")
+            result[f"{MAGI2_FUSED_GATE_UP}_{suffix}"] = torch.stack((gate, up), dim=1)
+        for suffix in MAGI2_NF4_CODE_FIELDS:
+            gate = getattr(self, f"W_gate_{suffix}")
+            up = getattr(self, f"W_up_{suffix}")
+            if not torch.equal(gate, up):
+                raise Magi2QuantizedExpertError("Fused gate/up requires identical NF4 codebooks.")
+            result[f"{MAGI2_FUSED_GATE_UP}_{suffix}"] = gate
+        for suffix in (*MAGI2_NF4_GROUP_FIELDS, *MAGI2_NF4_CODE_FIELDS):
+            result[f"W_down_{suffix}"] = getattr(self, f"W_down_{suffix}")
+        return result
+
+    @property
+    def has_fused_gate_up(self) -> bool:
+        return f"{MAGI2_FUSED_GATE_UP}_nf4" in self._buffers
+
     def restore_packed_state(
         self,
         *,
@@ -215,6 +246,14 @@ class Magi2Nf4ExpertStore(nn.Module):
             raise Magi2QuantizedExpertError(
                 "Packed MAGI-2 store buffer inventory does not match its descriptor."
             )
+        if descriptor.get("fused_gate_up", False):
+            if self._shapes["W_gate"] != self._shapes["W_up"] or self._dtypes["W_gate"] != self._dtypes["W_up"]:
+                raise Magi2QuantizedExpertError("Packed MAGI-2 fused projections have incompatible metadata.")
+            for suffix in MAGI2_NF4_GROUP_FIELDS:
+                if buffers[f"{MAGI2_FUSED_GATE_UP}_{suffix}"].shape[:2] != (self.num_groups, 2):
+                    raise Magi2QuantizedExpertError("Packed MAGI-2 fused projections require two lanes per group.")
+        for name in set(self._buffers) - expected_buffers:
+            delattr(self, name)
         for name, value in buffers.items():
             self._set_buffer(name, value)
 
@@ -232,6 +271,9 @@ class Magi2Nf4ExpertStore(nn.Module):
         return all(key in self._shapes for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
 
     def expert_weight_shape(self, key: str) -> tuple[int, int, int]:
+        if key == MAGI2_FUSED_GATE_UP and self.has_fused_gate_up:
+            groups, rows, columns = self._shapes["W_gate"]
+            return groups, rows, columns * 2
         self._require_loaded(key)
         return self._shapes[key]
 
@@ -365,7 +407,9 @@ class Magi2Nf4ExpertStore(nn.Module):
         autograd context, or cached, so it lives only as long as the matmul that
         consumes it.
         """
-        self._require_loaded(key)
+        both = key == MAGI2_FUSED_GATE_UP and self.has_fused_gate_up
+        logical_key = "W_gate" if both else key
+        self._require_loaded(logical_key)
         start = int(group_start)
         stop = int(group_stop)
         group_count = self.num_groups if group_ids is None else group_ids.numel()
@@ -381,24 +425,45 @@ class Magi2Nf4ExpertStore(nn.Module):
         # ``rows``/``cols`` are the two dimensions of one group's weight slice as
         # the vendored matmul consumes it (``x @ W[group]``); the shared NF4
         # helpers name the same pair out/in.
-        _groups, rows, cols = self._shapes[key]
+        _groups, rows, cols = self._shapes[logical_key]
         out_features, in_features = rows, cols
         count = stop - start
+        lane = None
+        storage_key = key
+        if self.has_fused_gate_up and key in {"W_gate", "W_up"}:
+            storage_key = MAGI2_FUSED_GATE_UP
+            lane = 0 if key == "W_gate" else 1
+        if both:
+            count *= 2
+
+        def projection_layout(values: torch.Tensor) -> torch.Tensor:
+            if not both:
+                return values
+            return values.reshape(stop - start, 2, rows, cols).transpose(1, 2).reshape(
+                stop - start, rows, 2 * cols
+            )
+
         with torch.no_grad():
             indices = None if group_ids is None else group_ids[start:stop]
 
             def select(suffix: str) -> torch.Tensor:
-                field = getattr(self, f"{key}_nf4{suffix}")
+                field = getattr(self, f"{storage_key}_nf4{suffix}")
+                if lane is not None:
+                    field = field[:, lane]
                 if indices is None:
-                    return field[start:stop].to(device=target)
-                return field.index_select(0, indices.to(device=field.device)).to(device=target)
+                    field = field[start:stop]
+                else:
+                    field = field.index_select(0, indices.to(device=field.device))
+                if both:
+                    field = field.flatten(0, 1)
+                return field.to(device=target).contiguous()
 
             packed = select("")
             absmax = select("_absmax")
             nested = select("_nabsmax")
             offsets = select("_offset")
-            code = getattr(self, f"{key}_nf4_code").to(device=target)
-            nested_code = getattr(self, f"{key}_nf4_ncode").to(device=target)
+            code = getattr(self, f"{storage_key}_nf4_code").to(device=target)
+            nested_code = getattr(self, f"{storage_key}_nf4_ncode").to(device=target)
             if count > 1 and target.type == "cuda" and nf4_stack_dequant_supported(
                 elements=int(out_features) * int(in_features), meta=meta
             ):
@@ -416,9 +481,9 @@ class Magi2Nf4ExpertStore(nn.Module):
                     meta=meta,
                 )
                 if stacked is not None:
-                    return stacked
+                    return projection_layout(stacked)
             codes = {"code": code, "nested_code": nested_code}
-            return torch.stack(
+            return projection_layout(torch.stack(
                 [
                     _nf4_dequantize(
                         {
@@ -436,7 +501,7 @@ class Magi2Nf4ExpertStore(nn.Module):
                     for index in range(count)
                 ],
                 dim=0,
-            )
+            ))
 
     def extra_repr(self) -> str:
         return (
