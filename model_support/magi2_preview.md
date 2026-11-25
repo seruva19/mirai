@@ -763,6 +763,9 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   head of a layer and preserve top-k. For training, select `attn_only`.
   Set `memory.quantize_experts_on_load=true` with a supported expert format to
   pack the retained rows during the shard read.
+  A packed expert export preserves the pruning digest. To restore it, set
+  `memory.frozen_weight_packed_state_path` and use the same pruning plan,
+  original checkpoint, and expert format.
   The Python plan builder accepts per-head REAP and AIMER scores. DIET plans
   carry explicit externally selected survivors.
   For AIMER, call `build_magi2_aimer_pruning_plan(transformer, keep_fraction=...)`

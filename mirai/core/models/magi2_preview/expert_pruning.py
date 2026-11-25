@@ -323,6 +323,7 @@ def apply_magi2_expert_pruning(transformer: nn.Module, plan: Magi2ExpertPruningP
 def stream_prune_magi2_experts(
     transformer: nn.Module, plan: Magi2ExpertPruningPlan, checkpoint_dir: str | Path,
     *, quant_format: str | None = None, blocksize: int = NF4_BLOCKSIZE,
+    prepare_packed_restore: bool = False,
 ) -> tuple[set[str], dict[str, Magi2Nf4ExpertStore]]:
     """Validate source tensors and materialize or pack the retained rows."""
     from safetensors import safe_open
@@ -331,9 +332,13 @@ def stream_prune_magi2_experts(
 
     layers = _dense_pruning_layers(transformer)
     selected = _pruning_indices(layers, plan)
+    if prepare_packed_restore and quant_format is not None:
+        raise ValueError("MAGI-2 packed restore cannot quantize source weights.")
     weight_map = read_safetensors_weight_map(str(checkpoint_dir))
     inputs = {}
     for name, layer in layers.items():
+        if prepare_packed_restore and name not in selected:
+            continue
         for key in _PARAMETERS if name in selected else MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             qualified = f"{name}.{key}"
             inputs[qualified] = (name, layer, key, qualified, layer._parameters[key])
@@ -360,6 +365,13 @@ def stream_prune_magi2_experts(
             value = value.to(dtype=target.dtype)
             if name in selected:
                 update_router_tensor_fingerprints((digest,), qualified, value)
+            if prepare_packed_restore and key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+                shape = (len(selected[name][1]), *target.shape[1:])
+                retained[qualified] = nn.Parameter(
+                    torch.empty(shape, dtype=target.dtype, device="meta"), requires_grad=target.requires_grad,
+                )
+                del value
+                continue
             if name in stores and key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
                 stores[name].quantize_dense(
                     key, value, group_ids=selected[name][1] if name in selected else None,
@@ -380,4 +392,7 @@ def stream_prune_magi2_experts(
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             del layer._parameters[key]
         layer.add_module(MAGI2_NF4_STORE_ATTR, store)
-    return set(retained), stores
+    return {
+        qualified for qualified in retained
+        if not prepare_packed_restore or inputs[qualified][2] not in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+    }, stores

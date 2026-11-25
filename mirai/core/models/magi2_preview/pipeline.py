@@ -323,10 +323,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             self._quantize_experts_on_load or self._packed_expert_state_path
         ):
             raise ValueError("MAGI-2 pruned-adapter source verification requires the dense checkpoint.")
-        if self._expert_pruning_plan_path and (
-            self._packed_expert_state_path or self._expert_precision_plan_path
-        ):
-            raise ValueError("MAGI-2 pruning requires an original dense expert checkpoint.")
+        if self._expert_pruning_plan_path and self._expert_precision_plan_path:
+            raise ValueError("MAGI-2 pruning cannot be combined with a mixed expert precision plan.")
         default_config = (
             Path(__file__).resolve().parents[3]
             / "vendors"
@@ -450,12 +448,24 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
 
             pruning_plan = Magi2ExpertPruningPlan.load(pruning_plan_path)
+            restoring_packed = bool(self._packed_expert_state_path)
             preloaded_keys, self._expert_stores = stream_prune_magi2_experts(
                 transformer, pruning_plan, checkpoint_dir,
-                quant_format=self._frozen_weight_quantization if self._quantizes_experts_on_load() else None,
+                quant_format=(
+                    self._frozen_weight_quantization
+                    if not restoring_packed and self._quantizes_experts_on_load() else None
+                ),
                 blocksize=getattr(self, "_nf4_blocksize", MAGI2_NF4_BLOCKSIZE),
+                prepare_packed_restore=restoring_packed,
             )
             self._expert_pruning_digest = pruning_plan.topology_digest()
+            if restoring_packed:
+                from mirai.core.models.magi2_preview.quantized_experts import install_magi2_nf4_expert_stores
+
+                install_magi2_nf4_expert_stores(
+                    transformer, blocksize=self._nf4_blocksize,
+                    quant_format=self._frozen_weight_quantization,
+                )
         elif mixed_stream:
             from mirai.core.models.magi2_preview.mixed_experts import stream_quantize_magi2_mixed_experts
 
@@ -489,7 +499,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             from mirai.core.models.magi2_preview.companion_weights import pack_magi2_norm_weights
 
             self._packed_norms = pack_magi2_norm_weights(transformer)
-        if packed_experts and not mixed_stream and not pruning_plan_path:
+        if packed_experts and not mixed_stream and (not pruning_plan_path or self._packed_expert_state_path):
             if self._packed_expert_state_path:
                 from mirai.core.models.magi2_preview.packed_experts import (
                     load_magi2_nf4_packed_state,
@@ -500,6 +510,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     transformer,
                     blocksize=self._nf4_blocksize,
                     quant_format=self._frozen_weight_quantization,
+                    expected_pruning_digest=self._expert_pruning_digest if pruning_plan_path else None,
                     expected_metadata={
                         "model_variant": str(self.model_config.params.variant),
                         "denoiser_subfolder": str(
@@ -803,14 +814,13 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         *,
         metadata: dict[str, str] | None = None,
     ) -> Any:
-        if getattr(self, "_expert_pruning_plan_path", ""):
-            raise ValueError("Reapply the MAGI-2 pruning plan to the original checkpoint to restore this topology.")
         from mirai.core.models.magi2_preview.packed_experts import (
             save_magi2_nf4_packed_state,
         )
 
         return save_magi2_nf4_packed_state(
             path, self.transformer, metadata=metadata,
+            pruning_digest=self._expert_pruning_digest if self._expert_pruning_plan_path else None,
             fuse_gate_up=(getattr(self.model_config.params, "family_params", None) or {}).get(
                 "nf4_fuse_gate_up", False
             ),

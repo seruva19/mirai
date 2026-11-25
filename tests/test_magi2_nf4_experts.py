@@ -931,7 +931,7 @@ def test_pruned_attention_adapter_restores_only_to_verified_source(tmp_path, mon
     monkeypatch.setattr(vendored_model, "Transformer", lambda *args, **kwargs: target.transformer)
     monkeypatch.setattr(preview_data_proxy, "Magi2DataProxy", lambda _: None)
     target.options = SimpleNamespace(config_path="")
-    target.model_config = SimpleNamespace(path=str(tmp_path))
+    target.model_config = SimpleNamespace(path=str(tmp_path), params=SimpleNamespace(variant="test"))
     streamed = fixture()
     streamed.options = target.options
     streamed.model_config = target.model_config
@@ -989,6 +989,38 @@ def test_pruned_attention_adapter_restores_only_to_verified_source(tmp_path, mon
             store.materialize_segment(key, 0, 4, **kwargs),
             reference.materialize_segment(key, 0, 4, **kwargs),
             rtol=0, atol=0,
+        )
+
+    from mirai.core.models.magi2_preview.packed_experts import (
+        Magi2PackedExpertStateError, load_magi2_nf4_packed_state,
+    )
+
+    artifact = streamed.save_packed_frozen_weight_state(
+        tmp_path / "packed", metadata={"model_variant": "test", "denoiser_subfolder": "transformer"},
+    )
+    with pytest.raises(Magi2PackedExpertStateError, match="pruning lineage"):
+        load_magi2_nf4_packed_state(artifact, target.transformer, blocksize=64, quant_format="fp8")
+    streamed = fixture()
+    streamed.options = target.options
+    streamed.model_config = target.model_config
+    streamed._expert_pruning_plan_path = str(path)
+    streamed._quantize_experts_on_load = False
+    streamed._frozen_weight_quantization = "fp8"
+    streamed._nf4_blocksize = 64
+    streamed._expert_rotation_group_size = 0
+    streamed._packed_expert_state_path = str(artifact)
+    streamed._configure_attention_backend = lambda _: None
+    _, streamed.transformer, _ = streamed._build_model()
+    restored = streamed._expert_stores[name]
+    assert streamed._expert_pruning_digest == plan.topology_digest()
+    assert streamed.transformer.layer.mlp.moe_mlp.num_experts == 2
+    for key, value in store.named_buffers():
+        torch.testing.assert_close(dict(restored.named_buffers())[key], value, rtol=0, atol=0)
+    wrong_survivors = replace(plan, kept_by_head={name: ((0, 1), (0, 1))})
+    with pytest.raises(Magi2PackedExpertStateError, match="pruning lineage"):
+        load_magi2_nf4_packed_state(
+            artifact, streamed.transformer, blocksize=64, quant_format="fp8",
+            expected_pruning_digest=wrong_survivors.topology_digest(),
         )
 
     monkeypatch.setattr(vendored_model, "Transformer", lambda *args, **kwargs: target.transformer)

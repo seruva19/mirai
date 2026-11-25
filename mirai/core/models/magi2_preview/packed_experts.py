@@ -28,10 +28,19 @@ _MULTIFORMAT_SCHEMA_VERSION = 4
 _MIXED_SCHEMA_VERSION = 5
 _ROTATED_MIXED_SCHEMA_VERSION = 6
 _MANIFEST_FILE = "manifest.json"
+_PRUNING_DIGEST_KEY = "head_expert_pruning_digest"
 
 
 class Magi2PackedExpertStateError(ValueError):
     """Raised when a packed MAGI-2 expert artifact is incompatible."""
+
+
+def _validate_pruning_topology(transformer: torch.nn.Module, digest: bytes | None) -> None:
+    if digest is not None and (not isinstance(digest, bytes) or len(digest) != 32):
+        raise Magi2PackedExpertStateError("Packed MAGI-2 expert pruning digest must contain 32 bytes.")
+    pruned = any(getattr(layer, "_mirai_experts_pruned", False) for _, layer in iter_magi2_moe_layers(transformer))
+    if pruned != (digest is not None):
+        raise Magi2PackedExpertStateError("Packed MAGI-2 expert pruning lineage requires a matching topology.")
 
 
 def save_magi2_nf4_packed_state(
@@ -40,11 +49,13 @@ def save_magi2_nf4_packed_state(
     *,
     metadata: dict[str, str] | None = None,
     fuse_gate_up: bool = False,
+    pruning_digest: bytes | None = None,
 ) -> Path:
     """Write the already-quantized expert stores without dense reconstruction."""
 
     from safetensors.torch import save_file
 
+    _validate_pruning_topology(transformer, pruning_digest)
     target = Path(path).expanduser()
     if target.exists() and any(target.iterdir()):
         raise FileExistsError(
@@ -106,6 +117,8 @@ def save_magi2_nf4_packed_state(
         "layers": layers,
         "metadata": dict(metadata or {}),
     }
+    if pruning_digest is not None:
+        manifest[_PRUNING_DIGEST_KEY] = pruning_digest.hex()
     (target / _MANIFEST_FILE).write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -119,6 +132,7 @@ def load_magi2_nf4_packed_state(
     blocksize: int,
     quant_format: str = "nf4",
     expected_metadata: dict[str, str] | None = None,
+    expected_pruning_digest: bytes | None = None,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Restore NF4 stores directly and reject topology or schema mismatches."""
 
@@ -142,6 +156,10 @@ def load_magi2_nf4_packed_state(
         raise Magi2PackedExpertStateError(
             "Packed MAGI-2 expert state has an unsupported schema or version."
         )
+    _validate_pruning_topology(transformer, expected_pruning_digest)
+    expected_hex = expected_pruning_digest.hex() if expected_pruning_digest is not None else None
+    if manifest.get(_PRUNING_DIGEST_KEY) != expected_hex:
+        raise Magi2PackedExpertStateError("Packed MAGI-2 expert state has incompatible pruning lineage.")
     if manifest.get("quant_format") != quant_format or (
         version not in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION}
         and (version == _MULTIFORMAT_SCHEMA_VERSION) != (quant_format != "nf4")
