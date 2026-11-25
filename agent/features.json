@@ -3163,7 +3163,8 @@
         "documentation"
       ],
       "symbols": [
-        "apply_magi2_expert_pruning"
+        "apply_magi2_expert_pruning",
+        "verify_magi2_pruning_source"
       ],
       "config_keys": [
         "model.params.family_params"

@@ -762,6 +762,12 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   head of a layer and preserve top-k. For training, select `attn_only`.
   The Python plan builder accepts per-head REAP and AIMER scores. DIET plans
   carry explicit externally selected survivors.
+  To use a pruned model's `attn_only` LoRA on the original dense model, set
+  `model.params.family_params.expert_pruning_adapter_source_plan_path` to the
+  same plan and leave `expert_pruning_plan_path` unset. The loader verifies the
+  source expert and router tensors against the plan and requires the adapter's
+  matching pruning digest. This mode verifies the checkpoint without
+  shortening the expert axes and requires dense checkpoint loading.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group

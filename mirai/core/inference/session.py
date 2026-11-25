@@ -386,10 +386,9 @@ class InferenceSession:
             trainer.load_state_dict(ckpt.get("trainer_state", {}))
         if adapter_path:
             adapter_payload = load_adapter_payload(adapter_path)
-            trainer.pipeline.validate_adapter_payload(adapter_payload)
-            trainer.pipeline.load_adapter_state(
-                normalize_adapter_state(adapter_payload, lora_format=lora_format)
-            )
+            adapter_state = normalize_adapter_state(adapter_payload, lora_format=lora_format)
+            trainer.pipeline.validate_adapter_payload(adapter_state)
+            trainer.pipeline.load_adapter_state(adapter_state)
         trainer.pipeline.eval()
         trainer.pipeline.set_lora_scale(lora_scale)
         merge_applied = False

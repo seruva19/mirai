@@ -314,6 +314,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         ):
             raise ValueError("MAGI-2 expert rotation requires precision calibration, a mixed plan, or a rotated artifact.")
         self._expert_pruning_plan_path = str(family.get("expert_pruning_plan_path", "")).strip()
+        self._expert_pruning_adapter_source_plan_path = str(
+            family.get("expert_pruning_adapter_source_plan_path", "") or ""
+        ).strip()
+        if self._expert_pruning_adapter_source_plan_path and self._expert_pruning_plan_path:
+            raise ValueError("Choose either pruning the MAGI-2 base or restoring a pruned adapter to the source base.")
+        if self._expert_pruning_adapter_source_plan_path and (
+            self._quantize_experts_on_load or self._packed_expert_state_path
+        ):
+            raise ValueError("MAGI-2 pruned-adapter source verification requires the dense checkpoint.")
         if self._expert_pruning_plan_path and (
             self._quantize_experts_on_load or self._packed_expert_state_path
             or self._expert_precision_plan_path
@@ -513,6 +522,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             pruning_plan = Magi2ExpertPruningPlan.load(self._expert_pruning_plan_path)
             apply_magi2_expert_pruning(transformer, pruning_plan)
             self._expert_pruning_digest = pruning_plan.topology_digest()
+        elif getattr(self, "_expert_pruning_adapter_source_plan_path", ""):
+            from mirai.core.models.magi2_preview.expert_pruning import (
+                Magi2ExpertPruningPlan,
+                verify_magi2_pruning_source,
+            )
+
+            source_plan = Magi2ExpertPruningPlan.load(self._expert_pruning_adapter_source_plan_path)
+            self._expert_pruning_digest = verify_magi2_pruning_source(transformer, source_plan)
         transformer.train()
         self._configure_attention_backend(transformer)
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
@@ -1147,8 +1164,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         if str(getattr(adapter_config, "type", "lora")).strip().lower() != "lora":
             raise ValueError("MAGI-2 Preview currently supports adapter.type='lora'.")
         preset = str(getattr(adapter_config, "target_preset", "attn_only")).strip()
-        if getattr(self, "_expert_pruning_plan_path", "") and preset != "attn_only":
-            raise ValueError("Pruned MAGI-2 layers currently require adapter.target_preset='attn_only'.")
+        if (
+            getattr(self, "_expert_pruning_plan_path", "")
+            or getattr(self, "_expert_pruning_digest", None) is not None
+        ) and preset != "attn_only":
+            raise ValueError("MAGI-2 pruning lineage requires adapter.target_preset='attn_only'.")
         if preset not in MAGI2_TARGET_PRESETS:
             raise ValueError(
                 f"Unsupported MAGI-2 adapter target preset '{preset}'; expected one of "
@@ -1232,6 +1252,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise TypeError("MAGI-2 adapter state must be a mapping.")
         self.validate_adapter_payload(state)
         expected = set(self.state_dict())
+        portable_alphas = {
+            key for key in state
+            if key.endswith(".lora_alpha") and key.removesuffix(".lora_alpha") + ".lora_a" in expected
+        }
+        for key in portable_alphas:
+            alpha = state[key]
+            adapter = self.transformer.get_submodule(key.removesuffix(".lora_alpha"))
+            expected_alpha = torch.tensor(adapter.scale * adapter.rank, dtype=torch.float32)
+            if not isinstance(alpha, torch.Tensor) or alpha.numel() != 1 or not torch.isclose(
+                alpha.detach().cpu().float().reshape(()), expected_alpha,
+            ):
+                raise ValueError(f"MAGI-2 adapter alpha does not match the configured scale for {key!r}.")
+        if portable_alphas:
+            state = {key: value for key, value in state.items() if key not in portable_alphas}
         supplied = {str(key) for key in state}
         unknown = sorted(supplied - expected)
         missing = sorted(expected - supplied)
@@ -2049,16 +2083,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         configured LoRA parameters is a lineage mismatch and fails.
         """
         self.validate_adapter_payload(state)
-        if strict:
+        if strict or getattr(self, "_expert_pruning_digest", None) is not None:
             expected = set(self.state_dict())
             supplied = {str(key) for key in state}
-            missing = sorted(expected - supplied)
+            missing = sorted(expected - supplied) if strict else []
             unexpected = sorted(supplied - expected)
             if missing or unexpected:
                 raise ValueError(
                     "MAGI-2 adapter state does not match the configured LoRA "
-                    f"targets (missing={missing[:4]}, unexpected={unexpected[:4]}). "
-                    "Pass strict=False to load a partial adapter surface."
+                    f"targets (missing={missing[:4]}, unexpected={unexpected[:4]})."
                 )
         return self.transformer.load_state_dict(
             {key: value for key, value in state.items() if key != "__mirai_magi2_pruning_digest__"},
@@ -2070,6 +2103,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
         "nf4_fuse_gate_up",
         "expert_pruning_plan_path",
+        "expert_pruning_adapter_source_plan_path",
         "expert_rotation_group_size",
         "companion_weight_quantization",
         "norm_weight_quantization",
@@ -2136,6 +2170,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             errors.append("MAGI-2 family_params.audio_tokens must be -1 (auto) or >= 0.")
         for name in (
             "expert_pruning_plan_path",
+            "expert_pruning_adapter_source_plan_path",
             "refiner_config_path",
             "refiner_subfolder",
             "refiner_attention_backend",

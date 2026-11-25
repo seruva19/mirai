@@ -136,7 +136,7 @@ def _multi_lora_prefixes(payload: dict[str, Any]) -> list[str]:
 
 
 def adapter_state_to_kohya(
-    adapter_state: dict[str, Any]
+    adapter_state: dict[str, Any], *, default_alpha: float = 1.0,
 ) -> dict[str, Any]:
     prefixes = _multi_lora_prefixes(adapter_state)
     if prefixes:
@@ -144,7 +144,7 @@ def adapter_state_to_kohya(
         for prefix in prefixes:
             a = adapter_state.get(f"{prefix}.lora_a", adapter_state.get(prefix + KOHYA_DOWN_SUFFIX))
             b = adapter_state.get(f"{prefix}.lora_b", adapter_state.get(prefix + KOHYA_UP_SUFFIX))
-            alpha = adapter_state.get(f"{prefix}.lora_alpha", adapter_state.get(f"{prefix}.alpha", 1.0))
+            alpha = adapter_state.get(f"{prefix}.lora_alpha", adapter_state.get(f"{prefix}.alpha", default_alpha))
             magnitude = adapter_state.get(f"{prefix}{DORA_MAGNITUDE_SUFFIX}")
             if a is None or b is None:
                 continue
@@ -172,14 +172,16 @@ def adapter_state_to_kohya(
     }
 
 
-def adapter_state_to_diffusers(adapter_state: dict[str, Any]) -> dict[str, Any]:
+def adapter_state_to_diffusers(
+    adapter_state: dict[str, Any], *, default_alpha: float = 1.0,
+) -> dict[str, Any]:
     prefixes = _multi_lora_prefixes(adapter_state)
     if prefixes:
         out: dict[str, Any] = {}
         for prefix in prefixes:
             a = adapter_state.get(f"{prefix}.lora_a", adapter_state.get(prefix + KOHYA_DOWN_SUFFIX))
             b = adapter_state.get(f"{prefix}.lora_b", adapter_state.get(prefix + KOHYA_UP_SUFFIX))
-            alpha = adapter_state.get(f"{prefix}.lora_alpha", adapter_state.get(f"{prefix}.alpha", 1.0))
+            alpha = adapter_state.get(f"{prefix}.lora_alpha", adapter_state.get(f"{prefix}.alpha", default_alpha))
             magnitude = adapter_state.get(f"{prefix}{DORA_MAGNITUDE_SUFFIX}")
             if a is None or b is None:
                 continue
@@ -264,7 +266,7 @@ def save_kohya_adapter_safetensors(
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     portable_state = _portable_adapter_state(adapter_state)
-    tensors = adapter_state_to_kohya(portable_state)
+    tensors = adapter_state_to_kohya(portable_state, default_alpha=alpha)
     metadata = {
         "format": "kohya",
         "rank": str(int(rank)),
@@ -299,7 +301,7 @@ def save_diffusers_adapter_safetensors(
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     portable_state = _portable_adapter_state(adapter_state)
-    tensors = adapter_state_to_diffusers(portable_state)
+    tensors = adapter_state_to_diffusers(portable_state, default_alpha=alpha)
     metadata = {
         "format": "diffusers",
         "rank": str(int(rank)),
@@ -551,7 +553,19 @@ def _restore_mirai_scaling_metadata(
     lineage = payload.get("__mirai_adapter_lineage__")
     if lineage is not None:
         restored["__mirai_adapter_lineage__"] = lineage
+    digest_key = "__mirai_magi2_pruning_digest__"
+    if digest_key in payload:
+        restored[digest_key] = payload[digest_key]
     if isinstance(metadata, dict):
+        encoded_digest = metadata.get("mirai_magi2_pruning_digest")
+        if encoded_digest is not None:
+            try:
+                digest = bytes.fromhex(encoded_digest)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Invalid MAGI-2 pruning digest in adapter metadata.") from exc
+            if len(digest) != 32:
+                raise ValueError("Invalid MAGI-2 pruning digest in adapter metadata.")
+            restored.setdefault(digest_key, torch.tensor(list(digest), dtype=torch.uint8))
         lineage = metadata.get("mirai_adapter_lineage")
         if lineage is not None and "__mirai_adapter_lineage__" not in restored:
             restored["__mirai_adapter_lineage__"] = torch.tensor(
@@ -606,6 +620,11 @@ def _append_structural_adapter_safetensors_state(
         if not _is_tensor(lineage) or lineage.dtype != torch.uint8 or lineage.ndim != 1:
             raise ValueError("Adapter lineage must be a one-dimensional uint8 JSON tensor.")
         metadata["mirai_adapter_lineage"] = bytes(lineage.detach().cpu().tolist()).decode("utf-8")
+    digest = adapter_state.get("__mirai_magi2_pruning_digest__")
+    if digest is not None:
+        if not _is_tensor(digest) or digest.dtype != torch.uint8 or digest.shape != (32,):
+            raise ValueError("MAGI-2 pruning digest must be a 32-byte uint8 tensor.")
+        metadata["mirai_magi2_pruning_digest"] = bytes(digest.detach().cpu().tolist()).hex()
     for prefix, schema_metadata, topology_metadata in (
         _STRUCTURAL_ADAPTER_EXTENSIONS
     ):

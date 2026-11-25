@@ -107,8 +107,7 @@ def build_magi2_diet_pruning_plan(
     return Magi2ExpertPruningPlan("diet", fingerprint, dict(kept_by_head))
 
 
-@torch.no_grad()
-def apply_magi2_expert_pruning(transformer: nn.Module, plan: Magi2ExpertPruningPlan) -> None:
+def _validated_pruning_source(transformer: nn.Module, plan: Magi2ExpertPruningPlan):
     layers = dict(iter_magi2_moe_layers(transformer))
     if not plan.kept_by_head or set(plan.kept_by_head) - set(layers):
         raise ValueError("MAGI-2 expert pruning plan does not match model topology.")
@@ -132,7 +131,18 @@ def apply_magi2_expert_pruning(transformer: nn.Module, plan: Magi2ExpertPruningP
         selected[name] = (keep_count, indices)
     if _source_fingerprint({name: layers[name] for name in selected}) != plan.source_weight_fingerprint:
         raise ValueError("MAGI-2 expert pruning plan source-weight fingerprint mismatch.")
+    return layers, selected
 
+
+def verify_magi2_pruning_source(transformer: nn.Module, plan: Magi2ExpertPruningPlan) -> bytes:
+    """Verify the dense source before accepting a pruned model's attention adapter."""
+    _validated_pruning_source(transformer, plan)
+    return plan.topology_digest()
+
+
+@torch.no_grad()
+def apply_magi2_expert_pruning(transformer: nn.Module, plan: Magi2ExpertPruningPlan) -> None:
+    layers, selected = _validated_pruning_source(transformer, plan)
     for name, (keep_count, ids) in selected.items():
         layer = layers[name]
         for key in _PARAMETERS:

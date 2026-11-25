@@ -788,6 +788,92 @@ def test_magi2_pruning_remaps_each_head_and_preserves_top_k(tmp_path, criterion)
     assert torch.isfinite(hidden.grad).all()
 
 
+def test_pruned_attention_adapter_restores_only_to_verified_source(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+    from mirai.core.training.adapters import load_adapter_payload, normalize_adapter_state, save_kohya_adapter_safetensors
+    from mirai.core.training.optim.ema import init_ema_state, update_ema_state
+    from mirai.core.models.magi2_preview.expert_pruning import (
+        apply_magi2_expert_pruning, build_magi2_expert_pruning_plan, verify_magi2_pruning_source,
+    )
+    from mirai.vendors.magi2_preview.common import magi2_config
+    from mirai.vendors.magi2_preview.model import magi2_preview as vendored_model
+    from mirai.vendors.magi2_preview.model.magi2_preview import CustomGroupedLinear
+    from mirai.vendors.magi2_preview.pipeline import preview_data_proxy
+
+    def fixture():
+        root = torch.nn.Module()
+        root.layer = _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32))
+        root.layer.attention = torch.nn.Module()
+        root.layer.attention.linear_proj = CustomGroupedLinear(16, 16, 1, 1, 1, dtype=torch.float32)
+        with torch.no_grad():
+            root.layer.attention.linear_proj.weight.normal_(std=0.1)
+            router = root.layer.mlp.moe_mlp.router
+            router.expert_bias_ema.copy_(router.expert_bias)
+        pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.transformer = root
+        return pipeline
+
+    config = SimpleNamespace(type="lora", target_preset="attn_only", rank=2, alpha=2.0)
+    source, target = fixture(), fixture()
+    name = "layer.mlp.moe_mlp"
+    plan = build_magi2_expert_pruning_plan(
+        source.transformer, {name: torch.arange(8).view(2, 4)}, criterion="reap", keep_fraction=0.5,
+    )
+    save_file(source.transformer.state_dict(), str(tmp_path / "model.safetensors"))
+    path = tmp_path / "pruning.json"
+    plan.save(path)
+    apply_magi2_expert_pruning(source.transformer, plan)
+    source._expert_pruning_digest = plan.topology_digest()
+    source.set_adapter_config(config)
+    source_adapter = source.transformer.layer.attention.linear_proj.parametrizations.weight[0]
+    with torch.no_grad():
+        source_adapter.lora_b.fill_(0.25)
+    payload = source.state_dict()
+    target.set_adapter_config(config)
+    with pytest.raises(ValueError, match="pruning topology"):
+        target.load_adapter_state(payload)
+    routed = target.transformer.layer.mlp.moe_mlp
+    with torch.no_grad():
+        routed.gate[0, 0] += 1
+    with pytest.raises(ValueError, match="fingerprint"):
+        verify_magi2_pruning_source(target.transformer, plan)
+    target = fixture()
+    config_stub = SimpleNamespace(
+        arch_config=None, engine_config=SimpleNamespace(),
+        evaluation_config=SimpleNamespace(data_proxy_config=None),
+    )
+    monkeypatch.setattr(magi2_config, "load_config", lambda _: config_stub)
+    monkeypatch.setattr(vendored_model, "Transformer", lambda *args, **kwargs: target.transformer)
+    monkeypatch.setattr(preview_data_proxy, "Magi2DataProxy", lambda _: None)
+    target.options = SimpleNamespace(config_path="")
+    target.model_config = SimpleNamespace(path=str(tmp_path))
+    target._expert_pruning_adapter_source_plan_path = str(path)
+    target._expert_pruning_plan_path = ""
+    target._quantize_experts_on_load = False
+    target._packed_expert_state_path = ""
+    target._configure_attention_backend = lambda _: None
+    _, target.transformer, _ = target._build_model()
+    target.set_adapter_config(config)
+    target.load_adapter_state(payload)
+    routed = target.transformer.layer.mlp.moe_mlp
+    assert routed.num_experts == 4
+    for key, value in target.state_dict().items():
+        torch.testing.assert_close(value, payload[key], rtol=0, atol=0)
+    ema = update_ema_state(init_ema_state(payload), payload, decay=0.5)
+    exported = save_kohya_adapter_safetensors(
+        tmp_path / "adapter.safetensors", adapter_state=ema, rank=2, alpha=2.0,
+        target_modules=["attention.linear_proj"], model_path=str(tmp_path),
+    )
+    target.load_adapter_state(normalize_adapter_state(load_adapter_payload(exported)))
+    for key, value in target.state_dict().items():
+        torch.testing.assert_close(value, payload[key], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="unexpected"):
+        target.load_state_dict({**payload, f"{name}.gate": routed.gate}, strict=False)
+
+
 @pytest.mark.parametrize("rotation_group_size", [0, 4])
 def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rotation_group_size, monkeypatch) -> None:
     from types import SimpleNamespace
