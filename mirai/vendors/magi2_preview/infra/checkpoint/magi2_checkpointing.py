@@ -213,19 +213,28 @@ def _apply_router_bias_ema(state_dict: dict[str, torch.Tensor]) -> dict[str, tor
     return state_dict
 
 
-def load_magi2_model_state_dict(model: torch.nn.Module, engine_config: EngineConfig) -> Mapping[str, Any]:
+def load_magi2_model_state_dict(
+    model: torch.nn.Module, engine_config: EngineConfig, *, preloaded_keys: set[str] | None = None,
+) -> Mapping[str, Any]:
     checkpoint_dir = engine_config.load
     if not checkpoint_dir:
         raise ValueError("engine_config.load must point at a safetensors checkpoint directory")
 
     print_rank_0(f"[magi2] Loading preview weights from {checkpoint_dir}")
     targets = model.state_dict()
-    weight_map = {key: path for key, path in read_safetensors_weight_map(checkpoint_dir).items() if key in targets}
+    preloaded = preloaded_keys or set()
+    if not preloaded <= targets.keys():
+        raise ValueError("MAGI-2 preloaded checkpoint keys are absent from the model state.")
+    weight_map = {
+        key: path for key, path in read_safetensors_weight_map(checkpoint_dir).items()
+        if key in targets and key not in preloaded
+    }
 
     state_dict = _load_by_shard(weight_map, reader=_read_ep_slice, desc="Loading shards", targets=targets)
     for key, value in state_dict.items():
         target = targets[key]
         if value.dtype != target.dtype and value.is_floating_point() and target.is_floating_point():
             state_dict[key] = value.to(dtype=target.dtype)
+    state_dict.update({key: targets[key] for key in preloaded})
     return _apply_router_bias_ema(state_dict)
 

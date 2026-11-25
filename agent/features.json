@@ -3279,7 +3279,8 @@
         "documentation"
       ],
       "symbols": [
-        "pack_magi2_companion_weights"
+        "pack_magi2_companion_weights",
+        "stream_pack_magi2_companion_weights"
       ],
       "config_keys": [
         "model.params.family_params"

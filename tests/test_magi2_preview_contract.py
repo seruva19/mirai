@@ -158,10 +158,14 @@ def test_magi2_grouped_linear_lora_executes_without_dense_delta() -> None:
     assert "parametrizations.weight.0.lora_b" in state_keys
 
 
-def test_magi2_packed_companion_preserves_grouped_lora_output_and_gradients() -> None:
+@pytest.mark.parametrize("streaming", [False, True])
+def test_magi2_packed_companion_preserves_grouped_lora_output_and_gradients(tmp_path, streaming) -> None:
     from types import SimpleNamespace
 
-    from mirai.core.models.magi2_preview.companion_weights import pack_magi2_companion_weights
+    from mirai.core.models.magi2_preview.companion_weights import (
+        pack_magi2_companion_weights,
+        stream_pack_magi2_companion_weights,
+    )
     from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
     from mirai.vendors.magi2_preview.model.magi2_preview import CustomGroupedLinear
 
@@ -181,7 +185,45 @@ def test_magi2_packed_companion_preserves_grouped_lora_output_and_gradients() ->
     transformer = torch.nn.Module()
     transformer.block = torch.nn.Module()
     transformer.block.layers = torch.nn.ModuleList([layer])
-    packed_linears = pack_magi2_companion_weights(transformer, quant_format="fp8", blocksize=64)
+    if streaming:
+        from safetensors.torch import save_file
+        from mirai.core.models.compressed_weights.quantization.blockwise_fp8 import quantize_blockwise_fp8_weight
+        from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import load_magi2_model_state_dict
+
+        checkpoint = {key: value.double() for key, value in transformer.state_dict().items()}
+        shard = str(tmp_path / "model.safetensors")
+        weight_key = "block.layers.0.attention.linear_qkv.weight"
+        bias_key = "block.layers.0.attention.linear_qkv.bias"
+        save_file({key: value for key, value in checkpoint.items() if key != weight_key}, shard)
+        with pytest.raises(ValueError, match="missing companion weight"):
+            stream_pack_magi2_companion_weights(
+                transformer, checkpoint_dir=str(tmp_path), quant_format="fp8", blocksize=64,
+            )
+        assert not hasattr(attention.linear_qkv, "_mirai_companion_projections")
+        save_file({key: value for key, value in checkpoint.items() if key != bias_key}, shard)
+        with torch.no_grad():
+            attention.linear_qkv.weight.zero_()
+        packed_linears, preloaded = stream_pack_magi2_companion_weights(
+            transformer, checkpoint_dir=str(tmp_path), quant_format="fp8", blocksize=64,
+        )
+        assert weight_key in preloaded
+        assert bias_key not in preloaded
+        codes = quantize_blockwise_fp8_weight(checkpoint[weight_key][:16].float())[0]
+        torch.testing.assert_close(
+            attention.linear_qkv._mirai_companion_projections[0].weight_fp8, codes,
+        )
+        state = load_magi2_model_state_dict(
+            transformer, SimpleNamespace(load=str(tmp_path)), preloaded_keys=preloaded,
+        )
+        with pytest.raises(RuntimeError, match=r"Missing key.*linear_qkv.bias"):
+            transformer.load_state_dict(state, strict=True)
+        save_file(checkpoint, shard)
+        state = load_magi2_model_state_dict(
+            transformer, SimpleNamespace(load=str(tmp_path)), preloaded_keys=preloaded,
+        )
+        transformer.load_state_dict(state, strict=True)
+    else:
+        packed_linears = pack_magi2_companion_weights(transformer, quant_format="fp8", blocksize=64)
     module = attention.linear_qkv
     assert module.weight.numel() == 0
     assert layer.mlp[0].weight.numel() == 0

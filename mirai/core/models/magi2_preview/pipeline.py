@@ -424,23 +424,28 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         checkpoint_dir = model_path / "preview" if (model_path / "preview").is_dir() else model_path
         config.engine_config.load = str(checkpoint_dir)
         transformer = Transformer(config.arch_config, ep_size=1)
-        if self._quantizes_experts_on_load() or self._packed_expert_state_path:
-            # Drop the dense routed-expert parameters before any shard is read.
-            # ``load_magi2_model_state_dict`` reads exactly the keys the model
-            # still declares, so the released expert stack never enters host
-            # memory as one dense copy; it is streamed and packed below.
-            from mirai.core.models.magi2_preview.quantized_experts import (
-                install_magi2_nf4_expert_stores,
-                stream_quantize_magi2_experts,
-            )
+        packed_experts = self._quantizes_experts_on_load() or bool(self._packed_expert_state_path)
+        if packed_experts:
+            # Remove the dense routed expert targets before reading checkpoint shards.
+            from mirai.core.models.magi2_preview.quantized_experts import install_magi2_nf4_expert_stores
 
             install_magi2_nf4_expert_stores(
                 transformer, blocksize=self._nf4_blocksize,
                 quant_format=self._frozen_weight_quantization,
             )
-            state = load_magi2_model_state_dict(transformer, config.engine_config)
-            transformer.load_state_dict(state, strict=True)
-            del state
+        preloaded_keys = set()
+        if self._companion_weight_quantization != "none":
+            from mirai.core.models.magi2_preview.companion_weights import stream_pack_magi2_companion_weights
+
+            self._packed_companion_linears, preloaded_keys = stream_pack_magi2_companion_weights(
+                transformer, checkpoint_dir=str(checkpoint_dir),
+                quant_format=self._companion_weight_quantization, blocksize=self._nf4_blocksize,
+            )
+        load_options = {"preloaded_keys": preloaded_keys} if preloaded_keys else {}
+        state = load_magi2_model_state_dict(transformer, config.engine_config, **load_options)
+        transformer.load_state_dict(state, strict=True)
+        del state
+        if packed_experts:
             if self._packed_expert_state_path:
                 from mirai.core.models.magi2_preview.packed_experts import (
                     load_magi2_nf4_packed_state,
@@ -469,31 +474,23 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 ):
                     raise ValueError("MAGI-2 packed artifact does not match the requested expert rotation.")
             else:
+                from mirai.core.models.magi2_preview.quantized_experts import stream_quantize_magi2_experts
+
                 self._expert_stores = stream_quantize_magi2_experts(
                     transformer,
                     checkpoint_dir=str(checkpoint_dir),
                     blocksize=self._nf4_blocksize,
                     quant_format=self._frozen_weight_quantization,
                 )
-        else:
-            state = load_magi2_model_state_dict(transformer, config.engine_config)
-            transformer.load_state_dict(state, strict=True)
-            del state
-            if self._expert_pruning_plan_path:
-                from mirai.core.models.magi2_preview.expert_pruning import (
-                    Magi2ExpertPruningPlan,
-                    apply_magi2_expert_pruning,
-                )
-
-                pruning_plan = Magi2ExpertPruningPlan.load(self._expert_pruning_plan_path)
-                apply_magi2_expert_pruning(transformer, pruning_plan)
-                self._expert_pruning_digest = pruning_plan.topology_digest()
-        if self._companion_weight_quantization != "none":
-            from mirai.core.models.magi2_preview.companion_weights import pack_magi2_companion_weights
-
-            self._packed_companion_linears = pack_magi2_companion_weights(
-                transformer, quant_format=self._companion_weight_quantization, blocksize=self._nf4_blocksize,
+        elif self._expert_pruning_plan_path:
+            from mirai.core.models.magi2_preview.expert_pruning import (
+                Magi2ExpertPruningPlan,
+                apply_magi2_expert_pruning,
             )
+
+            pruning_plan = Magi2ExpertPruningPlan.load(self._expert_pruning_plan_path)
+            apply_magi2_expert_pruning(transformer, pruning_plan)
+            self._expert_pruning_digest = pruning_plan.topology_digest()
         transformer.train()
         self._configure_attention_backend(transformer)
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
