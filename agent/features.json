@@ -3170,7 +3170,8 @@
         "build_magi2_aimer_pruning_plan_from_shards",
         "stream_prune_magi2_experts",
         "capture_magi2_diet_head",
-        "select_magi2_diet_pruning_plan"
+        "select_magi2_diet_pruning_plan",
+        "build_magi2_diet_calibration_targets"
       ],
       "config_keys": [
         "model.params.family_params"

@@ -2156,6 +2156,11 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             pipeline_type=Magi2PreviewPipeline,
         )
 
+    def build_diet_calibration_targets(self, pipeline: Any):
+        from mirai.core.models.magi2_preview.expert_pruning import build_magi2_diet_calibration_targets
+
+        return build_magi2_diet_calibration_targets(pipeline.transformer)
+
     def build_expert_pruning_calibration_targets(self, pipeline: Any):
         from mirai.core.models.magi2_preview.expert_pruning import build_magi2_pruning_calibration_targets
 

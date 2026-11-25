@@ -150,6 +150,7 @@ class _DietObserver:
             group_score_topk=int(raw.get("group_score_topk", self.target.group_score_topk)),
             normalize_topk_prob=bool(raw.get("norm_topk_prob", self.target.norm_topk_prob)),
             route_scale=float(raw.get("route_scale", self.target.route_scale)),
+            normalization_epsilon=float(getattr(self.target, "normalization_epsilon", 0.0)),
         )
         shared = raw.get("shared_output")
         postprocess = None if shared is None and raw.get("rms_weight") is None and raw.get("residual") is None else DietFamilyPostprocess(
@@ -200,6 +201,7 @@ class _DietObserver:
             self.target.num_experts, self.target.top_k, self.target.n_group,
             self.target.topk_group, self.target.group_score_topk,
             bool(self.target.norm_topk_prob), float(self.target.route_scale),
+            normalization_epsilon=float(getattr(self.target, "normalization_epsilon", 0.0)),
         )
         return DietCalibrationEvidence(
             signatures=(self.signature_sum / self.sample_count).to(torch.float32),

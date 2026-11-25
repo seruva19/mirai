@@ -6,13 +6,14 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 
 from mirai.core.moe.calibration.projection import ExpertProjectionSpec
 from mirai.core.moe.calibration.pruning import (
+    DietCalibrationTarget,
     ExpertPruningCalibrationTarget,
     aimer_expert_scores,
     normalize_expert_pruning_criterion,
@@ -223,7 +224,10 @@ def capture_magi2_diet_head(
         raise ValueError("MAGI-2 DIET needs a valid head and nonempty [tokens, head width] input.")
     if layer.ep_size != 1 or getattr(layer, "_mirai_experts_pruned", False) or any(
         layer._parameters.get(key) is None for key in _PARAMETERS
-    ) or getattr(layer, "_mirai_router_lora_executor", None) is not None:
+    ) or any(
+        getattr(layer, executor, None) is not None
+        for executor in ("_mirai_router_lora_executor", "_mirai_int8_router_executor")
+    ):
         raise ValueError("MAGI-2 DIET capture requires the original dense expert pool and router.")
     start = head * layer.num_experts
     rows = slice(start, start + layer.num_experts)
@@ -240,6 +244,71 @@ def capture_magi2_diet_head(
         choice_bias=layer.router.expert_bias[rows].detach().to(device="cpu", copy=True),
         topology=topology,
     ).validate()
+
+
+@dataclass(frozen=True)
+class _Magi2DietHeadHost:
+    module: nn.Module
+    head: int
+
+    def get_diet_capture_observer(self):
+        entry = getattr(self.module, "_mirai_diet_callbacks", {}).get(self.head)
+        return None if entry is None else entry.observer
+
+    def set_diet_capture_observer(self, observer) -> None:
+        callbacks = getattr(self.module, "_mirai_diet_callbacks", None)
+        if observer is None:
+            if callbacks is not None:
+                callbacks.pop(self.head, None)
+                if not callbacks:
+                    del self.module._mirai_diet_callbacks
+            return
+        if callbacks is None:
+            callbacks = {}
+            self.module._mirai_diet_callbacks = callbacks
+        callbacks[self.head] = _Magi2DietHeadCapture(self.module.moe_mlp, self.head, observer)
+
+
+@dataclass(frozen=True)
+class _Magi2DietHeadCapture:
+    layer: nn.Module
+    head: int
+    observer: Any
+
+    def __call__(self, inputs: torch.Tensor, video_rows: torch.Tensor) -> None:
+        if not self.observer.is_enabled or not video_rows.numel():
+            return
+        indices = self.observer.sample_token_indices(inputs[:video_rows.numel()])
+        if not indices.numel():
+            return
+        rows = video_rows.index_select(0, indices)
+        width = self.layer.d_head
+        head_input = inputs[:, self.head * width:(self.head + 1) * width]
+        capture = capture_magi2_diet_head(self.layer, self.head, head_input.index_select(0, rows))
+        self.observer.capture_layer(
+            sampled_token_indices=indices, expert_outputs=capture.expert_outputs,
+            router_scores=capture.router_scores, choice_bias=capture.choice_bias,
+        )
+
+
+def build_magi2_diet_calibration_targets(transformer: nn.Module) -> dict[str, DietCalibrationTarget]:
+    """Expose each head as a DIET target with paired video-token sampling."""
+    targets = {}
+    for name, layer in _dense_pruning_layers(transformer).items():
+        parent_name, _, _ = name.rpartition(".")
+        parent = transformer.get_submodule(parent_name)
+        if getattr(parent, "moe_mlp", None) is not layer:
+            raise ValueError(f"MAGI-2 DIET could not find the native MoE parent for {name!r}.")
+        topology = _diet_head_topology(layer)
+        for head in range(layer.num_heads):
+            target_name = f"{name}.head.{head}"
+            targets[target_name] = DietCalibrationTarget(
+                name=target_name, host=_Magi2DietHeadHost(parent, head),
+                num_experts=topology.num_experts, top_k=topology.top_k, n_group=1,
+                topk_group=1, group_score_topk=1, norm_topk_prob=topology.normalize_topk_prob,
+                route_scale=topology.route_scale, normalization_epsilon=topology.normalization_epsilon,
+            )
+    return targets
 
 
 def select_magi2_diet_pruning_plan(

@@ -878,6 +878,50 @@ def test_magi2_diet_head_replay_matches_native_expert_deletion() -> None:
     assert [len(ids) for ids in plan.kept_by_head[name]] == [2, 2]
 
 
+def test_magi2_diet_observers_align_video_rows_across_cfg_branches() -> None:
+    from mirai.core.models.magi2_preview.expert_pruning import (
+        build_magi2_diet_calibration_targets, capture_magi2_diet_head,
+    )
+    from mirai.core.moe.calibration.diet import DietPairedCapture, derive_diet_signatures
+    from mirai.core.training.calibration.diet import _DietObserver
+    from mirai.vendors.magi2_preview.model.magi2_preview import ModalityDispatcher, MultiHeadMoELayer
+
+    layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    transformer = _container(layer)
+    parent = transformer.mlp
+    parent.pre_norm = lambda values, **_: values
+    parent.split_linear = torch.nn.Identity()
+    parent.merge_linear = torch.nn.Identity()
+    parent._shared_expert_forward = lambda values, _: torch.zeros_like(values)
+    targets = build_magi2_diet_calibration_targets(transformer)
+    observers = {}
+    for name, target in targets.items():
+        observer = _DietObserver(target, sample_budget=2, seed=0)
+        observer.guidance_scale = 3.0
+        observers[name] = observer
+        target.host.set_diet_capture_observer(observer)
+    video = torch.randn(2, layer.num_heads * layer.d_head)
+    for sign, modalities in ((1, [0, 1, 0, 2]), (-1, [2, 0, 1, 1, 0])):
+        mapping = torch.tensor(modalities)
+        values = torch.randn(len(modalities), video.shape[-1])
+        values[mapping == 0] = sign * video
+        dispatcher = ModalityDispatcher(mapping, 3)
+        MultiHeadMoELayer.forward(parent, dispatcher._permute(values), dispatcher)
+    for head, (name, target) in enumerate(targets.items()):
+        values = video[:, head * layer.d_head:(head + 1) * layer.d_head]
+        pair = DietPairedCapture(
+            capture_magi2_diet_head(layer, head, values),
+            capture_magi2_diet_head(layer, head, -values),
+            pair_ids=torch.zeros(2, dtype=torch.long), token_positions=torch.arange(2),
+        )
+        expected = derive_diet_signatures(pair, guidance_scale=3.0)
+        evidence = observers[name].evidence()
+        assert evidence.topology == expected.topology
+        torch.testing.assert_close(evidence.signatures, expected.signatures.float())
+        target.host.set_diet_capture_observer(None)
+    assert not hasattr(parent, "_mirai_diet_callbacks")
+
+
 def test_pruning_calibration_keeps_head_local_route_ids(monkeypatch) -> None:
     from mirai.core.models.magi2_preview.expert_pruning import (
         build_magi2_expert_pruning_plan, build_magi2_pruning_calibration_targets,

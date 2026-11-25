@@ -3035,6 +3035,12 @@ class MultiHeadMoELayer(nn.Module):
             hidden_states, modality_dispatcher=modality_dispatcher
         )
         moe_input = self.split_linear(norm_output)
+        diet_callbacks = getattr(self, "_mirai_diet_callbacks", None)
+        if diet_callbacks:
+            original_rows = (modality_dispatcher.modality_mapping == Modality.VIDEO).nonzero().flatten()
+            video_rows = modality_dispatcher.inv_permute_mapping.index_select(0, original_rows)
+            for capture in diet_callbacks.values():
+                capture(moe_input, video_rows)
         moe_out = self.moe_mlp(moe_input)
         moe_out = self.merge_linear(moe_out)
         return moe_out + self._shared_expert_forward(norm_output, modality_dispatcher)

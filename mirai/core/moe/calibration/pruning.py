@@ -108,6 +108,7 @@ class DietCalibrationTarget:
     group_score_topk: int
     norm_topk_prob: bool
     route_scale: float
+    normalization_epsilon: float = 0.0
 
     def validate(self) -> "DietCalibrationTarget":
         if not self.name or int(self.num_experts) < 2:
