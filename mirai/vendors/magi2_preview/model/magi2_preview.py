@@ -66,6 +66,7 @@ from mirai.vendors.magi2_preview.infra.parallelism.all_to_all_primitive import (
     scatter_seqlen_gather_head,
 )
 from mirai.vendors.magi2_preview.infra.parallelism.context_parallel import ulysses_scheduler
+from mirai.vendors.magi2_preview.infra.parallelism.context_parallel.ulysses_scheduler import UlyssesScheduler
 
 
 logger = logging.getLogger(__name__)
@@ -3204,6 +3205,23 @@ class TransformerLayer(nn.Module):
         varlen_handler: VarlenHandler,
         modality_dispatcher: ModalityDispatcher,
         cp_split_sizes: torch.Tensor,
+        *,
+        paired: tuple[torch.Tensor, torch.Tensor, VarlenHandler, ModalityDispatcher, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        first = self._forward_branch(
+            hidden_states, rope, varlen_handler, modality_dispatcher, cp_split_sizes
+        )
+        if paired is None:
+            return first
+        return first, self._forward_branch(*paired)
+
+    def _forward_branch(
+        self,
+        hidden_states: torch.Tensor,
+        rope: torch.Tensor,
+        varlen_handler: VarlenHandler,
+        modality_dispatcher: ModalityDispatcher,
+        cp_split_sizes: torch.Tensor,
     ) -> torch.Tensor:
         n = self.config_mhc.num_stream
         s = hidden_states.reshape(hidden_states.shape[0], n, -1)
@@ -3413,12 +3431,27 @@ class Transformer(nn.Module):
         varlen_handler: VarlenHandler,
         time_token_sequence: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = ulysses_scheduler().dispatch(x)
-        coords_mapping = ulysses_scheduler().dispatch(coords_mapping)
-        modality_mapping = ulysses_scheduler().dispatch(modality_mapping)
+        scheduler = ulysses_scheduler()
+        branch, video_idx, audio_idx = self._prepare_forward(
+            scheduler, x, coords_mapping, modality_mapping, varlen_handler, time_token_sequence
+        )
+        return self._finish_forward(scheduler, self.block(*branch), video_idx, audio_idx)
+
+    def _prepare_forward(
+        self,
+        scheduler: UlyssesScheduler,
+        x: torch.Tensor,
+        coords_mapping: torch.Tensor,
+        modality_mapping: torch.Tensor,
+        varlen_handler: VarlenHandler,
+        time_token_sequence: Optional[torch.Tensor] = None,
+    ):
+        x = scheduler.dispatch(x)
+        coords_mapping = scheduler.dispatch(coords_mapping)
+        modality_mapping = scheduler.dispatch(modality_mapping)
         if time_token_sequence is not None:
-            time_token_sequence = ulysses_scheduler().dispatch(time_token_sequence)
-        cp_split_sizes = ulysses_scheduler().cp_split_sizes
+            time_token_sequence = scheduler.dispatch(time_token_sequence)
+        cp_split_sizes = scheduler.cp_split_sizes
         cp_split_sizes_t = torch.tensor(
             cp_split_sizes, device=x.device, dtype=torch.long
         )
@@ -3438,16 +3471,38 @@ class Transformer(nn.Module):
         if time_token_sequence is not None and time_token_sequence.shape[-1] > 0:
             x[:, : time_token_sequence.shape[-1]] = time_token_sequence.to(x.dtype)
 
-        x = self.block(
-            x,
-            rope,
-            varlen_handler=varlen_handler,
-            modality_dispatcher=modality_dispatcher,
-            cp_split_sizes=cp_split_sizes_t,
+        return (x, rope, varlen_handler, modality_dispatcher, cp_split_sizes_t), video_idx, audio_idx
+
+    def _finish_forward(self, scheduler, x, video_idx, audio_idx) -> torch.Tensor:
+        return scheduler.undispatch(self.post_adapter(x, video_idx, audio_idx))
+
+    def forward_pair(self, conditional, unconditional) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run separately packed CFG branches through one layer call per pair."""
+        if self.training or torch.is_grad_enabled():
+            raise RuntimeError("Paired MAGI-2 CFG requires eval mode with gradients disabled.")
+        if psm.get_world_size("cp") > 1 or psm.get_world_size("ep") > 1:
+            raise RuntimeError("Paired MAGI-2 CFG requires single-device execution.")
+        first_scheduler, second_scheduler = UlyssesScheduler(), UlyssesScheduler()
+        first, first_video, first_audio = self._prepare_forward(first_scheduler, *conditional)
+        second, second_video, second_audio = self._prepare_forward(second_scheduler, *unconditional)
+        first_x, first_rope, first_varlen, first_dispatch, first_cp = first
+        second_x, second_rope, second_varlen, second_dispatch, second_cp = second
+        first_x = first_dispatch._permute(first_x.to(torch.bfloat16))
+        second_x = second_dispatch._permute(second_x.to(torch.bfloat16))
+        for layer in self.block.layers:
+            first_x, second_x = layer(
+                first_x, first_rope, first_varlen, first_dispatch, first_cp,
+                paired=(second_x, second_rope, second_varlen, second_dispatch, second_cp),
+            )
+        return (
+            self._finish_forward(
+                first_scheduler, first_dispatch._inv_permute(first_x), first_video, first_audio
+            ),
+            self._finish_forward(
+                second_scheduler, second_dispatch._inv_permute(second_x), second_video, second_audio
+            ),
         )
-        x_out = self.post_adapter(x, video_idx, audio_idx)
-        x_out = ulysses_scheduler().undispatch(x_out)
-        return x_out
+
 
 
 # -----------------------------------------------------------------------------

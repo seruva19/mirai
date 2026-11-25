@@ -899,9 +899,9 @@ class TrainingConfig:
             inference_table.get("prompt_rewriter", "none")
         ).strip().lower() or "none"
         cfg_mode = str(inference_table.get("cfg_mode", "sequential")).strip().lower()
-        if cfg_mode not in {"sequential", "batched"}:
+        if cfg_mode not in {"sequential", "batched", "paired"}:
             raise ConfigError(
-                "inference.cfg_mode must be 'sequential' or 'batched'; "
+                "inference.cfg_mode must be 'sequential', 'batched', or 'paired'; "
                 f"got '{cfg_mode}'."
             )
         from mirai.core.moe.runtime.expert_feature_cache import (

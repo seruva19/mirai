@@ -3033,6 +3033,40 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_preview_paired_cfg",
+      "kind": "inference",
+      "owner": "mirai/core/models/magi2_preview/pipeline.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "reference_parity",
+        "native_execution",
+        "documentation"
+      ],
+      "symbols": [
+        "Magi2PreviewPipeline"
+      ],
+      "config_keys": [
+        "inference.cfg_mode"
+      ],
+      "disabled_config": {
+        "inference.cfg_mode": "sequential"
+      },
+      "contract_paths": [
+        "tests/test_magi2_attention_training.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": true,
+      "reference_path": "mirai/vendors/magi2_preview/model/magi2_preview.py",
+      "readme_claim": "Paired MAGI-2 Preview CFG",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_refiner_native_window_attention",
       "kind": "generic",
       "owner": "mirai/core/models/magi2_preview/refiner_attention.py",

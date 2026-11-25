@@ -1054,6 +1054,10 @@ Optional audio source path used by `audio_to_video`, or as an additional source 
 
 `sequential`, `batched`. `batched` executes conditional and unconditional branches in one single-device B=2 forward, with explicit prefix masks for variable-length text; only providers declaring batch/mask parity may enable it ([`cfg_batching.py`](mirai/core/inference/cfg_batching.py), [`preview.py`](mirai/core/training/preview/preview.py)).
 
+`paired` is an experimental MAGI-2 Preview mode. It packs each CFG branch
+separately and runs both through each loaded transformer layer before advancing.
+It requires the native inference runtime and `expert_feature_cache = "off"`.
+
 ### `keep_text_encoder_resident`
 
 - **Type:** bool

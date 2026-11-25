@@ -579,14 +579,11 @@ its generic 17-frame fallback applies only to families that declare no value.
 run that emits previews; the shipped example sets 121 for a cheap mid-length
 preview.
 
-The native sampler owns its own CFG execution and its own schedule, so both
-requested policies are checked rather than applied. Every denoise step packs
-the conditional and unconditional branches into one single-device `B=2`
-forward, which is why the shipped example sets `inference.cfg_mode = "batched"`
-and the family declares `unipc` as its default solver: `sequential` and any
-other solver name are rejected instead of being silently ignored. A training
-run that emits previews sets `logging.sample_solver = "unipc"` for the same
-reason.
+The native sampler uses Flow-UniPC. The shipped example uses
+`inference.cfg_mode = "batched"` for a single `B=2` forward per denoise step.
+The experimental `paired` mode packs two separate `B=1` branches and evaluates
+both before the next layer is staged. A training run that emits previews sets
+`logging.sample_solver = "unipc"`.
 
 Prompt-to-video output requires the official Qwen3.5 text encoder and the
 TurboVAE decoder from the same snapshot; both are validated before use and a
@@ -785,6 +782,6 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `adapter.target_preset` | `attn_only` or `attn_router`. |
 | `dataset.caption_format` | `raw`; captions are encoded by the native Qwen3.5 path at cache time. |
 | `inference.task` | `text_to_video`. |
-| `inference.cfg_mode` | `batched` only. The native sampler evaluates the conditional and unconditional branches together in one `B=2` forward; `sequential` is rejected. |
+| `inference.cfg_mode` | `batched` evaluates both branches in one `B=2` forward. Experimental `paired` executes two separately packed `B=1` branches per layer with one residency cycle. Paired mode requires `expert_feature_cache = "off"`. |
 | `training.gradient_checkpointing` | `off` or `standard`. The vendored transformer block exposes one whole-block recompute switch, so `selective` and `aggressive` are rejected rather than collapsed onto `standard`. |
 | `logging.sample_solver` / `--scheduler` | `unipc` only. The native sampler is the vendored Flow-UniPC multistep scheduler and implements no other schedule. |

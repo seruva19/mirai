@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--cfg-mode",
-        choices=["sequential", "batched"],
+        choices=["sequential", "batched", "paired"],
         default="",
         help="Single-device CFG execution override (default: inference.cfg_mode).",
     )

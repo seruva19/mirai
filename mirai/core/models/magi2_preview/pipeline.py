@@ -7,7 +7,7 @@ imports remain lazy so the rest of Mirai is usable without them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -71,8 +71,7 @@ MAGI2_TEXT_EMBED_WIDTH = 5120
 MAGI2_GRADIENT_CHECKPOINTING_OFF = frozenset({"off", "false", "none", "0", ""})
 MAGI2_GRADIENT_CHECKPOINTING_ON = frozenset({"standard", "true", "1"})
 
-# The vendored sampler is Flow-UniPC and always evaluates the conditional and
-# unconditional branches in one B=2 forward.
+# Flow-UniPC defaults to a single batched conditional/unconditional forward.
 MAGI2_NATIVE_SOLVER = "unipc"
 MAGI2_NATIVE_CFG_MODE = "batched"
 MAGI2_RELEASED_PREVIEW_WIDTH = 896
@@ -1349,10 +1348,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     ) -> torch.Tensor:
         """Run the shipping joint video/audio Flow-UniPC sampler.
 
-        The vendored sampler owns its schedule and its CFG execution, so the two
-        requested policies are checked rather than applied: it implements
-        Flow-UniPC only, and every step evaluates the conditional and
-        unconditional branches together in one ``B=2`` forward.
+        Both CFG layouts use the same Flow-UniPC schedule and guidance blend.
         """
         requested_solver = str(solver_name).strip().lower()
         if requested_solver != MAGI2_NATIVE_SOLVER:
@@ -1362,12 +1358,12 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 "Flow-UniPC multistep scheduler and has no other schedule."
             )
         requested_cfg_mode = str(cfg_mode).strip().lower()
-        if requested_cfg_mode != MAGI2_NATIVE_CFG_MODE:
+        if requested_cfg_mode not in {MAGI2_NATIVE_CFG_MODE, "paired"}:
             raise ValueError(
-                f"MAGI-2 Preview runs '{MAGI2_NATIVE_CFG_MODE}' CFG only; got "
-                f"'{requested_cfg_mode}'. The native sampler packs the conditional "
-                "and unconditional branches into one B=2 forward per step."
+                f"MAGI-2 Preview requires batched or paired CFG; got '{requested_cfg_mode}'."
             )
+        if requested_cfg_mode == "paired" and getattr(self, "_expert_feature_cache", None) is not None:
+            raise ValueError("Paired MAGI-2 CFG requires inference.expert_feature_cache='off'.")
         from mirai.vendors.magi2_preview.pipeline.preview_data_proxy import (
             CFGConfig,
             SamplerInput,
@@ -1425,7 +1421,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             output = self.transformer(*packed)
             return self.data_proxy.process_output(output)
 
-        sampler.forward = resident_forward
+        if requested_cfg_mode == "paired":
+            first_proxy = type(self.data_proxy)(self.data_proxy.config)
+            second_proxy = type(self.data_proxy)(self.data_proxy.config)
+            sampler.forward = lambda model_input: self._paired_preview_forward(
+                model_input, first_proxy, second_proxy
+            )
+        else:
+            sampler.forward = resident_forward
         sampler.step_callback = self.flush_runtime_offloads
         sampled_video, _sampled_audio = sampler.sample(
             SamplerInput(
@@ -1447,6 +1450,21 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             context_null.detach().to(device="cpu"),
         )
         return sampled_video[0]
+
+    def _paired_preview_forward(self, model_input, first_proxy, second_proxy):
+        def select(index):
+            return replace(model_input, **{
+                field.name: value[index : index + 1]
+                for field in fields(model_input)
+                if (value := getattr(model_input, field.name)) is not None
+            })
+
+        first, second = self.transformer.forward_pair(
+            first_proxy.process_input(select(0)), second_proxy.process_input(select(1))
+        )
+        first_video, first_audio = first_proxy.process_output(first)
+        second_video, second_audio = second_proxy.process_output(second)
+        return torch.cat((first_video, second_video)), torch.cat((first_audio, second_audio))
 
     # -- refiner stage -----------------------------------------------------
     def _refiner_assets(self) -> Any:
@@ -1781,6 +1799,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             sparse_moe=True,
             strict_native_assets_by_default=True,
             batched_cfg_inference=True,
+            paired_cfg_inference=True,
             # Raw media is encoded by the family-owned Qwen3.5/Wan2.2 encoder
             # returned from build_native_cache_encoder(); no generic pixel
             # projection is a valid MAGI-2 latent.

@@ -762,6 +762,10 @@ class InferenceSession:
             raise ValueError(
                 f"Model family '{provider.model_type}' does not support batched CFG inference."
             )
+        if cfg_mode_key == "paired" and (not self.use_native or not provider.paired_cfg_inference):
+            raise ValueError(
+                f"Model family '{provider.model_type}' does not support paired CFG in this runtime."
+            )
         # Invariant 4: a family that ships a default negative prompt degrades
         # measurably under an empty one, so no path may reach the denoise loop
         # with that combination silently. This is a warning, not a failure: an

@@ -1195,8 +1195,11 @@ def test_magi2_native_sampler_rejects_policies_it_does_not_implement() -> None:
     )
     with pytest.raises(ValueError, match="unipc"):
         pipeline.sample_native_preview(**call, solver_name="euler")
-    with pytest.raises(ValueError, match="B=2"):
+    with pytest.raises(ValueError, match="batched or paired"):
         pipeline.sample_native_preview(**call, cfg_mode="sequential")
+    pipeline._expert_feature_cache = object()
+    with pytest.raises(ValueError, match="expert_feature_cache"):
+        pipeline.sample_native_preview(**call, cfg_mode="paired")
 
 
 def test_magi2_shipped_examples_ask_for_implemented_sampling_policies() -> None:

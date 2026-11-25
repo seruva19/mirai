@@ -207,7 +207,7 @@ def run_native_denoise_loop(
     # unaffected: it still defaults to sequential.
     requested_cfg_mode = None if cfg_mode is None else str(cfg_mode).strip().lower()
     cfg_mode_key = requested_cfg_mode or "sequential"
-    if cfg_mode_key not in {"sequential", "batched"}:
+    if cfg_mode_key not in {"sequential", "batched", "paired"}:
         raise ValueError(f"Unknown CFG mode '{cfg_mode}'.")
     device = _resolve_model_compute_device(pipeline)
     model_dtype = _resolve_model_compute_dtype(pipeline)
@@ -314,6 +314,9 @@ def run_native_denoise_loop(
             **({} if requested_cfg_mode is None else {"cfg_mode": requested_cfg_mode}),
         )
         return sampled, []
+
+    if cfg_mode_key == "paired":
+        raise ValueError("Paired CFG requires a family-owned native sampler.")
 
     # Resolve the configured solver through the preview solver registry.
     steps = max(1, int(denoise_steps))

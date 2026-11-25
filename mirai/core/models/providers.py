@@ -172,6 +172,7 @@ class ModelFamilyProvider:
     release_eligible: bool = False
     inference_prompt_rewriters: tuple[str, ...] = ()
     batched_cfg_inference: bool = False
+    paired_cfg_inference: bool = False
     inference_tasks: tuple[str, ...] = ("text_to_video",)
     dataset_caption_formats: tuple[str, ...] = ("raw",)
     expert_mlp_execution_spec: ExpertMLPExecutionSpec | None = None

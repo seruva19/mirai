@@ -59,6 +59,79 @@ def _cloned(tensors: tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
     return [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
 
 
+def test_magi2_paired_cfg_matches_batched_and_visits_each_layer_once(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+    from mirai.vendors.magi2_preview.common.magi2_config import (
+        DataProxyConfig, MHCConfig, ModelConfig, MoEConfig,
+    )
+    from mirai.vendors.magi2_preview.model.magi2_preview import (
+        MultiModalityRMSNorm, Transformer, TransformerBlock,
+    )
+    from mirai.vendors.magi2_preview.pipeline.preview_data_proxy import Magi2DataProxy
+    from mirai.vendors.magi2_preview.pipeline.sampler import Magi2PreviewSampler
+
+    monkeypatch.setenv("MAGI2_MHC_BACKEND", "torch")
+    torch.manual_seed(42)
+    model = Transformer.__new__(Transformer)
+    torch.nn.Module.__init__(model)
+    model.block = TransformerBlock(ModelConfig(
+        num_layers=2, hidden_size=32, head_dim=16, num_heads_q=2,
+        num_heads_kv=1, num_query_groups=1, mm_layers=[],
+        mhc_config=MHCConfig(num_stream=2), moe_config=MoEConfig(moe_layers=[]),
+    ))
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(std=0.06)
+    for layer in model.block.layers:
+        monkeypatch.setattr(layer.mlp, "activation_func", layer.mlp.activation_func.__wrapped__)
+    for norm in model.modules():
+        if isinstance(norm, MultiModalityRMSNorm):
+            original = type(norm)._forward_single_expert_torch_impl.__wrapped__
+            monkeypatch.setattr(norm, "_forward_single_expert_torch_impl", original.__get__(norm))
+
+    def prepare(x, coords, *_indices):
+        rope = torch.cat((torch.zeros_like(coords[:, :1]).expand(-1, 8),
+                          torch.ones_like(coords[:, :1]).expand(-1, 8)), dim=-1)
+        return x[:, :32].repeat(1, 2), rope
+
+    model.pre_adapter = prepare
+    model.post_adapter = lambda x, *_indices: x[:, :32]
+    model.eval()
+    proxy_config = DataProxyConfig(time_channel_dim=0)
+    proxy = Magi2DataProxy(proxy_config)
+    sampler = Magi2PreviewSampler(model, proxy, "cpu", torch.bfloat16)
+    inputs = sampler.prepare_model_input(
+        latent=torch.randn(1, 32, 1, 2, 2),
+        audio_latent=torch.randn(1, 2, 32),
+        txt_feat=torch.randn(1, 3, 32),
+        null_txt_feat=torch.randn(1, 1, 32),
+        ref_audio_feat=torch.zeros(1, 0, 32),
+    )
+    pipeline = SimpleNamespace(transformer=model)
+    with torch.inference_mode():
+        reference = proxy.process_output(model(*proxy.process_input(inputs)))
+        visits = []
+        for index, layer in enumerate(model.block.layers):
+            layer.register_forward_pre_hook(lambda _layer, _args, i=index: visits.append(("in", i)))
+            layer.register_forward_hook(
+                lambda _layer, _args, _output, i=index: visits.append(("out", i))
+            )
+        observed = Magi2PreviewPipeline._paired_preview_forward(
+            pipeline, inputs, Magi2DataProxy(proxy_config), Magi2DataProxy(proxy_config)
+        )
+    assert visits == [("in", 0), ("out", 0), ("in", 1), ("out", 1)]
+    for actual, expected in zip(observed, reference):
+        torch.testing.assert_close(actual, expected)
+    guidance = torch.tensor(3.0)
+    for actual, expected in zip(
+        sampler.cfg_velocity(observed, guidance, guidance),
+        sampler.cfg_velocity(reference, guidance, guidance),
+    ):
+        torch.testing.assert_close(actual, expected)
+
+
 def test_magi2_regional_mhc_matches_eager_with_attention_views(monkeypatch) -> None:
     from types import SimpleNamespace
 
