@@ -113,6 +113,22 @@ def _sorted_layout(*, groups: int, rows_per_group: list[int], columns: int, dtyp
     return x_sorted, offsets, [int(value) for value in offsets.tolist()], groups
 
 
+@pytest.mark.parametrize("span", [1, 2, 3, 5, 16])
+def test_packed_segment_metadata_matches_full_host_layout(span: int) -> None:
+    from mirai.core.moe.runtime.gemm import grouped_mm_segments
+
+    counts = torch.tensor([0, 0, 5, 1, 0, 0, 0, 0, 2, 7, 0], dtype=torch.int32)
+    offsets = counts.cumsum(0, dtype=torch.int32)
+    reference = grouped_mm_segments(offsets.tolist(), max_groups=span)
+    metadata = grouped_moe._packed_group_segments(offsets, max_groups=span, routed=True)
+    assert tuple(segment for segment, _ in metadata) == reference
+    assert [maximum for _, maximum in metadata] == [
+        int(counts[segment.group_start : segment.group_stop].max())
+        for segment in reference
+    ]
+    assert grouped_moe._packed_group_segments(offsets[:0], max_groups=span, routed=True) == ()
+
+
 def test_segmented_backward_releases_weights_after_their_last_use(monkeypatch) -> None:
     weights = {
         "W_gate": torch.randn(1, 8, 16),

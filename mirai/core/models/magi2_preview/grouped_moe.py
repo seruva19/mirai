@@ -41,6 +41,7 @@ import torch
 from mirai.core.moe.runtime.gemm import (
     GROUPED_MM_ALIGNMENT_BYTES,
     BackendProbe,
+    GroupedMMSegment,
     grouped_mm_op,
     grouped_mm_operand,
     grouped_mm_row_operand,
@@ -201,6 +202,34 @@ def select_grouped_backends(
 
 def _grouped_boundaries(offsets: torch.Tensor) -> list[int]:
     return [int(value) for value in offsets.detach().to("cpu", torch.int64).tolist()]
+
+
+def _packed_group_segments(
+    offsets: torch.Tensor, *, max_groups: int, routed: bool = False
+) -> tuple[tuple[GroupedMMSegment, int], ...]:
+    """Copy one row end and, for routed GEMM, one maximum per segment."""
+    count = offsets.numel()
+    if count == 0:
+        return ()
+    span = min(count, max(1, int(max_groups)))
+    stops = list(range(span, count, span)) + [count]
+    ends = torch.cat((offsets[span - 1 : count - 1 : span], offsets[-1:]))
+    if routed:
+        rows = offsets.diff(prepend=offsets.new_zeros(1))
+        padding = (-count) % span
+        maxima = torch.nn.functional.pad(rows, (0, padding)).view(-1, span).amax(dim=1)
+        ends = torch.stack((ends, maxima), dim=1).flatten()
+    metadata = ends.tolist()
+    segments = []
+    row_start = 0
+    for index, stop in enumerate(stops):
+        row_stop = metadata[2 * index if routed else index]
+        maximum = metadata[2 * index + 1] if routed else 0
+        segments.append(
+            (GroupedMMSegment(index * span, stop, row_start, row_stop), maximum)
+        )
+        row_start = row_stop
+    return tuple(segments)
 
 
 def _grouped_linear(
@@ -837,12 +866,13 @@ def run_segmented_grouped_linear(
     x_sorted: torch.Tensor,
     offsets: torch.Tensor,
     *,
-    boundaries: list[int],
+    boundaries: list[int] | None = None,
     materialize: Callable[[int, int], torch.Tensor],
     backend: str,
     max_groups: int,
     columns: int,
     transposed: bool = False,
+    segments: tuple[GroupedMMSegment, ...] | None = None,
 ) -> torch.Tensor:
     """Run the sorted-layout grouped matmul one contiguous group range at a time.
 
@@ -859,7 +889,13 @@ def run_segmented_grouped_linear(
     and only decides the shape of an all-empty result.
     """
     outputs: list[torch.Tensor] = []
-    for segment in grouped_mm_segments(boundaries, max_groups=max(1, int(max_groups))):
+    if segments is None:
+        segments = (
+            grouped_mm_segments(boundaries, max_groups=max(1, int(max_groups)))
+            if boundaries is not None
+            else tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=max_groups))
+        )
+    for segment in segments:
         if segment.row_count == 0:
             continue
         weight = materialize(segment.group_start, segment.group_stop)
@@ -884,12 +920,13 @@ def run_segmented_grouped_expert_mlp(
     x_sorted: torch.Tensor,
     offsets: torch.Tensor,
     *,
-    boundaries: list[int],
+    boundaries: list[int] | None = None,
     materialize: Callable[[str, int, int], torch.Tensor],
     backend: str,
     max_groups: int,
     output_columns: int,
     activation_backend: str = "torch",
+    segments: tuple[GroupedMMSegment, ...] | None = None,
 ) -> torch.Tensor:
     """Evaluate one frozen SwiGLU7 expert segment end-to-end.
 
@@ -900,7 +937,13 @@ def run_segmented_grouped_expert_mlp(
     """
 
     outputs: list[torch.Tensor] = []
-    for segment in grouped_mm_segments(boundaries, max_groups=max(1, int(max_groups))):
+    if segments is None:
+        segments = (
+            grouped_mm_segments(boundaries, max_groups=max(1, int(max_groups)))
+            if boundaries is not None
+            else tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=max_groups))
+        )
+    for segment in segments:
         if segment.row_count == 0:
             continue
         local_offsets = (
@@ -955,13 +998,13 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         forward_backend: str,
         dx_backend: str,
     ) -> torch.Tensor:
-        boundaries = _grouped_boundaries(offsets)
         _groups, rows, cols = store.expert_weight_shape(key)
         span = store.segment_group_span()
+        segments = tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=span))
         output = run_segmented_grouped_linear(
             x_sorted,
             offsets,
-            boundaries=boundaries,
+            segments=segments,
             materialize=lambda start, stop: store.materialize_segment(
                 key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
             ),
@@ -973,7 +1016,7 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         ctx.store = store
         ctx.key = str(key)
         ctx.dx_backend = dx_backend
-        ctx.boundaries = boundaries
+        ctx.segments = segments
         ctx.segment_span = int(span)
         ctx.weight_rows = int(rows)
         return output
@@ -988,7 +1031,7 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
             grad_x = run_segmented_grouped_linear(
                 grad_output,
                 offsets,
-                boundaries=ctx.boundaries,
+                segments=ctx.segments,
                 materialize=lambda start, stop: store.materialize_segment(
                     key, start, stop, dtype=grad_output.dtype, device=grad_output.device
                 ),
@@ -1013,16 +1056,17 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         dx_backend: str,
         activation_backend: str,
     ) -> torch.Tensor:
-        boundaries = _grouped_boundaries(offsets)
+        span = store.segment_group_span()
+        segments = tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=span))
         output = run_segmented_grouped_expert_mlp(
             x_sorted,
             offsets,
-            boundaries=boundaries,
+            segments=segments,
             materialize=lambda key, start, stop: store.materialize_segment(
                 key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
             ),
             backend=forward_backend,
-            max_groups=store.segment_group_span(),
+            max_groups=span,
             output_columns=int(x_sorted.shape[-1]),
             activation_backend=str(activation_backend),
         )
@@ -1031,8 +1075,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         ctx.forward_backend = forward_backend
         ctx.dx_backend = dx_backend
         ctx.activation_backend = str(activation_backend)
-        ctx.boundaries = boundaries
-        ctx.segment_span = store.segment_group_span()
+        ctx.segments = segments
         return output
 
     @staticmethod
@@ -1040,9 +1083,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         x_sorted, offsets = ctx.saved_tensors
         grad_segments: list[torch.Tensor] = []
         store = ctx.store
-        for segment in grouped_mm_segments(
-            ctx.boundaries, max_groups=max(1, int(ctx.segment_span))
-        ):
+        for segment in ctx.segments:
             if segment.row_count == 0:
                 continue
             local_offsets = (
@@ -1116,20 +1157,6 @@ def _segment_routed_projection(
     )
 
 
-def _segment_max_group_rows(
-    boundaries: list[int], group_start: int, group_stop: int
-) -> int:
-    """Largest routed row count in one segment from its host-side layout."""
-
-    previous = boundaries[group_start - 1] if group_start else 0
-    maximum = 0
-    for group in range(group_start, group_stop):
-        stop = boundaries[group]
-        maximum = max(maximum, stop - previous)
-        previous = stop
-    return maximum
-
-
 class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
     """Routed BF16 projection over one transient NF4 segment at a time."""
 
@@ -1142,19 +1169,15 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
         store: Magi2Nf4ExpertStore,
         activation_backend: str,
     ) -> torch.Tensor:
-        boundaries = _grouped_boundaries(offsets)
-        span = store.segment_group_span()
+        segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
         outputs: list[torch.Tensor] = []
-        for segment in grouped_mm_segments(boundaries, max_groups=max(1, int(span))):
+        for segment, max_group_rows in segments:
             if segment.row_count == 0:
                 continue
             local_offsets = (
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
             local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
-            max_group_rows = _segment_max_group_rows(
-                boundaries, segment.group_start, segment.group_stop
-            )
             w_gate = store.materialize_segment(
                 "W_gate", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=x_rows.device,
@@ -1194,8 +1217,7 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
         ctx.save_for_backward(x_rows, offsets, sorted_rows)
         ctx.store = store
         ctx.activation_backend = str(activation_backend)
-        ctx.boundaries = boundaries
-        ctx.segment_span = int(span)
+        ctx.segments = segments
         return output
 
     @staticmethod
@@ -1203,18 +1225,13 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
         x_rows, offsets, sorted_rows = ctx.saved_tensors
         grad_input = torch.zeros_like(x_rows)
         store = ctx.store
-        for segment in grouped_mm_segments(
-            ctx.boundaries, max_groups=max(1, int(ctx.segment_span))
-        ):
+        for segment, max_group_rows in ctx.segments:
             if segment.row_count == 0:
                 continue
             local_offsets = (
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
             local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
-            max_group_rows = _segment_max_group_rows(
-                ctx.boundaries, segment.group_start, segment.group_stop
-            )
             grad_rows = grad_output[segment.row_start : segment.row_stop].contiguous()
             w_gate = store.materialize_segment(
                 "W_gate", segment.group_start, segment.group_stop,
@@ -1360,22 +1377,17 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         order = flat_experts.argsort(stable=True)
         sorted_rows = assignment_to_row.index_select(0, order)
         offsets = torch.bincount(flat_experts, minlength=groups).cumsum(0).to(torch.int32)
-        boundaries = _grouped_boundaries(offsets)
         x_rows = x_heads.reshape(tokens * num_heads, d_head)
         store = self._store(module)
         output = x_rows.new_zeros((tokens * num_heads, d_head))
-        for segment in grouped_mm_segments(
-            boundaries, max_groups=max(1, store.segment_group_span())
-        ):
+        segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
+        for segment, max_group_rows in segments:
             if segment.row_count == 0:
                 continue
             local_offsets = (
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
             local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
-            max_group_rows = _segment_max_group_rows(
-                boundaries, segment.group_start, segment.group_stop
-            )
             w_gate = store.materialize_segment(
                 "W_gate", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=device,
@@ -1500,11 +1512,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                 dx_backend,
                 self.activation_backend,
             )
-        boundaries = _grouped_boundaries(offsets)
         return run_segmented_grouped_expert_mlp(
             x_sorted,
             offsets,
-            boundaries=boundaries,
             materialize=lambda key, start, stop: store.materialize_segment(
                 key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
             ),
