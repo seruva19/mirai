@@ -146,12 +146,7 @@ class Magi2RoutingCollapseTap:
         )
         if self.inner is not None:
             return self.inner.execute(module, x_heads, topk_probs, topk_indices)
-        # Mirror of the backend-less branch of ``CoreMultiHeadMoE._forward_impl``:
-        # the fused kernel needs CUDA and no autograd graph, otherwise the
-        # vendored per-expert loop is the reference path.
-        if torch.is_grad_enabled() or x_heads.device.type != "cuda":
-            return module._torch_forward(x_heads, topk_probs, topk_indices)
-        return module._flash_forward(x_heads, topk_probs, topk_indices)
+        return module._native_expert_forward(x_heads, topk_probs, topk_indices)
 
 
 def attach_routing_collapse_tap(

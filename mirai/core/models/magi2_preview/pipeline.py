@@ -288,6 +288,12 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        self._expert_pruning_plan_path = str(family.get("expert_pruning_plan_path", "")).strip()
+        if self._expert_pruning_plan_path and (
+            self._quantize_experts_on_load or self._packed_expert_state_path
+            or str(getattr(memory_config, "expert_precision_plan_path", "") or "").strip()
+        ):
+            raise ValueError("MAGI-2 pruning requires loading the original dense experts before pruning.")
         default_config = (
             Path(__file__).resolve().parents[3]
             / "vendors"
@@ -447,6 +453,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             state = load_magi2_model_state_dict(transformer, config.engine_config)
             transformer.load_state_dict(state, strict=True)
             del state
+            if self._expert_pruning_plan_path:
+                from mirai.core.models.magi2_preview.expert_pruning import (
+                    Magi2ExpertPruningPlan,
+                    apply_magi2_expert_pruning,
+                )
+
+                pruning_plan = Magi2ExpertPruningPlan.load(self._expert_pruning_plan_path)
+                apply_magi2_expert_pruning(transformer, pruning_plan)
+                self._expert_pruning_digest = pruning_plan.topology_digest()
         transformer.train()
         self._configure_attention_backend(transformer)
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
@@ -714,6 +729,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         *,
         metadata: dict[str, str] | None = None,
     ) -> Any:
+        if getattr(self, "_expert_pruning_plan_path", ""):
+            raise ValueError("Reapply the MAGI-2 pruning plan to the original checkpoint to restore this topology.")
         from mirai.core.models.magi2_preview.packed_experts import (
             save_magi2_nf4_packed_state,
         )
@@ -1021,6 +1038,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         if str(getattr(adapter_config, "type", "lora")).strip().lower() != "lora":
             raise ValueError("MAGI-2 Preview currently supports adapter.type='lora'.")
         preset = str(getattr(adapter_config, "target_preset", "attn_only")).strip()
+        if getattr(self, "_expert_pruning_plan_path", "") and preset != "attn_only":
+            raise ValueError("Pruned MAGI-2 layers currently require adapter.target_preset='attn_only'.")
         if preset not in MAGI2_TARGET_PRESETS:
             raise ValueError(
                 f"Unsupported MAGI-2 adapter target preset '{preset}'; expected one of "
@@ -1094,6 +1113,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             state = payload
         if not isinstance(state, dict):
             raise TypeError("MAGI-2 adapter state must be a mapping.")
+        self.validate_adapter_payload(state)
         expected = set(self.state_dict())
         supplied = {str(key) for key in state}
         unknown = sorted(supplied - expected)
@@ -1103,7 +1123,23 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 "MAGI-2 adapter state does not match the configured LoRA targets "
                 f"(missing={missing[:4]}, unknown={unknown[:4]})."
             )
-        self.transformer.load_state_dict(state, strict=False)
+        self.transformer.load_state_dict(
+            {key: value for key, value in state.items() if key != "__mirai_magi2_pruning_digest__"},
+            strict=False,
+        )
+
+    def validate_adapter_payload(self, payload: dict[str, Any]) -> None:
+        state = payload.get("adapter_state", payload)
+        supplied = state.get("__mirai_magi2_pruning_digest__")
+        expected = getattr(self, "_expert_pruning_digest", None)
+        if expected is None and supplied is None:
+            return
+        if (
+            expected is None or not isinstance(supplied, torch.Tensor)
+            or supplied.dtype != torch.uint8 or supplied.shape != (len(expected),)
+            or bytes(supplied.detach().cpu().tolist()) != expected
+        ):
+            raise ValueError("MAGI-2 adapter expert pruning topology differs from the configured base.")
 
     def set_gradient_checkpointing(self, enabled: bool | str) -> None:
         mode = str(enabled).strip().lower()
@@ -1864,7 +1900,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
     def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         full = self.transformer.state_dict(*args, **kwargs)
-        return {key: value for key, value in full.items() if "parametrizations." in key and (key.endswith("lora_a") or key.endswith("lora_b"))}
+        adapter = {key: value for key, value in full.items() if "parametrizations." in key and (key.endswith("lora_a") or key.endswith("lora_b"))}
+        digest = getattr(self, "_expert_pruning_digest", None)
+        if digest is not None:
+            adapter["__mirai_magi2_pruning_digest__"] = torch.tensor(list(digest), dtype=torch.uint8)
+        return adapter
 
     def load_state_dict(self, state: dict[str, Any], strict: bool = True):
         """Load the adapter surface reported by :meth:`state_dict`.
@@ -1874,6 +1914,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         adapter surface itself: a payload that does not cover exactly the
         configured LoRA parameters is a lineage mismatch and fails.
         """
+        self.validate_adapter_payload(state)
         if strict:
             expected = set(self.state_dict())
             supplied = {str(key) for key in state}
@@ -1885,12 +1926,16 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     f"targets (missing={missing[:4]}, unexpected={unexpected[:4]}). "
                     "Pass strict=False to load a partial adapter surface."
                 )
-        return self.transformer.load_state_dict(state, strict=False)
+        return self.transformer.load_state_dict(
+            {key: value for key, value in state.items() if key != "__mirai_magi2_pruning_digest__"},
+            strict=False,
+        )
 
 
 class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
         "nf4_fuse_gate_up",
+        "expert_pruning_plan_path",
         "config_path",
         "audio_tokens",
         "refiner_config_path",
@@ -1930,6 +1975,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         if "audio_tokens" in params and int(params["audio_tokens"]) < -1:
             errors.append("MAGI-2 family_params.audio_tokens must be -1 (auto) or >= 0.")
         for name in (
+            "expert_pruning_plan_path",
             "refiner_config_path",
             "refiner_subfolder",
             "refiner_attention_backend",

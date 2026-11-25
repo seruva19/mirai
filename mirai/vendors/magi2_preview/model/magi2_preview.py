@@ -2817,10 +2817,8 @@ class CoreMultiHeadMoE(nn.Module):
             kernel_backend = self._mirai_moe_kernel_backend
             if kernel_backend is not None:
                 out = kernel_backend.execute(self, x_heads, topk_probs, topk_indices)
-            elif torch.is_grad_enabled() or x_heads.device.type != "cuda":
-                out = self._torch_forward(x_heads, topk_probs, topk_indices)
             else:
-                out = self._flash_forward(x_heads, topk_probs, topk_indices)
+                out = self._native_expert_forward(x_heads, topk_probs, topk_indices)
         else:
             out = torch.zeros_like(x_heads)
 
@@ -2831,6 +2829,11 @@ class CoreMultiHeadMoE(nn.Module):
             out = out[:, : self.num_heads, :]
 
         return out.reshape(-1, self.num_heads * self.d_head)
+
+    def _native_expert_forward(self, x_heads, topk_probs, topk_indices):
+        if getattr(self, "_mirai_experts_pruned", False) or torch.is_grad_enabled() or x_heads.device.type != "cuda":
+            return self._torch_forward(x_heads, topk_probs, topk_indices)
+        return self._flash_forward(x_heads, topk_probs, topk_indices)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return magi2_mh_moe(x, self._moe_key)

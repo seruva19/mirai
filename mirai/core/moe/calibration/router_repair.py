@@ -155,7 +155,9 @@ def _validate_tensor_mapping(tensors: Mapping[str, Any]) -> None:
             raise TypeError(f"Router repair tensor {name!r} is not a torch Tensor.")
         if tensor.numel() <= 0:
             raise ValueError(f"Router repair tensor {name!r} is empty.")
-        if not torch.isfinite(tensor.detach().float()).all():
+        value = tensor.detach()
+        chunks = value.view(-1).split(1 << 20) if value.is_contiguous() else (value,)
+        if any(not torch.isfinite(chunk.float()).all() for chunk in chunks):
             raise ValueError(f"Router repair tensor {name!r} contains non-finite values.")
 
 
@@ -202,7 +204,7 @@ def router_tensor_fingerprint(tensors: Mapping[str, Any]) -> str:
         digest.update(b"\0")
         digest.update(str(tuple(int(dim) for dim in value.shape)).encode("ascii"))
         digest.update(b"\0")
-        digest.update(value.view(torch.uint8).numpy().tobytes())
+        digest.update(memoryview(value.view(torch.uint8).numpy()))
         digest.update(b"\0")
     return "sha256:" + digest.hexdigest()
 

@@ -722,6 +722,71 @@ def _dense_from_store(store: Magi2Nf4ExpertStore, key: str) -> torch.Tensor:
     )
 
 
+@pytest.mark.parametrize("criterion", ["reap", "aimer", "diet"])
+def test_magi2_pruning_remaps_each_head_and_preserves_top_k(tmp_path, criterion) -> None:
+    from mirai.core.models.magi2_preview.expert_pruning import (
+        Magi2ExpertPruningPlan, apply_magi2_expert_pruning, build_magi2_diet_pruning_plan,
+        build_magi2_expert_pruning_plan,
+    )
+    from mirai.vendors.magi2_preview.model.magi2_preview import _mh_moe_compute_topk
+
+    layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32, hidden_size=32,
+                        expert_intermediate_size=16, num_heads=2, num_experts=4, top_k=2)
+    model = _container(layer)
+    name = "mlp.moe_mlp"
+    scores = torch.tensor([[9., 3., 8., 1.], [3., 9., 1., 8.]])
+    if criterion == "diet":
+        plan = build_magi2_diet_pruning_plan(model, {name: ((0, 1, 2), (0, 1, 3))})
+    else:
+        plan = build_magi2_expert_pruning_plan(
+            model, {name: scores}, criterion=criterion, keep_fraction=0.75,
+        )
+    expected_ids = (1, 2, 3, 4, 6, 7) if criterion == "aimer" else (0, 1, 2, 4, 5, 7)
+    snapshot = {key: getattr(layer, key).clone() for key in ("gate", "W_gate", "W_up", "W_down")}
+    bias = layer.router.expert_bias.clone()
+    path = tmp_path / "pruning.json"
+    plan.save(path)
+    parsed = Magi2ExpertPruningPlan.load(path)
+    assert parsed == plan
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._expert_pruning_digest = plan.topology_digest()
+    metadata = {"__mirai_magi2_pruning_digest__": torch.tensor(
+        list(parsed.topology_digest()), dtype=torch.uint8,
+    )}
+    pipeline.validate_adapter_payload({"adapter_state": metadata})
+    with pytest.raises(ValueError, match="pruning topology"):
+        pipeline.validate_adapter_payload({})
+    pipeline._expert_pruning_digest = dataclasses.replace(
+        plan, kept_by_head={name: ((0, 1, 3), (0, 1, 2))},
+    ).topology_digest()
+    with pytest.raises(ValueError, match="pruning topology"):
+        pipeline.validate_adapter_payload(metadata)
+    bad_plan = dataclasses.replace(parsed, kept_by_head={name: ((0,), (1,))})
+    with pytest.raises(ValueError, match="below top-k"):
+        apply_magi2_expert_pruning(model, bad_plan)
+    torch.testing.assert_close(layer.gate, snapshot["gate"])
+    apply_magi2_expert_pruning(model, parsed)
+    ids = torch.tensor(expected_ids)
+    for key, weight in snapshot.items():
+        torch.testing.assert_close(getattr(layer, key), weight[ids])
+    x = torch.randn(3, 2, 16)
+    logits = torch.einsum("shd,hed->hse", x, snapshot["gate"][ids].view(2, 3, 16))
+    probabilities, indices = _mh_moe_compute_topk(
+        router_logits=logits, top_k=2, score_func=layer.config.score_func,
+        expert_bias=bias[ids].view(2, 3), route_norm=layer.config.route_norm,
+    )
+    actual_probs, actual_ids = layer._route(x)
+    torch.testing.assert_close(actual_ids, indices)
+    torch.testing.assert_close(actual_probs, probabilities * layer.config.route_scale)
+    assert layer.local_flatten_num_experts == 6 and layer.topk == 2
+    hidden = x.reshape(3, 32).requires_grad_()
+    layer._forward_impl(hidden).sum().backward()
+    assert torch.isfinite(hidden.grad).all()
+
+
 def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tmp_path) -> None:
     import json
 
