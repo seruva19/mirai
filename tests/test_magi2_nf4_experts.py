@@ -722,6 +722,41 @@ def _dense_from_store(store: Magi2Nf4ExpertStore, key: str) -> torch.Tensor:
     )
 
 
+@pytest.mark.parametrize("fmt", ["gguf_iq2", "gguf_iq3", "fp8", "nvfp4"])
+def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -> None:
+    def model():
+        return _container(_reduced_moe(
+            device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
+            expert_intermediate_size=16, num_heads=1, num_experts=2, top_k=1,
+        ))
+
+    source = model()
+    store = quantize_magi2_experts_in_place(source, quant_format=fmt)["mlp.moe_mlp"]
+    artifact = save_magi2_nf4_packed_state(tmp_path / fmt, source)
+    restored = load_magi2_nf4_packed_state(
+        artifact, model(), blocksize=64, quant_format=fmt
+    )["mlp.moe_mlp"]
+    assert restored.quant_format == fmt
+    for key in ("W_gate", "W_up", "W_down"):
+        kwargs = dict(dtype=torch.float32, device=torch.device("cpu"))
+        whole = store.materialize_segment(key, 0, 2, **kwargs)
+        actual = restored.materialize_segment(key, 0, 1, group_ids=torch.tensor([1]), **kwargs)
+        torch.testing.assert_close(actual, whole[1:], rtol=0, atol=0)
+    x = torch.randn(3, 16, requires_grad=True)
+    offsets = torch.tensor([0, 3], dtype=torch.int32)
+    actual = grouped_moe._SegmentedQuantizedExpertMlp.apply(
+        x, offsets, restored, "bmm", "bmm", "torch"
+    )
+    expected = grouped_moe._SegmentedQuantizedExpertMlp.apply(
+        x, offsets, store, "bmm", "bmm", "torch"
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    grad = torch.autograd.grad(actual.sum(), x)[0]
+    torch.testing.assert_close(grad, torch.autograd.grad(expected.sum(), x)[0], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="does not match requested format"):
+        load_magi2_nf4_packed_state(artifact, model(), blocksize=64)
+
+
 @_requires_nf4
 def test_magi2_nf4_packed_state_round_trip(tmp_path) -> None:
     source_module = _reduced_moe(

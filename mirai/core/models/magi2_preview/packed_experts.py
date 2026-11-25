@@ -13,6 +13,7 @@ from mirai.core.models.magi2_preview.quantized_experts import (
     MAGI2_NF4_GROUP_FIELDS,
     MAGI2_NF4_CODE_FIELDS,
     Magi2Nf4ExpertStore,
+    Magi2PackedExpertStore,
     install_magi2_nf4_expert_stores,
     iter_magi2_moe_layers,
     magi2_expert_store,
@@ -21,6 +22,7 @@ from mirai.core.models.magi2_preview.quantized_experts import (
 
 MAGI2_PACKED_EXPERT_SCHEMA = "mirai.magi2_preview.nf4_experts"
 MAGI2_PACKED_EXPERT_SCHEMA_VERSION = 3
+_MULTIFORMAT_SCHEMA_VERSION = 4
 _MANIFEST_FILE = "manifest.json"
 
 
@@ -46,6 +48,7 @@ def save_magi2_nf4_packed_state(
         )
     target.mkdir(parents=True, exist_ok=True)
     layers: dict[str, Any] = {}
+    quant_format = None
     for layer_index, (module_name, module) in enumerate(
         iter_magi2_moe_layers(transformer)
     ):
@@ -54,6 +57,10 @@ def save_magi2_nf4_packed_state(
             raise Magi2PackedExpertStateError(
                 f"MAGI-2 layer '{module_name}' has no complete NF4 expert store."
             )
+        if quant_format is None:
+            quant_format = store.quant_format
+        if quant_format != store.quant_format or (fuse_gate_up and quant_format != "nf4"):
+            raise Magi2PackedExpertStateError("Incompatible gate/up or packed format across expert layers.")
         descriptor = store.packed_state_descriptor()
         tensors: dict[str, torch.Tensor] = {}
         buffers = (
@@ -75,11 +82,11 @@ def save_magi2_nf4_packed_state(
     manifest = {
         "schema": MAGI2_PACKED_EXPERT_SCHEMA,
         "schema_version": (
-            MAGI2_PACKED_EXPERT_SCHEMA_VERSION
-            if any(layer["fused_gate_up"] for layer in layers.values())
-            else 2
+            _MULTIFORMAT_SCHEMA_VERSION
+            if quant_format != "nf4"
+            else (MAGI2_PACKED_EXPERT_SCHEMA_VERSION if any(layer["fused_gate_up"] for layer in layers.values()) else 2)
         ),
-        "quant_format": "nf4",
+        "quant_format": quant_format,
         "layers": layers,
         "metadata": dict(metadata or {}),
     }
@@ -94,6 +101,7 @@ def load_magi2_nf4_packed_state(
     transformer: torch.nn.Module,
     *,
     blocksize: int,
+    quant_format: str = "nf4",
     expected_metadata: dict[str, str] | None = None,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Restore NF4 stores directly and reject topology or schema mismatches."""
@@ -103,7 +111,6 @@ def load_magi2_nf4_packed_state(
     source = Path(path).expanduser()
     if not source.is_dir():
         raise FileNotFoundError(f"Packed MAGI-2 expert state not found: {source}")
-    stores = install_magi2_nf4_expert_stores(transformer, blocksize=blocksize)
     manifest_path = source / _MANIFEST_FILE
     if not manifest_path.is_file():
         raise Magi2PackedExpertStateError(
@@ -114,14 +121,16 @@ def load_magi2_nf4_packed_state(
     if (
         manifest.get("schema") != MAGI2_PACKED_EXPERT_SCHEMA
         or type(version) is not int
-        or version not in (2, MAGI2_PACKED_EXPERT_SCHEMA_VERSION)
+        or version not in (2, MAGI2_PACKED_EXPERT_SCHEMA_VERSION, _MULTIFORMAT_SCHEMA_VERSION)
     ):
         raise Magi2PackedExpertStateError(
             "Packed MAGI-2 expert state has an unsupported schema or version."
         )
-    if manifest.get("quant_format") != "nf4":
+    if manifest.get("quant_format") != quant_format or (
+        (version == _MULTIFORMAT_SCHEMA_VERSION) != (quant_format != "nf4")
+    ):
         raise Magi2PackedExpertStateError(
-            "Packed MAGI-2 expert state must declare quant_format='nf4'."
+            f"Packed MAGI-2 expert state does not match requested format '{quant_format}'."
         )
     artifact_metadata = manifest.get("metadata")
     if not isinstance(artifact_metadata, dict):
@@ -133,6 +142,7 @@ def load_magi2_nf4_packed_state(
             raise Magi2PackedExpertStateError(
                 f"Packed MAGI-2 expert state has incompatible {key}."
             )
+    stores = install_magi2_nf4_expert_stores(transformer, blocksize=blocksize, quant_format=quant_format)
     layer_specs = manifest.get("layers")
     if not isinstance(layer_specs, dict) or set(layer_specs) != set(stores):
         raise Magi2PackedExpertStateError(
@@ -141,7 +151,7 @@ def load_magi2_nf4_packed_state(
     for module_name, store in stores.items():
         spec = layer_specs[module_name]
         fused = spec.get("fused_gate_up", False)
-        if not isinstance(fused, bool) or (version == 2 and fused):
+        if not isinstance(fused, bool) or (version != MAGI2_PACKED_EXPERT_SCHEMA_VERSION and fused):
             raise Magi2PackedExpertStateError("Packed MAGI-2 layer has an invalid gate/up layout.")
         shard_name = str(spec.get("shard", ""))
         if not shard_name or Path(shard_name).name != shard_name:
@@ -162,9 +172,11 @@ def load_magi2_nf4_packed_state(
                 )
                 for suffix in (*MAGI2_NF4_GROUP_FIELDS, *MAGI2_NF4_CODE_FIELDS)
             }
+            if isinstance(store, Magi2PackedExpertStore):
+                expected_from_keys = store.expected_buffers()
             if expected_buffers != expected_from_keys:
                 raise Magi2PackedExpertStateError(
-                    f"Packed MAGI-2 layer '{module_name}' has incomplete NF4 buffers."
+                    f"Packed MAGI-2 layer '{module_name}' has incomplete buffers."
                 )
             if set(handle.keys()) != expected_buffers:
                 raise Magi2PackedExpertStateError(

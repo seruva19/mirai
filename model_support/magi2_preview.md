@@ -724,6 +724,11 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 
 ## Model-specific features
 
+- **Additional MAGI-2 packed expert formats** — Experimental IQ2, IQ3, FP8,
+  and NVFP4 storage for frozen routed experts. These formats use version 4
+  packed artifacts and the same segmented dequantization and frozen-weight
+  input-gradient paths as NF4. Set `memory.frozen_weight_quantization` to
+  `gguf_iq2`, `gguf_iq3`, `fp8`, or `nvfp4`.
 - **MAGI-2 audio-token ablation** — Paired seeded video runs compare automatic
   and zero audio-token counts with identical inference settings. Run
   `python -m mirai.core.models.magi2_preview.audio_ab --config configs/magi2_preview/inference_offload.toml --output audio-ab --prompt "A kite over the sea" --seed 17 --seed 23`.

@@ -2944,6 +2944,40 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_additional_packed_expert_formats",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/magi2_preview/quantized_experts.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "Magi2PackedExpertStore"
+      ],
+      "config_keys": [
+        "memory.frozen_weight_quantization"
+      ],
+      "disabled_config": {
+        "memory.frozen_weight_quantization": "none"
+      },
+      "contract_paths": [
+        "tests/test_magi2_nf4_experts.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Additional MAGI-2 packed expert formats",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_audio_token_ablation",
       "kind": "tooling",
       "owner": "mirai/core/models/magi2_preview/audio_ab.py",

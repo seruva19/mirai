@@ -22,10 +22,30 @@ rather than retaining a dense copy.
 
 from __future__ import annotations
 
+from math import prod
 from typing import Iterator
 
 import torch
 from torch import nn
+
+from mirai.core.models.compressed_weights.quantization.blockwise_fp8 import (
+    BlockwiseFP8Meta,
+    dequantize_blockwise_fp8_weight,
+    quantize_blockwise_fp8_weight,
+    validate_blockwise_fp8_payload,
+)
+from mirai.core.models.compressed_weights.quantization.gguf_quant import (
+    dequantize_gguf,
+    gguf_num_superblocks,
+    quantize_gguf,
+    validate_gguf_blocks,
+)
+from mirai.core.models.compressed_weights.quantization.microscaling_quant import (
+    MicroscalingMeta,
+    dequantize_microscaling,
+    quantize_microscaling,
+    validate_microscaling_payload,
+)
 
 from mirai.core.models.compressed_weights.quantization.quant import (
     NF4_BLOCKSIZE,
@@ -60,6 +80,7 @@ MAGI2_EXPERT_ACCESS_POLICIES = ("full_dequant", "chunked_dequant", "active_group
 MAGI2_FUSED_GATE_UP = "W_gate_up"
 MAGI2_NF4_GROUP_FIELDS = ("nf4", "nf4_absmax", "nf4_nabsmax", "nf4_offset")
 MAGI2_NF4_CODE_FIELDS = ("nf4_code", "nf4_ncode")
+MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4")
 
 
 class Magi2QuantizedExpertError(ValueError):
@@ -74,6 +95,8 @@ class Magi2Nf4ExpertStore(nn.Module):
     registered as buffers rather than kept outside the module so that block
     residency moves them exactly as it moved the BF16 parameters they replace.
     """
+
+    quant_format = "nf4"
 
     def __init__(
         self,
@@ -505,10 +528,140 @@ class Magi2Nf4ExpertStore(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"groups={self.num_groups}, format=nf4, "
+            f"groups={self.num_groups}, format={self.quant_format}, "
             f"blocksize={self._blocksize}, access={self.expert_weight_access}, "
             f"chunk={self.expert_dequant_chunk_size}"
         )
+
+
+class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
+    """Addressable expert groups backed by a shared non-NF4 codec."""
+
+    def __init__(self, *, num_groups: int, quant_format: str, blocksize: int = NF4_BLOCKSIZE) -> None:
+        super().__init__(num_groups=num_groups, blocksize=blocksize)
+        if quant_format not in MAGI2_PACKED_EXPERT_FORMATS[1:]:
+            raise Magi2QuantizedExpertError(f"Unsupported MAGI-2 packed format '{quant_format}'.")
+        self.quant_format = quant_format
+        self.expected_shapes: dict[str, tuple[int, ...]] = {}
+
+    def _buffer_names(self, key: str) -> tuple[str, ...]:
+        suffixes = ("codes",)
+        if self.quant_format == "fp8":
+            suffixes += ("scales",)
+        elif self.quant_format == "nvfp4":
+            suffixes += ("scales", "global_scale")
+        return tuple(f"{key}_{suffix}" for suffix in suffixes)
+
+    def expected_buffers(self) -> set[str]:
+        return {name for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES for name in self._buffer_names(key)}
+
+    def _nvfp4_meta(self, shape):
+        return MicroscalingMeta("nvfp4", 16, shape, (-prod(shape)) % 16)
+
+    @torch.no_grad()
+    def quantize_dense(self, key: str, source: torch.Tensor) -> None:
+        if key not in MAGI2_ROUTED_EXPERT_TENSOR_NAMES or source.ndim != 3 or source.shape[0] != self.num_groups:
+            raise Magi2QuantizedExpertError("Invalid dense MAGI-2 packed expert input.")
+        payload = []
+        for group in source:
+            if self.quant_format == "fp8":
+                values = quantize_blockwise_fp8_weight(group)[:2]
+            elif self.quant_format == "nvfp4":
+                values = quantize_microscaling(self.quant_format, group)[:3]
+            else:
+                values = (quantize_gguf(self.quant_format, group),)
+            payload.append(values)
+        for name, values in zip(self._buffer_names(key), zip(*payload, strict=True), strict=True):
+            self._set_buffer(name, torch.stack(values))
+        self._shapes[key] = tuple(source.shape)
+        self._dtypes[key] = source.dtype
+
+    def packed_state_descriptor(self) -> dict[str, object]:
+        if not self.is_fully_loaded():
+            raise Magi2QuantizedExpertError("MAGI-2 packed store is incomplete.")
+        return {
+            "num_groups": self.num_groups,
+            "expert_shapes": self._shapes,
+            "expert_dtypes": {key: str(dtype).removeprefix("torch.") for key, dtype in self._dtypes.items()},
+            "buffers": sorted(self.expected_buffers()),
+        }
+
+    def restore_packed_state(self, *, descriptor, buffers) -> None:
+        shapes, dtypes = descriptor.get("expert_shapes"), descriptor.get("expert_dtypes")
+        keys = set(MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
+        if (
+            descriptor.get("num_groups") != self.num_groups
+            or set(buffers) != self.expected_buffers()
+            or not isinstance(shapes, dict) or set(shapes) != keys
+            or not isinstance(dtypes, dict) or set(dtypes) != keys
+        ):
+            raise Magi2QuantizedExpertError("Invalid MAGI-2 packed expert metadata or inventory.")
+        restored_shapes = {}
+        restored_dtypes = {}
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            shape = tuple(shapes[key])
+            dtype = getattr(torch, str(dtypes[key]), None)
+            if (
+                len(shape) != 3 or shape[0] != self.num_groups
+                or any(type(dim) is not int or dim < 1 for dim in shape)
+                or dtype not in {torch.float16, torch.bfloat16, torch.float32}
+            ):
+                raise Magi2QuantizedExpertError(f"Invalid packed shape or dtype for '{key}'.")
+            group_shape = shape[1:]
+            if key in self.expected_shapes and shape != self.expected_shapes[key]:
+                raise Magi2QuantizedExpertError(f"Packed shape for '{key}' does not match the model.")
+            fields = tuple(buffers[name] for name in self._buffer_names(key))
+            if any(field.ndim < 1 or field.shape[0] != self.num_groups for field in fields):
+                raise Magi2QuantizedExpertError(f"Invalid packed group axis for '{key}'.")
+            if self.quant_format == "fp8":
+                validate_blockwise_fp8_payload(*fields, BlockwiseFP8Meta(group_shape))
+            elif self.quant_format == "nvfp4":
+                validate_microscaling_payload(*fields, self._nvfp4_meta(group_shape))
+            else:
+                blocks = fields[0]
+                if blocks.ndim != 3 or blocks.shape[1] != gguf_num_superblocks(prod(group_shape)):
+                    raise Magi2QuantizedExpertError(f"Invalid GGUF block count for '{key}'.")
+                validate_gguf_blocks(self.quant_format, blocks.flatten(0, 1))
+            restored_shapes[key] = shape
+            restored_dtypes[key] = dtype
+        for name, value in buffers.items():
+            self._set_buffer(name, value)
+        self._shapes = restored_shapes
+        self._dtypes = restored_dtypes
+
+    @torch.no_grad()
+    def materialize_segment(self, key, group_start, group_stop, *, dtype, device, group_ids=None):
+        self._require_loaded(key)
+        count = self.num_groups if group_ids is None else group_ids.numel()
+        if not 0 <= group_start < group_stop <= count:
+            raise Magi2QuantizedExpertError("MAGI-2 packed expert segment is out of bounds.")
+        fields = []
+        for name in self._buffer_names(key):
+            value = getattr(self, name)
+            if group_ids is None:
+                value = value[group_start:group_stop]
+            else:
+                value = value.index_select(0, group_ids[group_start:group_stop].to(value.device))
+            fields.append(value.to(device=device))
+        shape = self._shapes[key][1:]
+        if self.quant_format == "fp8":
+            return dequantize_blockwise_fp8_weight(*fields, BlockwiseFP8Meta(shape), dtype=dtype, device=device)
+        if self.quant_format == "nvfp4":
+            meta = self._nvfp4_meta(shape)
+            return torch.stack([
+                dequantize_microscaling(*group, meta, dtype=dtype, device=device)
+                for group in zip(*fields, strict=True)
+            ])
+        return torch.stack([
+            dequantize_gguf(self.quant_format, group, shape=shape, dtype=dtype, device=device)
+            for group in fields[0]
+        ])
+
+
+def _new_expert_store(*, num_groups: int, blocksize: int, quant_format: str) -> Magi2Nf4ExpertStore:
+    if quant_format == "nf4":
+        return Magi2Nf4ExpertStore(num_groups=num_groups, blocksize=blocksize)
+    return Magi2PackedExpertStore(num_groups=num_groups, blocksize=blocksize, quant_format=quant_format)
 
 
 def iter_magi2_moe_layers(transformer: nn.Module) -> Iterator[tuple[str, nn.Module]]:
@@ -530,6 +683,7 @@ def install_magi2_nf4_expert_stores(
     transformer: nn.Module,
     *,
     blocksize: int = NF4_BLOCKSIZE,
+    quant_format: str = "nf4",
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Replace every MoE layer's dense expert parameters with an NF4 store.
 
@@ -541,11 +695,18 @@ def install_magi2_nf4_expert_stores(
     for name, module in list(iter_magi2_moe_layers(transformer)):
         existing = magi2_expert_store(module)
         if existing is not None:
+            if existing.quant_format != quant_format:
+                raise Magi2QuantizedExpertError("MAGI-2 layer already carries a different packed format.")
             stores[name] = existing
             continue
-        store = Magi2Nf4ExpertStore(
-            num_groups=int(module.local_flatten_num_experts), blocksize=blocksize
+        store = _new_expert_store(
+            num_groups=int(module.local_flatten_num_experts), blocksize=blocksize, quant_format=quant_format
         )
+        if isinstance(store, Magi2PackedExpertStore):
+            store.expected_shapes = {
+                key: tuple(module._parameters[key].shape)
+                for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+            }
         for tensor_name in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             if tensor_name in module._parameters:
                 del module._parameters[tensor_name]
@@ -562,6 +723,7 @@ def quantize_magi2_experts_in_place(
     transformer: nn.Module,
     *,
     blocksize: int = NF4_BLOCKSIZE,
+    quant_format: str = "nf4",
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Quantize already-materialized dense expert parameters, layer by layer.
 
@@ -578,8 +740,8 @@ def quantize_magi2_experts_in_place(
             continue
         if magi2_expert_store(module) is not None:
             continue
-        store = Magi2Nf4ExpertStore(
-            num_groups=int(module.local_flatten_num_experts), blocksize=blocksize
+        store = _new_expert_store(
+            num_groups=int(module.local_flatten_num_experts), blocksize=blocksize, quant_format=quant_format
         )
         for tensor_name in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             parameter = module._parameters.get(tensor_name)
@@ -608,6 +770,7 @@ def stream_quantize_magi2_experts(
     *,
     checkpoint_dir: str,
     blocksize: int = NF4_BLOCKSIZE,
+    quant_format: str = "nf4",
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Read the released expert shards one tensor at a time and pack them.
 
@@ -624,7 +787,7 @@ def stream_quantize_magi2_experts(
     )
 
     weight_map = read_safetensors_weight_map(str(checkpoint_dir))
-    stores = install_magi2_nf4_expert_stores(transformer, blocksize=blocksize)
+    stores = install_magi2_nf4_expert_stores(transformer, blocksize=blocksize, quant_format=quant_format)
     for module_name, store in stores.items():
         for tensor_name in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             if store.is_loaded(tensor_name):

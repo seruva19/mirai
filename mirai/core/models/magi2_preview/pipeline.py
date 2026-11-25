@@ -24,6 +24,7 @@ from mirai.core.models.base import (
     SyntheticBatchSpec,
 )
 from mirai.core.models.magi2_preview.quantized_experts import (
+    MAGI2_PACKED_EXPERT_FORMATS,
     MAGI2_ROUTED_EXPERT_TENSORS,
     Magi2Nf4ExpertStore,
     iter_magi2_moe_layers,
@@ -121,7 +122,7 @@ MAGI2_MAX_SAMPLING_LATENT_FRAMES = 32
 # Frozen-weight quantization formats this family implements. Only the routed
 # expert stack is packed; the router, expert bias, shared experts, hyper
 # connections, and norms keep their released dtype.
-MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS = ("nf4",)
+MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS = MAGI2_PACKED_EXPERT_FORMATS
 MAGI2_NF4_BLOCKSIZE = 64
 
 
@@ -402,7 +403,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
 
             install_magi2_nf4_expert_stores(
-                transformer, blocksize=self._nf4_blocksize
+                transformer, blocksize=self._nf4_blocksize,
+                quant_format=self._frozen_weight_quantization,
             )
             state = load_magi2_model_state_dict(transformer, config.engine_config)
             transformer.load_state_dict(state, strict=True)
@@ -416,6 +418,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     self._packed_expert_state_path,
                     transformer,
                     blocksize=self._nf4_blocksize,
+                    quant_format=self._frozen_weight_quantization,
                     expected_metadata={
                         "model_variant": str(self.model_config.params.variant),
                         "denoiser_subfolder": str(
@@ -433,6 +436,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     transformer,
                     checkpoint_dir=str(checkpoint_dir),
                     blocksize=self._nf4_blocksize,
+                    quant_format=self._frozen_weight_quantization,
                 )
         else:
             state = load_magi2_model_state_dict(transformer, config.engine_config)
@@ -759,7 +763,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             for tensor_name, role in MAGI2_ROUTED_EXPERT_TENSORS:
                 if store is not None:
                     shape = store.expert_weight_shape(tensor_name)
-                    dtype = "nf4"
+                    dtype = store.quant_format
                 else:
                     tensor = getattr(module, tensor_name)
                     shape = tuple(int(dim) for dim in tensor.shape)
@@ -933,6 +937,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 + ", ".join(sorted(kwargs))
                 + "."
             )
+        if self._expert_stores and any(store.quant_format != scheme for store in self._expert_stores.values()):
+            raise ValueError("MAGI-2 expert storage already contains a different packed format.")
         self._frozen_weight_quantization = scheme
         self._nf4_blocksize = block_size
         if not self.has_quantized_frozen_weights():
@@ -941,7 +947,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
 
             self._expert_stores = quantize_magi2_experts_in_place(
-                self.transformer, blocksize=block_size
+                self.transformer, blocksize=block_size, quant_format=scheme
             )
         self._attach_moe_execution()
 
@@ -954,7 +960,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         stores = list(self._expert_stores.values())
         return {
             "strategy": "compressed_weights",
-            "quant_format": "nf4",
+            "quant_format": stores[0].quant_format,
             "linear_modules": 0,
             "grouped_expert_modules": len(stores),
             "quantized_tensors": sum(
