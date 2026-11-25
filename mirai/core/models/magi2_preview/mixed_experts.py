@@ -117,18 +117,22 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
         self._locations: dict[str, tuple[tuple[str, int], ...]] = {}
 
     @torch.no_grad()
-    def quantize_dense(self, key: str, source: torch.Tensor) -> None:
+    def quantize_dense(self, key: str, source: torch.Tensor, *, group_ids=None) -> None:
         _validate_rotation_size(self.rotation_group_size, source.shape[-2])
         assignments = self._formats[key]
+        source_ids = range(source.shape[0]) if group_ids is None else group_ids
+        if len(source_ids) != len(assignments):
+            raise ValueError("MAGI-2 mixed projections and group selections do not align.")
         locations = [None] * len(assignments)
         for fmt in sorted(set(assignments)):
             ids = [index for index, value in enumerate(assignments) if value == fmt]
             name = f"{key}_{fmt}"
             for position, index in enumerate(ids):
                 locations[index] = (name, position)
+            original_ids = [source_ids[index] for index in ids]
             if fmt == "bf16":
                 selected = torch.empty((len(ids), *source.shape[1:]), dtype=torch.bfloat16, device=source.device)
-                for row, index in enumerate(ids):
+                for row, index in enumerate(original_ids):
                     selected[row].copy_(source[index])
                 bucket = _Bf16Groups(selected)
             else:
@@ -139,11 +143,11 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
                     return _rotate_native_projection(group, group_size=self.rotation_group_size).to(group.dtype)
 
                 bucket.quantize_dense(
-                    key, source, group_ids=ids, transform=rotate if self.rotation_group_size else None,
+                    key, source, group_ids=original_ids, transform=rotate if self.rotation_group_size else None,
                 )
             self.buckets[name] = bucket
         self._locations[key] = tuple(locations)
-        self._shapes[key] = tuple(source.shape)
+        self._shapes[key] = (len(source_ids), *source.shape[1:])
         self._dtypes[key] = source.dtype
 
     @torch.no_grad()
@@ -284,7 +288,9 @@ def _validate_nf4_bucket(key, fields, spec, shape, blocksize):
         raise ValueError("Invalid mixed MAGI-2 NF4 codebook size.")
 
 
-def _prepare_mixed_stores(transformer, *, plan_path, base_format, blocksize, rotation_group_size):
+def _prepare_mixed_stores(
+    transformer, *, plan_path, base_format, blocksize, rotation_group_size, pruning_indices=None,
+):
     from mirai.core.moe.calibration.precision import TensorPrecisionPlan, load_precision_plan
 
     plan = load_precision_plan(plan_path)
@@ -309,8 +315,14 @@ def _prepare_mixed_stores(transformer, *, plan_path, base_format, blocksize, rot
 
     stores = {}
     for name, layer in layers.items():
+        indices = (pruning_indices or {}).get(name)
+        if indices is not None:
+            assignments[name] = {
+                key: [formats[index] for index in indices] for key, formats in assignments[name].items()
+            }
         store = Magi2MixedExpertStore(
-            num_groups=int(layer.local_flatten_num_experts), blocksize=blocksize,
+            num_groups=len(indices) if indices is not None else int(layer.local_flatten_num_experts),
+            blocksize=blocksize,
             base_format=base_format, formats=assignments[name], lineage=lineage,
             rotation_group_size=rotation_group_size,
         )
@@ -351,6 +363,7 @@ def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksi
 
 def stream_quantize_magi2_mixed_experts(
     transformer, *, checkpoint_dir, plan_path, base_format, blocksize, rotation_group_size=0,
+    pruning_plan=None,
 ):
     """Pack one source projection at a time and bind only the verified stores."""
     from safetensors import safe_open
@@ -358,9 +371,15 @@ def stream_quantize_magi2_mixed_experts(
     from mirai.core.moe.calibration.router_repair import update_router_tensor_fingerprints
     from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import read_safetensors_weight_map
 
+    pruning_indices = {}
+    if pruning_plan is not None:
+        from mirai.core.models.magi2_preview.expert_pruning import _pruning_indices, stream_prune_magi2_experts
+
+        source_layers = dict(iter_magi2_moe_layers(transformer))
+        pruning_indices = {name: ids for name, (_, ids) in _pruning_indices(source_layers, pruning_plan).items()}
     plan, layers, stores = _prepare_mixed_stores(
         transformer, plan_path=plan_path, base_format=base_format, blocksize=blocksize,
-        rotation_group_size=rotation_group_size,
+        rotation_group_size=rotation_group_size, pruning_indices=pruning_indices,
     )
     weight_map = read_safetensors_weight_map(checkpoint_dir)
     inputs = {}
@@ -396,13 +415,20 @@ def stream_quantize_magi2_mixed_experts(
         if key == "gate":
             routers[name] = source
         else:
-            stores[name].quantize_dense(key, source)
+            stores[name].quantize_dense(key, source, group_ids=pruning_indices.get(name))
         del source
     if plan.source_weight_fingerprint not in {f"sha256:{plain.hexdigest()}", f"sha256:{protected.hexdigest()}"}:
         raise ValueError("MAGI-2 precision plan does not match the source-weight fingerprint.")
+    preloaded_keys = {f"{name}.gate" for name in routers}
+    if pruning_plan is not None:
+        pruned_keys, _ = stream_prune_magi2_experts(
+            transformer, pruning_plan, checkpoint_dir, prepare_packed_restore=True,
+        )
+        preloaded_keys.update(pruned_keys)
     for name, layer in layers.items():
-        layer.gate.detach().copy_(routers[name])
+        if name not in pruning_indices:
+            layer.gate.detach().copy_(routers[name])
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             del layer._parameters[key]
         layer.add_module(MAGI2_NF4_STORE_ATTR, stores[name])
-    return stores, {f"{name}.gate" for name in routers}
+    return stores, preloaded_keys

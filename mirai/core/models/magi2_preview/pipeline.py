@@ -323,8 +323,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             self._quantize_experts_on_load or self._packed_expert_state_path
         ):
             raise ValueError("MAGI-2 pruned-adapter source verification requires the dense checkpoint.")
-        if self._expert_pruning_plan_path and self._expert_precision_plan_path:
-            raise ValueError("MAGI-2 pruning cannot be combined with a mixed expert precision plan.")
+        if self._expert_pruning_plan_path and self._expert_precision_plan_path and not self._quantizes_experts_on_load():
+            raise ValueError("MAGI-2 pruning with a mixed precision plan requires quantize_experts_on_load.")
         default_config = (
             Path(__file__).resolve().parents[3]
             / "vendors"
@@ -441,13 +441,23 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         )
         mixed_stream = self._quantizes_experts_on_load() and self._expert_precision_plan_path
         preloaded_keys = set()
+        pruning_plan = None
         if pruning_plan_path:
-            from mirai.core.models.magi2_preview.expert_pruning import (
-                Magi2ExpertPruningPlan,
-                stream_prune_magi2_experts,
-            )
+            from mirai.core.models.magi2_preview.expert_pruning import Magi2ExpertPruningPlan
 
             pruning_plan = Magi2ExpertPruningPlan.load(pruning_plan_path)
+        if mixed_stream:
+            from mirai.core.models.magi2_preview.mixed_experts import stream_quantize_magi2_mixed_experts
+
+            self._expert_stores, preloaded_keys = stream_quantize_magi2_mixed_experts(
+                transformer, checkpoint_dir=str(checkpoint_dir), plan_path=self._expert_precision_plan_path,
+                base_format=self._frozen_weight_quantization, blocksize=self._nf4_blocksize,
+                rotation_group_size=self._expert_rotation_group_size, pruning_plan=pruning_plan,
+            )
+            self._applied_expert_precision_plan = self._expert_precision_plan_path
+        elif pruning_plan is not None:
+            from mirai.core.models.magi2_preview.expert_pruning import stream_prune_magi2_experts
+
             restoring_packed = bool(self._packed_expert_state_path)
             preloaded_keys, self._expert_stores = stream_prune_magi2_experts(
                 transformer, pruning_plan, checkpoint_dir,
@@ -458,7 +468,6 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 blocksize=getattr(self, "_nf4_blocksize", MAGI2_NF4_BLOCKSIZE),
                 prepare_packed_restore=restoring_packed,
             )
-            self._expert_pruning_digest = pruning_plan.topology_digest()
             if restoring_packed:
                 from mirai.core.models.magi2_preview.quantized_experts import install_magi2_nf4_expert_stores
 
@@ -466,15 +475,6 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     transformer, blocksize=self._nf4_blocksize,
                     quant_format=self._frozen_weight_quantization,
                 )
-        elif mixed_stream:
-            from mirai.core.models.magi2_preview.mixed_experts import stream_quantize_magi2_mixed_experts
-
-            self._expert_stores, preloaded_keys = stream_quantize_magi2_mixed_experts(
-                transformer, checkpoint_dir=str(checkpoint_dir), plan_path=self._expert_precision_plan_path,
-                base_format=self._frozen_weight_quantization, blocksize=self._nf4_blocksize,
-                rotation_group_size=self._expert_rotation_group_size,
-            )
-            self._applied_expert_precision_plan = self._expert_precision_plan_path
         elif packed_experts:
             # Remove the dense routed expert targets before reading checkpoint shards.
             from mirai.core.models.magi2_preview.quantized_experts import install_magi2_nf4_expert_stores
@@ -483,6 +483,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 transformer, blocksize=self._nf4_blocksize,
                 quant_format=self._frozen_weight_quantization,
             )
+        if pruning_plan is not None:
+            self._expert_pruning_digest = pruning_plan.topology_digest()
         if self._companion_weight_quantization != "none":
             from mirai.core.models.magi2_preview.companion_weights import stream_pack_magi2_companion_weights
 

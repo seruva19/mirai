@@ -1095,7 +1095,13 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rot
     )
     path = plan.save(tmp_path / "plan.json")
     from safetensors.torch import save_file
+    from mirai.core.models.magi2_preview.expert_pruning import build_magi2_expert_pruning_plan
 
+    with torch.no_grad():
+        layer.router.expert_bias.copy_(layer.router.expert_bias_ema)
+    pruning_plan = build_magi2_expert_pruning_plan(
+        model, {name: torch.arange(8)}, criterion="reap", keep_fraction=0.5,
+    )
     checkpoint = {key: value.double() for key, value in model.state_dict().items()}
     save_file(checkpoint, str(tmp_path / "model.safetensors"))
     streamed_model = _container(_reduced_moe(
@@ -1123,6 +1129,25 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rot
     assert hasattr(streamed_model.mlp.moe_mlp, "W_gate")
     checkpoint[tampered].view(-1)[0] -= 1
     save_file(checkpoint, str(tmp_path / "model.safetensors"))
+    pruned_model = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, hidden_size=32,
+        expert_intermediate_size=24, num_heads=2, num_experts=4, top_k=1,
+        routed_weight_device="meta",
+    ))
+    pruned_stores, preloaded = stream_quantize_magi2_mixed_experts(
+        pruned_model, **options, pruning_plan=pruning_plan,
+    )
+    selected = [2, 3, 6, 7]
+    route = pruned_model.mlp.moe_mlp
+    assert route.num_experts == 2
+    assert preloaded == {f"{name}.gate", f"{name}.router.expert_bias", f"{name}.router.expert_bias_ema"}
+    torch.testing.assert_close(route.gate, layer.gate[selected], rtol=0, atol=0)
+    for key in ("W_gate", "W_up", "W_down"):
+        kwargs = dict(device=torch.device("cpu"), dtype=torch.float32)
+        torch.testing.assert_close(
+            pruned_stores[name].materialize_segment(key, 0, 4, **kwargs),
+            store.materialize_segment(key, 0, 8, **kwargs)[selected], rtol=0, atol=0,
+        )
     from mirai.vendors.magi2_preview.common import magi2_config
     from mirai.vendors.magi2_preview.model import magi2_preview as vendored_model
     from mirai.vendors.magi2_preview.pipeline import preview_data_proxy

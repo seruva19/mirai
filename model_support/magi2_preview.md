@@ -763,6 +763,9 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   head of a layer and preserve top-k. For training, select `attn_only`.
   Set `memory.quantize_experts_on_load=true` with a supported expert format to
   pack the retained rows during the shard read.
+  You can combine on-load quantization with a mixed expert precision plan
+  built for the original checkpoint. Format assignments follow the original
+  expert IDs into the compacted pool.
   A packed expert export preserves the pruning digest. To restore it, set
   `memory.frozen_weight_packed_state_path` and use the same pruning plan,
   original checkpoint, and expert format.
