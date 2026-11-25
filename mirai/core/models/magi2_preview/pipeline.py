@@ -252,6 +252,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     _residency_request: "Magi2ResidencyRequest | None" = None
     _expert_stores: "dict[str, Magi2Nf4ExpertStore]" = {}
     _packed_companion_linears: tuple[nn.Module, ...] = ()
+    _packed_norms: tuple[nn.Module, ...] = ()
     _companion_weight_quantization = "none"
     _router_int8_enabled = False
     _routing_collapse: Any | None = None
@@ -296,11 +297,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         from mirai.core.models.magi2_preview.mixed_experts import MAGI2_EXPERT_ROTATION_SIZES
 
         self._expert_rotation_group_size = family.get("expert_rotation_group_size", 0)
-        from mirai.core.models.magi2_preview.companion_weights import MAGI2_COMPANION_FORMATS
+        from mirai.core.models.magi2_preview.companion_weights import MAGI2_COMPANION_FORMATS, MAGI2_NORM_FORMATS
 
         self._companion_weight_quantization = family.get("companion_weight_quantization", "none")
         if self._companion_weight_quantization not in MAGI2_COMPANION_FORMATS:
             raise ValueError("MAGI-2 companion_weight_quantization must be 'none', 'fp8', or 'nf4'.")
+        self._norm_weight_quantization = family.get("norm_weight_quantization", "none")
+        if self._norm_weight_quantization not in MAGI2_NORM_FORMATS:
+            raise ValueError("MAGI-2 norm_weight_quantization must be 'none' or 'int8'.")
         if type(self._expert_rotation_group_size) is not int or self._expert_rotation_group_size not in MAGI2_EXPERT_ROTATION_SIZES:
             raise ValueError("Invalid MAGI-2 expert Hadamard group size.")
         if self._expert_rotation_group_size and not (
@@ -459,6 +463,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         state = load_magi2_model_state_dict(transformer, config.engine_config, **load_options)
         transformer.load_state_dict(state, strict=True)
         del state
+        if getattr(self, "_norm_weight_quantization", "none") == "int8":
+            from mirai.core.models.magi2_preview.companion_weights import pack_magi2_norm_weights
+
+            self._packed_norms = pack_magi2_norm_weights(transformer)
         if packed_experts and not mixed_stream:
             if self._packed_expert_state_path:
                 from mirai.core.models.magi2_preview.packed_experts import (
@@ -1057,7 +1065,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._attach_moe_execution()
 
     def has_quantized_frozen_weights(self) -> bool:
-        return bool(self._expert_stores or self._packed_companion_linears or self._router_int8_enabled)
+        return bool(self._expert_stores or self._packed_companion_linears or self._packed_norms or self._router_int8_enabled)
 
     def get_quantized_frozen_weight_report(self) -> dict[str, Any] | None:
         if not self.has_quantized_frozen_weights():
@@ -1081,6 +1089,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             module._mirai_router_weight_scale.numel() * module._mirai_router_weight_scale.element_size()
             for module in routers
         )
+        norm_numel = sum(module._mirai_norm_weight_int8.numel() for module in self._packed_norms)
+        norm_bytes = norm_numel + sum(
+            module._mirai_norm_weight_scale.numel() * module._mirai_norm_weight_scale.element_size()
+            for module in self._packed_norms
+        )
         return {
             "strategy": "compressed_weights",
             "quant_format": (
@@ -1092,12 +1105,16 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             "linear_modules": len(self._packed_companion_linears),
             "grouped_expert_modules": len(stores),
             "router_modules": len(routers),
+            "norm_modules": len(self._packed_norms),
             "router_quantization": "int8_per_channel" if routers else "disabled",
-            "quantized_tensors": len(MAGI2_ROUTED_EXPERT_TENSORS) * len(stores) + len(companion_projections) + len(routers),
-            "quantized_numel": router_numel + sum(store.quantized_numel() for store in stores) + sum(
+            "quantized_tensors": (
+                len(MAGI2_ROUTED_EXPERT_TENSORS) * len(stores)
+                + len(companion_projections) + len(routers) + len(self._packed_norms)
+            ),
+            "quantized_numel": router_numel + norm_numel + sum(store.quantized_numel() for store in stores) + sum(
                 projection.frozen_quantized_numel() for projection in companion_projections
             ),
-            "packed_bytes": sum(store.payload_bytes() for store in stores) + companion_bytes + router_bytes,
+            "packed_bytes": sum(store.payload_bytes() for store in stores) + companion_bytes + router_bytes + norm_bytes,
             "expert_weight_access": stores[0].expert_weight_access if stores else None,
             "expert_dequant_chunk_size": stores[0].expert_dequant_chunk_size if stores else None,
         }
@@ -2055,6 +2072,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "expert_pruning_plan_path",
         "expert_rotation_group_size",
         "companion_weight_quantization",
+        "norm_weight_quantization",
         "config_path",
         "audio_tokens",
         "refiner_config_path",
@@ -2100,13 +2118,15 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         return (*MAGI2_PACKED_EXPERT_FORMATS, "bf16")
 
     def validate_family_params(self, params: dict[str, Any]) -> list[str]:
-        from mirai.core.models.magi2_preview.companion_weights import MAGI2_COMPANION_FORMATS
+        from mirai.core.models.magi2_preview.companion_weights import MAGI2_COMPANION_FORMATS, MAGI2_NORM_FORMATS
         from mirai.core.models.magi2_preview.mixed_experts import MAGI2_EXPERT_ROTATION_SIZES
 
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
         if params.get("companion_weight_quantization", "none") not in MAGI2_COMPANION_FORMATS:
             errors.append("MAGI-2 companion_weight_quantization must be 'none', 'fp8', or 'nf4'.")
+        if params.get("norm_weight_quantization", "none") not in MAGI2_NORM_FORMATS:
+            errors.append("MAGI-2 norm_weight_quantization must be 'none' or 'int8'.")
         rotation = params.get("expert_rotation_group_size", 0)
         if type(rotation) is not int or rotation not in MAGI2_EXPERT_ROTATION_SIZES:
             errors.append("MAGI-2 expert_rotation_group_size must be 0, 4, 16, 64, or 256.")

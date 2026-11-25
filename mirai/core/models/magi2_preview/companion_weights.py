@@ -10,6 +10,31 @@ from mirai.core.models.compressed_weights.execution.linear import CompressedLine
 
 
 MAGI2_COMPANION_FORMATS = ("none", "fp8", "nf4")
+MAGI2_NORM_FORMATS = ("none", "int8")
+
+
+@torch.no_grad()
+def pack_magi2_norm_weights(transformer: nn.Module) -> tuple[nn.Module, ...]:
+    from mirai.core.models.compressed_weights.quantization.quant import _quantize_weight
+    from mirai.vendors.magi2_preview.model.magi2_preview import MultiModalityRMSNorm
+
+    norms = tuple(module for module in transformer.modules() if isinstance(module, MultiModalityRMSNorm))
+    if not norms:
+        raise ValueError("MAGI-2 norm packing matched no RMSNorm layers.")
+    pending = []
+    for module in norms:
+        if hasattr(module, "_mirai_norm_weight_int8"):
+            continue
+        source = module.weight.detach().view(-1, module.dim)
+        if not torch.isfinite(source).all():
+            raise ValueError("MAGI-2 RMSNorm weights must be finite before packing.")
+        codes, scale, _ = _quantize_weight(source, group_size=0)
+        pending.append((module, codes, scale))
+    for module, codes, scale in pending:
+        module.register_buffer("_mirai_norm_weight_int8", codes, persistent=False)
+        module.register_buffer("_mirai_norm_weight_scale", scale, persistent=False)
+        module.weight = nn.Parameter(module.weight.new_empty(0), requires_grad=False)
+    return norms
 
 
 def execute_companion_linear(module, input, cu_seqlens=None, m_splits=None, gather_ids=None):

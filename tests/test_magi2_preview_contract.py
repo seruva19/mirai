@@ -77,6 +77,8 @@ def test_magi2_provider_is_native_sparse_moe() -> None:
     assert provider.supports_batched_cfg_inference()
     assert provider.require_pipeline_type().__name__ == "Magi2PreviewPipeline"
     assert provider.validate_family_params({"audio_tokens": 1}) == []
+    assert provider.validate_family_params({"norm_weight_quantization": "int8"}) == []
+    assert provider.validate_family_params({"norm_weight_quantization": "nf4"})
     assert provider.validate_family_params({"unknown": True})
 
 
@@ -125,6 +127,63 @@ def test_magi2_low_rank_weight_preserves_default_and_gradients() -> None:
     assert adapter.lora_b.grad is not None
     assert torch.isfinite(adapter.lora_a.grad).all()
     assert torch.isfinite(adapter.lora_b.grad).all()
+
+
+@pytest.mark.parametrize("num_modality", [1, 3])
+def test_magi2_int8_norm_preserves_reference_dispatch_and_gradients(num_modality, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from mirai.core.models.magi2_preview.companion_weights import pack_magi2_norm_weights
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+    from mirai.vendors.magi2_preview.model import magi2_preview as vendored
+    from mirai.vendors.magi2_preview.model.magi2_preview import ModalityDispatcher, MultiModalityRMSNorm
+
+    for method in ("_forward_single_expert_torch_impl", "_forward_multi_experts_torch_impl"):
+        original = getattr(MultiModalityRMSNorm, method)
+        monkeypatch.setattr(MultiModalityRMSNorm, method, original.__wrapped__)
+    norm = MultiModalityRMSNorm(16, num_modality=num_modality, num_patterns=2, backend="torch")
+    rng = torch.Generator().manual_seed(251)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(norm.weight.shape, generator=rng) * 0.1)
+    original_bytes = norm.weight.numel() * norm.weight.element_size()
+    assert pack_magi2_norm_weights(norm) == (norm,)
+    assert norm.weight.numel() == 0
+    assert not norm.weight.requires_grad
+    packed_bytes = sum(x.numel() * x.element_size() for x in norm.buffers())
+    assert packed_bytes < original_bytes
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._packed_norms = (norm,)
+    report = pipeline.get_quantized_frozen_weight_report()
+    assert report["norm_modules"] == 1
+    assert report["packed_bytes"] == packed_bytes
+    ids = torch.tensor([0, 0, num_modality - 1])
+    dispatcher = ModalityDispatcher(ids, num_modality) if num_modality > 1 else None
+    x = torch.randn(3, 2, 16, generator=rng, requires_grad=True)
+    weights = (norm._mirai_norm_weight_int8.float() * norm._mirai_norm_weight_scale)
+    weights = weights.reshape(num_modality, 2, 16).index_select(0, ids)
+    reference = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + norm.eps) * (1 + weights)
+    actual = norm(x, dispatcher)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual.square().sum(), x)[0],
+        torch.autograd.grad(reference.square().sum(), x)[0],
+        rtol=0, atol=0,
+    )
+    norm.backend = "triton"
+    expected_weight = (norm._mirai_norm_weight_int8.float() * norm._mirai_norm_weight_scale).flatten()
+    kernel = "_multi_head_rms_norm_triton" if num_modality == 1 else "_grouped_multi_head_rms_norm_triton"
+    sentinel = object()
+
+    def capture_kernel(**options):
+        torch.testing.assert_close(options["weight"], expected_weight, rtol=0, atol=0)
+        assert options["weight"].dtype == torch.float32
+        return sentinel
+
+    monkeypatch.setattr(vendored, kernel, capture_kernel)
+    with torch.no_grad():
+        fixture = SimpleNamespace(is_cuda=True, dtype=x.dtype, device=x.device)
+        assert norm(fixture, dispatcher) is sentinel
 
 
 def test_magi2_grouped_linear_lora_executes_without_dense_delta() -> None:

@@ -560,6 +560,12 @@ class MultiModalityRMSNorm(nn.Module):
             )
         )
 
+    def _weight_for_compute(self) -> torch.Tensor:
+        packed = getattr(self, "_mirai_norm_weight_int8", None)
+        if packed is None:
+            return self.weight
+        return (packed.float() * self._mirai_norm_weight_scale).flatten()
+
     def forward(
         self, x: torch.Tensor, modality_dispatcher: Optional[ModalityDispatcher] = None
     ) -> torch.Tensor:
@@ -583,7 +589,7 @@ class MultiModalityRMSNorm(nn.Module):
         if self.backend == "triton" and x.is_cuda and not torch.is_grad_enabled():
             return _grouped_multi_head_rms_norm_triton(
                 x=x,
-                weight=self.weight,
+                weight=self._weight_for_compute(),
                 num_groups=self.num_modality,
                 num_heads=self.num_patterns,
                 head_dim=self.dim,
@@ -608,7 +614,7 @@ class MultiModalityRMSNorm(nn.Module):
         t, original_dtype = x.float(), x.dtype
         t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)
 
-        weight_chunked = self.weight.chunk(self.num_modality, dim=-1)
+        weight_chunked = self._weight_for_compute().chunk(self.num_modality, dim=-1)
         t_list = modality_dispatcher.dispatch(t)
 
         for i in range(self.num_modality):
@@ -633,7 +639,7 @@ class MultiModalityRMSNorm(nn.Module):
         ):
             return _multi_head_rms_norm_triton(
                 x=x,
-                weight=self.weight,
+                weight=self._weight_for_compute(),
                 num_heads=self.num_patterns,
                 head_dim=self.dim,
                 eps=self.eps,
@@ -651,7 +657,7 @@ class MultiModalityRMSNorm(nn.Module):
 
         out_dtype = target_dtype if target_dtype is not None else original_dtype
 
-        return (t * (self.weight.view(self.num_patterns, self.dim) + 1)).to(out_dtype)
+        return (t * (self._weight_for_compute().view(self.num_patterns, self.dim) + 1)).to(out_dtype)
 
 
 class CustomGroupedLinear(GroupedLinearBase):

@@ -200,10 +200,10 @@ described in [`CONFIG_REFERENCE.md`](../CONFIG_REFERENCE.md).
 NF4 instead of BF16. Exactly three tensors per MoE layer are packed —
 `moe_mlp.W_gate`, `moe_mlp.W_up`, and `moe_mlp.W_down` — because they are the
 only tensors addressed on the flattened `head * num_experts + expert` axis. The
-router bias buffers, hyper-connection state, and norms keep their released
-dtype. Separate options control storage for the router projection
-(`memory.router_quantization`) and attention and shared-expert projections
-(`companion_weight_quantization`).
+router bias buffers and hyper-connection state keep their released dtype.
+Separate options control storage for the router projection
+(`memory.router_quantization`), RMSNorm (`norm_weight_quantization`), and
+attention and shared-expert projections (`companion_weight_quantization`).
 
 Storage is one NF4 quantization per group, stacked along the group axis, which
 is what makes a contiguous group range independently dequantizable. NF4 requires
@@ -725,6 +725,12 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 
 ## Model-specific features
 
+- **Packed MAGI-2 RMSNorm weights** — Set
+  `model.params.family_params.norm_weight_quantization` to `"int8"` to
+  store RMSNorm weights as INT8 values with one FP32 scale per modality and
+  pattern. Both the PyTorch and Triton paths reconstruct the weights in FP32.
+  The loader repacks these weights from the source checkpoint.
+
 - **Packed MAGI-2 router weights** — Set `memory.router_quantization` to
   `"int8_per_channel"` to store an INT8 row and FP32 scale per head-local
   expert. The router reconstructs FP32 weights for the logits and input
@@ -863,6 +869,7 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `model.params.flow_shift` | Preset value `7.0`, matching the release's `evaluation_config.shift`. |
 | `model.params.family_params.config_path` | Override for the vendored architecture JSON; empty resolves to the shipped `magi2_preview.json`. |
 | `model.params.family_params.companion_weight_quantization` | `"none"` (default), `"fp8"`, or `"nf4"`. Packs attention and MLP companion weights one tensor at a time from denoiser shards. NF4 packing requires CUDA and bitsandbytes. |
+| `model.params.family_params.norm_weight_quantization` | `"none"` (default) or `"int8"`. Compresses the denoiser's frozen RMSNorm weights. |
 | `model.params.family_params.refiner_config_path` | Override for the vendored refiner profile JSON; empty resolves to the shipped `magi2_refiner.json`. The profile states the refiner architecture, its step count, guidance scale, flow shift, VAE stride and the zero-terminal-SNR index the stage re-noises at, so changing the refinement means pointing this at a different profile. Only read when `--refine` is requested. |
 | `model.params.family_params.refiner_subfolder` | Snapshot subdirectory holding the refiner shards; defaults to `refiner`. Must be relative to the snapshot root and must not traverse upwards. |
 | `model.params.family_params.refiner_attention_backend` | `auto`, `native_flex`, or `vendor_eager`, selecting how the refiner's local-attention layers evaluate their paired query/key ranges. `auto` uses, in order, a registered `torch.ops.magi2.flex_flash_attn_func` operator, the authors' importable single-GPU MagiAttention kernel on Hopper, then Mirai's portable FlexAttention range-union path. `native_flex` always binds the portable path. `vendor_eager` leaves the vendored dispatch unchanged, which needs either MagiAttention or a FlashAttention-2 install. Both accelerated paths and the portable path implement the union of every key range paired with a query position under one softmax; only the final FlashAttention-2 correction fallback merges per-range partial softmaxes and can double-count keys reachable through more than one range. Only read when `--refine` is requested. |
