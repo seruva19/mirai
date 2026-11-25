@@ -16,7 +16,7 @@ from mirai.core.models.magi2_preview.quantized_experts import (
     MAGI2_NF4_CODE_FIELDS,
     Magi2Nf4ExpertStore,
     Magi2PackedExpertStore,
-    install_magi2_nf4_expert_stores,
+    _new_expert_store,
     iter_magi2_moe_layers,
     magi2_expert_store,
 )
@@ -41,6 +41,10 @@ def _validate_pruning_topology(transformer: torch.nn.Module, digest: bytes | Non
     pruned = any(getattr(layer, "_mirai_experts_pruned", False) for _, layer in iter_magi2_moe_layers(transformer))
     if pruned != (digest is not None):
         raise Magi2PackedExpertStateError("Packed MAGI-2 expert pruning lineage requires a matching topology.")
+
+
+def _head_layout(layer: torch.nn.Module) -> dict[str, int]:
+    return {"num_heads": layer.local_num_heads, "experts_per_head": layer.num_experts}
 
 
 def save_magi2_nf4_packed_state(
@@ -100,7 +104,7 @@ def save_magi2_nf4_packed_state(
         descriptor["fused_gate_up"] = f"{MAGI2_FUSED_GATE_UP}_nf4" in tensors
         shard_name = f"layer_{layer_index:03d}.safetensors"
         save_file(tensors, str(target / shard_name))
-        layers[module_name] = {"shard": shard_name, **descriptor}
+        layers[module_name] = {"shard": shard_name, "head_layout": _head_layout(module), **descriptor}
     if not layers:
         raise Magi2PackedExpertStateError(
             "MAGI-2 packed expert export matched no routed-expert layers."
@@ -177,17 +181,17 @@ def load_magi2_nf4_packed_state(
             raise Magi2PackedExpertStateError(
                 f"Packed MAGI-2 expert state has incompatible {key}."
             )
-    stores = install_magi2_nf4_expert_stores(transformer, blocksize=blocksize, quant_format=quant_format)
-    mixed_layers = (
-        dict(iter_magi2_moe_layers(transformer))
-        if version in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION} else {}
-    )
+    layers = dict(iter_magi2_moe_layers(transformer))
+    mixed = version in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION}
     layer_specs = manifest.get("layers")
-    if not isinstance(layer_specs, dict) or set(layer_specs) != set(stores):
+    if (
+        not isinstance(layer_specs, dict) or not layers or set(layer_specs) != set(layers)
+        or any(not isinstance(spec, dict) for spec in layer_specs.values())
+    ):
         raise Magi2PackedExpertStateError(
             "Packed MAGI-2 expert layer inventory does not match the model."
         )
-    if mixed_layers:
+    if mixed:
         lineage = next(iter(layer_specs.values())).get("lineage")
         if any(spec.get("lineage") != lineage for spec in layer_specs.values()):
             raise Magi2PackedExpertStateError("Mixed MAGI-2 layers declare different precision plans.")
@@ -197,8 +201,18 @@ def load_magi2_nf4_packed_state(
             or bool(rotations[0]) != (version == _ROTATED_MIXED_SCHEMA_VERSION)
         ):
             raise Magi2PackedExpertStateError("Mixed MAGI-2 artifact has inconsistent rotation metadata.")
-    for module_name, store in stores.items():
+    stores = {}
+    for module_name, layer in layers.items():
         spec = layer_specs[module_name]
+        if "head_layout" in spec and spec["head_layout"] != _head_layout(layer):
+            raise Magi2PackedExpertStateError(f"Packed MAGI-2 layer '{module_name}' has incompatible head topology.")
+        groups = int(layer.local_flatten_num_experts)
+        gate = (groups, int(layer.d_head), int(layer.d_expert))
+        down = (groups, int(layer.d_expert), int(layer.d_head))
+        shapes = {"W_gate": gate, "W_up": gate, "W_down": down}
+        if spec.get("expert_shapes") != {key: list(shape) for key, shape in shapes.items()}:
+            raise Magi2PackedExpertStateError(f"Packed MAGI-2 layer '{module_name}' has incompatible projection shapes.")
+        store = _new_expert_store(num_groups=groups, blocksize=blocksize, quant_format=quant_format)
         fused = spec.get("fused_gate_up", False)
         if not isinstance(fused, bool) or (version != MAGI2_PACKED_EXPERT_SCHEMA_VERSION and fused):
             raise Magi2PackedExpertStateError("Packed MAGI-2 layer has an invalid gate/up layout.")
@@ -223,7 +237,7 @@ def load_magi2_nf4_packed_state(
             }
             if isinstance(store, Magi2PackedExpertStore):
                 expected_from_keys = store.expected_buffers()
-            if not mixed_layers and expected_buffers != expected_from_keys:
+            if not mixed and expected_buffers != expected_from_keys:
                 raise Magi2PackedExpertStateError(
                     f"Packed MAGI-2 layer '{module_name}' has incomplete buffers."
                 )
@@ -240,21 +254,26 @@ def load_magi2_nf4_packed_state(
                         f"Packed MAGI-2 layer '{module_name}' is missing '{buffer_name}'."
                     ) from exc
                 restored_buffers[buffer_name] = value.clone().contiguous()
-            if mixed_layers:
-                layer = mixed_layers[module_name]
-                gate = (store.num_groups, int(layer.d_head), int(layer.d_expert))
-                down = (store.num_groups, int(layer.d_expert), int(layer.d_head))
+            if mixed:
                 try:
                     packed = Magi2MixedExpertStore.from_packed_state(
                         descriptor=spec, buffers=restored_buffers, blocksize=blocksize,
-                        base_format=quant_format, group_shapes={"W_gate": gate, "W_up": gate, "W_down": down},
+                        base_format=quant_format, group_shapes=shapes,
                     )
                 except (KeyError, TypeError, ValueError) as exc:
                     raise Magi2PackedExpertStateError(f"Invalid mixed MAGI-2 layer '{module_name}': {exc}") from exc
-                setattr(layer, MAGI2_NF4_STORE_ATTR, packed)
-                stores[module_name] = packed
+                store = packed
             else:
-                store.restore_packed_state(descriptor=spec, buffers=restored_buffers)
+                try:
+                    store.restore_packed_state(descriptor=spec, buffers=restored_buffers)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise Magi2PackedExpertStateError(f"Invalid packed MAGI-2 layer '{module_name}': {exc}") from exc
+        stores[module_name] = store
+    for module_name, layer in layers.items():
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            if key in layer._parameters:
+                del layer._parameters[key]
+        setattr(layer, MAGI2_NF4_STORE_ATTR, stores[module_name])
     return stores
 
 

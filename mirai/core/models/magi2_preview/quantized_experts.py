@@ -255,27 +255,57 @@ class Magi2Nf4ExpertStore(nn.Module):
         raw_meta = descriptor.get("nf4_meta")
         if not isinstance(raw_meta, dict):
             raise Magi2QuantizedExpertError("Packed MAGI-2 store has no NF4 metadata.")
-        self._meta = _Nf4Meta(
+        meta = _Nf4Meta(
             blocksize=int(raw_meta["blocksize"]),
             nested_blocksize=int(raw_meta["nested_blocksize"]),
             nested_dtype=parse_dtype(raw_meta["nested_dtype"]),
             weight_dtype=parse_dtype(raw_meta["weight_dtype"]),
         )
-        self._shapes = {
+        if meta.blocksize != self._blocksize or meta.nested_blocksize <= 0:
+            raise Magi2QuantizedExpertError("Packed MAGI-2 store has invalid NF4 scale block sizes.")
+        restored_shapes = {
             key: tuple(int(dim) for dim in shapes[key]) for key in expected_names
         }
-        self._dtypes = {key: parse_dtype(dtypes[key]) for key in expected_names}
+        restored_dtypes = {key: parse_dtype(dtypes[key]) for key in expected_names}
+        for shape in restored_shapes.values():
+            if len(shape) != 3 or shape[0] != self.num_groups or min(shape) <= 0:
+                raise Magi2QuantizedExpertError("Packed MAGI-2 store has invalid NF4 expert shapes.")
         expected_buffers = set(descriptor.get("buffers", []))
         if expected_buffers != set(buffers):
             raise Magi2QuantizedExpertError(
                 "Packed MAGI-2 store buffer inventory does not match its descriptor."
             )
-        if descriptor.get("fused_gate_up", False):
-            if self._shapes["W_gate"] != self._shapes["W_up"] or self._dtypes["W_gate"] != self._dtypes["W_up"]:
+        fused = descriptor.get("fused_gate_up", False)
+        if fused:
+            if restored_shapes["W_gate"] != restored_shapes["W_up"] or restored_dtypes["W_gate"] != restored_dtypes["W_up"]:
                 raise Magi2QuantizedExpertError("Packed MAGI-2 fused projections have incompatible metadata.")
-            for suffix in MAGI2_NF4_GROUP_FIELDS:
-                if buffers[f"{MAGI2_FUSED_GATE_UP}_{suffix}"].shape[:2] != (self.num_groups, 2):
-                    raise Magi2QuantizedExpertError("Packed MAGI-2 fused projections require two lanes per group.")
+        for key, shape in restored_shapes.items():
+            if fused and key == "W_up":
+                continue
+            fused_gate = fused and key == "W_gate"
+            prefix = MAGI2_FUSED_GATE_UP if fused_gate else key
+            leading_shape = (self.num_groups, 2) if fused_gate else (self.num_groups,)
+            elements = prod(shape[1:])
+            absmax = (elements + meta.blocksize - 1) // meta.blocksize
+            nested = (absmax + meta.nested_blocksize - 1) // meta.nested_blocksize
+            for suffix, count in zip(MAGI2_NF4_GROUP_FIELDS, ((elements + 1) // 2, absmax, nested, 1), strict=True):
+                value = buffers[f"{prefix}_{suffix}"]
+                valid_dtype = (
+                    value.dtype == torch.uint8
+                    if suffix in {"nf4", "nf4_absmax"} else value.is_floating_point()
+                )
+                if (
+                    not valid_dtype or value.shape[:len(leading_shape)] != leading_shape
+                    or value.numel() != count * prod(leading_shape)
+                ):
+                    raise Magi2QuantizedExpertError(f"Invalid packed MAGI-2 NF4 field '{prefix}_{suffix}'.")
+            for suffix, count in zip(MAGI2_NF4_CODE_FIELDS, (16, 256), strict=True):
+                value = buffers[f"{prefix}_{suffix}"]
+                if value.shape != (count,) or not value.is_floating_point():
+                    raise Magi2QuantizedExpertError(f"Invalid packed MAGI-2 NF4 codebook '{prefix}_{suffix}'.")
+        self._meta = meta
+        self._shapes = restored_shapes
+        self._dtypes = restored_dtypes
         for name in set(self._buffers) - expected_buffers:
             delattr(self, name)
         for name, value in buffers.items():

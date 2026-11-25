@@ -480,21 +480,24 @@ def test_active_groups_decode_only_routed_weights_and_preserve_backward(
         nested_dtype=torch.float32, weight_dtype=torch.float32,
     )
     decoded = []
+    dense_weights = []
 
     def dequantize(fields, *args, **kwargs):
-        packed = fields["packed"]
-        decoded.append(int(fields["offset"]))
-        return packed
+        group = int(fields["offset"])
+        decoded.append(group)
+        return dense_weights[int(fields["packed"].flatten()[0])][group]
 
     monkeypatch.setattr(quantized_experts, "_nf4_dequantize", dequantize)
-    for key, shape in {"W_gate": (8, 16), "W_up": (8, 16), "W_down": (16, 8)}.items():
+    for index, (key, shape) in enumerate({"W_gate": (8, 16), "W_up": (8, 16), "W_down": (16, 8)}.items()):
         store._shapes[key] = (5, *shape)
         store._dtypes[key] = torch.float32
-        store._set_buffer(f"{key}_nf4", torch.randn(5, *shape, generator=generator))
-        for suffix in ("absmax", "nabsmax", "offset"):
-            store._set_buffer(f"{key}_nf4_{suffix}", torch.arange(5))
-        for suffix in ("code", "ncode"):
-            store._set_buffer(f"{key}_nf4_{suffix}", torch.zeros(1))
+        dense_weights.append(torch.randn(5, *shape, generator=generator))
+        store._set_buffer(f"{key}_nf4", torch.full((5, 64), index, dtype=torch.uint8))
+        store._set_buffer(f"{key}_nf4_absmax", torch.zeros(5, 2, dtype=torch.uint8))
+        store._set_buffer(f"{key}_nf4_nabsmax", torch.ones(5, 1))
+        store._set_buffer(f"{key}_nf4_offset", torch.arange(5, dtype=torch.float32))
+        store._set_buffer(f"{key}_nf4_code", torch.zeros(16))
+        store._set_buffer(f"{key}_nf4_ncode", torch.zeros(256))
 
     offsets = torch.tensor([0, 2, 2, 2, 5], dtype=torch.int32)
     inputs = torch.randn(5, 8, generator=generator)
@@ -526,12 +529,10 @@ def test_active_groups_decode_only_routed_weights_and_preserve_backward(
 
     source = store
     model = torch.nn.Module()
+    model.local_num_heads, model.num_experts, model.local_flatten_num_experts = 1, 5, 5
+    model.d_head, model.d_expert = 8, 16
     monkeypatch.setattr(packed_experts, "iter_magi2_moe_layers", lambda _: [("layer", model)])
     monkeypatch.setattr(packed_experts, "magi2_expert_store", lambda _: source)
-    monkeypatch.setattr(
-        packed_experts, "install_magi2_nf4_expert_stores",
-        lambda *args, **kwargs: {"layer": Magi2Nf4ExpertStore(num_groups=5)},
-    )
     legacy_path = save_magi2_nf4_packed_state(tmp_path / "separate", model)
     store = load_magi2_nf4_packed_state(legacy_path, model, blocksize=64)["layer"]
     assert not store.has_fused_gate_up
@@ -1095,7 +1096,9 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rot
     )
     path = plan.save(tmp_path / "plan.json")
     from safetensors.torch import save_file
-    from mirai.core.models.magi2_preview.expert_pruning import build_magi2_expert_pruning_plan
+    from mirai.core.models.magi2_preview.expert_pruning import (
+        build_magi2_expert_pruning_plan, stream_prune_magi2_experts,
+    )
 
     with torch.no_grad():
         layer.router.expert_bias.copy_(layer.router.expert_bias_ema)
@@ -1142,12 +1145,27 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rot
     assert route.num_experts == 2
     assert preloaded == {f"{name}.gate", f"{name}.router.expert_bias", f"{name}.router.expert_bias_ema"}
     torch.testing.assert_close(route.gate, layer.gate[selected], rtol=0, atol=0)
+    artifact = save_magi2_nf4_packed_state(
+        tmp_path / "pruned-mixed", pruned_model, pruning_digest=pruning_plan.topology_digest(),
+    )
+    restore_model = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, hidden_size=32,
+        expert_intermediate_size=24, num_heads=2, num_experts=4, top_k=1,
+        routed_weight_device="meta",
+    ))
+    stream_prune_magi2_experts(restore_model, pruning_plan, tmp_path, prepare_packed_restore=True)
+    restored = load_magi2_nf4_packed_state(
+        artifact, restore_model, blocksize=64, quant_format="fp8",
+        expected_pruning_digest=pruning_plan.topology_digest(),
+    )[name]
     for key in ("W_gate", "W_up", "W_down"):
         kwargs = dict(device=torch.device("cpu"), dtype=torch.float32)
+        original_rows = pruned_stores[name].materialize_segment(key, 0, 4, **kwargs)
         torch.testing.assert_close(
-            pruned_stores[name].materialize_segment(key, 0, 4, **kwargs),
+            original_rows,
             store.materialize_segment(key, 0, 8, **kwargs)[selected], rtol=0, atol=0,
         )
+        torch.testing.assert_close(restored.materialize_segment(key, 0, 4, **kwargs), original_rows, rtol=0, atol=0)
     from mirai.vendors.magi2_preview.common import magi2_config
     from mirai.vendors.magi2_preview.model import magi2_preview as vendored_model
     from mirai.vendors.magi2_preview.pipeline import preview_data_proxy
@@ -1323,6 +1341,60 @@ def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -
     torch.testing.assert_close(grad, torch.autograd.grad(expected.sum(), x)[0], rtol=0, atol=0)
     with pytest.raises(ValueError, match="does not match requested format"):
         load_magi2_nf4_packed_state(artifact, model(), blocksize=64)
+
+
+def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path) -> None:
+    import json
+
+    def model(*, heads=2, experts=2):
+        return _container(_reduced_moe(
+            device=torch.device("cpu"), dtype=torch.float32, hidden_size=16 * heads,
+            expert_intermediate_size=16, num_heads=heads, num_experts=experts, top_k=1,
+        ))
+
+    source = model()
+    quantize_magi2_experts_in_place(source, quant_format="fp8")
+    artifact = save_magi2_nf4_packed_state(tmp_path / "packed", source)
+    target = model(heads=1, experts=4)
+    with pytest.raises(ValueError, match="head topology"):
+        load_magi2_nf4_packed_state(artifact, target, blocksize=64, quant_format="fp8")
+    assert hasattr(target.mlp.moe_mlp, "W_gate")
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["layers"]["mlp.moe_mlp"]["expert_shapes"]["W_down"][1] += 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    target = model()
+    with pytest.raises(ValueError, match="projection shapes"):
+        load_magi2_nf4_packed_state(artifact, target, blocksize=64, quant_format="fp8")
+    assert hasattr(target.mlp.moe_mlp, "W_down")
+
+
+def test_nf4_restore_rejects_incompatible_statistics_without_mutation() -> None:
+    from mirai.core.models.magi2_preview.quantized_experts import Magi2Nf4ExpertStore
+
+    store = Magi2Nf4ExpertStore(num_groups=2, blocksize=64)
+    buffers = {
+        "W_gate_nf4": torch.zeros(2, 128, dtype=torch.uint8),
+        "W_gate_nf4_absmax": torch.zeros(2, 4, dtype=torch.uint8),
+        "W_gate_nf4_nabsmax": torch.ones(2, 1),
+        "W_gate_nf4_offset": torch.zeros(2),
+        "W_gate_nf4_code": torch.zeros(16),
+        "W_gate_nf4_ncode": torch.zeros(256),
+    }
+    descriptor = {
+        "num_groups": 2, "blocksize": 64, "expert_shapes": {"W_gate": [2, 16, 16]},
+        "expert_dtypes": {"W_gate": "bfloat16"}, "buffers": list(buffers),
+        "nf4_meta": {"blocksize": 64, "nested_blocksize": 256,
+                     "nested_dtype": "float32", "weight_dtype": "bfloat16"},
+    }
+    with pytest.raises(ValueError, match="nf4_absmax"):
+        store.restore_packed_state(
+            descriptor=descriptor, buffers={**buffers, "W_gate_nf4_absmax": torch.zeros(2, 3)},
+            keys=("W_gate",),
+        )
+    assert not store.is_loaded("W_gate")
+    store.restore_packed_state(descriptor=descriptor, buffers=buffers, keys=("W_gate",))
+    assert store.is_loaded("W_gate")
 
 
 @_requires_nf4
