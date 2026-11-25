@@ -1,6 +1,7 @@
 include CONFIG_REFERENCE.md
 include requirements-cu126.txt
 recursive-include assets *.png
+recursive-include notebooks *.ipynb
 recursive-include agent *.md *.json
 recursive-include configs *.toml
 recursive-include inference *.py *.json

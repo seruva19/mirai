@@ -865,3 +865,7 @@ configuration and compatibility rules are documented in
 
 Apache-2.0. Vendored runtime source retains its upstream attribution and license
 notices.
+
+## Google Colab
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/seruva19/mirai/blob/main/notebooks/mirai_demo.ipynb)

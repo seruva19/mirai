@@ -140,6 +140,7 @@
       "paths": [
         "README.md",
         "assets/",
+        "notebooks/",
         "CONFIG_REFERENCE.md",
         "MANIFEST.in",
         "pyproject.toml",
