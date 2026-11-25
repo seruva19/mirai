@@ -2784,6 +2784,7 @@ class CoreMultiHeadMoE(nn.Module):
     ) -> torch.Tensor:
         observer = getattr(self, "_mirai_importance_observer", None)
         pruning_observer = self.get_expert_output_observer()
+        aliases = getattr(self, "_mirai_expert_aliases", None)
         output = torch.zeros_like(x_heads)
         for head in range(int(x_heads.shape[1])):
             head_input = x_heads[:, head]
@@ -2794,9 +2795,10 @@ class CoreMultiHeadMoE(nn.Module):
                 if token_indices.numel() == 0:
                     continue
                 flat_expert = head * self.num_experts + expert
+                physical_expert = flat_expert if aliases is None else aliases[flat_expert]
                 values = head_input.index_select(0, token_indices)
-                gate = values @ self.W_gate[flat_expert]
-                up = values @ self.W_up[flat_expert]
+                gate = values @ self.W_gate[physical_expert]
+                up = values @ self.W_up[physical_expert]
                 gate = gate.float().clamp(max=7.0)
                 up = up.float().clamp(min=-7.0, max=7.0)
                 hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
@@ -2804,7 +2806,7 @@ class CoreMultiHeadMoE(nn.Module):
                 if observer is not None:
                     observer.record(flat_expert, ("w1", "w3"), values)
                     observer.record(flat_expert, "w2", down_input)
-                expert_output = down_input @ self.W_down[flat_expert]
+                expert_output = down_input @ self.W_down[physical_expert]
                 route_weights = topk_probs[head, token_indices, slots]
                 if pruning_observer is not None:
                     positions = (head * x_heads.shape[0] + token_indices) * self.topk + slots
@@ -2837,6 +2839,8 @@ class CoreMultiHeadMoE(nn.Module):
             # when no backend is attached, and it needs CUDA and no autograd
             # graph; otherwise the vendored per-expert loop is the reference.
             kernel_backend = self._mirai_moe_kernel_backend
+            if kernel_backend is not None and getattr(self, "_mirai_expert_aliases", None) is not None:
+                raise RuntimeError("MAGI-2 consolidated experts require native reference execution.")
             pruning_observer = self.get_expert_output_observer()
             if pruning_observer is not None and topk_indices.numel():
                 head_offsets = torch.arange(self.num_heads, device=topk_indices.device) * self.num_experts
@@ -2868,7 +2872,10 @@ class CoreMultiHeadMoE(nn.Module):
         return out.reshape(-1, self.num_heads * self.d_head)
 
     def _native_expert_forward(self, x_heads, topk_probs, topk_indices):
-        if getattr(self, "_mirai_experts_pruned", False) or torch.is_grad_enabled() or x_heads.device.type != "cuda":
+        if (
+            getattr(self, "_mirai_experts_pruned", False) or getattr(self, "_mirai_expert_aliases", None) is not None
+            or torch.is_grad_enabled() or x_heads.device.type != "cuda"
+        ):
             return self._torch_forward(x_heads, topk_probs, topk_indices)
         return self._flash_forward(x_heads, topk_probs, topk_indices)
 

@@ -835,6 +835,47 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
         verify_magi2_pruning_source(transformer, plan)
 
 
+def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head() -> None:
+    from copy import deepcopy
+
+    from mirai.core.models.magi2_preview.expert_pruning import (
+        apply_magi2_hierarchical_merge, build_magi2_hierarchical_merge_plan,
+    )
+    from mirai.core.moe.calibration.prototypes import PrototypeCalibrationEvidence
+
+    layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    reference = deepcopy(layer)
+    transformer = _container(layer)
+    evidence = []
+    for positions in ((0.0, 0.1, 6.0, 6.1), (0.0, 6.0, 0.1, 6.1)):
+        positions = torch.tensor(positions, dtype=torch.float64)
+        evidence.append(PrototypeCalibrationEvidence(
+            torch.ones(4), torch.tensor([1, 3, 2, 2]), (positions[:, None] - positions).abs(),
+            distance_metric="mean_output_euclidean",
+        ))
+    plan = build_magi2_hierarchical_merge_plan(
+        transformer, {"mlp.moe_mlp": tuple(evidence)}, reduction_ratio=0.5,
+    )
+    tokens = torch.randn(5, 2, layer.d_head)
+    before = layer._route(tokens)
+    apply_magi2_hierarchical_merge(transformer, plan)
+    assert layer.num_experts == 4
+    assert layer._mirai_expert_aliases == (0, 0, 1, 1, 2, 3, 2, 3)
+    for current, prior in zip(layer._route(tokens), before, strict=True):
+        torch.testing.assert_close(current, prior, rtol=0, atol=0)
+    with torch.no_grad():
+        for key in ("W_gate", "W_up", "W_down"):
+            source = getattr(reference, key)
+            compact = getattr(layer, key)
+            torch.testing.assert_close(compact[0], 0.25 * source[0] + 0.75 * source[1])
+            assert compact.shape[0] == 4
+            source.copy_(compact[list(layer._mirai_expert_aliases)])
+    torch.testing.assert_close(
+        layer._forward_impl(tokens.flatten(1)), reference._forward_impl(tokens.flatten(1)),
+        rtol=0, atol=0,
+    )
+
+
 def test_magi2_diet_head_replay_matches_native_expert_deletion() -> None:
     from copy import deepcopy
 

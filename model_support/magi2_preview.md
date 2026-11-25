@@ -800,6 +800,12 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   source expert and router tensors against the plan and requires the adapter's
   matching pruning digest. This mode verifies the checkpoint without
   shortening the expert axes and requires dense checkpoint loading.
+- **Head-local hierarchical expert merging** — Experimental Python workflow.
+  Pass one mean-output calibration evidence item per head to
+  `build_magi2_hierarchical_merge_plan` and apply the plan with
+  `apply_magi2_hierarchical_merge` on the original frozen dense model.
+  Clustering and weight averaging operate within each head while routing
+  retains the original expert IDs. The merged model uses reference execution.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group

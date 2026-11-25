@@ -35,6 +35,7 @@ from .quantized_experts import (
 
 if TYPE_CHECKING:
     from mirai.core.moe.calibration.diet import DietCalibrationEvidence, DietGroupTopology, DietLayerCapture, DietODLConfig
+    from mirai.core.moe.calibration.prototypes import HierarchicalOutputMergePlan, PrototypeCalibrationEvidence
 
 
 _SCHEMA = "mirai.magi2_preview.head_expert_pruning"
@@ -48,6 +49,7 @@ def _dense_pruning_layers(transformer: nn.Module) -> dict[str, nn.Module]:
         if (
             layer.ep_size != 1
             or getattr(layer, "_mirai_experts_pruned", False)
+            or getattr(layer, "_mirai_expert_aliases", None) is not None
             or any(layer._parameters.get(key) is None for key in _PARAMETERS)
         ):
             raise ValueError("MAGI-2 pruning requires native dense single-device experts.")
@@ -155,6 +157,84 @@ def _source_fingerprint(layers) -> str:
         for key in _ROUTER_BUFFERS
     })
     return router_tensor_fingerprint(tensors)
+
+
+@dataclass(frozen=True)
+class Magi2ExpertConsolidationPlan:
+    source_weight_fingerprint: str
+    heads_by_layer: dict[str, tuple[HierarchicalOutputMergePlan, ...]]
+
+
+def build_magi2_hierarchical_merge_plan(
+    transformer: nn.Module, evidence: dict[str, tuple[PrototypeCalibrationEvidence, ...]],
+    *, reduction_ratio: float,
+) -> Magi2ExpertConsolidationPlan:
+    from mirai.core.moe.calibration.prototypes import select_hierarchical_output_merge
+
+    layers = _dense_pruning_layers(transformer)
+    if not evidence or set(evidence) - set(layers):
+        raise ValueError("MAGI-2 consolidation evidence must identify routed layers.")
+    heads_by_layer = {}
+    for name, heads in evidence.items():
+        layer = layers[name]
+        if len(heads) != layer.num_heads or any(item.num_experts != layer.num_experts for item in heads):
+            raise ValueError(f"MAGI-2 consolidation evidence has incompatible head topology for {name!r}.")
+        heads_by_layer[name] = tuple(select_hierarchical_output_merge(item, reduction_ratio) for item in heads)
+    return Magi2ExpertConsolidationPlan(
+        _source_fingerprint({name: layers[name] for name in heads_by_layer}), heads_by_layer,
+    )
+
+
+@torch.no_grad()
+def apply_magi2_hierarchical_merge(
+    transformer: nn.Module, plan: Magi2ExpertConsolidationPlan,
+) -> None:
+    """Store merged expert matrices while preserving every logical router row."""
+    from mirai.core.moe.storage.aliases import validate_logical_to_physical
+
+    layers = _dense_pruning_layers(transformer)
+    if not plan.heads_by_layer or set(plan.heads_by_layer) - set(layers):
+        raise ValueError("MAGI-2 consolidation plan does not match model topology.")
+    selected = {name: layers[name] for name in plan.heads_by_layer}
+    if _source_fingerprint(selected) != plan.source_weight_fingerprint:
+        raise ValueError("MAGI-2 consolidation source-weight fingerprint mismatch.")
+    for name, heads in plan.heads_by_layer.items():
+        layer = selected[name]
+        if len(heads) != layer.num_heads or any(
+            item.validate().consolidation.logical_experts != layer.num_experts for item in heads
+        ):
+            raise ValueError(f"MAGI-2 consolidation plan has incompatible head topology for {name!r}.")
+        for item in heads:
+            validate_logical_to_physical(
+                item.consolidation.logical_to_physical,
+                physical_experts=item.consolidation.physical_experts,
+            )
+        if layer._mirai_moe_kernel_backend is not None or any(
+            layer._parameters[key].requires_grad for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+        ):
+            raise ValueError("MAGI-2 consolidation requires frozen experts and native reference execution.")
+    for name, heads in plan.heads_by_layer.items():
+        layer = selected[name]
+        mapping = []
+        clusters = []
+        for head, item in enumerate(heads):
+            aliases = item.consolidation.logical_to_physical
+            mapping.extend(len(clusters) + alias for alias in aliases)
+            for physical in range(item.consolidation.physical_experts):
+                clusters.append([
+                    (head * layer.num_experts + expert, item.merge_weights[expert])
+                    for expert, alias in enumerate(aliases) if alias == physical
+                ])
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            weight = layer._parameters[key]
+            compact = weight.new_empty((len(clusters), *weight.shape[1:]))
+            for physical, members in enumerate(clusters):
+                merged = torch.zeros_like(weight[0], dtype=torch.float32)
+                for expert, coefficient in members:
+                    merged.add_(weight[expert].float(), alpha=coefficient)
+                compact[physical].copy_(merged)
+            setattr(layer, key, nn.Parameter(compact, requires_grad=False))
+        layer._mirai_expert_aliases = tuple(mapping)
 
 
 def build_magi2_expert_pruning_plan(
