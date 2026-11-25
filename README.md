@@ -369,6 +369,8 @@ configuration and compatibility rules are documented in
 - **RAM-to-VRAM block swapping** — Transformer blocks move between host and
   device under an explicit synchronous or overlapped residency policy, for
   training runs and for sampling runs that stream an uncompressed base.
+- **Block-swap host-memory check interval** — Training can configure how often
+  block-swap hooks sample available host RAM.
 - **Explicit disk-backed block streaming** — Frozen tensors from non-resident
   transformer blocks are held in atomic safetensors-backed mappings and loaded
   through the same bounded residency schedule; trainable adapter state remains

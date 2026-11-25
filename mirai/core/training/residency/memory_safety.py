@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 
@@ -15,6 +16,7 @@ class MemorySafetyPolicy:
     # allocate. The ceiling prevents pinned allocation from scaling with all
     # available host memory.
     max_pinned_host_gib: float = 12.0
+    block_swap_memory_check_interval_seconds: float = 0.0
 
 
 _ACTIVE_POLICY = MemorySafetyPolicy()
@@ -32,6 +34,9 @@ def configure_memory_safety(memory_config: Any) -> MemorySafetyPolicy:
         max_pinned_host_gib=float(
             getattr(memory_config, "max_pinned_host_gib", 12.0)
         ),
+        block_swap_memory_check_interval_seconds=float(
+            getattr(memory_config, "block_swap_memory_check_interval_seconds", 0.0)
+        ),
     )
     if not 0.0 < policy.cuda_memory_fraction <= 1.0:
         raise ValueError("memory.cuda_memory_fraction must be in (0, 1].")
@@ -39,6 +44,9 @@ def configure_memory_safety(memory_config: Any) -> MemorySafetyPolicy:
         raise ValueError("memory.minimum_system_memory_gib must be >= 0.")
     if policy.max_pinned_host_gib <= 0.0:
         raise ValueError("memory.max_pinned_host_gib must be > 0.")
+    interval = policy.block_swap_memory_check_interval_seconds
+    if not isfinite(interval) or interval < 0.0:
+        raise ValueError("memory.block_swap_memory_check_interval_seconds must be finite and >= 0.")
     _ACTIVE_POLICY = policy
     try:
         import torch

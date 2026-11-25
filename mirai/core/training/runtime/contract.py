@@ -380,6 +380,11 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
         float(config.memory.minimum_system_memory_gib) >= 0.0,
         "memory.minimum_system_memory_gib must be >= 0.",
     )
+    memory_check_interval = float(config.memory.block_swap_memory_check_interval_seconds)
+    _check(
+        math.isfinite(memory_check_interval) and memory_check_interval >= 0.0,
+        "memory.block_swap_memory_check_interval_seconds must be finite and >= 0.",
+    )
     _check(
         float(config.memory.max_pinned_host_gib) > 0.0,
         "memory.max_pinned_host_gib must be > 0.",

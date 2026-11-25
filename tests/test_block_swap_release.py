@@ -7,9 +7,50 @@ from types import SimpleNamespace
 
 import pytest
 
+from mirai.core.training.residency import block_swap
 from mirai.core.training.residency.block_swap import BlockSwapEvent, BlockSwapManager
+from mirai.core.training.residency.memory_safety import MemorySafetyPolicy
 
 torch = pytest.importorskip("torch")
+
+
+def test_memory_check_interval_retries_failed_check_and_observes_policy_changes(monkeypatch):
+    policy = MemorySafetyPolicy(block_swap_memory_check_interval_seconds=2)
+    now = 0.0
+    available = True
+    calls = []
+
+    def check(*, context):
+        calls.append(context)
+        if not available:
+            raise MemoryError("low memory")
+
+    monkeypatch.setattr(block_swap, "current_memory_safety_policy", lambda: policy)
+    monkeypatch.setattr(block_swap, "monotonic", lambda: now)
+    monkeypatch.setattr(block_swap, "assert_system_memory_headroom", check)
+    manager = BlockSwapManager(total_blocks=1, blocks_to_swap=1)
+    manager.bind([], device="cpu")
+    manager.before_block(0)
+    manager.after_block(0)
+    assert calls == ["block swap bind"]
+
+    now = 2.0
+    available = False
+    for _ in range(2):
+        with pytest.raises(MemoryError, match="low memory"):
+            manager.before_block(0)
+    available = True
+    manager.before_block(0)
+    manager.after_block(0)
+    assert calls[1:] == ["block 0 swap-in"] * 3
+
+    policy = MemorySafetyPolicy(block_swap_memory_check_interval_seconds=5)
+    manager.before_block(0)
+    assert len(calls) == 5
+    policy = MemorySafetyPolicy()
+    manager.before_block(0)
+    manager.after_block(0)
+    assert calls[-2:] == ["block 0 swap-in", "block 0 swap-out"]
 
 
 class _RecordingUnit:

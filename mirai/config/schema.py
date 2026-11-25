@@ -646,6 +646,7 @@ class MemoryConfig:
     moe_kernel_backend: str = "auto"
     cuda_memory_fraction: float = 1.0
     minimum_system_memory_gib: float = 0.0
+    block_swap_memory_check_interval_seconds: float = 0.0
     # Independent page-locked host-memory ceiling for block residency and packed
     # state preload. Over-budget tensors remain in pageable host memory; tensor
     # values and persistence formats are unchanged.
@@ -1387,6 +1388,7 @@ class TrainingConfig:
             "moe_kernel_backend",
             "cuda_memory_fraction",
             "minimum_system_memory_gib",
+            "block_swap_memory_check_interval_seconds",
             "max_pinned_host_gib",
             "trainable_parameter_offload",
             "packed_state_preload",
@@ -3361,6 +3363,9 @@ class TrainingConfig:
             cuda_memory_fraction=float(memory_table.get("cuda_memory_fraction", 1.0)),
             minimum_system_memory_gib=float(
                 memory_table.get("minimum_system_memory_gib", 0.0)
+            ),
+            block_swap_memory_check_interval_seconds=float(
+                memory_table.get("block_swap_memory_check_interval_seconds", 0.0)
             ),
             max_pinned_host_gib=float(
                 memory_table.get("max_pinned_host_gib", 12.0)

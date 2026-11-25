@@ -3334,6 +3334,18 @@ CUDA memory fraction cap ([`memory_safety.py`](mirai/core/training/residency/mem
 
 Floor on **available (free)** host RAM, not a statement of total RAM required. Residency and packed-state paths abort when the free reading falls below this, and the block-swap pinned budget is `min(free_ram - this, max_pinned_host_gib)`. A value near a machine's total RAM aborts on contact. Requires `psutil` when non-zero ([`memory_safety.py`](mirai/core/training/residency/memory_safety.py)).
 
+### `block_swap_memory_check_interval_seconds`
+
+- **Type:** float
+- **Default:** `0.0`
+- **Allowed / range:** finite and >=0
+
+Minimum elapsed time between successful block-swap host-memory checks. Zero
+checks at each swap hook. A positive interval checks immediately at binding
+and when the process memory policy changes. The next eligible swap hook checks
+again after the interval. Packed-state checks and pinned-memory budgets are
+independent of this interval.
+
 ### `max_pinned_host_gib`
 
 - **Type:** float

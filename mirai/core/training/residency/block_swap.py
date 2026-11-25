@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any, Mapping, Sequence
 
 from mirai.core.training.residency.tensor_residency import ImmutableModuleResidency
@@ -87,6 +88,20 @@ class BlockSwapManager:
         self._backward_hooks: list[Any] = []
         self._backward_active = False
         self._flat_ring: FlatRingResidencyPool | None = None
+        self._memory_check_policy = None
+        self._last_memory_check = float("-inf")
+
+    def _check_memory_headroom(self, context: str, *, force: bool = False) -> None:
+        policy = current_memory_safety_policy()
+        interval = policy.block_swap_memory_check_interval_seconds
+        if interval == 0.0:
+            assert_system_memory_headroom(context=context)
+            return
+        now = monotonic()
+        if force or policy is not self._memory_check_policy or now - self._last_memory_check >= interval:
+            assert_system_memory_headroom(context=context)
+            self._memory_check_policy = policy
+            self._last_memory_check = now
 
     def _build_plan(self) -> ResidencyPlan:
         return build_residency_plan(
@@ -130,6 +145,8 @@ class BlockSwapManager:
         return bounded_pin_budget_bytes(available, floor, cap_bytes)
 
     def bind(self, units: list[tuple[int, Any]], *, device: Any) -> None:
+        if current_memory_safety_policy().block_swap_memory_check_interval_seconds:
+            self._check_memory_headroom("block swap bind", force=True)
         if self._device is not None or self._units or self._flat_ring is not None:
             self.release_device()
         for handle in self._backward_hooks:
@@ -298,7 +315,7 @@ class BlockSwapManager:
                 self._prefetch_events[nxt] = event
 
     def before_block(self, block_idx: int) -> None:
-        assert_system_memory_headroom(context=f"block {int(block_idx)} swap-in")
+        self._check_memory_headroom(f"block {int(block_idx)} swap-in")
         idx = int(block_idx)
         if idx < 0 or idx >= self.total_blocks:
             raise IndexError(idx)
@@ -351,7 +368,7 @@ class BlockSwapManager:
         if self.mode == "async" and self._prefetch_q:
             done = self._prefetch_q.popleft()
             self.events.append(BlockSwapEvent(kind="prefetch_done", block_idx=done))
-        assert_system_memory_headroom(context=f"block {idx} swap-out")
+        self._check_memory_headroom(f"block {idx} swap-out")
 
     def snapshot(self) -> dict[str, Any]:
         return {

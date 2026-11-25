@@ -599,6 +599,38 @@
       "promotion_evidence": ""
     },
     {
+      "name": "block_swap_memory_check_interval",
+      "kind": "runtime_guard",
+      "owner": "mirai/core/training/residency/block_swap.py",
+      "check": "residency",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "documentation"
+      ],
+      "symbols": [
+        "BlockSwapManager"
+      ],
+      "config_keys": [
+        "memory.block_swap_memory_check_interval_seconds"
+      ],
+      "disabled_config": {
+        "memory.block_swap_memory_check_interval_seconds": 0.0
+      },
+      "contract_paths": [
+        "tests/test_block_swap_release.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Block-swap host-memory check interval",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "bounded_h2d_residency_ring",
       "kind": "residency",
       "owner": "mirai/core/training/residency/h2d_ring_residency.py",
