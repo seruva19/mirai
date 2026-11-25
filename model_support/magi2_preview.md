@@ -310,6 +310,11 @@ exact FP32 SwiGLU7 forward and backward pointwise operations on CUDA.
 
 ## Training
 
+With `training.compile = true` and `training.compile_scope = "regional"`,
+MAGI-2 Preview compiles the three multi-stream hyper-connection (mHC)
+regions in each transformer layer. The layer call, weight-residency hooks,
+attention dispatch, and routed expert dispatch execute outside these regions.
+
 Use [`configs/magi2_preview/train_offload.toml`](../configs/magi2_preview/train_offload.toml),
 which selects the offload preset and sets `model.path`, the dataset, and the
 output directory:

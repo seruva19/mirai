@@ -2526,10 +2526,10 @@ class Attention(nn.Module):
         qkv = self.linear_qkv(x, modality_dispatcher=modality_dispatcher)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=1)
 
-        q = q.view(hidden_states.size(0), self.num_heads_q, self.head_dim).clone()
-        k = k.view(hidden_states.size(0), self.num_heads_kv, self.head_dim).clone()
+        q = q.view(hidden_states.size(0), self.num_heads_q, self.head_dim)
+        k = k.view(hidden_states.size(0), self.num_heads_kv, self.head_dim)
         v = v.view(hidden_states.size(0), self.num_heads_kv, self.head_dim)
-        g = g.view(hidden_states.size(0), self.num_heads_q, 1).clone()
+        g = g.view(hidden_states.size(0), self.num_heads_q, 1)
 
         q = self.q_norm(q, modality_dispatcher=modality_dispatcher)
         k = self.k_norm(k, modality_dispatcher=modality_dispatcher)

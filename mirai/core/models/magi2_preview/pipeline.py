@@ -59,6 +59,7 @@ from mirai.core.training.residency.tensor_residency import (
     move_tensors_outside_modules,
     move_trainable_tensors,
 )
+from mirai.core.training.runtime.compilation import CompilationRegion
 
 
 # Hidden width of the Qwen3.5 text encoder shipped with the MAGI-2 snapshot;
@@ -1061,6 +1062,23 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
     def get_block_swap_units(self) -> list[tuple[int, Any]]:
         return list(enumerate(self.transformer.block.layers))
+
+    def get_compilation_regions(self) -> list[CompilationRegion]:
+        # The layer call and its residency hooks stay eager. Packed attention
+        # and routed experts own their dispatch and synchronization boundaries.
+        return [
+            CompilationRegion(
+                name=f"transformer.block.layers.{index}.{method}",
+                owner=layer,
+                attribute=method,
+            )
+            for index, layer in self.get_block_swap_units()
+            for method in (
+                "_forward_mhc_pre_attn",
+                "_forward_mhc_attn_to_mlp",
+                "_forward_mhc_post_mlp",
+            )
+        ]
 
     def set_weight_residency_strategy(
         self,

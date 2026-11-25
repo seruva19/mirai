@@ -59,6 +59,91 @@ def _cloned(tensors: tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
     return [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
 
 
+def test_magi2_regional_mhc_matches_eager_with_attention_views(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewPipeline
+    from mirai.core.training.runtime.compilation import (
+        CompilationPolicy,
+        prepare_training_compilation,
+    )
+    from mirai.vendors.magi2_preview.common.magi2_config import MHCConfig, ModelConfig, MoEConfig
+    from mirai.vendors.magi2_preview.model.magi2_preview import (
+        ModalityDispatcher,
+        MultiModalityRMSNorm,
+        TransformerLayer,
+    )
+
+    monkeypatch.setenv("MAGI2_MHC_BACKEND", "torch")
+    torch.manual_seed(97)
+    config = ModelConfig(
+        num_layers=1, hidden_size=32, head_dim=16, num_heads_q=2,
+        num_heads_kv=1, num_query_groups=1, mm_layers=[],
+        mhc_config=MHCConfig(num_stream=2),
+        moe_config=MoEConfig(moe_layers=[]),
+    )
+    layer = TransformerLayer(config, 0)
+    with torch.no_grad():
+        for parameter in layer.parameters():
+            parameter.normal_(std=0.04)
+    # Exercise Dynamo without requiring an Inductor build toolchain.
+    for norm in layer.modules():
+        if isinstance(norm, MultiModalityRMSNorm):
+            original = type(norm)._forward_single_expert_torch_impl.__wrapped__
+            monkeypatch.setattr(norm, "_forward_single_expert_torch_impl", original.__get__(norm))
+    monkeypatch.setattr(layer.mlp, "activation_func", layer.mlp.activation_func.__wrapped__)
+
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = SimpleNamespace(block=SimpleNamespace(layers=[layer]))
+    compile_fn = torch.compile
+    graphs = []
+
+    def capture(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    monkeypatch.setattr(torch, "compile", lambda target, **kw: compile_fn(target, backend=capture, **kw))
+    clones = [
+        norm.register_forward_pre_hook(lambda _module, args: (args[0].clone(),))
+        for norm in (layer.attention.q_norm, layer.attention.k_norm)
+    ]
+    cases = [torch.randn(tokens, 64, dtype=torch.bfloat16) for tokens in (5, 7)]
+
+    def run(value):
+        tokens = value.shape[0]
+        x = value.detach().requires_grad_()
+        offsets = torch.tensor([0, tokens], dtype=torch.int32)
+        output = layer(
+            x,
+            torch.cat((torch.zeros(1, tokens, 8), torch.ones(1, tokens, 8)), dim=-1),
+            VarlenHandler(offsets, offsets, tokens, tokens),
+            ModalityDispatcher(torch.zeros(tokens, dtype=torch.int64), num_modalities=1),
+            torch.tensor([tokens]),
+        )
+        loss = output.float().square().mean()
+        gradients = torch.autograd.grad(loss, (x, layer.attention.sinks))
+        return output.detach(), loss.detach(), *gradients
+
+    expected = [run(value) for value in cases]
+    for handle in clones:
+        handle.remove()
+    forward = layer.forward
+    session = prepare_training_compilation(
+        pipeline=pipeline, policy=CompilationPolicy(enabled=True, dynamic=True)
+    )
+    assert session.enabled, session.warning
+    assert len(session.regions) == 3
+    assert layer.forward == forward
+    try:
+        for value, reference in zip(cases, expected):
+            for actual, wanted in zip(run(value), reference):
+                torch.testing.assert_close(actual, wanted)
+        assert len(graphs) >= 3
+    finally:
+        session.disable(warning="test complete")
+
+
 @pytest.mark.parametrize("sink_tokens", (1, 2))
 @pytest.mark.parametrize("softcap", (-1.0, 8.0))
 @pytest.mark.parametrize("offsets", (CU_SEQLENS, torch.tensor([0, 12])))
