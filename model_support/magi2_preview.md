@@ -731,7 +731,10 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   Assignments can use BF16, NF4, IQ2, IQ3, FP8, and NVFP4. The plan's
   source-weight fingerprint covers each `<layer>.W_gate`, `<layer>.W_down`,
   and `<layer>.W_up` tensor. Load the original dense checkpoint with
-  `memory.quantize_experts_on_load = false`.
+  `memory.quantize_experts_on_load = false` when applying the plan. The packed
+  exporter saves the resolved assignments and plan lineage as a version 5
+  artifact. Restore it with the same base quantization setting and
+  `memory.frozen_weight_packed_state_path`, with the plan path unset.
 - **Additional MAGI-2 packed expert formats** — Experimental IQ2, IQ3, FP8,
   and NVFP4 storage for frozen routed experts. These formats use version 4
   packed artifacts and the same segmented dequantization and frozen-weight

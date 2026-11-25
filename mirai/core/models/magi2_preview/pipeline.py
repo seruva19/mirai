@@ -984,7 +984,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return {
             "strategy": "compressed_weights",
             "quant_format": stores[0].quant_format,
-            "mixed_precision": bool(getattr(self, "_applied_expert_precision_plan", "")),
+            "mixed_precision": bool(getattr(stores[0], "is_mixed_precision", False)),
             "linear_modules": 0,
             "grouped_expert_modules": len(stores),
             "quantized_tensors": sum(

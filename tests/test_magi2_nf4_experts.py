@@ -757,6 +757,25 @@ def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tm
     selected = store.materialize_segment("W_gate", 0, 3, group_ids=selection, **kwargs)
     torch.testing.assert_close(selected, whole[selection], rtol=0, atol=0)
     assert not hasattr(layer, "W_gate")
+    artifact = save_magi2_nf4_packed_state(tmp_path / "packed", model)
+    restored_model = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
+        expert_intermediate_size=16, num_heads=1, num_experts=3, top_k=1,
+    ))
+    restored = load_magi2_nf4_packed_state(
+        artifact, restored_model, blocksize=64, quant_format="fp8"
+    )[module_name]
+    assert restored.lineage == store.lineage
+    for key in weights:
+        expected = store.materialize_segment(key, 0, 3, group_ids=selection, **kwargs)
+        actual = restored.materialize_segment(key, 0, 3, group_ids=selection, **kwargs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["layers"][module_name]["formats"]["W_gate"][0] = "bf16"
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="bucket inventory"):
+        load_magi2_nf4_packed_state(artifact, restored_model, blocksize=64, quant_format="fp8")
 
 
 @pytest.mark.parametrize("fmt", ["gguf_iq2", "gguf_iq3", "fp8", "nvfp4"])

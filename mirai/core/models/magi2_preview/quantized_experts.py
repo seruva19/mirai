@@ -163,9 +163,9 @@ class Magi2Nf4ExpertStore(nn.Module):
         """NF4 block size encoded by this store."""
         return self._blocksize
 
-    def packed_state_descriptor(self) -> dict[str, object]:
+    def packed_state_descriptor(self, *, keys=MAGI2_ROUTED_EXPERT_TENSOR_NAMES) -> dict[str, object]:
         """Version-independent metadata needed to restore this exact payload."""
-        if not self.is_fully_loaded() or self._meta is None:
+        if not all(self.is_loaded(key) for key in keys) or self._meta is None:
             raise Magi2QuantizedExpertError(
                 "MAGI-2 NF4 store must be complete before it can be persisted."
             )
@@ -175,11 +175,11 @@ class Magi2Nf4ExpertStore(nn.Module):
             "blocksize": self._blocksize,
             "expert_shapes": {
                 key: list(self.expert_weight_shape(key))
-                for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+                for key in keys
             },
             "expert_dtypes": {
                 key: str(self.expert_weight_dtype(key)).removeprefix("torch.")
-                for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
+                for key in keys
             },
             "nf4_meta": {
                 "blocksize": meta.blocksize,
@@ -223,6 +223,7 @@ class Magi2Nf4ExpertStore(nn.Module):
         *,
         descriptor: dict[str, object],
         buffers: dict[str, torch.Tensor],
+        keys=MAGI2_ROUTED_EXPERT_TENSOR_NAMES,
     ) -> None:
         """Restore a validated persisted payload without dense reconstruction."""
         if int(descriptor.get("num_groups", -1)) != self.num_groups:
@@ -246,7 +247,7 @@ class Magi2Nf4ExpertStore(nn.Module):
             raise Magi2QuantizedExpertError(
                 "Packed MAGI-2 store has incomplete tensor metadata."
             )
-        expected_names = set(MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
+        expected_names = set(keys)
         if set(shapes) != expected_names or set(dtypes) != expected_names:
             raise Magi2QuantizedExpertError(
                 "Packed MAGI-2 store has incomplete expert metadata."
@@ -552,8 +553,8 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
             suffixes += ("scales", "global_scale")
         return tuple(f"{key}_{suffix}" for suffix in suffixes)
 
-    def expected_buffers(self) -> set[str]:
-        return {name for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES for name in self._buffer_names(key)}
+    def expected_buffers(self, *, keys=MAGI2_ROUTED_EXPERT_TENSOR_NAMES) -> set[str]:
+        return {name for key in keys for name in self._buffer_names(key)}
 
     def _nvfp4_meta(self, shape):
         return MicroscalingMeta("nvfp4", 16, shape, (-prod(shape)) % 16)
@@ -576,29 +577,29 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         self._shapes[key] = tuple(source.shape)
         self._dtypes[key] = source.dtype
 
-    def packed_state_descriptor(self) -> dict[str, object]:
-        if not self.is_fully_loaded():
+    def packed_state_descriptor(self, *, keys=MAGI2_ROUTED_EXPERT_TENSOR_NAMES) -> dict[str, object]:
+        if not all(self.is_loaded(key) for key in keys):
             raise Magi2QuantizedExpertError("MAGI-2 packed store is incomplete.")
         return {
             "num_groups": self.num_groups,
             "expert_shapes": self._shapes,
             "expert_dtypes": {key: str(dtype).removeprefix("torch.") for key, dtype in self._dtypes.items()},
-            "buffers": sorted(self.expected_buffers()),
+            "buffers": sorted(self.expected_buffers(keys=keys)),
         }
 
-    def restore_packed_state(self, *, descriptor, buffers) -> None:
+    def restore_packed_state(self, *, descriptor, buffers, keys=MAGI2_ROUTED_EXPERT_TENSOR_NAMES) -> None:
         shapes, dtypes = descriptor.get("expert_shapes"), descriptor.get("expert_dtypes")
-        keys = set(MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
+        key_set = set(keys)
         if (
             descriptor.get("num_groups") != self.num_groups
-            or set(buffers) != self.expected_buffers()
-            or not isinstance(shapes, dict) or set(shapes) != keys
-            or not isinstance(dtypes, dict) or set(dtypes) != keys
+            or set(buffers) != self.expected_buffers(keys=keys)
+            or not isinstance(shapes, dict) or set(shapes) != key_set
+            or not isinstance(dtypes, dict) or set(dtypes) != key_set
         ):
             raise Magi2QuantizedExpertError("Invalid MAGI-2 packed expert metadata or inventory.")
         restored_shapes = {}
         restored_dtypes = {}
-        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+        for key in keys:
             shape = tuple(shapes[key])
             dtype = getattr(torch, str(dtypes[key]), None)
             if (

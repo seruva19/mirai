@@ -3092,6 +3092,7 @@
         "default_path",
         "gradients",
         "resource_bound",
+        "persistence",
         "documentation"
       ],
       "symbols": [
@@ -3107,7 +3108,7 @@
         "tests/test_magi2_nf4_experts.py"
       ],
       "default_off": true,
-      "stateful": false,
+      "stateful": true,
       "optimized": false,
       "reference_path": "",
       "readme_claim": "Mixed MAGI-2 expert precision",

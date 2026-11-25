@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
+import json
+from math import prod
+
 import torch
 from torch import nn
 
 from .quantized_experts import (
     MAGI2_PACKED_EXPERT_FORMATS,
     MAGI2_NF4_STORE_ATTR,
+    MAGI2_NF4_CODE_FIELDS,
+    MAGI2_NF4_GROUP_FIELDS,
     MAGI2_ROUTED_EXPERT_TENSOR_NAMES,
     Magi2Nf4ExpertStore,
     _new_expert_store,
@@ -31,12 +37,14 @@ class _Bf16Groups(nn.Module):
 
 class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
     """Compact format buckets with a stable mapping to the logical group IDs."""
+    is_mixed_precision = True
 
-    def __init__(self, *, num_groups: int, blocksize: int, base_format: str, formats) -> None:
+    def __init__(self, *, num_groups: int, blocksize: int, base_format: str, formats, lineage) -> None:
         super().__init__(num_groups=num_groups, blocksize=blocksize)
         self.quant_format = base_format
         self.buckets = nn.ModuleDict()
         self._formats = {key: tuple(value) for key, value in formats.items()}
+        self.lineage = dict(lineage)
         self._locations: dict[str, tuple[tuple[str, int], ...]] = {}
 
     @torch.no_grad()
@@ -84,7 +92,107 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
         return output
 
     def packed_state_descriptor(self):
-        raise ValueError("Mixed-precision MAGI-2 stores currently require the original dense checkpoint and precision plan.")
+        specs = {}
+        for key, formats in self._formats.items():
+            for fmt in sorted(set(formats)):
+                name = f"{key}_{fmt}"
+                bucket = self.buckets[name]
+                specs[name] = (
+                    {"buffers": ["weight"]}
+                    if fmt == "bf16"
+                    else bucket.packed_state_descriptor(keys=(key,))
+                )
+        return {
+            "num_groups": self.num_groups,
+            "blocksize": self.blocksize,
+            "expert_shapes": self._shapes,
+            "expert_dtypes": {key: str(dtype).removeprefix("torch.") for key, dtype in self._dtypes.items()},
+            "formats": self._formats,
+            "bucket_specs": specs,
+            "lineage": self.lineage,
+        }
+
+    @classmethod
+    def from_packed_state(cls, *, descriptor, buffers, blocksize, base_format, group_shapes):
+        formats, specs, lineage = (
+            descriptor.get("formats"), descriptor.get("bucket_specs"), descriptor.get("lineage"),
+        )
+        keys = set(MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
+        groups = group_shapes["W_gate"][0]
+        if (
+            not isinstance(formats, dict) or set(formats) != keys or not isinstance(specs, dict)
+            or descriptor.get("num_groups") != groups or descriptor.get("blocksize") != blocksize
+            or not isinstance(lineage, dict) or not all(
+                isinstance(lineage.get(key), str) and lineage[key].strip()
+                for key in ("plan_sha256", "source_weight_fingerprint", "model_snapshot_id", "dataset_snapshot_id", "config_snapshot_id")
+            )
+        ):
+            raise ValueError("Invalid mixed MAGI-2 artifact topology or lineage.")
+        if any(
+            not isinstance(values, list) or len(values) != groups
+            or any(not isinstance(fmt, str) or fmt not in _SUPPORTED_FORMATS for fmt in values)
+            for values in formats.values()
+        ):
+            raise ValueError("Invalid mixed MAGI-2 format assignments.")
+        if set(specs) != {f"{key}_{fmt}" for key, values in formats.items() for fmt in set(values)}:
+            raise ValueError("Invalid mixed MAGI-2 bucket inventory.")
+        store = cls(num_groups=groups, blocksize=blocksize, base_format=base_format, formats=formats, lineage=lineage)
+        consumed = set()
+        for key, values in formats.items():
+            shape = group_shapes[key]
+            dtype = getattr(torch, str(descriptor["expert_dtypes"][key]), None)
+            if tuple(descriptor["expert_shapes"][key]) != shape or dtype not in {torch.float32, torch.float16, torch.bfloat16}:
+                raise ValueError("Mixed MAGI-2 projection shape or dtype is invalid.")
+            locations = [None] * groups
+            for fmt in sorted(set(values)):
+                ids = [index for index, value in enumerate(values) if value == fmt]
+                name = f"{key}_{fmt}"
+                spec = specs[name]
+                names = spec["buffers"]
+                prefix = f"buckets.{name}."
+                fields = {buffer: buffers[prefix + buffer] for buffer in names}
+                consumed.update(prefix + buffer for buffer in names)
+                bucket_shape = (len(ids), *shape[1:])
+                if fmt == "bf16":
+                    if set(fields) != {"weight"} or fields["weight"].shape != bucket_shape or fields["weight"].dtype != torch.bfloat16:
+                        raise ValueError("Invalid BF16 bucket in a mixed MAGI-2 artifact.")
+                    bucket = _Bf16Groups(fields["weight"])
+                else:
+                    bucket = _new_expert_store(num_groups=len(ids), blocksize=blocksize, quant_format=fmt)
+                    if tuple(spec["expert_shapes"][key]) != bucket_shape or spec["expert_dtypes"][key] != descriptor["expert_dtypes"][key]:
+                        raise ValueError("Mixed MAGI-2 bucket shape or dtype mismatch.")
+                    if fmt == "nf4":
+                        _validate_nf4_bucket(key, fields, spec, bucket_shape, blocksize)
+                    bucket.restore_packed_state(descriptor=spec, buffers=fields, keys=(key,))
+                store.buckets[name] = bucket
+                for position, index in enumerate(ids):
+                    locations[index] = (name, position)
+            store._locations[key] = tuple(locations)
+            store._shapes[key] = shape
+            store._dtypes[key] = dtype
+        if consumed != set(buffers):
+            raise ValueError("Mixed MAGI-2 artifact has unexpected packed buffers.")
+        return store
+
+
+def _validate_nf4_bucket(key, fields, spec, shape, blocksize):
+    expected = {f"{key}_{suffix}" for suffix in (*MAGI2_NF4_GROUP_FIELDS, *MAGI2_NF4_CODE_FIELDS)}
+    if set(fields) != expected:
+        raise ValueError("Invalid NF4 mixed MAGI-2 bucket inventory.")
+    meta = spec["nf4_meta"]
+    nested = meta["nested_blocksize"]
+    if meta["blocksize"] != blocksize or type(nested) is not int or nested < 1:
+        raise ValueError("Invalid mixed MAGI-2 NF4 block metadata.")
+    groups, *matrix = shape
+    elements = prod(matrix)
+    count = (elements + blocksize - 1) // blocksize
+    sizes = ((elements + 1) // 2, count, (count + nested - 1) // nested, 1)
+    for suffix, size in zip(MAGI2_NF4_GROUP_FIELDS, sizes, strict=True):
+        value = fields[f"{key}_{suffix}"]
+        if value.ndim < 1 or value.shape[0] != groups or value.numel() != groups * size:
+            raise ValueError("Invalid mixed MAGI-2 NF4 field shape.")
+    if fields[f"{key}_nf4_code"].numel() != 16 or fields[f"{key}_nf4_ncode"].numel() != 256:
+        raise ValueError("Invalid mixed MAGI-2 NF4 codebook size.")
 
 
 def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksize):
@@ -113,12 +221,15 @@ def quantize_magi2_mixed_experts(transformer, *, plan_path, base_format, blocksi
     if router_tensor_fingerprint(source_tensors) != plan.source_weight_fingerprint:
         raise ValueError("MAGI-2 precision plan does not match the source-weight fingerprint.")
     del source_tensors
+    plan_payload = plan.to_dict()
+    lineage = {key: value for key, value in plan_payload.items() if key.endswith("_snapshot_id") or key == "source_weight_fingerprint"}
+    lineage["plan_sha256"] = sha256(json.dumps(plan_payload, sort_keys=True).encode()).hexdigest()
 
     stores = {}
     for name, layer in layers.items():
         store = Magi2MixedExpertStore(
             num_groups=int(layer.local_flatten_num_experts), blocksize=blocksize,
-            base_format=base_format, formats=assignments[name],
+            base_format=base_format, formats=assignments[name], lineage=lineage,
         )
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             store.quantize_dense(key, layer._parameters[key])
