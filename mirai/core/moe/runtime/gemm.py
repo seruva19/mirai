@@ -48,7 +48,7 @@ except ModuleNotFoundError:  # pragma: no cover - torch-less static analysis
     torch = None  # type: ignore[assignment]
 
 
-MOE_GEMM_BACKENDS = ("auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8")
+MOE_GEMM_BACKENDS = ("auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8", "scaled_mm_fp8")
 MOE_GEMM_ROLES = ("forward", "dx", "dw")
 
 # Accepted spellings that normalize onto a canonical backend name. Kept small and
@@ -217,6 +217,15 @@ def probe_backend(name: str, *, device=None) -> BackendProbe:
                 f"SM{capability[0]}{capability[1]}",
             )
         return BackendProbe(name, True, "DeepGEMM M-grouped block-scaled FP8")
+    if name == "scaled_mm_fp8":
+        if not callable(getattr(torch, "_scaled_mm", None)) or not hasattr(torch, "float8_e4m3fn"):
+            return BackendProbe(name, False, "scaled_mm_fp8 requires PyTorch FP8 scaled matmul")
+        if device is not None and getattr(device, "type", None) != "cuda":
+            return BackendProbe(name, False, "scaled_mm_fp8 requires a CUDA device")
+        capability = _cuda_capability(device)
+        if capability is None or capability < (8, 9):
+            return BackendProbe(name, False, "scaled_mm_fp8 requires CUDA SM89 or newer")
+        return BackendProbe(name, True, "PyTorch FP8 scaled matmul with FP32 accumulation")
     # torch_grouped
     if grouped_mm_op() is None:
         return BackendProbe(
@@ -536,9 +545,9 @@ def resolve_moe_gemm_backend(role: str, *, device=None) -> str:
     backend = _role_backend(role)
     if backend == "":
         backend = _main_backend()
-    if backend == "deepgemm_fp8" and role != "forward":
+    if backend in {"deepgemm_fp8", "scaled_mm_fp8"} and role != "forward":
         raise RuntimeError(
-            "deepgemm_fp8 is a forward-only backend; frozen-weight Dgrad remains "
+            f"{backend} is a forward-only backend; frozen-weight Dgrad remains "
             "high precision and adapter gradients remain in the adapter path."
         )
     if backend != "auto" and device is not None:
@@ -560,7 +569,7 @@ def describe(*, device=None) -> dict:
         "roles": {role: resolve_moe_gemm_backend(role) for role in MOE_GEMM_ROLES},
         "backends": {
             name: {"available": probe.available, "reason": probe.reason}
-            for name in ("bmm", "persistent", "torch_grouped", "deepgemm_fp8")
+            for name in ("bmm", "persistent", "torch_grouped", "deepgemm_fp8", "scaled_mm_fp8")
             for probe in (probe_backend(name, device=device),)
         },
         "grouped_mm": {

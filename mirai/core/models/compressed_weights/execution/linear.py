@@ -766,11 +766,14 @@ class CompressedLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._quant_format in BLOCKWISE_FP8_FORMATS:
+            from mirai.core.moe.runtime.gemm import resolve_moe_gemm_backend
+
             output = blockwise_fp8_linear(
                 x,
                 self.weight_fp8,
                 self.weight_fp8_scale,
                 self._blockwise_fp8_meta,
+                native=resolve_moe_gemm_backend("forward") == "scaled_mm_fp8",
             )
             bias = (
                 self.bias.to(device=x.device, dtype=x.dtype)

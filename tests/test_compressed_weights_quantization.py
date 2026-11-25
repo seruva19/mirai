@@ -471,6 +471,53 @@ class CompressedWeightQuantizationTests(unittest.TestCase):
         torch.testing.assert_close(observed, expected, rtol=0.0, atol=0.0)
         torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0.0, atol=0.0)
 
+    def test_scaled_mm_fp8_preserves_block_scaling_and_reference_dgrad(self) -> None:
+        from types import SimpleNamespace
+
+        torch.manual_seed(151)
+        weight = torch.randn(133, 259)
+        codes, scales, meta = quantize_blockwise_fp8_weight(weight)
+        inputs = torch.randn(5, 259, requires_grad=True)
+        other = inputs.detach().clone().requires_grad_()
+        calls = []
+
+        def scaled_mm(left, right, *, scale_a, scale_b, out_dtype, use_fast_accum):
+            self.assertEqual(left.dtype, torch.float8_e4m3fn)
+            self.assertEqual(right.dtype, torch.float8_e4m3fn)
+            self.assertEqual(left.stride(1), 1)
+            self.assertEqual(right.stride(0), 1)
+            self.assertEqual(out_dtype, torch.float32)
+            self.assertFalse(use_fast_accum)
+            calls.append(left.shape[-1])
+            return (left.float() @ right.float()) * scale_a * scale_b
+
+        expected = blockwise_fp8_linear(inputs, codes, scales, meta)
+        with patch("mirai.core.moe.runtime.gemm.probe_backend", return_value=SimpleNamespace(available=True)), patch.object(
+            torch, "_scaled_mm", side_effect=scaled_mm
+        ):
+            actual = blockwise_fp8_linear(other, codes, scales, meta, native=True)
+        self.assertEqual(calls, [128, 128, 128])
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-5)
+        grad = torch.randn_like(actual)
+        actual.backward(grad)
+        expected.backward(grad)
+        torch.testing.assert_close(other.grad, inputs.grad, rtol=0, atol=0)
+
+    def test_scaled_mm_fp8_native_cuda_matches_reference(self) -> None:
+        from mirai.core.moe.runtime.gemm import probe_backend
+
+        device = torch.device("cuda")
+        verdict = probe_backend("scaled_mm_fp8", device=device)
+        if not verdict.available:
+            self.skipTest(verdict.reason)
+        torch.manual_seed(157)
+        weight = torch.randn(133, 259, device=device)
+        codes, scales, meta = quantize_blockwise_fp8_weight(weight)
+        inputs = torch.randn(5, 259, device=device)
+        expected = blockwise_fp8_linear(inputs, codes, scales, meta)
+        actual = blockwise_fp8_linear(inputs, codes, scales, meta, native=True)
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-3)
+
     def test_blockwise_fp8_matches_e4m3_tile_oracle_and_high_precision_dgrad(
         self,
     ) -> None:

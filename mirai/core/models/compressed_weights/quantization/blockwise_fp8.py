@@ -175,10 +175,14 @@ def _blockwise_fp8_matmul_2d(
     codes: "torch.Tensor",
     scales: "torch.Tensor",
     meta: BlockwiseFP8Meta,
+    *,
+    native: bool = False,
 ) -> "torch.Tensor":
     _validate_blockwise_fp8_layout(codes, scales, meta)
     if int(x_2d.shape[-1]) != meta.shape[1]:
         raise ValueError("blockwise FP8 activation width does not match the weight.")
+    if x_2d.shape[0] == 0:
+        return x_2d.new_empty((0, meta.shape[0]), dtype=torch.float32)
     padded_out, padded_in = _padded_shape(meta)
     block = BLOCKWISE_FP8_BLOCK_SIZE
     activation_codes, activation_scales = _quantize_activation_tiles(
@@ -195,7 +199,19 @@ def _blockwise_fp8_matmul_2d(
         device=x_2d.device,
     )
     output_scales = scales.to(device=x_2d.device).repeat_interleave(block, dim=-2)
+    unit_scale = torch.ones(1, device=x_2d.device, dtype=torch.float32) if native else None
     for k_block in range(padded_in // block):
+        if native:
+            left = activation_codes[:, k_block].contiguous().view(torch.float8_e4m3fn)
+            right = weight_codes[:, k_block * block : (k_block + 1) * block].contiguous()
+            right = right.view(torch.float8_e4m3fn).transpose(0, 1)
+            partial = torch._scaled_mm(
+                left, right, scale_a=unit_scale, scale_b=unit_scale,
+                out_dtype=torch.float32, use_fast_accum=False,
+            )
+            partial.mul_(activation_scales[:, k_block, None])
+            accumulator.addcmul_(partial, output_scales[:, k_block][None, :])
+            continue
         activation = (
             _decode_e4m3(activation_codes[:, k_block])
             * activation_scales[:, k_block].unsqueeze(-1)
@@ -211,13 +227,14 @@ if torch is not None:
 
     class _BlockwiseFP8Linear(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, inputs, codes, scales, meta):
+        def forward(ctx, inputs, codes, scales, meta, native):
             leading = tuple(int(dim) for dim in inputs.shape[:-1])
             output = _blockwise_fp8_matmul_2d(
                 inputs.reshape(-1, inputs.shape[-1]),
                 codes,
                 scales,
                 meta,
+                native=native,
             )
             ctx.save_for_backward(codes, scales)
             ctx.meta = meta
@@ -235,7 +252,7 @@ if torch is not None:
                 device=grad_output.device,
             )
             grad_input = grad_output.float() @ weight
-            return grad_input.to(dtype=ctx.input_dtype), None, None, None
+            return grad_input.to(dtype=ctx.input_dtype), None, None, None, None
 
 
 def blockwise_fp8_linear(
@@ -243,10 +260,18 @@ def blockwise_fp8_linear(
     codes: "torch.Tensor",
     scales: "torch.Tensor",
     meta: BlockwiseFP8Meta,
+    *,
+    native: bool = False,
 ) -> "torch.Tensor":
     """W8A8 reference linear with a high-precision frozen-weight Dgrad."""
     _require_torch()
-    return _BlockwiseFP8Linear.apply(inputs, codes, scales, meta)
+    if native:
+        from mirai.core.moe.runtime.gemm import probe_backend
+
+        status = probe_backend("scaled_mm_fp8", device=inputs.device)
+        if not status.available:
+            raise RuntimeError(status.reason)
+    return _BlockwiseFP8Linear.apply(inputs, codes, scales, meta, native)
 
 
 def blockwise_fp8_batched_linear(
@@ -254,6 +279,8 @@ def blockwise_fp8_batched_linear(
     codes: "torch.Tensor",
     scales: "torch.Tensor",
     meta: BlockwiseFP8Meta,
+    *,
+    native: bool = False,
 ) -> "torch.Tensor":
     """Apply the reference linear to matching leading expert batches."""
     _require_torch()
@@ -263,7 +290,7 @@ def blockwise_fp8_batched_linear(
         raise ValueError("batched blockwise FP8 expert axes must match.")
     return torch.stack(
         [
-            blockwise_fp8_linear(inputs[index], codes[index], scales[index], meta)
+            blockwise_fp8_linear(inputs[index], codes[index], scales[index], meta, native=native)
             for index in range(int(inputs.shape[0]))
         ],
         dim=0,

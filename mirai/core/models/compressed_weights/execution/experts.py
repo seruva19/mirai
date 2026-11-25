@@ -1354,15 +1354,16 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
             expert_indices,
             device=x.device,
         )
-        if resolve_moe_gemm_backend("forward", device=x.device) == "deepgemm_fp8":
+        backend = resolve_moe_gemm_backend("forward", device=x.device)
+        if backend == "deepgemm_fp8":
             from ..quantization.deepgemm_fp8 import (
                 deepgemm_blockwise_fp8_batched_linear,
             )
 
             return deepgemm_blockwise_fp8_batched_linear(x, codes, scales, meta)
         if len(expert_indices) == 1 and x.ndim == 2:
-            return blockwise_fp8_linear(x, codes[0], scales[0], meta)
-        return blockwise_fp8_batched_linear(x, codes, scales, meta)
+            return blockwise_fp8_linear(x, codes[0], scales[0], meta, native=backend == "scaled_mm_fp8")
+        return blockwise_fp8_batched_linear(x, codes, scales, meta, native=backend == "scaled_mm_fp8")
 
     def _microscaling_dequantize_expert(
         self,
@@ -2212,7 +2213,7 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         # forward role selects (independent per-role wiring is a documented
         # backend contract in moe/runtime/gemm.py).
         forward_backend = resolve_moe_gemm_backend("forward", device=tokens.device)
-        if forward_backend == "bmm":
+        if forward_backend in {"bmm", "scaled_mm_fp8"}:
             runner = self._run_direct_routed_batched_vectorized
         elif forward_backend == "persistent":
             runner = self._run_direct_routed_batched_persistent

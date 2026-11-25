@@ -413,40 +413,38 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
         "memory.moe_dispatch='triton_persistent' or "
         "memory.moe_gemm_backend='persistent'.",
     )
-    _gemm_backends = {"auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8"}
+    _gemm_backends = {"auto", "bmm", "persistent", "torch_grouped", "deepgemm_fp8", "scaled_mm_fp8"}
     _check(
         str(config.memory.moe_gemm_backend).strip().lower() in _gemm_backends,
         "memory.moe_gemm_backend must be one of: auto, bmm, persistent, "
-        "torch_grouped, deepgemm_fp8.",
+        "torch_grouped, deepgemm_fp8, scaled_mm_fp8.",
     )
     for _role in ("forward", "dx", "dw"):
         _value = str(getattr(config.memory, f"moe_gemm_backend_{_role}")).strip().lower()
         _check(
             _value in ({""} | _gemm_backends),
             f"memory.moe_gemm_backend_{_role} must be '' (inherit) or one of: "
-            "auto, bmm, persistent, torch_grouped, deepgemm_fp8.",
+            "auto, bmm, persistent, torch_grouped, deepgemm_fp8, scaled_mm_fp8.",
         )
-    _deepgemm_main = str(config.memory.moe_gemm_backend).strip().lower() == "deepgemm_fp8"
-    _deepgemm_forward = (
-        str(config.memory.moe_gemm_backend_forward).strip().lower() == "deepgemm_fp8"
-    )
+    forward_only = {"deepgemm_fp8", "scaled_mm_fp8"}
+    forward_backend = str(config.memory.moe_gemm_backend_forward).strip().lower()
     _check(
-        not _deepgemm_main,
-        "deepgemm_fp8 is a forward-only frozen-expert backend; select it with "
+        str(config.memory.moe_gemm_backend).strip().lower() not in forward_only,
+        "FP8 GEMM selection requires a forward-only frozen-expert backend; select it with "
         "memory.moe_gemm_backend_forward, not memory.moe_gemm_backend.",
     )
     _check(
         all(
             str(getattr(config.memory, f"moe_gemm_backend_{role}")).strip().lower()
-            != "deepgemm_fp8"
+            not in forward_only
             for role in ("dx", "dw")
         ),
-        "deepgemm_fp8 may only be selected for memory.moe_gemm_backend_forward.",
+        "FP8 GEMM backends may only be selected for memory.moe_gemm_backend_forward.",
     )
     _check(
-        not _deepgemm_forward
+        forward_backend not in forward_only
         or str(config.memory.frozen_weight_quantization).strip().lower() == "fp8",
-        "memory.moe_gemm_backend_forward='deepgemm_fp8' requires "
+        f"memory.moe_gemm_backend_forward='{forward_backend}' requires "
         "memory.frozen_weight_quantization='fp8'.",
     )
     if (

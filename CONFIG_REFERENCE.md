@@ -3480,9 +3480,15 @@ Grouped-GEMM primitive below `moe_dispatch`. `auto` inherits dispatch selection;
 
 - **Type:** str
 - **Default:** `""`
-- **Allowed / range:** `""` (inherit), `auto`, `bmm`, `persistent`, `torch_grouped`, `deepgemm_fp8`
+- **Allowed / range:** `""` (inherit), `auto`, `bmm`, `persistent`, `torch_grouped`, `deepgemm_fp8`, `scaled_mm_fp8`
 
 Forward matmul override. `deepgemm_fp8` uses stored 128×128 FP8 weights and online 1×128 activation scales; it requires `frozen_weight_quantization="fp8"`, DeepGEMM, CUDA SM90, and expert widths divisible by 128. Routed execution accepts stable unequal group boundaries, including empty groups, gathers token rows before the role-specific FP8 projection, and combines grouped output rows directly into weighted token results without an assignment-order output buffer. Input gradients remain high precision, and routing-coefficient and adapter gradients remain differentiable through the adjacent combine and adapter seams.
+
+`scaled_mm_fp8` is an experimental forward-only alternative for FP8
+compressed linear layers and routed experts on CUDA SM89 or newer. It
+computes native FP8 products per input tile, applies the existing block
+scales, and accumulates in FP32. Frozen-weight input gradients use the
+high-precision reference path.
 
 ### `moe_gemm_backend_dx`
 
