@@ -3171,7 +3171,8 @@
         "stream_prune_magi2_experts",
         "capture_magi2_diet_head",
         "select_magi2_diet_pruning_plan",
-        "build_magi2_diet_calibration_targets"
+        "build_magi2_diet_calibration_targets",
+        "build_magi2_diet_pruning_plan_from_evidence"
       ],
       "config_keys": [
         "model.params.family_params"

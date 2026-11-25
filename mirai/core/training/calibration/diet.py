@@ -212,7 +212,7 @@ class _DietObserver:
 
 def run_diet_calibration_session(
     session: Any, *, requests: Sequence[DietCalibrationRequest], output_path: str | Path,
-    samples_per_layer: int, source_packed_state: str | Path,
+    samples_per_layer: int, source_packed_state: str | Path | None,
     calibration_manifest_id: str, config_snapshot_id: str, overwrite: bool = False,
     seed: int = 0,
 ) -> DietCalibrationRunReport:
@@ -220,7 +220,7 @@ def run_diet_calibration_session(
     if str(getattr(session, "checkpoint", "")).strip() or str(
         getattr(session, "adapter", "")
     ).strip() or bool(getattr(session, "merge", False)):
-        raise ValueError("DIET calibration requires an unmodified packed base session.")
+        raise ValueError("DIET calibration requires an unmodified base session.")
     if str(config.model.params.expert_pruning).strip().lower() != "prune" or str(config.model.params.expert_pruning_criterion).strip().lower() != "diet":
         raise ValueError("DIET calibration requires expert_pruning='prune' and expert_pruning_criterion='diet'.")
     if (int(samples_per_layer) <= 0 or not requests or int(seed) < 0
@@ -239,22 +239,28 @@ def run_diet_calibration_session(
     output = Path(output_path)
     if output.exists() and not overwrite:
         raise ValueError(f"DIET calibration output already exists: {output}.")
-    source = Path(source_packed_state)
-    if not source.is_file():
-        raise ValueError(f"DIET source packed state does not exist: {source}.")
-    if output.resolve() == source.resolve():
-        raise ValueError("DIET evidence output cannot overwrite its packed source state.")
+    provider = get_model_family_provider(str(config.model.type))
+    dense_source = bool(getattr(provider, "diet_calibration_dense_source", False))
+    cfg_mode = getattr(provider, "diet_calibration_cfg_mode", "sequential")
     configured_value = str(
         getattr(config.memory, "frozen_weight_packed_state_path", "")
     ).strip()
-    if not configured_value or Path(configured_value).resolve() != source.resolve():
-        raise ValueError(
-            "DIET source packed state must exactly match "
-            "memory.frozen_weight_packed_state_path loaded by the inference session."
-        )
-    source_fingerprint = fingerprint_file(source)
-    provider = get_model_family_provider(str(config.model.type))
-    build = None if provider is None else getattr(provider, "build_diet_calibration_targets", None)
+    if dense_source:
+        if configured_value or source_packed_state is not None:
+            raise ValueError("This DIET calibration provider requires a dense source checkpoint.")
+        source_file = None
+    else:
+        if source_packed_state is None or not Path(source_packed_state).is_file():
+            raise ValueError(f"DIET source packed state does not exist: {source_packed_state}.")
+        source_file = Path(source_packed_state)
+        if output.resolve() == source_file.resolve():
+            raise ValueError("DIET evidence output cannot overwrite its packed source state.")
+        if not configured_value or Path(configured_value).resolve() != source_file.resolve():
+            raise ValueError(
+                "DIET source packed state must exactly match "
+                "memory.frozen_weight_packed_state_path loaded by the inference session."
+            )
+    build = getattr(provider, "build_diet_calibration_targets", None)
     if not callable(build):
         raise ValueError(f"Model provider {config.model.type!r} does not support DIET calibration.")
     raw_targets = build(session.pipeline)
@@ -269,6 +275,12 @@ def run_diet_calibration_session(
     previous = {str(t.name): t.host.get_diet_capture_observer() for t in targets}
     if any(value is not None for value in previous.values()):
         raise ValueError("DIET calibration cannot replace an active capture observer.")
+    def current_source_fingerprint() -> str:
+        if source_file is not None:
+            return fingerprint_file(source_file)
+        return provider.diet_dense_source_fingerprint(session.pipeline)
+
+    source_fingerprint = current_source_fingerprint()
     training_model = session.pipeline.get_training_model()
     was_training = None if training_model is None else bool(training_model.training)
     cpu_rng_state = torch.get_rng_state()
@@ -291,7 +303,7 @@ def run_diet_calibration_session(
                     prompt=request.prompt, negative_prompt=request.negative_prompt,
                     seed=request.seed, steps=request.steps, cfg_scale=request.cfg_scale,
                     frames=request.frames, height=request.height, width=request.width,
-                    scheduler=request.scheduler, cfg_mode="sequential",
+                    scheduler=request.scheduler, cfg_mode=cfg_mode,
                     out_path=Path(temp_dir) / f"capture-{index:04d}.pt",
                     allow_latent_output_only=True,
                 )
@@ -318,8 +330,8 @@ def run_diet_calibration_session(
     if short:
         raise ValueError(f"DIET calibration exhausted its manifest before reaching the sample budget: {short}.")
     evidence = {name: observer.evidence() for name, observer in observers.items()}
-    if fingerprint_file(source) != source_fingerprint:
-        raise RuntimeError("DIET packed source state changed during calibration.")
+    if current_source_fingerprint() != source_fingerprint:
+        raise RuntimeError("DIET source state changed during calibration.")
     capture_payload = {name: {"samples": item.sample_count, "signature": hashlib.sha256(torch.as_tensor(item.signatures).numpy().tobytes()).hexdigest()} for name, item in sorted(evidence.items())}
     capture_fingerprint = hashlib.sha256(json.dumps(capture_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     save_diet_evidence(output, evidence, lineage=DietLineage(
@@ -327,8 +339,9 @@ def run_diet_calibration_session(
         model_snapshot_id=source_fingerprint,
         config_snapshot_id=config_snapshot_id,
         calibration_manifest_id=calibration_manifest_id,
-        packed_state_sha256=source_fingerprint,
+        packed_state_sha256="" if dense_source else source_fingerprint,
         capture_fingerprint=capture_fingerprint,
+        dense_source_sha256=source_fingerprint if dense_source else "",
     ))
     return DietCalibrationRunReport(str(output), len(requests), int(samples_per_layer), {name: item.sample_count for name, item in evidence.items()})
 

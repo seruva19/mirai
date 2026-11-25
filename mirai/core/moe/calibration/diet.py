@@ -505,20 +505,30 @@ class DietLineage:
     calibration_manifest_id: str
     packed_state_sha256: str
     capture_fingerprint: str
+    dense_source_sha256: str = ""
 
     def validate(self) -> "DietLineage":
-        if not all(str(value).strip() for value in dataclasses.astuple(self)):
+        if not all(str(value).strip() for value in (
+            self.dataset_snapshot_id, self.model_snapshot_id, self.config_snapshot_id,
+            self.calibration_manifest_id, self.capture_fingerprint,
+        )):
             raise ValueError("DIET evidence requires complete snapshot and capture lineage.")
-        if len(self.packed_state_sha256) != 64 or any(
+        if bool(self.packed_state_sha256) == bool(self.dense_source_sha256):
+            raise ValueError("DIET evidence requires exactly one source fingerprint.")
+        fingerprint = self.packed_state_sha256 or self.dense_source_sha256
+        if len(fingerprint) != 64 or any(
             character not in "0123456789abcdefABCDEF"
-            for character in self.packed_state_sha256
+            for character in fingerprint
         ):
-            raise ValueError("DIET packed-state lineage must be a SHA-256 fingerprint.")
+            raise ValueError("DIET source lineage must be a SHA-256 fingerprint.")
         return self
 
     def to_dict(self) -> dict[str, str]:
         self.validate()
-        return dataclasses.asdict(self)
+        payload = dataclasses.asdict(self)
+        if not self.dense_source_sha256:
+            del payload["dense_source_sha256"]
+        return payload
 
 
 def _topology_dict(value: DietGroupTopology) -> dict[str, Any]:
@@ -544,7 +554,7 @@ def save_diet_evidence(path: str | Path, evidence_by_module: Mapping[str, DietCa
                         "topology": _topology_dict(evidence.topology), "cfg_mode": evidence.cfg_mode,
                         "guidance_scale": evidence.guidance_scale, "token_pool": evidence.token_pool})
     manifest = {"format": DIET_EVIDENCE_FORMAT, "schema_version": DIET_EVIDENCE_SCHEMA_VERSION,
-                "lineage": dataclasses.asdict(lineage), "modules": modules}
+                "lineage": lineage.to_dict(), "modules": modules}
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(output), metadata={DIET_EVIDENCE_METADATA_KEY: json.dumps(manifest, sort_keys=True, separators=(",", ":"))})

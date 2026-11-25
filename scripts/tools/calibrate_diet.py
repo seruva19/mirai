@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from mirai.core.inference.session import InferenceSession
 from mirai.core.builtins import register_builtin_components
+from mirai.core.models.providers import get_model_family_provider
 from mirai.core.training.calibration.diet import (
     load_diet_calibration_manifest,
     run_diet_calibration_session,
@@ -45,13 +46,17 @@ def main() -> int:
             "expert_pruning_criterion='diet'."
         )
     packed_state = str(config.memory.frozen_weight_packed_state_path).strip()
-    if not packed_state or not Path(packed_state).is_file():
+    provider = get_model_family_provider(str(config.model.type))
+    dense_source = provider is not None and provider.diet_calibration_dense_source
+    if dense_source and (packed_state or config.memory.quantize_experts_on_load):
+        raise ValueError("This DIET calibration provider requires a dense source checkpoint.")
+    if not dense_source and (not packed_state or not Path(packed_state).is_file()):
         raise ValueError(
             "DIET calibration requires an existing "
             "memory.frozen_weight_packed_state_path."
         )
     output = Path(args.output)
-    if output.resolve() == Path(packed_state).resolve():
+    if packed_state and output.resolve() == Path(packed_state).resolve():
         raise ValueError("DIET evidence output cannot overwrite its packed source state.")
     if output.exists() and not args.overwrite:
         raise ValueError(f"DIET calibration output already exists: {output}.")
@@ -69,7 +74,7 @@ def main() -> int:
             report = run_diet_calibration_session(
                 session, requests=requests, output_path=output,
                 samples_per_layer=args.samples_per_layer,
-                source_packed_state=packed_state,
+                source_packed_state=packed_state or None,
                 calibration_manifest_id=manifest_id, config_snapshot_id=config_id,
                 overwrite=args.overwrite, seed=args.seed,
             )

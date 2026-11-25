@@ -311,6 +311,11 @@ def build_magi2_diet_calibration_targets(transformer: nn.Module) -> dict[str, Di
     return targets
 
 
+def magi2_diet_source_fingerprint(transformer: nn.Module) -> str:
+    """Fingerprint the full dense routed expert inventory used for DIET capture."""
+    return _source_fingerprint(_dense_pruning_layers(transformer)).removeprefix("sha256:")
+
+
 def select_magi2_diet_pruning_plan(
     transformer: nn.Module, evidence: dict[str, tuple[DietCalibrationEvidence, ...]],
     *, keep_fraction: float, config: DietODLConfig | None = None,
@@ -335,6 +340,26 @@ def select_magi2_diet_pruning_plan(
             for item in heads
         )
     return build_magi2_diet_pruning_plan(transformer, kept)
+
+
+def build_magi2_diet_pruning_plan_from_evidence(
+    transformer: nn.Module, evidence_path: str | Path, *,
+    keep_fraction: float, config: DietODLConfig | None = None,
+) -> Magi2ExpertPruningPlan:
+    from mirai.core.moe.calibration.diet import load_diet_evidence
+
+    evidence, lineage = load_diet_evidence(evidence_path)
+    if lineage.dense_source_sha256 != magi2_diet_source_fingerprint(transformer):
+        raise ValueError("DIET evidence belongs to a different MAGI-2 dense source.")
+    layers = _dense_pruning_layers(transformer)
+    expected = {f"{name}.head.{head}" for name, layer in layers.items() for head in range(layer.num_heads)}
+    if set(evidence) != expected:
+        raise ValueError("DIET evidence must cover every MAGI-2 routing head.")
+    by_layer = {
+        name: tuple(evidence[f"{name}.head.{head}"] for head in range(layer.num_heads))
+        for name, layer in layers.items()
+    }
+    return select_magi2_diet_pruning_plan(transformer, by_layer, keep_fraction=keep_fraction, config=config)
 
 
 def build_magi2_aimer_pruning_plan(

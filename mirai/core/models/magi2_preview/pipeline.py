@@ -2145,6 +2145,8 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             batched_cfg_inference=True,
             paired_cfg_inference=True,
             expert_pruning_calibration=True,
+            diet_calibration_dense_source=True,
+            diet_calibration_cfg_mode="paired",
             expert_precision_calibration=True,
             # Raw media is encoded by the family-owned Qwen3.5/Wan2.2 encoder
             # returned from build_native_cache_encoder(); no generic pixel
@@ -2160,6 +2162,11 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         from mirai.core.models.magi2_preview.expert_pruning import build_magi2_diet_calibration_targets
 
         return build_magi2_diet_calibration_targets(pipeline.transformer)
+
+    def diet_dense_source_fingerprint(self, pipeline: Any) -> str:
+        from mirai.core.models.magi2_preview.expert_pruning import magi2_diet_source_fingerprint
+
+        return magi2_diet_source_fingerprint(pipeline.transformer)
 
     def build_expert_pruning_calibration_targets(self, pipeline: Any):
         from mirai.core.models.magi2_preview.expert_pruning import build_magi2_pruning_calibration_targets

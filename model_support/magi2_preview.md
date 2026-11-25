@@ -775,6 +775,12 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   to replay one-expert deletions for a dense sigmoid-routed head. Derive DIET
   evidence from aligned conditional and unconditional captures, then pass one
   evidence item per head to `select_magi2_diet_pruning_plan`.
+  To collect a source-bound artifact through inference, run
+  `python scripts/tools/calibrate_diet.py --config <config> --manifest <requests.json> --output <scores.safetensors> --samples-per-layer <count>`
+  with dense unpruned weights and `expert_pruning="prune"`,
+  `expert_pruning_criterion="diet"`. The command samples aligned video
+  tokens in paired CFG. Use `build_magi2_diet_pruning_plan_from_evidence`
+  with the same dense source to verify the evidence and select survivors.
   For AIMER, call `build_magi2_aimer_pruning_plan(transformer, keep_fraction=...)`
   on the loaded dense source transformer. It computes scores from the three
   expert projections in blocks and ranks the experts independently in each
