@@ -56,7 +56,7 @@ MAGI2_NF4_STORE_ATTR = "mirai_nf4_experts"
 # Access policies the quantized MAGI-2 expert path implements. ``active_dequant``
 # and ``fused_kernel`` describe per-routed-expert operations that the flattened
 # head-major group axis does not expose.
-MAGI2_EXPERT_ACCESS_POLICIES = ("full_dequant", "chunked_dequant")
+MAGI2_EXPERT_ACCESS_POLICIES = ("full_dequant", "chunked_dequant", "active_group_dequant")
 
 
 class Magi2QuantizedExpertError(ValueError):
@@ -128,7 +128,7 @@ class Magi2Nf4ExpertStore(nn.Module):
 
     def segment_group_span(self) -> int:
         """Groups dequantized per segment under the configured access policy."""
-        if self.expert_weight_access == "chunked_dequant":
+        if self.expert_weight_access != "full_dequant" and self.expert_dequant_chunk_size:
             return max(1, min(self.num_groups, int(self.expert_dequant_chunk_size)))
         return self.num_groups
 
@@ -356,8 +356,9 @@ class Magi2Nf4ExpertStore(nn.Module):
         *,
         dtype: torch.dtype,
         device: torch.device,
+        group_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Dequantize groups ``[group_start, group_stop)`` into a dense buffer.
+        """Dequantize a range in the native or selected group order.
 
         The result is a freshly allocated contiguous ``[groups, out, in]``
         tensor produced under ``no_grad``; it is never registered, saved on an
@@ -367,10 +368,11 @@ class Magi2Nf4ExpertStore(nn.Module):
         self._require_loaded(key)
         start = int(group_start)
         stop = int(group_stop)
-        if not 0 <= start < stop <= self.num_groups:
+        group_count = self.num_groups if group_ids is None else group_ids.numel()
+        if not 0 <= start < stop <= group_count:
             raise Magi2QuantizedExpertError(
                 f"MAGI-2 expert segment [{start}, {stop}) lies outside the "
-                f"{self.num_groups}-group axis of '{key}'."
+                f"{group_count}-group axis of '{key}'."
             )
         meta = self._meta
         if meta is None:  # pragma: no cover - set by quantize_dense
@@ -383,10 +385,18 @@ class Magi2Nf4ExpertStore(nn.Module):
         out_features, in_features = rows, cols
         count = stop - start
         with torch.no_grad():
-            packed = getattr(self, f"{key}_nf4")[start:stop].to(device=target)
-            absmax = getattr(self, f"{key}_nf4_absmax")[start:stop].to(device=target)
-            nested = getattr(self, f"{key}_nf4_nabsmax")[start:stop].to(device=target)
-            offsets = getattr(self, f"{key}_nf4_offset")[start:stop].to(device=target)
+            indices = None if group_ids is None else group_ids[start:stop]
+
+            def select(suffix: str) -> torch.Tensor:
+                field = getattr(self, f"{key}_nf4{suffix}")
+                if indices is None:
+                    return field[start:stop].to(device=target)
+                return field.index_select(0, indices.to(device=field.device)).to(device=target)
+
+            packed = select("")
+            absmax = select("_absmax")
+            nested = select("_nabsmax")
+            offsets = select("_offset")
             code = getattr(self, f"{key}_nf4_code").to(device=target)
             nested_code = getattr(self, f"{key}_nf4_ncode").to(device=target)
             if count > 1 and target.type == "cuda" and nf4_stack_dequant_supported(

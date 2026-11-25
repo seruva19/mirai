@@ -976,6 +976,36 @@ def run_segmented_grouped_expert_mlp(
     return torch.cat(outputs, dim=0)
 
 
+@dataclass(frozen=True)
+class _ActiveExpertGroups:
+    store: Magi2Nf4ExpertStore
+    group_ids: torch.Tensor
+
+    def segment_group_span(self) -> int:
+        return self.store.segment_group_span()
+
+    def expert_weight_shape(self, key: str) -> tuple[int, int, int]:
+        _, rows, columns = self.store.expert_weight_shape(key)
+        return self.group_ids.numel(), rows, columns
+
+    def materialize_segment(
+        self, key: str, start: int, stop: int, *, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        return self.store.materialize_segment(
+            key, start, stop, dtype=dtype, device=device, group_ids=self.group_ids
+        )
+
+
+def _packed_expert_layout(
+    store: Magi2Nf4ExpertStore, offsets: torch.Tensor
+) -> tuple[Magi2Nf4ExpertStore | _ActiveExpertGroups, torch.Tensor]:
+    if store.expert_weight_access != "active_group_dequant":
+        return store, offsets
+    counts = offsets.diff(prepend=offsets.new_zeros(1))
+    group_ids = counts.nonzero(as_tuple=True)[0]
+    return _ActiveExpertGroups(store, group_ids), offsets.index_select(0, group_ids)
+
+
 class _QuantizedGroupedExpertLinear(torch.autograd.Function):
     """Grouped expert matmul against a frozen NF4 payload.
 
@@ -993,7 +1023,7 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         ctx: Any,
         x_sorted: torch.Tensor,
         offsets: torch.Tensor,
-        store: Magi2Nf4ExpertStore,
+        store: Magi2Nf4ExpertStore | _ActiveExpertGroups,
         key: str,
         forward_backend: str,
         dx_backend: str,
@@ -1051,7 +1081,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         ctx: Any,
         x_sorted: torch.Tensor,
         offsets: torch.Tensor,
-        store: Magi2Nf4ExpertStore,
+        store: Magi2Nf4ExpertStore | _ActiveExpertGroups,
         forward_backend: str,
         dx_backend: str,
         activation_backend: str,
@@ -1166,7 +1196,7 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
         x_rows: torch.Tensor,
         offsets: torch.Tensor,
         sorted_rows: torch.Tensor,
-        store: Magi2Nf4ExpertStore,
+        store: Magi2Nf4ExpertStore | _ActiveExpertGroups,
         activation_backend: str,
     ) -> torch.Tensor:
         segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
@@ -1349,8 +1379,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         forward_backend: str,
         dx_backend: str,
     ) -> torch.Tensor:
+        store, offsets = _packed_expert_layout(self._store(module), offsets)
         return _QuantizedGroupedExpertLinear.apply(
-            x_sorted, offsets, self._store(module), key, forward_backend, dx_backend
+            x_sorted, offsets, store, key, forward_backend, dx_backend
         )
 
     def _routed_inference(
@@ -1378,7 +1409,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         sorted_rows = assignment_to_row.index_select(0, order)
         offsets = torch.bincount(flat_experts, minlength=groups).cumsum(0).to(torch.int32)
         x_rows = x_heads.reshape(tokens * num_heads, d_head)
-        store = self._store(module)
+        store, offsets = _packed_expert_layout(self._store(module), offsets)
         output = x_rows.new_zeros((tokens * num_heads, d_head))
         segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
         for segment, max_group_rows in segments:
@@ -1476,11 +1507,12 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                 tokens = int(x_heads.shape[0])
                 num_heads = int(x_heads.shape[1])
                 d_head = int(x_heads.shape[2])
+                store, offsets = _packed_expert_layout(self._store(module), offsets)
                 return _SegmentedRoutedQuantizedExpertMlp.apply(
                     x_heads.reshape(tokens * num_heads, d_head),
                     offsets,
                     sorted_rows,
-                    self._store(module),
+                    store,
                     self.activation_backend,
                 )
             if self.plan.routed_gemm == "triton":
@@ -1502,7 +1534,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         d_head = int(x_heads.shape[2])
         x_rows = x_heads.reshape(tokens * num_heads, d_head)
         x_sorted = x_rows.index_select(0, sorted_rows)
-        store = self._store(module)
+        store, offsets = _packed_expert_layout(self._store(module), offsets)
         if torch.is_grad_enabled():
             return _SegmentedQuantizedExpertMlp.apply(
                 x_sorted,

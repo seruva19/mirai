@@ -11,6 +11,7 @@ import torch
 from torch.nn.utils import parametrize
 
 from mirai.core.models.magi2_preview import grouped_moe
+from mirai.core.models.magi2_preview import quantized_experts
 from mirai.core.models.magi2_preview.grouped_moe import (
     _CONSUMED_POLICY_FIELDS,
     _MemoryBoundedSwiGlu7,
@@ -462,6 +463,60 @@ def test_packed_experts_admit_default_off_routed_fusion_policy() -> None:
 # ---------------------------------------------------------------------------
 # Store contract
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("expert_autograd", ["standard", "segmented_recompute"])
+@pytest.mark.parametrize("training", [False, True])
+def test_active_groups_decode_only_routed_weights_and_preserve_backward(
+    monkeypatch, expert_autograd, training
+) -> None:
+    generator = torch.Generator().manual_seed(29)
+    store = Magi2Nf4ExpertStore(num_groups=5)
+    store._meta = object()
+    decoded = []
+
+    def dequantize(fields, *args, **kwargs):
+        packed = fields["packed"]
+        decoded.append(int(fields["offset"]))
+        return packed
+
+    monkeypatch.setattr(quantized_experts, "_nf4_dequantize", dequantize)
+    for key, shape in {"W_gate": (8, 16), "W_up": (8, 16), "W_down": (16, 8)}.items():
+        store._shapes[key] = (5, *shape)
+        store._dtypes[key] = torch.float32
+        store._set_buffer(f"{key}_nf4", torch.randn(5, *shape, generator=generator))
+        for suffix in ("absmax", "nabsmax", "offset"):
+            store._set_buffer(f"{key}_nf4_{suffix}", torch.arange(5))
+        for suffix in ("code", "ncode"):
+            store._set_buffer(f"{key}_nf4_{suffix}", torch.zeros(1))
+
+    offsets = torch.tensor([0, 2, 2, 2, 5], dtype=torch.int32)
+    inputs = torch.randn(5, 8, generator=generator)
+    backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(), expert_autograd=expert_autograd
+    )
+    monkeypatch.setattr(type(backend), "_store", lambda self, module: store)
+
+    def run(access):
+        store.set_expert_weight_access_policy(
+            expert_weight_access=access, expert_dequant_chunk_size=3
+        )
+        with torch.set_grad_enabled(training):
+            x = inputs.clone().requires_grad_(training)
+            output = backend.branch_features(
+                object(), x.unsqueeze(1), torch.arange(5), offsets, "bmm", "bmm"
+            )
+            if training:
+                return output.detach(), torch.autograd.grad(output.square().sum(), x)[0]
+            return (output,)
+
+    expected = run("chunked_dequant")
+    decoded.clear()
+    actual = run("active_group_dequant")
+    visits = 6 if training else 3
+    assert sorted(decoded) == [1] * visits + [4] * visits
+    for observed, reference in zip(actual, expected):
+        torch.testing.assert_close(observed, reference)
 
 
 def test_store_rejects_access_policies_it_has_no_operand_for() -> None:

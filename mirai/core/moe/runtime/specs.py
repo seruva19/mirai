@@ -44,6 +44,7 @@ EXPERT_WEIGHT_ACCESS_POLICIES = {
     "full_dequant",
     "active_dequant",
     "chunked_dequant",
+    "active_group_dequant",
     "fused_kernel",
 }
 

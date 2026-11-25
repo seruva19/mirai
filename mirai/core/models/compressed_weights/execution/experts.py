@@ -195,6 +195,8 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         # NF4 codebooks so their packed stacks can be concatenated into one dequant.
         self._nf4_pair_codebook_cache: dict[tuple[str, str], bool] = {}
         self.expert_weight_access = normalize_expert_weight_access_policy(expert_weight_access)
+        if self.expert_weight_access == "active_group_dequant":
+            raise ValueError("This compressed expert host does not support active_group_dequant.")
         if self.expert_weight_access in {"auto", "disabled"}:
             self.expert_weight_access = "full_dequant"
         chunk = int(expert_dequant_chunk_size)
@@ -829,6 +831,8 @@ class CompressedGroupedExperts(RoutedOutputObserverHost, nn.Module):
         expert_dequant_chunk_size: int = 0,
     ) -> None:
         access = normalize_expert_weight_access_policy(expert_weight_access)
+        if access == "active_group_dequant":
+            raise ValueError("This compressed expert host does not support active_group_dequant.")
         if access in {"auto", "disabled"}:
             access = "full_dequant"
         chunk = int(expert_dequant_chunk_size)
