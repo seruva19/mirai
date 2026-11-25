@@ -762,6 +762,12 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   head of a layer and preserve top-k. For training, select `attn_only`.
   The Python plan builder accepts per-head REAP and AIMER scores. DIET plans
   carry explicit externally selected survivors.
+  To collect REAP scores on a training dataset, use
+  `python scripts/tools/calibrate_expert_pruning.py --config <config> --output <scores.safetensors> --steps <count>`
+  with `model.params.expert_pruning="prune"`,
+  `model.params.expert_pruning_criterion="reap"`, and dense, unpruned routed
+  experts. Pass each layer's loaded evidence `scores()` directly to the
+  Python plan builder. The builder accepts head-major scores.
   To use a pruned model's `attn_only` LoRA on the original dense model, set
   `model.params.family_params.expert_pruning_adapter_source_plan_path` to the
   same plan and leave `expert_pruning_plan_path` unset. The loader verifies the

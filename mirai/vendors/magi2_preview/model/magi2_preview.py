@@ -2783,6 +2783,7 @@ class CoreMultiHeadMoE(nn.Module):
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
         observer = getattr(self, "_mirai_importance_observer", None)
+        pruning_observer = self.get_expert_output_observer()
         output = torch.zeros_like(x_heads)
         for head in range(int(x_heads.shape[1])):
             head_input = x_heads[:, head]
@@ -2804,7 +2805,11 @@ class CoreMultiHeadMoE(nn.Module):
                     observer.record(flat_expert, ("w1", "w3"), values)
                     observer.record(flat_expert, "w2", down_input)
                 expert_output = down_input @ self.W_down[flat_expert]
-                weights = topk_probs[head, token_indices, slots].to(expert_output.dtype)
+                route_weights = topk_probs[head, token_indices, slots]
+                if pruning_observer is not None:
+                    positions = (head * x_heads.shape[0] + token_indices) * self.topk + slots
+                    pruning_observer.capture_routes(expert_output, positions)
+                weights = route_weights.to(expert_output.dtype)
                 head_output.index_add_(0, token_indices, expert_output * weights[:, None])
             output[:, head] = head_output
         return output
@@ -2832,7 +2837,20 @@ class CoreMultiHeadMoE(nn.Module):
             # when no backend is attached, and it needs CUDA and no autograd
             # graph; otherwise the vendored per-expert loop is the reference.
             kernel_backend = self._mirai_moe_kernel_backend
-            if getattr(self, "_mirai_importance_observer", None) is not None:
+            pruning_observer = self.get_expert_output_observer()
+            if pruning_observer is not None and topk_indices.numel():
+                head_offsets = torch.arange(self.num_heads, device=topk_indices.device) * self.num_experts
+                flat_ids = (topk_indices + head_offsets[:, None, None]).flatten(0, 1)
+                try:
+                    pruning_observer.bind_routes(flat_ids, topk_probs.flatten(0, 1))
+                    pruning_observer.begin_routes(
+                        num_tokens=flat_ids.shape[0], top_k=self.topk, device=x.device,
+                    )
+                    out = self._torch_forward(x_heads, topk_probs, topk_indices)
+                    pruning_observer.end_routes()
+                finally:
+                    pruning_observer.abort_capture()
+            elif getattr(self, "_mirai_importance_observer", None) is not None:
                 out = self._torch_forward(x_heads, topk_probs, topk_indices)
             elif kernel_backend is not None:
                 out = kernel_backend.execute(self, x_heads, topk_probs, topk_indices)
@@ -2856,6 +2874,12 @@ class CoreMultiHeadMoE(nn.Module):
 
     def set_importance_calibration_observer(self, observer) -> None:
         self._mirai_importance_observer = observer
+
+    def set_expert_output_observer(self, observer) -> None:
+        self._mirai_pruning_observer = observer
+
+    def get_expert_output_observer(self):
+        return getattr(self, "_mirai_pruning_observer", None)
 
     def clear_importance_calibration_observer(self) -> None:
         self._mirai_importance_observer = None

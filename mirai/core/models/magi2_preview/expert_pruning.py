@@ -10,7 +10,11 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from mirai.core.moe.calibration.pruning import normalize_expert_pruning_criterion, select_pruned_experts
+from mirai.core.moe.calibration.pruning import (
+    ExpertPruningCalibrationTarget,
+    normalize_expert_pruning_criterion,
+    select_pruned_experts,
+)
 from mirai.core.moe.calibration.router_repair import router_tensor_fingerprint
 
 from .quantized_experts import MAGI2_ROUTED_EXPERT_TENSOR_NAMES, iter_magi2_moe_layers
@@ -19,6 +23,23 @@ from .quantized_experts import MAGI2_ROUTED_EXPERT_TENSOR_NAMES, iter_magi2_moe_
 _SCHEMA = "mirai.magi2_preview.head_expert_pruning"
 _PARAMETERS = ("gate", *MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
 _ROUTER_BUFFERS = ("expert_bias", "expert_bias_ema")
+
+
+def build_magi2_pruning_calibration_targets(
+    transformer: nn.Module,
+) -> dict[str, ExpertPruningCalibrationTarget]:
+    targets = {}
+    for name, layer in iter_magi2_moe_layers(transformer):
+        if (
+            layer.ep_size != 1
+            or getattr(layer, "_mirai_experts_pruned", False)
+            or any(layer._parameters.get(key) is None for key in _PARAMETERS)
+        ):
+            raise ValueError("MAGI-2 pruning calibration requires native dense single-device experts.")
+        targets[name] = ExpertPruningCalibrationTarget(
+            name, layer, layer.num_heads * layer.num_experts,
+        )
+    return targets
 
 
 @dataclass(frozen=True)
@@ -76,7 +97,7 @@ def _source_fingerprint(layers) -> str:
 def build_magi2_expert_pruning_plan(
     transformer: nn.Module, scores: dict[str, torch.Tensor], *, criterion: str, keep_fraction: float,
 ) -> Magi2ExpertPruningPlan:
-    """Rank REAP or AIMER scores independently within each head."""
+    """Rank head-major REAP or AIMER scores independently within each head."""
     criterion = normalize_expert_pruning_criterion(criterion)
     if criterion not in {"reap", "aimer"}:
         raise ValueError("MAGI-2 head-local score ranking requires REAP or AIMER.")
@@ -86,6 +107,8 @@ def build_magi2_expert_pruning_plan(
     kept = {}
     for name, values in scores.items():
         layer = layers[name]
+        if values.shape == (layer.num_heads * layer.num_experts,):
+            values = values.reshape(layer.num_heads, layer.num_experts)
         if values.shape != (layer.num_heads, layer.num_experts) or not bool(torch.isfinite(values).all()):
             raise ValueError(f"Invalid per-head expert pruning scores for '{name}'.")
         selected = select_pruned_experts(

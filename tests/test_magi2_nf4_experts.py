@@ -788,6 +788,40 @@ def test_magi2_pruning_remaps_each_head_and_preserves_top_k(tmp_path, criterion)
     assert torch.isfinite(hidden.grad).all()
 
 
+def test_pruning_calibration_keeps_head_local_route_ids(monkeypatch) -> None:
+    from mirai.core.models.magi2_preview.expert_pruning import (
+        build_magi2_expert_pruning_plan, build_magi2_pruning_calibration_targets,
+    )
+    from mirai.core.moe.calibration.pruning import (
+        ExpertPruningRoutedOutputObserver, ExpertPruningSaliencyAccumulator,
+    )
+
+    layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    transformer = _container(layer)
+    target, = build_magi2_pruning_calibration_targets(transformer).values()
+    assert target.num_experts == 8
+    tokens = torch.ones(2, layer.num_heads * layer.d_head)
+    ids = torch.tensor([[[0, 1], [0, 1]], [[0, 2], [0, 2]]])
+    weights = torch.tensor([[[0.25, 0.75], [0.5, 0.5]], [[0.2, 0.8], [0.9, 0.1]]])
+    monkeypatch.setattr(layer, "_route", lambda _: (weights, ids))
+    expected = layer._forward_impl(tokens)
+    accumulator = ExpertPruningSaliencyAccumulator(target.num_experts, criterion="reap")
+    target.host.set_expert_output_observer(ExpertPruningRoutedOutputObserver(accumulator))
+    torch.testing.assert_close(layer._forward_impl(tokens), expected)
+    evidence = accumulator.evidence()
+    assert evidence.selected_count.tolist() == [2, 2, 0, 0, 2, 0, 2, 0]
+    ones = torch.ones(layer.d_head)
+    gate = (ones @ layer.W_gate).clamp(max=7.0)
+    up = (ones @ layer.W_up).clamp(min=-7.0, max=7.0)
+    hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    norms = torch.bmm(hidden[:, None, :], layer.W_down).flatten(1).double().norm(dim=1)
+    expected_weights = torch.tensor([0.75, 1.25, 0, 0, 1.1, 0, 0.9, 0], dtype=torch.float64)
+    torch.testing.assert_close(evidence.score_sum, norms * expected_weights, rtol=2e-6, atol=1e-6)
+    scores = evidence.scores()
+    flat = build_magi2_expert_pruning_plan(transformer, {target.name: scores}, criterion="reap", keep_fraction=0.5)
+    assert flat.kept_by_head[target.name] == ((0, 1), (0, 2))
+
+
 def test_pruned_attention_adapter_restores_only_to_verified_source(tmp_path, monkeypatch) -> None:
     from types import SimpleNamespace
 
