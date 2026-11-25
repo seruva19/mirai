@@ -589,6 +589,10 @@ The native sampler supports `inference.cfg_interval` and
 `inference.uncond_reuse_stride` with batched or paired CFG. These controls
 require `inference.expert_feature_cache = "off"`.
 
+With `inference.diffusion_cache_threshold > 0`, the sampler can reuse both
+branch predictions when the video latent, audio latent, and timestep stay
+within the drift bound. Guidance and the solver still run each step.
+
 Prompt-to-video output requires the official Qwen3.5 text encoder and the
 TurboVAE decoder from the same snapshot; both are validated before use and a
 missing asset fails with the expected path named. Throughput and peak-memory

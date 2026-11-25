@@ -1078,6 +1078,25 @@ unconditional prediction. Values above one approximate CFG. The cache is
 local to the generation. Family-owned samplers may reject scheduling when
 they do not implement it.
 
+### `diffusion_cache_threshold`
+
+- **Type:** nonnegative float
+- **Default:** `0.0`
+
+Experimental prediction reuse for native inference. Zero disables it.
+Positive values bound relative mean absolute change in the current inputs and
+timestep against the last computed anchor. A hit skips the denoiser for that
+step and reuses its prediction. Requires a compatible single-denoiser path,
+default CFG scheduling, and expert-feature caching off.
+
+### `diffusion_cache_max_reuse`
+
+- **Type:** positive integer
+- **Default:** `1`
+
+Maximum consecutive cache hits before recomputing the denoiser. A generation
+with caching enabled reports compute, reuse, and invalidation counts.
+
 ### `keep_text_encoder_resident`
 
 - **Type:** bool

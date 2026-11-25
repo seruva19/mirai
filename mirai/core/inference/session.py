@@ -700,6 +700,7 @@ class InferenceSession:
         """
         output_fps = resolve_output_fps(pipeline=self.pipeline, requested=fps)
         from mirai.core.inference.cfg_schedule import CfgSchedule
+        from mirai.core.inference.diffusion_cache import DiffusionPredictionCache
 
         cfg_schedule = CfgSchedule(
             tuple(getattr(self.cfg.inference, "cfg_interval", (0.0, 1.0))),
@@ -707,6 +708,18 @@ class InferenceSession:
         )
         schedule_kwargs = {"cfg_schedule": cfg_schedule} if cfg_schedule.enabled else {}
         decode_latent_path = str(decode_latent or "").strip()
+        diffusion_cache = None
+        cache_threshold = getattr(self.cfg.inference, "diffusion_cache_threshold", 0.0)
+        if cache_threshold and not decode_latent_path:
+            if not self.use_native:
+                raise ValueError("Diffusion caching requires native inference.")
+            if cfg_schedule.enabled or self._expert_feature_cache is not None:
+                raise ValueError("Diffusion caching requires default CFG scheduling and expert-feature caching off.")
+            diffusion_cache = DiffusionPredictionCache(
+                threshold=cache_threshold,
+                max_reuse=self.cfg.inference.diffusion_cache_max_reuse,
+            )
+            schedule_kwargs["diffusion_cache"] = diffusion_cache
         discard_refiner_context = getattr(
             self.pipeline, "discard_refiner_context", None
         )
@@ -1011,6 +1024,8 @@ class InferenceSession:
         if cfg_schedule.enabled and ran_denoise_loop:
             payload["cfg_interval"] = list(cfg_schedule.interval)
             payload["uncond_reuse_stride"] = cfg_schedule.uncond_reuse_stride
+        if diffusion_cache is not None and ran_denoise_loop:
+            payload["diffusion_cache"] = diffusion_cache.snapshot()
         if self._expert_feature_cache is not None:
             payload["expert_feature_cache"] = {
                 "mode": self._expert_feature_cache.policy.mode,

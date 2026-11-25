@@ -1191,6 +1191,41 @@
       "promotion_evidence": ""
     },
     {
+      "name": "diffusion_timestep_cache",
+      "kind": "inference",
+      "owner": "mirai/core/inference/diffusion_cache.py",
+      "check": "inference",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "native_execution",
+        "documentation"
+      ],
+      "symbols": [
+        "DiffusionPredictionCache"
+      ],
+      "config_keys": [
+        "inference.diffusion_cache_threshold",
+        "inference.diffusion_cache_max_reuse"
+      ],
+      "disabled_config": {
+        "inference.diffusion_cache_threshold": 0.0,
+        "inference.diffusion_cache_max_reuse": 1
+      },
+      "contract_paths": [
+        "tests/test_cfg_batching.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Diffusion timestep caching",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "direct_selected_expert_tuning",
       "kind": "adapter",
       "owner": "mirai/core/training/optim/selected_expert_adamw.py",

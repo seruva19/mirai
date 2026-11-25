@@ -224,6 +224,8 @@ configuration and compatibility rules are documented in
   batched path with explicit variable-length prefix masks.
 - **CFG scheduling and unconditional reuse** — Experimental controls for an
   active guidance interval and unconditional prediction refresh cadence.
+- **Diffusion timestep caching** — Experimental whole-prediction reuse for
+  compatible native denoisers with a configurable drift bound.
 - **Batch inference sessions** — Per-request negative prompts, seeds, FPS, and
   decoding of saved latent outputs.
 - **Conditioned inference** — Provider-owned T2I, text-plus-image-to-video, and

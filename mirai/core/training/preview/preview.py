@@ -26,6 +26,7 @@ except ModuleNotFoundError:  # pragma: no cover
     Image = None  # type: ignore[assignment]
 
 from mirai.core.inference.cfg_schedule import CfgSchedule
+from mirai.core.inference.diffusion_cache import DiffusionPredictionCache
 
 try:
     import torch
@@ -199,6 +200,7 @@ def run_native_denoise_loop(
     solver_name: str = "euler",
     cfg_mode: str | None = None,
     cfg_schedule: CfgSchedule | None = None,
+    diffusion_cache: DiffusionPredictionCache | None = None,
     forward_fn: Any = None,
     conditioning: Any | None = None,
     encoded_context: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -298,6 +300,12 @@ def run_native_denoise_loop(
     # Generate initial noise
     noise = torch.randn(target_shape, dtype=torch.float32, device=device, generator=g)
 
+    if diffusion_cache is not None and cfg_schedule is not None and cfg_schedule.enabled:
+        raise ValueError("Diffusion caching cannot be combined with scheduled CFG.")
+    cache_kwargs = {}
+    if diffusion_cache is not None and getattr(pipeline, "supports_native_diffusion_cache", False):
+        cache_kwargs["diffusion_cache"] = diffusion_cache
+
     schedule_kwargs = {}
     if cfg_schedule is not None and cfg_schedule.enabled:
         if getattr(pipeline, "supports_native_cfg_schedule", False):
@@ -305,6 +313,8 @@ def run_native_denoise_loop(
 
     conditioned_sampler = getattr(pipeline, "sample_native_conditioned_media", None)
     if callable(conditioned_sampler):
+        if getattr(pipeline, "owns_native_conditioned_sampling", False) and diffusion_cache is not None and not cache_kwargs:
+            raise ValueError("This native conditioned sampler does not support diffusion caching.")
         if getattr(pipeline, "owns_native_conditioned_sampling", False) and cfg_schedule is not None and cfg_schedule.enabled and not schedule_kwargs:
             raise ValueError("This native conditioned sampler does not support CFG scheduling.")
         sampled = conditioned_sampler(
@@ -318,6 +328,7 @@ def run_native_denoise_loop(
             generator=g,
             solver_name=str(solver_name),
             **schedule_kwargs,
+            **cache_kwargs,
             **({} if requested_cfg_mode is None else {"cfg_mode": requested_cfg_mode}),
         )
         if sampled is not None:
@@ -325,6 +336,8 @@ def run_native_denoise_loop(
 
     native_sampler = getattr(pipeline, "sample_native_preview", None)
     if callable(native_sampler) and request.task == TEXT_TO_VIDEO:
+        if diffusion_cache is not None and not cache_kwargs:
+            raise ValueError("This native sampler does not support diffusion caching.")
         if cfg_schedule is not None and cfg_schedule.enabled and not schedule_kwargs:
             raise ValueError("This native sampler does not support CFG scheduling.")
         sampled = native_sampler(
@@ -336,6 +349,7 @@ def run_native_denoise_loop(
             generator=g,
             solver_name=str(solver_name),
             **schedule_kwargs,
+            **cache_kwargs,
             **({} if requested_cfg_mode is None else {"cfg_mode": requested_cfg_mode}),
         )
         return sampled, []
@@ -391,6 +405,10 @@ def run_native_denoise_loop(
     uses_saliency_guidance = bool(
         getattr(pipeline, "uses_previous_clean_routing_guidance", lambda: False)()
     )
+    if diffusion_cache is not None and (
+        uses_saliency_guidance or getattr(pipeline, "high_noise_model", None) is not None
+    ):
+        raise ValueError("Diffusion caching requires a single denoiser without previous-step routing guidance.")
     autocast_ctx = (
         torch.amp.autocast("cuda", dtype=model_dtype)
         if device.type == "cuda"
@@ -409,69 +427,76 @@ def run_native_denoise_loop(
             if uses_saliency_guidance and saliency_guidance is None:
                 saliency_guidance = sample_a.detach()
 
-            text_cond = {"t5": context}
-            guided = scale > 1.0 and (
-                cfg_schedule is None or cfg_schedule.applies(idx, len(solver.timesteps))
-            )
-            if not guided:
-                cached_uncond = None
-                v_out = fwd(
-                    sample_a,
-                    timestep,
-                    text_cond,
-                    **(
-                        {"routing_guidance_latents": saliency_guidance}
-                        if uses_saliency_guidance
-                        else {}
-                    ),
-                )
+            cache_inputs = (sample_a, timestep)
+            reused = diffusion_cache.lookup(cache_inputs) if diffusion_cache is not None else None
+            if reused is not None:
+                v_out = reused[0]
             else:
-                refresh = cached_uncond is None or idx - last_uncond_step >= reuse_stride
-                if cfg_mode_key == "batched" and refresh:
-                    from mirai.core.inference.cfg_batching import (
-                        build_batched_cfg_inputs,
-                        split_batched_cfg_output,
-                    )
-
-                    batch = build_batched_cfg_inputs(
-                        sample=sample_a,
-                        timestep=timestep,
-                        conditional=context,
-                        unconditional=context_null,
-                    )
-                    v_uncond, v_cond = split_batched_cfg_output(
-                        fwd(
-                            batch.sample,
-                            batch.timestep,
-                            batch.text_embeds,
-                            **(
-                                {
-                                    "routing_guidance_latents": torch.cat(
-                                        (saliency_guidance, saliency_guidance),
-                                        dim=0,
-                                    )
-                                }
-                                if uses_saliency_guidance
-                                else {}
-                            ),
-                        )
+                text_cond = {"t5": context}
+                guided = scale > 1.0 and (
+                    cfg_schedule is None or cfg_schedule.applies(idx, len(solver.timesteps))
+                )
+                if not guided:
+                    cached_uncond = None
+                    v_out = fwd(
+                        sample_a,
+                        timestep,
+                        text_cond,
+                        **(
+                            {"routing_guidance_latents": saliency_guidance}
+                            if uses_saliency_guidance
+                            else {}
+                        ),
                     )
                 else:
-                    text_uncond = {"t5": context_null}
-                    guidance_kwargs = (
-                        {"routing_guidance_latents": saliency_guidance}
-                        if uses_saliency_guidance
-                        else {}
-                    )
-                    v_cond = fwd(sample_a, timestep, text_cond, **guidance_kwargs)
-                    v_uncond = (
-                        fwd(sample_a, timestep, text_uncond, **guidance_kwargs)
-                        if refresh else cached_uncond
-                    )
-                if refresh and reuse_stride > 1:
-                    cached_uncond = v_uncond.detach().clone()
-                    last_uncond_step = idx
-                v_out = v_uncond + scale * (v_cond - v_uncond)
+                    refresh = cached_uncond is None or idx - last_uncond_step >= reuse_stride
+                    if cfg_mode_key == "batched" and refresh:
+                        from mirai.core.inference.cfg_batching import (
+                            build_batched_cfg_inputs,
+                            split_batched_cfg_output,
+                        )
+
+                        batch = build_batched_cfg_inputs(
+                            sample=sample_a,
+                            timestep=timestep,
+                            conditional=context,
+                            unconditional=context_null,
+                        )
+                        v_uncond, v_cond = split_batched_cfg_output(
+                            fwd(
+                                batch.sample,
+                                batch.timestep,
+                                batch.text_embeds,
+                                **(
+                                    {
+                                        "routing_guidance_latents": torch.cat(
+                                            (saliency_guidance, saliency_guidance),
+                                            dim=0,
+                                        )
+                                    }
+                                    if uses_saliency_guidance
+                                    else {}
+                                ),
+                            )
+                        )
+                    else:
+                        text_uncond = {"t5": context_null}
+                        guidance_kwargs = (
+                            {"routing_guidance_latents": saliency_guidance}
+                            if uses_saliency_guidance
+                            else {}
+                        )
+                        v_cond = fwd(sample_a, timestep, text_cond, **guidance_kwargs)
+                        v_uncond = (
+                            fwd(sample_a, timestep, text_uncond, **guidance_kwargs)
+                            if refresh else cached_uncond
+                        )
+                    if refresh and reuse_stride > 1:
+                        cached_uncond = v_uncond.detach().clone()
+                        last_uncond_step = idx
+                    v_out = v_uncond + scale * (v_cond - v_uncond)
+                if diffusion_cache is not None:
+                    diffusion_cache.store(cache_inputs, (v_out,))
 
             if uses_saliency_guidance:
                 sigma = timestep.detach().float()

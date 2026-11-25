@@ -1202,6 +1202,28 @@ def test_magi2_native_sampler_rejects_policies_it_does_not_implement() -> None:
         pipeline.sample_native_preview(**call, cfg_mode="paired")
 
 
+def test_magi2_diffusion_cache_skips_whole_prediction_and_refreshes_on_time_drift() -> None:
+    from mirai.core.inference.diffusion_cache import DiffusionPredictionCache
+    from mirai.vendors.magi2_preview.pipeline.preview_data_proxy import ModelInput
+
+    latent = torch.ones(2, 3)
+    audio = torch.empty(2, 0, 3)
+    batch = ModelInput(latent, audio, [0, 0], latent, [1, 1], torch.tensor([0.5, 0.5]))
+    cache = DiffusionPredictionCache(threshold=0.1, max_reuse=2)
+
+    def forward(model_input):
+        return model_input.x_t + model_input.t[:, None], model_input.audio_x_t
+
+    predict = _bare_pipeline()._cached_preview_prediction(cache, forward)
+    expected = predict(batch)[0].clone()
+    hit = predict(batch)[0]
+    hit.zero_()
+    torch.testing.assert_close(predict(batch)[0], expected)
+    batch.t.fill_(0.25)
+    torch.testing.assert_close(predict(batch)[0], torch.full_like(latent, 1.25))
+    assert cache.snapshot() == {"computed": 2, "reused": 2, "invalidated": 1}
+
+
 def test_magi2_scheduled_prediction_preserves_branch_order_and_refreshes() -> None:
     from mirai.core.inference.cfg_schedule import CfgSchedule
     from mirai.vendors.magi2_preview.pipeline.preview_data_proxy import ModelInput

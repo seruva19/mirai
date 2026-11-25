@@ -343,6 +343,8 @@ class InferenceConfig:
     cfg_mode: str = "sequential"
     cfg_interval: list[float] = field(default_factory=lambda: [0.0, 1.0])
     uncond_reuse_stride: int = 1
+    diffusion_cache_threshold: float = 0.0
+    diffusion_cache_max_reuse: int = 1
     keep_text_encoder_resident: bool = False
     stage_text_encoder_before_denoiser: bool = False
     text_encoder_weight_quantization: str = "none"
@@ -761,6 +763,8 @@ class TrainingConfig:
                 "cfg_mode",
                 "cfg_interval",
                 "uncond_reuse_stride",
+                "diffusion_cache_threshold",
+                "diffusion_cache_max_reuse",
                 "keep_text_encoder_resident",
                 "stage_text_encoder_before_denoiser",
                 "text_encoder_weight_quantization",
@@ -912,6 +916,12 @@ class TrainingConfig:
         ):
             raise ValueError("inference.cfg_interval must be [start, end] within [0, 1].")
         reuse_stride = inference_table.get("uncond_reuse_stride", 1)
+        diffusion_threshold = inference_table.get("diffusion_cache_threshold", 0.0)
+        diffusion_max_reuse = inference_table.get("diffusion_cache_max_reuse", 1)
+        if type(diffusion_threshold) not in {int, float} or not 0 <= diffusion_threshold < float("inf"):
+            raise ValueError("inference.diffusion_cache_threshold must be finite and nonnegative.")
+        if type(diffusion_max_reuse) is not int or diffusion_max_reuse < 1:
+            raise ValueError("inference.diffusion_cache_max_reuse must be a positive integer.")
         if type(reuse_stride) is not int or reuse_stride < 1:
             raise ValueError("inference.uncond_reuse_stride must be a positive integer.")
         if cfg_mode not in {"sequential", "batched", "paired"}:
@@ -3566,6 +3576,8 @@ class TrainingConfig:
                 cfg_mode=cfg_mode,
                 cfg_interval=list(map(float, cfg_interval)),
                 uncond_reuse_stride=reuse_stride,
+                diffusion_cache_threshold=float(diffusion_threshold),
+                diffusion_cache_max_reuse=diffusion_max_reuse,
                 keep_text_encoder_resident=bool(
                     inference_table.get("keep_text_encoder_resident", False)
                 ),

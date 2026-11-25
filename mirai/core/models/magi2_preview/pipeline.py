@@ -16,6 +16,7 @@ from torch import nn
 from torch.nn.utils import parametrize
 
 from mirai.core.inference.cfg_schedule import CfgSchedule
+from mirai.core.inference.diffusion_cache import DiffusionPredictionCache
 
 from mirai.core.models.base import (
     MemoryFeatureCapabilities,
@@ -240,6 +241,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     """Native MAGI-2 denoiser with host-resident block streaming."""
 
     supports_native_cfg_schedule = True
+    supports_native_diffusion_cache = True
     # Class-level defaults so every policy seam answers identically before
     # __init__ has run, which is how the weightless contract probes reach them.
     _refiner: Any | None = None
@@ -1370,6 +1372,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         solver_name: str = MAGI2_NATIVE_SOLVER,
         cfg_mode: str = MAGI2_NATIVE_CFG_MODE,
         cfg_schedule: CfgSchedule | None = None,
+        diffusion_cache: DiffusionPredictionCache | None = None,
     ) -> torch.Tensor:
         """Run the shipping joint video/audio Flow-UniPC sampler.
 
@@ -1389,6 +1392,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
         if requested_cfg_mode == "paired" and getattr(self, "_expert_feature_cache", None) is not None:
             raise ValueError("Paired MAGI-2 CFG requires inference.expert_feature_cache='off'.")
+        if diffusion_cache is not None and (
+            (cfg_schedule is not None and cfg_schedule.enabled)
+            or getattr(self, "_expert_feature_cache", None) is not None
+        ):
+            raise ValueError("Diffusion caching requires default CFG scheduling and expert-feature caching off.")
         from mirai.vendors.magi2_preview.pipeline.preview_data_proxy import (
             CFGConfig,
             SamplerInput,
@@ -1450,6 +1458,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
         else:
             sampler.forward = resident_forward
+        if diffusion_cache is not None:
+            sampler.forward = self._cached_preview_prediction(diffusion_cache, sampler.forward)
         if cfg_schedule is not None and cfg_schedule.enabled:
             if getattr(self, "_expert_feature_cache", None) is not None:
                 raise ValueError("Scheduled MAGI-2 CFG requires inference.expert_feature_cache='off'.")
@@ -1477,6 +1487,19 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             context_null.detach().to(device="cpu"),
         )
         return sampled_video[0]
+
+    @staticmethod
+    def _cached_preview_prediction(cache, forward):
+        def predict(model_input):
+            inputs = (model_input.x_t[:1], model_input.audio_x_t[:1], model_input.t[:1])
+            reused = cache.lookup(inputs)
+            if reused is not None:
+                return reused
+            prediction = forward(model_input)
+            cache.store(inputs, prediction)
+            return prediction
+
+        return predict
 
     @staticmethod
     def _preview_branch_input(model_input, index):

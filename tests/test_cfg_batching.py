@@ -112,6 +112,7 @@ class CfgBatchingContractTests(unittest.TestCase):
     def test_variable_length_masked_forward_matches_sequential_cfg(self) -> None:
         from mirai.core.training.preview.preview import run_native_denoise_loop
         from mirai.core.inference.cfg_schedule import CfgSchedule
+        from mirai.core.inference.diffusion_cache import DiffusionPredictionCache
 
         batch_sizes = []
 
@@ -180,6 +181,18 @@ class CfgBatchingContractTests(unittest.TestCase):
         policy = CfgSchedule((0.25, 0.75), 2)
         run_native_denoise_loop(cfg_mode="batched", cfg_schedule=policy, **kwargs)
         self.assertEqual(batch_sizes, [1, 2, 1, 2, 1])
+
+        batch_sizes.clear()
+        reference, _ = run_native_denoise_loop(cfg_mode="batched", **kwargs)
+        cache = DiffusionPredictionCache(threshold=1e-10, max_reuse=1)
+        candidate, _ = run_native_denoise_loop(cfg_mode="batched", diffusion_cache=cache, **kwargs)
+        torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
+        self.assertEqual(cache.snapshot(), {"reused": 0, "computed": 5, "invalidated": 4})
+        batch_sizes.clear()
+        cache = DiffusionPredictionCache(threshold=10.0, max_reuse=1)
+        run_native_denoise_loop(cfg_mode="batched", diffusion_cache=cache, **kwargs)
+        self.assertEqual(cache.snapshot(), {"reused": 2, "computed": 3, "invalidated": 2})
+        self.assertEqual(batch_sizes, [2, 2, 2])
         batch_sizes.clear()
         run_native_denoise_loop(cfg_mode="batched", cfg_schedule=policy, **kwargs)
         self.assertEqual(batch_sizes, [1, 2, 1, 2, 1])
