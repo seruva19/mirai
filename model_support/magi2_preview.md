@@ -250,9 +250,11 @@ owning tensor before a slot can be overwritten, and the packed payload
 bypasses host RAM.
 Set `MIRAI_PACKED_CUDA_ARENA=raw` to back the GDS slots with one aligned
 allocation outside the PyTorch caching allocator. Host-backed streams use
-the same option for two fixed 32 MiB upload slots. Uploads reuse those slots
-and copy to owning CUDA tensors before handing weights to the caller. This
-experimental mode requires CuPy for the active CUDA version. Compare with
+the same option for two fixed 32 MiB upload slots. With prefetch disabled,
+dequantization reads borrowed packed fields directly from a slot when the
+batch fits. A CUDA event orders reuse after the consumer finishes. Larger
+batches and prefetched reads use owning CUDA tensors. This experimental
+mode requires CuPy for the active CUDA version. Compare with
 the variable unset using the same synthetic shard, reader depth, and device.
 With `memory.weight_residency_strategy="stream_disk"` and
 `memory.packed_stream_backend="staged"`, uniform NF4, FP8, NVFP4, MXFP4, and GGUF expert

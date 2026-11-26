@@ -83,3 +83,12 @@ class FixedCudaArena:
             self._release_events[index] = event
             self._available.append(index)
             self._leases.notify()
+
+    def synchronize(self) -> None:
+        """Drain returned leases after the owner has stopped new submissions."""
+        with self._leases:
+            if self._failed or len(self._available) != self._slots:
+                raise RuntimeError("CUDA arena has outstanding slot usage.")
+            for event in self._release_events.values():
+                if event is not None:
+                    event.synchronize()

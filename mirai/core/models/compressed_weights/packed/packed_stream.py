@@ -7,6 +7,7 @@ import time
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -123,7 +124,6 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._staging_pool = None
         self._raw_staging = self._backend != "gds" and os.environ.get("MIRAI_PACKED_CUDA_ARENA", "") == "raw"
         self._staging_arena = None
-        self._staging_arena_position = 0
         self._staging_arena_device = None
         self._staging_unavailable = False
         self._pinned_in_flight = 0
@@ -285,6 +285,40 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             self._h2d_bytes += transferred
         return PackedCudaTransfer(stacked, event)
 
+    @contextmanager
+    def borrow_packed_fields(self, keys, indices, *, device):
+        """Supply short-lived packed fields on the current CUDA stream."""
+        target = torch.device(device)
+        if self._raw_staging and target.type == "cuda" and self._backend != "gds" and not self.prefetch_enabled:
+            indices = tuple(indices)
+            offsets = []
+            size = 0
+            for key in keys:
+                region = self._region(key)
+                size = (size + 15) // 16 * 16
+                offsets.append(size)
+                size += region.nbytes // region.shape[0] * len(indices)
+            if size <= _MAX_RANGE_BYTES:
+                with self._staging_lock:
+                    if self._closed:
+                        raise RuntimeError("Packed stream mapping is closed.")
+                    sources = [self.get_slices_to_device(key, indices, device="cpu") for key in keys]
+                    stream = torch.cuda.current_stream(target)
+                    arena = self._cuda_staging_arena(target, stream)
+                    with arena.lease(stream) as slot:
+                        fields = []
+                        for source, offset in zip(sources, offsets, strict=True):
+                            packed_bytes = source.numel() * source.element_size()
+                            field = slot[offset:offset + packed_bytes].view(source.dtype).view(source.shape)
+                            field.copy_(source)
+                            fields.append(field)
+                        with self._stats_lock:
+                            self._h2d_ops += len(sources)
+                            self._h2d_bytes += sum(source.numel() * source.element_size() for source in sources)
+                        yield fields
+                return
+        yield [self.get_slices_to_device(key, indices, device=target) for key in keys]
+
     def _host_expert_slice_batch(self, key, indices):
         cache_keys = {index: packed_stream_cache_key(key, (index,), access="slice") for index in indices}
         tensors = {index: self._cache.get(cache_key) for index, cache_key in cache_keys.items()}
@@ -408,6 +442,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._executor.shutdown(wait=True, cancel_futures=False)
         with self._staging_lock:
             if self._staging_arena is not None:
+                self._staging_arena.synchronize()
                 for stream in self._streams.values():
                     stream.synchronize()
                 self._staging_arena = None
@@ -559,7 +594,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 return self._copy_through_cuda_arena(host_tensors, target, dtype, stream)
         return [tensor.to(device=target, dtype=dtype) for tensor in host_tensors]
 
-    def _copy_through_cuda_arena(self, host_tensors, target, dtype, stream):
+    def _cuda_staging_arena(self, target, stream):
         from .fixed_cuda_arena import FixedCudaArena
 
         if self._staging_arena is None:
@@ -569,6 +604,10 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             self._staging_arena_device = stream.device
         elif self._staging_arena_device != stream.device:
             raise ValueError("Packed CUDA staging slots are bound to one device.")
+        return self._staging_arena
+
+    def _copy_through_cuda_arena(self, host_tensors, target, dtype, stream):
+        arena = self._cuda_staging_arena(target, stream)
         copies = []
         for source in host_tensors:
             result = torch.empty_like(source, device=target)
@@ -576,14 +615,13 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             result_bytes = result.view(-1).view(torch.uint8)
             for start in range(0, source_bytes.numel(), _MAX_RANGE_BYTES):
                 chunk = source_bytes[start:start + _MAX_RANGE_BYTES]
-                slot = self._staging_arena.slot(self._staging_arena_position)[:chunk.numel()]
-                self._staging_arena_position = (self._staging_arena_position + 1) % _CUDA_STAGING_SLOTS
-                if self._staging_pool is not None:
-                    self._staging_pool.copy_into([chunk], [slot], stream=stream)
-                else:
-                    slot.copy_(chunk)
-                # All slot writes and reads are submitted on the same staging stream.
-                result_bytes[start:start + chunk.numel()].copy_(slot)
+                with arena.lease(stream) as storage:
+                    slot = storage[:chunk.numel()]
+                    if self._staging_pool is not None:
+                        self._staging_pool.copy_into([chunk], [slot], stream=stream)
+                    else:
+                        slot.copy_(chunk)
+                    result_bytes[start:start + chunk.numel()].copy_(slot)
             copies.append(result if dtype is None else result.to(dtype=dtype))
         return copies
 

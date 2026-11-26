@@ -65,6 +65,8 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         third_done.record.assert_called_once_with(consumer)
 
     def test_raw_staged_upload_reuses_slots_without_aliasing_results(self) -> None:
+        from contextlib import nullcontext
+        from itertools import cycle
         from types import SimpleNamespace
 
         from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
@@ -72,7 +74,6 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         reader = StreamingPackedTensorMapping.__new__(StreamingPackedTensorMapping)
         reader._closed = True
         reader._staging_arena = None
-        reader._staging_arena_position = 0
         reader._staging_arena_device = None
         reader._staging_pool = mock.Mock()
 
@@ -83,6 +84,8 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         storage = torch.zeros(2, 8, dtype=torch.uint8)
         arena = mock.Mock()
         arena.slot.side_effect = lambda index: storage[index]
+        positions = cycle(range(2))
+        arena.lease.side_effect = lambda _: nullcontext(arena.slot(next(positions)))
         device = torch.device("cpu")
         stream = SimpleNamespace(device=device)
         module = "mirai.core.models.compressed_weights.packed"
@@ -95,6 +98,48 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         self.assertEqual(arena.slot.call_args_list, [mock.call(0), mock.call(1), mock.call(0), mock.call(1)])
         torch.testing.assert_close(first, torch.arange(5, dtype=torch.int32))
         torch.testing.assert_close(second, torch.tensor([23], dtype=torch.float64))
+
+    def test_raw_borrowed_fields_alias_aligned_slot_during_consumer(self) -> None:
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
+
+        reader = StreamingPackedTensorMapping.__new__(StreamingPackedTensorMapping)
+        reader._closed = False
+        reader._raw_staging = True
+        reader._backend = "staged"
+        reader._prefetch = None
+        reader._staging_lock = reader._stats_lock = mock.MagicMock()
+        reader._h2d_ops = reader._h2d_bytes = 0
+        reader._region = mock.Mock(return_value=SimpleNamespace(shape=(2,), nbytes=8))
+        first = torch.tensor([7, 5], dtype=torch.int32)
+        second = torch.tensor([2.5, 1.5], dtype=torch.float32)
+        reader.get_slices_to_device = mock.Mock(side_effect=[first, second])
+        slot = torch.empty(32, dtype=torch.uint8)
+        released = mock.Mock()
+
+        @contextmanager
+        def lease(_stream):
+            try:
+                yield slot
+            finally:
+                released()
+
+        reader._cuda_staging_arena = mock.Mock(return_value=SimpleNamespace(lease=lease))
+        with mock.patch("torch.cuda.current_stream"):
+            with reader.borrow_packed_fields(("weights", "scales"), (1, 0), device="cuda:0") as fields:
+                released.assert_not_called()
+                torch.testing.assert_close(fields[0], first)
+                torch.testing.assert_close(fields[1], second)
+                self.assertEqual(fields[0].data_ptr(), slot.data_ptr())
+                self.assertEqual(fields[1].data_ptr(), slot.data_ptr() + 16)
+        released.assert_called_once()
+        self.assertEqual(reader._h2d_bytes, 16)
+        self.assertEqual(reader.get_slices_to_device.call_args_list, [
+            mock.call("weights", (1, 0), device="cpu"), mock.call("scales", (1, 0), device="cpu"),
+        ])
+        reader._closed = True
 
     def test_uring_fixed_window_reuses_one_buffer_across_chunks(self) -> None:
         import ctypes

@@ -22,6 +22,7 @@ rather than retaining a dense copy.
 
 from __future__ import annotations
 
+from contextlib import ExitStack, nullcontext
 from math import prod
 from typing import Callable, Iterator, Sequence
 
@@ -99,6 +100,12 @@ class PackedExpertRangeView:
 
     def get_slices_to_device(self, key, indices, **kwargs):
         return self.reader.get_slices_to_device(self.prefix + key, indices, **kwargs)
+
+    def borrow_packed_fields(self, keys, indices, *, device):
+        borrow = getattr(self.reader, "borrow_packed_fields", None)
+        if borrow is None:
+            return nullcontext([self.get_slices_to_device(key, indices, device=device) for key in keys])
+        return borrow(tuple(self.prefix + key for key in keys), indices, device=device)
 
     def prefetch_slices_to_device(self, key, indices, **kwargs):
         return self.reader.prefetch_slices_to_device(self.prefix + key, indices, **kwargs)
@@ -559,15 +566,21 @@ class Magi2Nf4ExpertStore(nn.Module):
                 stop - start, rows, 2 * cols
             )
 
-        with torch.no_grad():
+        with torch.no_grad(), ExitStack() as leases:
             indices = None if group_ids is None else group_ids[start:stop]
             reader = getattr(self, "_packed_range_reader", None)
             ids = range(start, stop) if indices is None else (indices.tolist() if reader is not None else ())
+            suffixes = ("", "_absmax", "_nabsmax", "_offset")
+            if reader is not None:
+                names = tuple(f"{storage_key}_nf4{suffix}" for suffix in suffixes)
+                streamed = dict(zip(suffixes, leases.enter_context(
+                    reader.borrow_packed_fields(names, ids, device=target)
+                ), strict=True))
 
             def select(suffix: str) -> torch.Tensor:
                 name = f"{storage_key}_nf4{suffix}"
                 if reader is not None:
-                    field = reader.get_slices_to_device(name, ids, device=target)
+                    field = streamed[suffix]
                     if lane is not None:
                         field = field[:, lane]
                     if both:
@@ -760,7 +773,11 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
 
     @torch.no_grad()
     def materialize_segment(self, key, group_start, group_stop, *, dtype, device, group_ids=None):
-        fields = self._packed_segment(key, group_start, group_stop, device=device, group_ids=group_ids)
+        with ExitStack() as leases:
+            fields = self._packed_segment(key, group_start, group_stop, device=device, group_ids=group_ids, leases=leases)
+            return self._dequantize_segment(key, fields, dtype=dtype, device=device)
+
+    def _dequantize_segment(self, key, fields, *, dtype, device):
         shape = self._shapes[key][1:]
         if self.quant_format == "fp8":
             return dequantize_blockwise_fp8_weight(*fields, BlockwiseFP8Meta(shape), dtype=dtype, device=device)
@@ -784,7 +801,7 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         fields = self._packed_segment(key, group, group + 1, device=x.device)
         return native_fp4_linear(x, *(field[0] for field in fields), self._fp4_meta(self._shapes[key][1:]))
 
-    def _packed_segment(self, key, group_start, group_stop, *, device, group_ids=None):
+    def _packed_segment(self, key, group_start, group_stop, *, device, group_ids=None, leases=None):
         self._require_loaded(key)
         count = self.num_groups if group_ids is None else group_ids.numel()
         if not 0 <= group_start < group_stop <= count:
@@ -793,6 +810,8 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         reader = getattr(self, "_packed_range_reader", None)
         if reader is not None:
             ids = range(group_start, group_stop) if group_ids is None else group_ids[group_start:group_stop].tolist()
+            if leases is not None:
+                return leases.enter_context(reader.borrow_packed_fields(self._buffer_names(key), ids, device=device))
         for name in self._buffer_names(key):
             if reader is not None:
                 fields.append(reader.get_slices_to_device(name, ids, device=device))
