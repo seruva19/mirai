@@ -2735,7 +2735,7 @@ class CoreMultiHeadMoE(nn.Module):
                 self.W_up.zero_()
                 self.W_down.zero_()
 
-    def _route(self, x_heads: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _route(self, x_heads: torch.Tensor, *, observe: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         num_heads = x_heads.size(1)
         int8_router = getattr(self, "_mirai_int8_router_executor", None)
         if self._mirai_router_lora_executor is not None:
@@ -2762,7 +2762,7 @@ class CoreMultiHeadMoE(nn.Module):
         if candidates is not None:
             topk_indices = candidates.gather(2, topk_indices)
         observer = getattr(self, "_mirai_expert_selection_observer", None)
-        if observer is not None:
+        if observe and observer is not None:
             observer(topk_indices)
         topk_probs = topk_probs * self.config.route_scale
         return topk_probs, topk_indices
@@ -3421,7 +3421,10 @@ class TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         x = x.to(torch.bfloat16)
         x = modality_dispatcher._permute(x)
-        for layer in self.layers:
+        lookahead = getattr(self, "_mirai_expert_lookahead", None)
+        for index, layer in enumerate(self.layers):
+            if lookahead is not None:
+                lookahead(index, x)
             if self.gradient_checkpointing and torch.is_grad_enabled():
                 # Non-reentrant checkpointing supports the non-Tensor native
                 # routing helpers captured by this closure and recomputes each
@@ -3571,7 +3574,10 @@ class Transformer(nn.Module):
         second_x, second_rope, second_varlen, second_dispatch, second_cp = second
         first_x = first_dispatch._permute(first_x.to(torch.bfloat16))
         second_x = second_dispatch._permute(second_x.to(torch.bfloat16))
-        for layer in self.block.layers:
+        lookahead = getattr(self.block, "_mirai_expert_lookahead", None)
+        for index, layer in enumerate(self.block.layers):
+            if lookahead is not None:
+                lookahead(index, first_x)
             first_x, second_x = layer(
                 first_x, first_rope, first_varlen, first_dispatch, first_cp,
                 paired=(second_x, second_rope, second_varlen, second_dispatch, second_cp),

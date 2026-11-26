@@ -308,6 +308,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        self._expert_prefetch_lookahead = family.get("expert_prefetch_lookahead", 0)
+        if type(self._expert_prefetch_lookahead) is not int or self._expert_prefetch_lookahead not in (0, 1, 2):
+            raise ValueError("MAGI-2 expert_prefetch_lookahead must be 0, 1, or 2.")
+        if self._expert_prefetch_lookahead and (
+            not self._stream_expert_artifact or not self._packed_expert_state_path
+            or self._packed_stream_cache_bytes <= 0
+            or self._packed_stream_backend not in {"staged", "direct_io", "io_uring"}
+        ):
+            raise ValueError("MAGI-2 expert lookahead requires a host-backed packed stream and a positive host cache.")
         self._compact_expert_lora = family.get("expert_compact_lora", False)
         if type(self._compact_expert_lora) is not bool:
             raise ValueError("MAGI-2 expert_compact_lora must be a boolean.")
@@ -676,6 +685,17 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
             source_plan = Magi2ExpertPruningPlan.load(self._expert_pruning_adapter_source_plan_path)
             self._expert_pruning_digest = verify_magi2_pruning_source(transformer, source_plan)
+        lookahead_depth = getattr(self, "_expert_prefetch_lookahead", 0)
+        if lookahead_depth:
+            from mirai.core.models.magi2_preview.expert_lookahead import attach_magi2_expert_lookahead
+            from mirai.core.models.magi2_preview.quantized_experts import Magi2PackedExpertStore
+
+            if not self._expert_stores or any(
+                type(store) not in (Magi2Nf4ExpertStore, Magi2PackedExpertStore)
+                for store in self._expert_stores.values()
+            ):
+                raise ValueError("MAGI-2 expert lookahead requires uniformly packed expert stores.")
+            attach_magi2_expert_lookahead(transformer, depth=lookahead_depth, max_experts=8)
         transformer.train()
         self._configure_attention_backend(transformer)
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
@@ -2492,6 +2512,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
         "nf4_fuse_gate_up",
         "expert_cpu_max_tokens",
+        "expert_prefetch_lookahead",
         "expert_compact_lora",
         "expert_int8_checkpoint",
         "expert_nvfp4_native_layout",
@@ -2589,6 +2610,9 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
 
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        lookahead = params.get("expert_prefetch_lookahead", 0)
+        if type(lookahead) is not int or lookahead not in (0, 1, 2):
+            errors.append("MAGI-2 expert_prefetch_lookahead must be 0, 1, or 2.")
         if type(params.get("expert_compact_lora", False)) is not bool:
             errors.append("MAGI-2 expert_compact_lora must be a boolean.")
         if type(params.get("expert_int8_checkpoint", False)) is not bool:

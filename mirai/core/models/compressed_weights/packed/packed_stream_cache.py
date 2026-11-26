@@ -37,6 +37,10 @@ class PackedStreamHostCache:
     def enabled(self) -> bool:
         return self._capacity_bytes > 0
 
+    def contains(self, key: PackedStreamCacheKey) -> bool:
+        with self._lock:
+            return key in self._entries
+
     def get(
         self, key: PackedStreamCacheKey
     ) -> PackedStreamCacheValue | None:

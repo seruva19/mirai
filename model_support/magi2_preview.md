@@ -266,6 +266,15 @@ For segmented grouped linear and expert MLP execution,
 within the active segment and the first projection of the next active segment,
 including during input-gradient recomputation.
 
+Set `model.params.family_params.expert_prefetch_lookahead` to `1` or `2`
+to warm the host cache for the next one or two layers before current-layer
+attention. The predictor runs future routers on a sample of the current
+residual and requests up to eight experts per future layer. The actual router
+still determines which weights execution uses. This experimental option
+requires a uniformly packed host-backed stream with a positive host cache.
+Compare read bytes and stall time against lookahead `0` with the same
+artifact and cache budget.
+
 For experimental hybrid CPU/CUDA execution, set
 `model.params.family_params.expert_cpu_max_tokens` from `1` to `10`.
 Packed experts with at most that many routed rows run on a CPU worker while
@@ -921,6 +930,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   groups on a CPU worker and preserve the routed output order.
 - **INT8 expert activation checkpointing** — Compress the activations saved
   by segmented expert recomputation.
+- **Speculative expert prefetch** — Warm the packed host cache based on
+  predictions for upcoming expert layers.
 - **Packed routed expert LoRA** — Use
   `adapter.target_preset="attn_router_routed_experts"` with uniform packed
   experts to adapt attention, the router, and individual expert projections.

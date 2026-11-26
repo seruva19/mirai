@@ -3074,6 +3074,39 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_expert_lookahead",
+      "kind": "residency",
+      "owner": "mirai/core/models/magi2_preview/expert_lookahead.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "attach_magi2_expert_lookahead"
+      ],
+      "config_keys": [
+        "model.params.family_params"
+      ],
+      "disabled_config": {
+        "model.params.family_params": {}
+      },
+      "contract_paths": [
+        "tests/test_magi2_nf4_experts.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Speculative expert prefetch",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_flex_attention_training",
       "kind": "generic",
       "owner": "mirai/core/models/magi2_preview/flex_attention.py",

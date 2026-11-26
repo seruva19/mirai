@@ -2239,6 +2239,85 @@ def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -
         load_magi2_nf4_packed_state(artifact, model(), blocksize=64)
 
 
+def test_magi2_lookahead_warms_future_hosts_without_changing_routes(tmp_path, monkeypatch) -> None:
+    from threading import Event
+    from types import SimpleNamespace
+
+    from mirai.core.models.magi2_preview.expert_lookahead import attach_magi2_expert_lookahead
+
+    def model():
+        root = torch.nn.Module()
+        root.block = torch.nn.Module()
+        root.block.layers = torch.nn.ModuleList([
+            _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32))
+            for _ in range(3)
+        ])
+        for layer in root.block.layers:
+            layer.config_mhc = SimpleNamespace(num_stream=2)
+        return root
+
+    source = model()
+    resident = quantize_magi2_experts_in_place(source, quant_format="fp8")
+    artifact = save_magi2_nf4_packed_state(tmp_path / "packed", source)
+    target = model()
+    ranged = load_magi2_nf4_packed_state(
+        artifact, target, blocksize=64, quant_format="fp8", range_read_backend="staged",
+        stream_cache_bytes=16 << 20,
+    )
+    reader = ranged["block.layers.0.mlp.moe_mlp"]._packed_range_reader.reader
+    proceed = Event()
+    read = reader._read_slice_run
+
+    def hold_read(*args):
+        if not proceed.wait(timeout=5):
+            raise TimeoutError("Test did not release the speculative read.")
+        return read(*args)
+
+    monkeypatch.setattr(reader, "_read_slice_run", hold_read)
+    input_rows = torch.randn(5, 2, 2, 128)
+    residual = input_rows.mean(1)
+    try:
+        attach_magi2_expert_lookahead(target, depth=2, max_experts=1)
+        target.block._mirai_expert_lookahead(0, input_rows.flatten(1))
+        target.block._mirai_expert_lookahead(0, input_rows.flatten(1))
+        proceed.set()
+        reader._warm_future.result(timeout=5)
+        before = reader.snapshot()
+        assert before["speculative_warm_submitted"] == 1
+        assert before["speculative_warm_dropped"] == 1
+        assert before["speculative_warm_failed"] == 0
+        assert before["read_bytes"] > 0
+        for i in (1, 2):
+            module = target.block.layers[i].mlp.moe_mlp
+            _, predicted = module._route(residual)
+            ids = (predicted + torch.arange(2)[:, None, None] * module.num_experts).flatten()
+            selected = torch.bincount(ids, minlength=8).argmax().item()
+            store = ranged[f"block.layers.{i}.mlp.moe_mlp"]
+            baseline = resident[f"block.layers.{i}.mlp.moe_mlp"]
+            expected = baseline.materialize_segment("W_gate", selected, selected + 1, dtype=torch.float32, device="cpu")
+            actual = store.materialize_segment("W_gate", selected, selected + 1, dtype=torch.float32, device="cpu")
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert reader.snapshot()["read_bytes"] == before["read_bytes"]
+
+        backend = Magi2QuantizedGroupedMoEBackend(
+            Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"), expert_autograd="segmented_recompute",
+        )
+        rows = torch.randn_like(residual, requires_grad=True)
+        scores = torch.ones(2, 5, 2) / 2
+        routes = torch.tensor([[[3, 1]] * 5, [[2, 0]] * 5])
+        actual = backend.execute(target.block.layers[1].mlp.moe_mlp, rows, scores, routes)
+        expected = backend.execute(source.block.layers[1].mlp.moe_mlp, rows, scores, routes)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        torch.testing.assert_close(
+            torch.autograd.grad(actual.sum(), rows)[0], torch.autograd.grad(expected.sum(), rows)[0],
+            atol=0, rtol=0,
+        )
+        assert reader.snapshot()["read_bytes"] > before["read_bytes"]
+    finally:
+        proceed.set()
+        reader.close()
+
+
 def test_magi2_staged_layers_share_one_packed_reader(tmp_path, monkeypatch) -> None:
     def model():
         root = _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32))

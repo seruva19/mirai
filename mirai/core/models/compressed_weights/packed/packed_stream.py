@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +91,12 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._streams: dict[str, Any] = {}
         self._cache = PackedStreamHostCache(cache_capacity_bytes)
         self._cache_expert_slices = bool(cache_expert_slices)
+        self._warm_lock = threading.Lock()
+        self._warm_executor: ThreadPoolExecutor | None = None
+        self._warm_future: Future[None] | None = None
+        self._warm_submitted = 0
+        self._warm_dropped = 0
+        self._warm_failed = 0
         self._prefetch: Any | None = None
         if depth:
             self._prefetch = PackedStreamPrefetchRing(depth)
@@ -281,6 +287,46 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 self._cache.put(cache_keys[index], entry)
         return torch.stack([tensors[index][0] for index in indices])
 
+    def warm_expert_cache(self, requests: Mapping[str, Sequence[int]]) -> bool:
+        """Offer one bounded, best-effort batch of speculative host reads."""
+        if self._gds is not None or not self._cache_expert_slices or not self._cache.enabled:
+            return False
+        normalized = {
+            key: tuple(sorted(set(self._normalize_indices(key, ids))))
+            for key, ids in requests.items() if ids
+        }
+        if not normalized:
+            return False
+        with self._warm_lock:
+            if self._closed:
+                return False
+            if self._warm_future is not None and not self._warm_future.done():
+                self._warm_dropped += 1
+                return False
+            if self._warm_executor is None:
+                self._warm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mirai-packed-warm")
+            self._warm_future = self._warm_executor.submit(self._warm_expert_cache, normalized)
+            self._warm_submitted += 1
+            return True
+
+    def _warm_expert_cache(self, requests: Mapping[str, Sequence[int]]) -> None:
+        try:
+            for key, indices in requests.items():
+                missing = tuple(
+                    index for index in indices
+                    if not self._cache.contains(packed_stream_cache_key(key, (index,), access="slice"))
+                )
+                for start, count in self._bounded_runs(key, missing):
+                    if self._closed:
+                        return
+                    for offset, tensor in enumerate(self._read_slice_run(key, start, count)):
+                        cache_key = packed_stream_cache_key(key, (start + offset,), access="slice")
+                        self._cache.put(cache_key, (tensor.clone(),))
+        except Exception:
+            # The demand path retries the read and owns error reporting for required weights.
+            with self._warm_lock:
+                self._warm_failed += 1
+
     def snapshot(self) -> dict[str, int | float | str]:
         with self._stats_lock:
             snapshot: dict[str, int | float | str] = {
@@ -311,6 +357,13 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             snapshot.update(self._gds.snapshot())
         if self._prefetch is not None:
             snapshot.update(self._prefetch.snapshot())
+        with self._warm_lock:
+            if self._warm_submitted:
+                snapshot.update(
+                    speculative_warm_submitted=self._warm_submitted,
+                    speculative_warm_dropped=self._warm_dropped,
+                    speculative_warm_failed=self._warm_failed,
+                )
         return snapshot
 
     def evict_file_cache(self) -> bool:
@@ -320,9 +373,13 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         )
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._warm_lock:
+            if self._closed:
+                return
+            self._closed = True
+            warmer = self._warm_executor
+        if warmer is not None:
+            warmer.shutdown(wait=True, cancel_futures=True)
         if self._prefetch is not None:
             self._prefetch.close()
         self._executor.shutdown(wait=True, cancel_futures=False)
