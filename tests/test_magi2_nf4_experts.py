@@ -2682,6 +2682,62 @@ def test_nf4_restore_rejects_incompatible_statistics_without_mutation() -> None:
 
 
 @_requires_nf4
+@pytest.mark.parametrize("fmt", ["nf4", "fp8"])
+@pytest.mark.parametrize("depth", [0, 4])
+def test_raw_cuda_expert_slots_match_owning_stream(tmp_path, monkeypatch, fmt, depth) -> None:
+    pytest.importorskip("cupy")
+
+    def model(device):
+        return _container(_reduced_moe(
+            device=torch.device(device), dtype=torch.bfloat16, hidden_size=256,
+            expert_intermediate_size=256, num_heads=1, num_experts=4, top_k=1,
+        ))
+
+    source = model("cuda")
+    quantize_magi2_experts_in_place(source, quant_format=fmt)
+    path = save_magi2_nf4_packed_state(tmp_path / "packed", source, fuse_gate_up=fmt == "nf4")
+    options = dict(blocksize=64, quant_format=fmt, range_read_backend="staged")
+    monkeypatch.delenv("MIRAI_PACKED_CUDA_ARENA", raising=False)
+    reference = load_magi2_nf4_packed_state(path, model("cpu"), **options)["mlp.moe_mlp"]
+    monkeypatch.setenv("MIRAI_PACKED_CUDA_ARENA", "raw")
+    candidate = load_magi2_nf4_packed_state(
+        path, model("cpu"), stream_prefetch_depth=depth, **options,
+    )["mlp.moe_mlp"]
+    reader = candidate._packed_range_reader.reader
+    offsets = torch.tensor([2, 4, 6, 8], device="cuda", dtype=torch.int32)
+    values = torch.randn(8, candidate.expert_weight_shape("W_gate")[1], device="cuda", dtype=torch.bfloat16)
+
+    def execute(store):
+        rows = values.clone().requires_grad_()
+        result = grouped_moe._SegmentedQuantizedExpertMlp.apply(rows, offsets, store, "bmm", "bmm", "torch")
+        (grad,) = torch.autograd.grad(result.float().sum(), rows)
+        return result, grad
+
+    try:
+        for store in (reference, candidate):
+            store.set_expert_weight_access_policy(
+                expert_weight_access="chunked_dequant", expert_dequant_chunk_size=2,
+            )
+        expected = execute(reference)
+        for _ in range(2):
+            if depth:
+                key = "W_gate_up" if candidate.has_fused_gate_up else "W_gate"
+                candidate.prefetch_segment(key, 0, 2, device=values.device, dtype=values.dtype)
+            for actual, wanted in zip(execute(candidate), expected, strict=True):
+                torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+        stats = reader.snapshot()
+        if depth:
+            assert stats["cuda_prefetch_dense_arena_bytes"] > 0
+            assert stats["cuda_prefetch_packed_arena_bytes"] > 0
+            assert stats["prefetch_consumed"] > 0
+        else:
+            assert stats["cuda_staging_arena_bytes"] > 0
+    finally:
+        reader.close()
+        reference._packed_range_reader.reader.close()
+
+
+@_requires_nf4
 def test_magi2_nf4_packed_state_round_trip(tmp_path) -> None:
     source_module = _reduced_moe(
         device=torch.device("cuda"), dtype=torch.bfloat16
