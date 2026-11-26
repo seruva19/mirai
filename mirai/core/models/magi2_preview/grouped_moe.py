@@ -1638,6 +1638,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         fused_gguf: bool = False,
         fused_int4: bool = False,
         persistent_packed: bool = False,
+        packed_graph_cache_size: int = 0,
     ) -> None:
         super().__init__(
             plan,
@@ -1657,6 +1658,13 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         if persistent_packed and not self.fused_formats:
             raise Magi2GroupedMoEPolicyError("Persistent packed GEMM requires a fused packed expert mode.")
         self.fused_backend = "triton_persistent_packed" if persistent_packed else "triton_grouped_packed"
+        self._packed_graph_cache = None
+        if packed_graph_cache_size:
+            if not persistent_packed:
+                raise Magi2GroupedMoEPolicyError("Packed expert graph caching requires persistent packed GEMM.")
+            from .packed_mlp_graph import PackedMlpGraphCache
+
+            self._packed_graph_cache = PackedMlpGraphCache(packed_graph_cache_size)
         if self.fused_formats and (
             self.expert_autograd != "standard" or plan.routed_gemm != "disabled"
             or cpu_expert_max_tokens or plan.forward_backend == "scaled_mm_fp4"
@@ -1888,6 +1896,27 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             if self.fused_formats:
                 forward_backend = self.fused_backend
             return self._expert_lora_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend, adapters)
+        if (
+            self._packed_graph_cache is not None and x_heads.is_cuda and sorted_rows.numel()
+            and not torch.is_grad_enabled() and not torch.cuda.is_current_stream_capturing()
+        ):
+            store = self._store(module)
+            weights = store.resident_graph_weights(x_heads.device) if isinstance(store, Magi2PackedExpertStore) else ()
+            if weights:
+                x_sorted = x_heads.reshape(-1, x_heads.shape[-1]).index_select(0, sorted_rows)
+
+                def execute(rows, ends):
+                    def project(key, values):
+                        return _QuantizedGroupedExpertLinear.apply(values, ends, store, key, self.fused_backend, dx_backend)
+
+                    gate = project("W_gate", rows)
+                    up = project("W_up", rows)
+                    hidden = _ConfiguredSwiGlu7.apply(
+                        gate, up, store.expert_weight_dtype("W_down"), self.activation_backend,
+                    )
+                    return project("W_down", hidden)
+
+                return self._packed_graph_cache.run(x_sorted, offsets, weights, execute)
         if self.fused_formats or forward_backend == "scaled_mm_fp4":
             return super().branch_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend)
         if self.plan.routed_gemm != "disabled":

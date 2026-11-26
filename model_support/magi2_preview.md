@@ -300,6 +300,13 @@ artifact stores one FP32 scale per 32 weights.
 Set `model.params.family_params.expert_persistent_packed = true` with one
 of these fused modes to use a persistent Triton grid. It schedules tiles
 from cumulative group row counts on CUDA and skips empty groups.
+Set `model.params.family_params.expert_packed_graph_cache_size` to a positive
+integer up to 8 to reuse CUDA Graphs for resident packed expert inference.
+Each entry captures the three expert projections and activation in a
+power-of-two routed-row bucket. The graph path requires persistent packed
+GEMM, `memory.expert_weight_access="full_dequant"`, and GPU-resident weights.
+Block swapping is incompatible with this cache because captured graphs retain
+references to their packed weight buffers.
 
 For new uniform NVFP4 exports, set
 `model.params.family_params.expert_nvfp4_native_layout = true` while packing

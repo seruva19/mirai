@@ -729,6 +729,12 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
             suffixes += ("scales", "global_scale")
         return tuple(f"{key}_{suffix}" for suffix in suffixes)
 
+    def resident_graph_weights(self, device):
+        if self.expert_weight_access != "full_dequant" or getattr(self, "_packed_range_reader", None) is not None:
+            return ()
+        weights = tuple(getattr(self, name) for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES for name in self._buffer_names(key))
+        return weights if all(weight.device == device and weight.is_contiguous() for weight in weights) else ()
+
     def expected_buffers(self, *, keys=MAGI2_ROUTED_EXPERT_TENSOR_NAMES) -> set[str]:
         return {name for key in keys for name in self._buffer_names(key)}
 

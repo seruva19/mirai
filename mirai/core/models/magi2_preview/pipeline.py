@@ -358,6 +358,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             self._fused_fp4_experts or self._fused_gguf_experts or self._fused_int4_experts
         ):
             raise ValueError("MAGI-2 expert_persistent_packed requires a fused packed expert mode.")
+        self._packed_graph_cache_size = family.get("expert_packed_graph_cache_size", 0)
+        if type(self._packed_graph_cache_size) is not int or not 0 <= self._packed_graph_cache_size <= 8:
+            raise ValueError("MAGI-2 expert_packed_graph_cache_size must be an integer in [0, 8].")
+        if self._packed_graph_cache_size and not self._persistent_packed_experts:
+            raise ValueError("MAGI-2 expert_packed_graph_cache_size requires expert_persistent_packed.")
         self._cpu_expert_max_tokens = family.get("expert_cpu_max_tokens", 0)
         if type(self._cpu_expert_max_tokens) is not int or not 0 <= self._cpu_expert_max_tokens <= 10:
             raise ValueError("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")
@@ -1213,6 +1218,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 fused_gguf=getattr(self, "_fused_gguf_experts", False),
                 fused_int4=getattr(self, "_fused_int4_experts", False),
                 persistent_packed=getattr(self, "_persistent_packed_experts", False),
+                packed_graph_cache_size=getattr(self, "_packed_graph_cache_size", 0),
             )
         else:
             backend = Magi2GroupedMoEBackend(
@@ -1718,6 +1724,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         phase = WeightResidencyExecutionMode.coerce(execution_mode)
         resolved = str(strategy).strip().lower()
         enabled = resolved != "disabled" and int(blocks_to_swap) > 0
+        if enabled and getattr(self, "_packed_graph_cache_size", 0):
+            raise ValueError("MAGI-2 packed expert CUDA Graphs require resident layers without block swapping.")
         # The adapter is what keeps the streamed base frozen under a training
         # backward; an inference forward has no backward to protect.
         if (
@@ -2560,6 +2568,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "expert_fused_gguf",
         "expert_fused_int4",
         "expert_persistent_packed",
+        "expert_packed_graph_cache_size",
         "expert_nvfp4_native_layout",
         "expert_pruning_plan_path",
         "expert_consolidation_plan_path",
@@ -2682,6 +2691,11 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             params.get(key) is True for key in ("expert_fused_fp4", "expert_fused_gguf", "expert_fused_int4")
         ):
             errors.append("MAGI-2 expert_persistent_packed requires a fused packed expert mode.")
+        graph_size = params.get("expert_packed_graph_cache_size", 0)
+        if type(graph_size) is not int or not 0 <= graph_size <= 8:
+            errors.append("MAGI-2 expert_packed_graph_cache_size must be an integer in [0, 8].")
+        elif graph_size and params.get("expert_persistent_packed") is not True:
+            errors.append("MAGI-2 expert_packed_graph_cache_size requires expert_persistent_packed.")
         cpu_max = params.get("expert_cpu_max_tokens", 0)
         if type(cpu_max) is not int or not 0 <= cpu_max <= 10:
             errors.append("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")
