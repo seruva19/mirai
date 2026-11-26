@@ -540,7 +540,7 @@ def test_active_groups_decode_only_routed_weights_and_preserve_backward(
         torch.testing.assert_close(observed, reference)
 
     path = save_magi2_nf4_packed_state(tmp_path / "packed", model, fuse_gate_up=True)
-    store = load_magi2_nf4_packed_state(path, model, blocksize=64, staged_range_reads=True)["layer"]
+    store = load_magi2_nf4_packed_state(path, model, blocksize=64, range_read_backend="staged")["layer"]
     assert store.has_fused_gate_up
     assert all(name.endswith(("_nf4_code", "_nf4_ncode")) for name, _ in store.named_buffers())
     assert not hasattr(store, "W_gate_nf4")
@@ -906,7 +906,7 @@ def test_magi2_mixture_basis_preserves_packed_down_and_selected_group_order(tmp_
         torch.testing.assert_close(dict(restored.named_buffers())[name], value, rtol=0, atol=0)
     streamed_restore = load_magi2_nf4_packed_state(
         artifact, skeleton, blocksize=64, quant_format="mixture_basis",
-        expected_mixture_basis=(2, 2, "fp8"), staged_range_reads=True,
+        expected_mixture_basis=(2, 2, "fp8"), range_read_backend="staged",
     )["mlp.moe_mlp"]
     assert set(dict(streamed_restore.named_buffers())) == {"W_gate_bases", "W_up_bases"}
     for key in ("W_gate", "W_up", "W_down"):
@@ -997,7 +997,7 @@ def test_magi2_shared_basis_reconstructs_selected_native_groups(tmp_path) -> Non
         torch.testing.assert_close(dict(loaded.named_buffers())[key], value, rtol=0, atol=0)
     ranged = load_magi2_nf4_packed_state(
         artifact, target, blocksize=64, quant_format="shared_basis",
-        expected_shared_basis_rank=2, staged_range_reads=True,
+        expected_shared_basis_rank=2, range_read_backend="staged",
     )["mlp.moe_mlp"]
     assert all(name.endswith("_basis") for name, _ in ranged.named_buffers())
     options = dict(device="cpu", dtype=torch.float32, group_ids=torch.tensor([7, 0, 7]))
@@ -1657,7 +1657,7 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rot
     restored = load_magi2_nf4_packed_state(
         artifact, restore_model, blocksize=64, quant_format="fp8",
         expected_pruning_digest=pruning_plan.topology_digest(),
-        staged_range_reads=True,
+        range_read_backend="staged",
     )[name]
     assert restored.payload_bytes() == pruned_stores[name].payload_bytes()
     assert not list(restored.buffers())
@@ -1858,7 +1858,7 @@ def test_magi2_staged_layers_share_one_packed_reader(tmp_path) -> None:
     resident = quantize_magi2_experts_in_place(source, quant_format="fp8")
     artifact = save_magi2_nf4_packed_state(tmp_path / "packed", source)
     ranged = load_magi2_nf4_packed_state(
-        artifact, model(), blocksize=64, quant_format="fp8", staged_range_reads=True,
+        artifact, model(), blocksize=64, quant_format="fp8", range_read_backend="staged",
         stream_cache_bytes=1024, stream_prefetch_depth=2,
     )
     assert len({id(store._packed_range_reader.reader) for store in ranged.values()}) == 1
@@ -1941,7 +1941,7 @@ def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, 
         expected, rtol=0, atol=0,
     )
     ranged = load_magi2_nf4_packed_state(
-        artifact, model(), blocksize=64, quant_format="fp8", staged_range_reads=True,
+        artifact, model(), blocksize=64, quant_format="fp8", range_read_backend="staged",
     )["mlp.moe_mlp"]
     assert not list(ranged.buffers())
     assert ranged.payload_bytes() == resident.payload_bytes()
@@ -1951,6 +1951,30 @@ def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, 
         ),
         expected[[1, 0, 1]], rtol=0, atol=0,
     )
+    from mirai.core.models.compressed_weights.packed import packed_stream_gds
+
+    gds_shards = []
+
+    class FakeGdsReader:
+        def __init__(self, shard_paths):
+            gds_shards.extend(shard_paths.values())
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(packed_stream_gds, "KvikioGdsReader", FakeGdsReader)
+    gds = load_magi2_nf4_packed_state(
+        artifact, model(), blocksize=64, quant_format="fp8", range_read_backend="gds",
+    )["mlp.moe_mlp"]
+    assert gds_shards == [shard]
+    assert not list(gds.buffers())
+    with pytest.raises(ValueError, match="requires a CUDA target"):
+        gds.materialize_segment("W_gate", 0, 1, dtype=torch.float32, device="cpu")
+    unaligned = save_magi2_nf4_packed_state(tmp_path / "unaligned", source)
+    with pytest.raises(ValueError, match="4096-byte-aligned"):
+        load_magi2_nf4_packed_state(
+            unaligned, model(), blocksize=64, quant_format="fp8", range_read_backend="gds",
+        )
     target = model(heads=1, experts=4)
     with pytest.raises(ValueError, match="head topology"):
         load_magi2_nf4_packed_state(artifact, target, blocksize=64, quant_format="fp8")

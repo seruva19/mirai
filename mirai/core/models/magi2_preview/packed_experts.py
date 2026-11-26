@@ -182,7 +182,7 @@ def load_magi2_nf4_packed_state(
     expected_shared_basis_rank: int | None = None,
     expected_mixture_basis: tuple[int, int, str] | None = None,
     retain_mapped_buffers: bool = False,
-    staged_range_reads: bool = False,
+    range_read_backend: str | None = None,
     stream_cache_bytes: int = 0,
     stream_prefetch_depth: int = 0,
 ) -> dict[str, Magi2Nf4ExpertStore]:
@@ -203,6 +203,8 @@ def load_magi2_nf4_packed_state(
     alignment = manifest.get("storage_alignment_bytes", 0)
     if type(alignment) is not int or alignment not in {0, GDS_STORAGE_ALIGNMENT_BYTES}:
         raise Magi2PackedExpertStateError("Packed MAGI-2 expert state has invalid shard alignment.")
+    if range_read_backend == "gds" and alignment != GDS_STORAGE_ALIGNMENT_BYTES:
+        raise Magi2PackedExpertStateError("MAGI-2 GDS requires a 4096-byte-aligned packed export.")
     if (
         manifest.get("schema") != MAGI2_PACKED_EXPERT_SCHEMA
         or type(version) is not int
@@ -328,7 +330,7 @@ def load_magi2_nf4_packed_state(
                     raise Magi2PackedExpertStateError(
                         f"Packed MAGI-2 layer '{module_name}' is missing '{buffer_name}'."
                     ) from exc
-                restored_buffers[buffer_name] = value if retain_mapped_buffers or staged_range_reads else value.clone().contiguous()
+                restored_buffers[buffer_name] = value if retain_mapped_buffers or range_read_backend is not None else value.clone().contiguous()
             if mixed:
                 try:
                     packed = Magi2MixedExpertStore.from_packed_state(
@@ -351,15 +353,15 @@ def load_magi2_nf4_packed_state(
                         store.restore_packed_state(descriptor=spec, buffers=restored_buffers)
                 except (KeyError, TypeError, ValueError) as exc:
                     raise Magi2PackedExpertStateError(f"Invalid packed MAGI-2 layer '{module_name}': {exc}") from exc
-        if staged_range_reads:
+        if range_read_backend is not None:
             tensor_aliases.update({f"{module_name}:{key}": (shard_name, key) for key in expected_buffers})
         stores[module_name] = store
-    if staged_range_reads:
+    if range_read_backend is not None:
         from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
 
         reader = StreamingPackedTensorMapping(
             manifest_path, tensor_aliases=tensor_aliases, cache_capacity_bytes=stream_cache_bytes,
-            prefetch_depth=stream_prefetch_depth,
+            prefetch_depth=stream_prefetch_depth, backend=range_read_backend,
         )
         try:
             for module_name, store in stores.items():

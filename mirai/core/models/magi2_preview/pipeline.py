@@ -270,8 +270,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._packed_stream_backend = getattr(memory_config, "packed_stream_backend", "auto")
         self._packed_stream_cache_bytes = int(float(getattr(memory_config, "packed_stream_cache_gib", 0)) * 1024**3)
         self._packed_stream_prefetch_depth = int(getattr(memory_config, "packed_stream_prefetch_depth", 0))
+        self._stream_expert_artifact = getattr(memory_config, "weight_residency_strategy", "disabled") == "stream_disk"
         self._retain_mapped_expert_buffers = (
-            getattr(memory_config, "weight_residency_strategy", "disabled") == "stream_disk"
+            self._stream_expert_artifact
             and self._packed_stream_backend in {"auto", "staged"}
         )
         # The frozen-weight storage decision is read before the checkpoint is
@@ -908,9 +909,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             expected_shared_basis_rank=shared_basis_rank,
             expected_mixture_basis=mixture_basis,
             retain_mapped_buffers=getattr(self, "_retain_mapped_expert_buffers", False),
-            staged_range_reads=(
-                getattr(self, "_retain_mapped_expert_buffers", False)
-                and getattr(self, "_packed_stream_backend", "auto") == "staged"
+            range_read_backend=(
+                self._packed_stream_backend
+                if getattr(self, "_stream_expert_artifact", False) and self._packed_stream_backend in {"staged", "gds"}
+                else None
             ),
             stream_cache_bytes=getattr(self, "_packed_stream_cache_bytes", 0),
             stream_prefetch_depth=getattr(self, "_packed_stream_prefetch_depth", 0),
