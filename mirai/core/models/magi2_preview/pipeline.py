@@ -753,23 +753,18 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
 
     def _configure_attention_backend(self, transformer: nn.Module) -> None:
-        """Select the attention execution path declared by ``model.attention_backend``.
-
-        Only ``flex`` has a MAGI-2 implementation, because the family's
-        attention carries per-head sink logits the shared SDPA and
-        FlashAttention backends do not model. Every other value leaves the
-        vendored dispatch in place.
-        """
+        """Bind a configured attention implementation that supports MAGI-2 sinks."""
         from mirai.core.models.magi2_preview.flex_attention import (
             attach_flex_attention_backend,
             resolve_magi2_flex_attention,
             validate_flex_attention_support,
         )
 
-        if str(getattr(self.model_config, "attention_backend", "auto")).strip().lower() in {"sage", "sage2"}:
+        requested = str(getattr(self.model_config, "attention_backend", "auto")).strip().lower()
+        if requested in {"sage", "sage2"}:
             raise ValueError("MAGI-2 attention requires sink logits, which SageAttention does not support.")
         backend = resolve_magi2_flex_attention(self.model_config)
-        if backend is not None:
+        if requested == "flex":
             validate_flex_attention_support()
         attach_flex_attention_backend(transformer, backend)
 

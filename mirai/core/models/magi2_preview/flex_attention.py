@@ -49,6 +49,7 @@ import torch
 
 from mirai.core.models.attention_backends import (
     attention_backend_status,
+    flash4_varlen_with_lse,
     flex_attention_function,
     flex_document_block_mask,
 )
@@ -240,21 +241,47 @@ class Magi2FlexAttentionBackend:
         )
 
 
-def resolve_magi2_flex_attention(model_config: Any) -> Magi2FlexAttentionBackend | None:
+class Magi2Flash4AttentionBackend:
+    """Apply the MAGI-2 sink denominator to packed FlashAttention-4 output."""
+
+    def execute(self, q, k, v, *, cu_seqlens_q, cu_seqlens_k, softcap, sink):
+        if torch.is_grad_enabled() and any(
+            tensor is not None and tensor.requires_grad for tensor in (q, k, v, sink)
+        ):
+            raise Magi2FlexAttentionUnsupported("MAGI-2 FlashAttention-4 is inference-only.")
+        if q.ndim == 4 and k.ndim == 4 and v.ndim == 4:
+            q, k, v = q.squeeze(0), k.squeeze(0), v.squeeze(0)
+        if any(tensor.ndim != 3 for tensor in (q, k, v)):
+            raise Magi2FlexAttentionUnsupported("MAGI-2 FlashAttention-4 requires packed Q/K/V.")
+        sink_logits = (
+            _sink_log_denominator(sink, heads=q.shape[1])
+            if sink is not None and sink.numel() else None
+        )
+        output, lse = flash4_varlen_with_lse(
+            q.to(v.dtype), k.to(v.dtype), v,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, softcap=softcap,
+        )
+        if sink_logits is not None:
+            output = output.float() * torch.sigmoid(lse.float() - sink_logits).unsqueeze(-1)
+        return output.to(q.dtype)
+
+
+def resolve_magi2_flex_attention(model_config: Any) -> Magi2FlexAttentionBackend | Magi2Flash4AttentionBackend | None:
     """Return the flex backend when ``model.attention_backend`` selects it.
 
-    Every other value keeps the vendored dispatch, whose training path is the
-    reference implementation; MAGI-2 attention carries sink logits that the
-    SDPA and FlashAttention backends of the shared registry do not implement.
+    FlashAttention-4 applies the same sink denominator in inference.
+    Other values keep the vendored dispatch.
     """
     requested = str(getattr(model_config, "attention_backend", "auto")).strip().lower()
+    if requested == "flash4":
+        return Magi2Flash4AttentionBackend()
     if requested != "flex":
         return None
     return Magi2FlexAttentionBackend()
 
 
 def attach_flex_attention_backend(
-    transformer: Any, backend: Magi2FlexAttentionBackend | None
+    transformer: Any, backend: Magi2FlexAttentionBackend | Magi2Flash4AttentionBackend | None
 ) -> int:
     """Bind (or clear) the attention execution seam on every vendored module."""
     from mirai.vendors.magi2_preview.model.magi2_preview import Attention
@@ -266,7 +293,7 @@ def attach_flex_attention_backend(
             attached += 1
     if backend is not None and attached == 0:
         raise Magi2FlexAttentionUnsupported(
-            "model.attention_backend='flex' matched no MAGI-2 attention layer "
+            "The configured attention backend matched no MAGI-2 attention layer "
             "in this model."
         )
     return attached

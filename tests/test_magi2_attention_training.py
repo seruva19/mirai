@@ -75,6 +75,38 @@ def _cloned(tensors: tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
     return [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
 
 
+@pytest.mark.parametrize("softcap", [-1.0, 8.0])
+def test_preview_flash4_preserves_packed_sink_denominators(monkeypatch, softcap):
+    from types import SimpleNamespace
+
+    from mirai.core.models import attention_backends
+
+    def packed(*, q, k, v, cu_seqlens_q, cu_seqlens_k, causal, softcap, return_lse):
+        assert return_lse and not causal
+        outputs, lses = [], []
+        for start, stop in zip(cu_seqlens_q[:-1], cu_seqlens_q[1:], strict=True):
+            query, key, value = (tensor[start:stop].transpose(0, 1) for tensor in (q, k, v))
+            logits = (query @ key.mT) * q.shape[-1] ** -0.5
+            if softcap:
+                logits = softcap * torch.tanh(logits / softcap)
+            outputs.append((logits.softmax(-1) @ value).transpose(0, 1))
+            lses.append(logits.logsumexp(-1))
+        torch.testing.assert_close(cu_seqlens_k, cu_seqlens_q)
+        return torch.cat(outputs), torch.cat(lses, dim=1)
+
+    monkeypatch.setattr(attention_backends, "_require_backend", lambda *args, **kwargs: None)
+    monkeypatch.setattr(attention_backends, "_load_external_function", lambda *args, **kwargs: packed)
+    backend = resolve_magi2_flex_attention(SimpleNamespace(attention_backend="flash4"))
+    q, k, v, sink = _packed_inputs(heads_kv=1, sink_tokens=2)
+    options = dict(cu_seqlens_q=CU_SEQLENS, cu_seqlens_k=CU_SEQLENS, softcap=softcap, sink=sink)
+    with pytest.raises(Magi2FlexAttentionUnsupported, match="inference-only"):
+        backend.execute(q, k, v, **options)
+    with torch.inference_mode():
+        actual = backend.execute(q, k, v, **options)
+        expected = _torch_varlen_attention_with_sink(q, k, v, **options)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("capability, expected", [((8, 6), "reference"), ((9, 0), "fa3"), ((10, 0), "reference"), ((12, 0), "reference")])
 @torch.inference_mode()
 def test_preview_automatic_fa3_dispatch_is_hopper_only(monkeypatch, capability, expected):

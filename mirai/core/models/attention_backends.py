@@ -531,6 +531,25 @@ def dispatch_attention(
     return output.transpose(1, 2)
 
 
+def flash4_varlen_with_lse(query, key, value, *, cu_seqlens_q, cu_seqlens_k, softcap):
+    """Return packed FlashAttention-4 values and natural-log LSE in token-head order."""
+    _require_backend("flash4", device=query.device, varlen=True)
+    function = _load_external_function("flash4", varlen=True)
+    result = function(
+        q=query.contiguous(), k=key.contiguous(), v=value.contiguous(),
+        cu_seqlens_q=cu_seqlens_q.to(device=query.device, dtype=torch.int32).contiguous(),
+        cu_seqlens_k=cu_seqlens_k.to(device=query.device, dtype=torch.int32).contiguous(),
+        causal=False, softcap=max(0.0, float(softcap)), return_lse=True,
+    )
+    expected_lse_shape = (query.shape[1], query.shape[0])
+    if (
+        not isinstance(result, tuple) or len(result) != 2
+        or not isinstance(result[1], torch.Tensor) or result[1].shape != expected_lse_shape
+    ):
+        raise RuntimeError("FlashAttention-4 must return packed LSE in heads-by-tokens layout.")
+    return result[0], result[1].transpose(0, 1)
+
+
 def dispatch_varlen_attention(
     query: torch.Tensor,
     key: torch.Tensor,
