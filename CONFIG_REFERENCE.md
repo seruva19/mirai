@@ -1556,6 +1556,16 @@ each microbatch and accumulate in FP32 on the host. The optimizer receives the
 completed accumulation after the final transfer drains
 ([`gradients.py`](mirai/core/training/optim/gradients.py)).
 
+### `gradient_cpu_offload_bitpack`
+
+- **Type:** bool
+- **Default:** `False`
+- **Allowed / range:** requires `gradient_cpu_offload=true`
+
+Pack CUDA gradients of at least 64 KiB using a one-bit mask and the values
+whose bit patterns are nonzero. The trainer uses this representation when it
+reduces the transfer size and restores the FP32 gradient on the host.
+
 ### `activation_cpu_offload`
 
 - **Type:** bool

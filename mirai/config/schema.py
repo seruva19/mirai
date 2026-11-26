@@ -411,6 +411,7 @@ class TrainingSection:
     block_swap_mode: str = "sync"
     optimizer_cpu_offload: bool = False
     gradient_cpu_offload: bool = False
+    gradient_cpu_offload_bitpack: bool = False
     activation_cpu_offload: bool = False
     activation_cpu_offload_min_mib: int = 8
     activation_cpu_offload_max_gib: float = 0.0
@@ -1136,6 +1137,7 @@ class TrainingConfig:
             "block_swap_mode",
             "optimizer_cpu_offload",
             "gradient_cpu_offload",
+            "gradient_cpu_offload_bitpack",
             "activation_cpu_offload",
             "activation_cpu_offload_min_mib",
             "activation_cpu_offload_max_gib",
@@ -2804,6 +2806,7 @@ class TrainingConfig:
             gradient_cpu_offload=bool(
                 training_table.get("gradient_cpu_offload", False)
             ),
+            gradient_cpu_offload_bitpack=bool(training_table.get("gradient_cpu_offload_bitpack", False)),
             activation_cpu_offload=bool(
                 training_table.get("activation_cpu_offload", False)
             ),

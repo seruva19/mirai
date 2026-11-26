@@ -5,7 +5,7 @@ import unittest
 from mirai.config.schema import ModelConfig, ModelParams, StrategyConfig, TrainingConfig, TrainingSection
 from mirai.core.builtins import register_builtin_components
 from mirai.core.parity.gradient_harness import run_gradient_harness
-from mirai.core.training.optim.gradients import PendingGradientOffload, offload_gradients_to_cpu
+from mirai.core.training.optim.gradients import PendingGradientOffload, _pack_sparse_gradient, offload_gradients_to_cpu
 
 try:
     import torch
@@ -15,6 +15,24 @@ except ModuleNotFoundError:  # pragma: no cover
 
 @unittest.skipIf(torch is None, "torch not installed")
 class GradientHarnessTests(unittest.TestCase):
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA required")
+    def test_sparse_gradient_bitpacking_preserves_bits_and_skips_dense_payloads(self) -> None:
+        grad = torch.zeros(16385, device="cuda", dtype=torch.float32)
+        grad[::32] = 0.75
+        grad[3] = -0.0
+        grad[-1] = float("nan")
+        packed = _pack_sparse_gradient(grad)
+        self.assertIsNotNone(packed.mask)
+        self.assertLess(packed.values.nbytes + packed.mask.nbytes, grad.nbytes)
+        self.assertIsNone(_pack_sparse_gradient(torch.ones_like(grad)).mask)
+
+        parameter = torch.nn.Parameter(torch.empty_like(grad))
+        parameter.grad = grad
+        transfers = PendingGradientOffload(bitpack=True)
+        self.assertEqual(offload_gradients_to_cpu([parameter], pending=transfers), 1)
+        transfers.finish()
+        torch.testing.assert_close(parameter._mirai_cpu_grad.view(torch.int32), grad.cpu().view(torch.int32), rtol=0, atol=0)
+
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA required")
     def test_cuda_gradient_offload_drains_previous_microbatch_in_order(self) -> None:
         parameter = torch.nn.Parameter(torch.ones(5, device="cuda", dtype=torch.bfloat16))

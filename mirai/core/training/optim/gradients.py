@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from mirai.core.training.residency.activation_compression import training_cuda_copy_streams
 
 try:
@@ -53,35 +55,75 @@ def _accumulate_cpu_gradient(param, cpu_grad):
         param._mirai_cpu_grad = cpu_grad
 
 
+@dataclass(frozen=True)
+class _GradientPayload:
+    values: torch.Tensor
+    shape: torch.Size
+    mask: torch.Tensor | None = None
+
+    def fp32(self):
+        if self.mask is None:
+            output = torch.empty_like(self.values, dtype=torch.float32, pin_memory=False)
+            return output.copy_(self.values)
+        output = torch.zeros(self.shape, dtype=torch.float32)
+        flat = output.view(-1)
+        bits = torch.arange(8, dtype=torch.uint8)
+        selected = ((self.mask[:, None] >> bits) & 1).flatten()[:flat.numel()].bool()
+        flat.masked_scatter_(selected, self.values.float())
+        return output
+
+
+def _pack_sparse_gradient(grad):
+    integer_dtype = {
+        torch.float16: torch.int16, torch.bfloat16: torch.int16,
+        torch.float32: torch.int32, torch.float64: torch.int64,
+    }.get(grad.dtype)
+    if integer_dtype is None or grad.numel() * grad.element_size() < 65536:
+        return _GradientPayload(grad, grad.shape)
+    flat = grad.contiguous().view(-1)
+    # Test the representation so negative zeros and NaN payloads are retained.
+    selected = flat.view(integer_dtype).ne(0)
+    values = flat.masked_select(selected)
+    if values.numel() * grad.element_size() + (flat.numel() + 7) // 8 >= flat.numel() * grad.element_size():
+        return _GradientPayload(grad, grad.shape)
+    padded = torch.nn.functional.pad(selected, (0, (-flat.numel()) % 8))
+    shifts = torch.arange(8, dtype=torch.uint8, device=grad.device)
+    mask = (padded.view(-1, 8).to(torch.uint8) << shifts).sum(dim=1, dtype=torch.uint8)
+    return _GradientPayload(values, grad.shape, mask)
+
+
 class PendingGradientOffload:
     """Keep at most one microbatch's pinned gradient transfers in flight."""
 
-    def __init__(self):
+    def __init__(self, *, bitpack: bool = False):
         self._pending = []
         self._last_event = {}
+        self._bitpack = bitpack
 
     def submit(self, param, grad) -> bool:
+        payload = _pack_sparse_gradient(grad) if self._bitpack else _GradientPayload(grad, grad.shape)
         try:
-            host = torch.empty_like(grad, device="cpu", pin_memory=True)
+            host = torch.empty_like(payload.values, device="cpu", pin_memory=True)
+            mask = None if payload.mask is None else torch.empty_like(payload.mask, device="cpu", pin_memory=True)
         except RuntimeError:
             return False
         d2h, _ = training_cuda_copy_streams(grad.device)
         d2h.wait_stream(torch.cuda.current_stream(grad.device))
         with torch.cuda.stream(d2h):
-            host.copy_(grad, non_blocking=True)
-            grad.record_stream(d2h)
+            host.copy_(payload.values, non_blocking=True)
+            payload.values.record_stream(d2h)
+            if mask is not None:
+                mask.copy_(payload.mask, non_blocking=True)
+                payload.mask.record_stream(d2h)
             self._last_event[grad.device] = d2h.record_event()
-        self._pending.append((param, host))
+        self._pending.append((param, _GradientPayload(host, payload.shape, mask)))
         return True
 
     def finish(self):
         for event in self._last_event.values():
             event.synchronize()
-        for param, host in self._pending:
-            # Keep the accumulated gradients in pageable FP32 memory.
-            cpu_grad = torch.empty_like(host, dtype=torch.float32, pin_memory=False)
-            cpu_grad.copy_(host)
-            _accumulate_cpu_gradient(param, cpu_grad)
+        for param, payload in self._pending:
+            _accumulate_cpu_gradient(param, payload.fp32())
         self._pending.clear()
         self._last_event.clear()
 

@@ -151,6 +151,7 @@ def run_pre_postprocessed_training_step(
         ),
         params=session.params,
         gradient_cpu_offload=bool(config.training.gradient_cpu_offload),
+        gradient_cpu_offload_bitpack=bool(config.training.gradient_cpu_offload_bitpack),
         expert_touch_guard_mode=str(config.training.moe_expert_touch_guard),
         expert_touch_max_fraction=float(
             config.training.moe_expert_touch_max_fraction

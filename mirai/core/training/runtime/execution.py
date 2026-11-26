@@ -91,6 +91,7 @@ def accumulate_training_gradients(
     build_batch: Callable[[int], dict[str, Any]],
     params: list[Any],
     gradient_cpu_offload: bool,
+    gradient_cpu_offload_bitpack: bool = False,
     oom_error_predicate: Callable[[RuntimeError], bool] | None = None,
     on_forward_started: Callable[[int, int], None] | None = None,
     on_forward_completed: Callable[[Any], None] | None = None,
@@ -103,7 +104,9 @@ def accumulate_training_gradients(
 ) -> GradientAccumulationResult:
     gradient_offload_ops = 0
     last_metrics: dict[str, Any] = {}
-    gradient_transfers = PendingGradientOffload() if gradient_cpu_offload else None
+    if gradient_cpu_offload_bitpack and not gradient_cpu_offload:
+        raise ValueError("gradient_cpu_offload_bitpack requires gradient_cpu_offload.")
+    gradient_transfers = PendingGradientOffload(bitpack=gradient_cpu_offload_bitpack) if gradient_cpu_offload else None
     try:
         for micro_batch_index in range(int(grad_accum)):
             batch = build_batch(micro_batch_index)
