@@ -242,12 +242,11 @@ artifact's shards. The last mode also requires a reserved 2 MiB HugeTLB page
 and kernel support for SQPOLL. An unavailable requested mode fails at startup.
 The default `legacy` supports the bridge's original request path.
 With `stream_disk`, the GDS backend requires an aligned export and a CUDA
-target. It routes packed expert reads through the shared KvikIO reader. When
-KvikIO exposes stream-based cuFile reads, the reader waits on the issuing
-storage stream and reports `gds_async_read_ops`. Reads reuse a bounded ring
-of aligned CUDA slots. The requested bytes are copied within VRAM into an
-owning tensor before a slot can be overwritten, and the packed payload
-bypasses host RAM.
+target. The shared KvikIO reader requires the `raw_read_async` cuFile API,
+waits on the issuing storage stream, and reports `gds_async_read_ops`.
+Reads reuse a bounded ring of aligned CUDA slots. The requested bytes are
+copied within VRAM into an owning tensor before a slot can be overwritten,
+and the packed payload bypasses host RAM.
 Set `MIRAI_PACKED_CUDA_ARENA=raw` to back the GDS slots with one aligned
 allocation outside the PyTorch caching allocator. Both GDS and host-backed
 streams use four fixed 32 MiB slots for packed fields and dense
