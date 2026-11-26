@@ -232,9 +232,17 @@ def attention_backend_status(
             )
         return AttentionBackendStatus(resolved, True, "PyTorch SDPA backend", capability)
     try:
-        _load_external_function(resolved, varlen=varlen and resolved != "sage2")
+        function = _load_external_function(resolved, varlen=varlen and resolved != "sage2")
     except RuntimeError as exc:
         return AttentionBackendStatus(resolved, False, str(exc), capability)
+    if resolved == "sage2":
+        # The dispatcher can import even when the architecture-specific
+        # extensions were omitted from the upstream build.
+        architecture = "SM90" if capability == (9, 0) else "SM89"
+        if getattr(function, "__globals__", {}).get(f"{architecture}_ENABLED") is False:
+            return AttentionBackendStatus(
+                resolved, False, f"SageAttention was built without {architecture} kernels", capability,
+            )
     return AttentionBackendStatus(resolved, True, "external kernel available", capability)
 
 

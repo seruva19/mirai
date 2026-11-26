@@ -32,6 +32,19 @@ def test_attention_backend_registry_and_cpu_probe_are_explicit() -> None:
     assert statuses["flex"].reason == "PyTorch FlexAttention"
 
 
+@pytest.mark.parametrize("capability, architecture", [((8, 9), "SM89"), ((9, 0), "SM90"), ((12, 0), "SM89")])
+def test_sage2_probe_rejects_missing_cuda_extension(monkeypatch, capability, architecture) -> None:
+    def dispatcher():
+        pytest.fail("A backend status probe must not execute attention.")
+
+    monkeypatch.setitem(dispatcher.__globals__, f"{architecture}_ENABLED", False)
+    monkeypatch.setattr(attention, "_cuda_capability", lambda _device: capability)
+    monkeypatch.setattr(attention, "_load_external_function", lambda _name, *, varlen: dispatcher)
+    status = attention.attention_backend_status("sage2", device=torch.device("cuda"), varlen=True)
+    assert not status.available
+    assert architecture in status.reason
+
+
 @pytest.mark.parametrize("backend", ["sage", "sage2"])
 def test_sage_packed_dispatch_preserves_document_boundaries(monkeypatch, backend) -> None:
     monkeypatch.setattr(attention, "_cuda_capability", lambda _device: (8, 9))
