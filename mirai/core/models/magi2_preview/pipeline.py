@@ -1393,8 +1393,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("MAGI-2 routed expert LoRA requires fully packed, unconsolidated experts.")
         if str(getattr(adapter_config, "expert_selection", "all")).strip().lower() == "routing_topk" and not expert_targets:
             raise ValueError("MAGI-2 routing_topk requires adapter.target_preset='attn_router_routed_experts'.")
-        if expert_targets and getattr(adapter_config, "sparse_expert_export", False):
-            raise ValueError("MAGI-2 expert LoRA requires full adapter checkpoint tensors.")
+        sparse_export = bool(getattr(adapter_config, "sparse_expert_export", False))
+        if sparse_export and not expert_targets:
+            raise ValueError("MAGI-2 sparse expert export requires routed expert LoRA.")
         for parameter in self.transformer.parameters():
             parameter.requires_grad_(False)
         targets = MAGI2_TARGET_PRESETS[preset]
@@ -1450,6 +1451,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 matched.append(name)
         if not matched:
             raise ValueError(f"MAGI-2 LoRA preset '{preset}' matched no parameters.")
+        self._sparse_expert_export = sparse_export
         self._adapter_configured = True
 
     def expert_selection_layers(self):
@@ -1516,8 +1518,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             state = payload
         if not isinstance(state, dict):
             raise TypeError("MAGI-2 adapter state must be a mapping.")
-        self.validate_adapter_payload(state)
-        expected = set(self.state_dict())
+        expected = set(self._full_adapter_state())
         portable_alphas = {
             key for key in state
             if key.endswith(".lora_alpha") and key not in expected
@@ -1533,18 +1534,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 raise ValueError(f"MAGI-2 adapter alpha does not match the configured scale for {key!r}.")
         if portable_alphas:
             state = {key: value for key, value in state.items() if key not in portable_alphas}
-        supplied = {str(key) for key in state}
-        unknown = sorted(supplied - expected)
-        missing = sorted(expected - supplied)
-        if unknown or missing:
-            raise ValueError(
-                "MAGI-2 adapter state does not match the configured LoRA targets "
-                f"(missing={missing[:4]}, unknown={unknown[:4]})."
-            )
-        self.transformer.load_state_dict(
-            {key: value for key, value in state.items() if key != "__mirai_magi2_pruning_digest__"},
-            strict=False,
-        )
+        self.load_state_dict(state, strict=True)
 
     def validate_adapter_payload(self, payload: dict[str, Any]) -> None:
         state = payload.get("adapter_state", payload)
@@ -2373,6 +2363,18 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return self.train(False)
 
     def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        state = self._full_adapter_state(*args, **kwargs)
+        if getattr(self, "_sparse_expert_export", False):
+            from mirai.core.models.adapters.sparse_expert_export import SparseExpertExportPolicy
+
+            policy = SparseExpertExportPolicy(enabled=True)
+            prefix = kwargs.get("prefix", "")
+            for name, module in self.transformer.named_modules():
+                if "._mirai_expert_lora." in name and policy.write_module_state(state, name=prefix + name, module=module):
+                    del state[f"{prefix}{name}.lora_a"], state[f"{prefix}{name}.lora_b"]
+        return state
+
+    def _full_adapter_state(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         full = self.transformer.state_dict(*args, **kwargs)
         adapter = {
             key: value for key, value in full.items()
@@ -2395,9 +2397,47 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         configured LoRA parameters is a lineage mismatch and fails.
         """
         self.validate_adapter_payload(state)
+        from mirai.core.models.adapters.sparse_expert_export import (
+            MASK_SUFFIX,
+            SPARSE_A_SUFFIX,
+            SPARSE_B_SUFFIX,
+            SPARSE_IDS_SUFFIX,
+            load_compact_expert_adapter,
+        )
+
+        expected = set(self._full_adapter_state())
+        supplied = set(state)
+        compact_suffixes = (SPARSE_A_SUFFIX, SPARSE_B_SUFFIX, SPARSE_IDS_SUFFIX)
+        compact_names = {key.rsplit(".", 1)[0] for key in supplied if key.endswith(compact_suffixes)}
+        compact_modules = {}
+        compact_keys = set()
+        for name in sorted(compact_names):
+            a_key, b_key = f"{name}.lora_a", f"{name}.lora_b"
+            keys = {f"{name}{suffix}" for suffix in (*compact_suffixes, MASK_SUFFIX, ".lora_alpha")}
+            if a_key not in expected or "._mirai_expert_lora." not in name or not keys <= supplied or {a_key, b_key} & supplied:
+                raise ValueError(f"Invalid compact MAGI-2 expert adapter '{name}'.")
+            module = self.transformer.get_submodule(name)
+            ids = state[f"{name}{SPARSE_IDS_SUFFIX}"]
+            mask = state[f"{name}{MASK_SUFFIX}"]
+            if (
+                not isinstance(ids, torch.Tensor) or ids.dtype != torch.long or ids.ndim != 1
+                or not isinstance(mask, torch.Tensor) or mask.shape != module.active_expert_mask.shape
+                or not bool(((mask == 0) | (mask == 1)).all())
+                or not torch.equal(ids.cpu(), mask.nonzero().flatten().cpu())
+            ):
+                raise ValueError(f"Invalid selected expert IDs or mask for '{name}'.")
+            for suffix, parameter in ((SPARSE_A_SUFFIX, module.lora_a), (SPARSE_B_SUFFIX, module.lora_b)):
+                value = state[f"{name}{suffix}"]
+                if not isinstance(value, torch.Tensor) or value.shape != (ids.numel(), *parameter.shape[1:]):
+                    raise ValueError(f"Invalid compact MAGI-2 expert adapter shape for '{name}{suffix}'.")
+            alpha = state[f"{name}.lora_alpha"]
+            if not isinstance(alpha, torch.Tensor) or alpha.numel() != 1:
+                raise ValueError(f"Invalid compact MAGI-2 expert adapter alpha for '{name}'.")
+            expected.difference_update({a_key, b_key})
+            expected.update(keys)
+            compact_keys.update(keys)
+            compact_modules[name] = module
         if strict or getattr(self, "_expert_pruning_digest", None) is not None:
-            expected = set(self.state_dict())
-            supplied = {str(key) for key in state}
             missing = sorted(expected - supplied) if strict else []
             unexpected = sorted(supplied - expected)
             if missing or unexpected:
@@ -2405,10 +2445,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     "MAGI-2 adapter state does not match the configured LoRA "
                     f"targets (missing={missing[:4]}, unexpected={unexpected[:4]})."
                 )
-        return self.transformer.load_state_dict(
-            {key: value for key, value in state.items() if key != "__mirai_magi2_pruning_digest__"},
+        result = self.transformer.load_state_dict(
+            {key: value for key, value in state.items()
+             if key not in compact_keys and key != "__mirai_magi2_pruning_digest__"},
             strict=False,
         )
+        with torch.no_grad():
+            for name, module in compact_modules.items():
+                load_compact_expert_adapter(module, name, state)
+        return result
 
 
 class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):

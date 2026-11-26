@@ -2021,7 +2021,8 @@ def test_magi2_native_fp4_sm120_matches_decoded_operands(fmt) -> None:
     torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.025)
 
 
-def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute() -> None:
+@pytest.mark.parametrize("sparse_export", [False, True])
+def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute(sparse_export) -> None:
     from types import SimpleNamespace
 
     def pipeline_with_adapter():
@@ -2030,7 +2031,9 @@ def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute() -> None
         torch.nn.Module.__init__(pipeline)
         pipeline.transformer = _container(module)
         pipeline._expert_stores = quantize_magi2_experts_in_place(pipeline.transformer, quant_format="fp8")
-        pipeline.set_adapter_config(SimpleNamespace(target_preset="attn_router_routed_experts", rank=2, alpha=2.0))
+        pipeline.set_adapter_config(SimpleNamespace(
+            target_preset="attn_router_routed_experts", rank=2, alpha=2.0, sparse_expert_export=sparse_export,
+        ))
         return pipeline, module
 
     pipeline, module = pipeline_with_adapter()
@@ -2059,7 +2062,18 @@ def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute() -> None
         assert torch.count_nonzero(grad[[0, 2, 3, 4, 5, 7]]) == 0
 
     restored, restored_module = pipeline_with_adapter()
-    restored.load_adapter_state(pipeline.state_dict())
+    state = pipeline.state_dict()
+    prefix = "mlp.moe_mlp._mirai_expert_lora.W_gate"
+    if sparse_export:
+        assert state[f"{prefix}.lora_a_selected"].shape[0] == 2
+        assert f"{prefix}.lora_a" not in state
+        invalid = dict(state)
+        invalid[f"{prefix}.active_expert_ids"] = torch.tensor([1, 5])
+        with pytest.raises(ValueError, match="Invalid selected expert IDs or mask"):
+            restored.load_adapter_state(invalid)
+    else:
+        assert state[f"{prefix}.lora_a"].shape[0] == 8
+    restored.load_adapter_state(state)
     assert restored_module._mirai_expert_lora["W_gate"].active_expert_ids() == [1, 6]
     torch.testing.assert_close(reference.execute(restored_module, rows, scores, routes), expected)
 
