@@ -257,7 +257,8 @@ batches and prefetched reads use owning CUDA tensors. Eligible segmented
 NF4 grouped projections can also write the dense weights into a second
 slot and hold it until the grouped matrix multiplication finishes. This
 includes the forward and first-order backward passes of the segmented MLP,
-with fused gate/up weights when both layouts fit in the slot. This experimental
+including routed Triton execution and fused gate/up when both layouts fit.
+This experimental
 mode requires CuPy for the active CUDA version. Compare with
 the variable unset using the same synthetic shard, reader depth, and device.
 With `memory.weight_residency_strategy="stream_disk"` and

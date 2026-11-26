@@ -1272,6 +1272,13 @@ def _expert_projection_prefetch(store, x):
     return lambda key, start, stop: store.prefetch_segment(key, start, stop, device=x.device, dtype=x.dtype)
 
 
+def _expert_weight_lease(store, key, start, stop, rows):
+    borrow = getattr(store, "borrow_segment", None)
+    if borrow is None:
+        return nullcontext(store.materialize_segment(key, start, stop, dtype=rows.dtype, device=rows.device))
+    return borrow(key, start, stop, dtype=rows.dtype, device=rows.device)
+
+
 class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
     """Rematerialize one NF4 expert segment at a time in forward and backward."""
 
@@ -1320,14 +1327,6 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         store = ctx.store
         prefetch = _expert_projection_prefetch(store, x_sorted)
         segments = tuple(segment for segment in ctx.segments if segment.row_count)
-        borrow = getattr(store, "borrow_segment", None)
-
-        def lease(key, start, stop):
-            kwargs = {"dtype": x_sorted.dtype, "device": x_sorted.device}
-            if borrow is None:
-                return nullcontext(store.materialize_segment(key, start, stop, **kwargs))
-            return borrow(key, start, stop, **kwargs)
-
         for index, segment in enumerate(segments):
             if segment.row_count == 0:
                 continue
@@ -1341,20 +1340,20 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
 
             with ExitStack() as gate_lease, ExitStack() as up_lease:
                 if store.has_fused_gate_up:
-                    w_gate_up = gate_lease.enter_context(lease(MAGI2_FUSED_GATE_UP, start, stop))
+                    w_gate_up = gate_lease.enter_context(_expert_weight_lease(store, MAGI2_FUSED_GATE_UP, start, stop, rows))
                     if prefetch is not None:
                         prefetch("W_down", start, stop)
                     gate, up = _grouped_linear(rows, w_gate_up, local_offsets, ctx.forward_backend).chunk(2, dim=-1)
                 else:
-                    w_gate = gate_lease.enter_context(lease("W_gate", start, stop))
+                    w_gate = gate_lease.enter_context(_expert_weight_lease(store, "W_gate", start, stop, rows))
                     if prefetch is not None:
                         prefetch("W_up", start, stop)
                     gate = _grouped_linear(rows, w_gate, local_offsets, ctx.forward_backend)
-                    w_up = up_lease.enter_context(lease("W_up", start, stop))
+                    w_up = up_lease.enter_context(_expert_weight_lease(store, "W_up", start, stop, rows))
                     if prefetch is not None:
                         prefetch("W_down", start, stop)
                     up = _grouped_linear(rows, w_up, local_offsets, ctx.forward_backend)
-                with lease("W_down", start, stop) as w_down:
+                with _expert_weight_lease(store, "W_down", start, stop, rows) as w_down:
                     if prefetch is not None and index + 1 < len(segments):
                         next_segment = segments[index + 1]
                         prefetch(
@@ -1436,54 +1435,43 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
             local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
+            start, stop = segment.group_start, segment.group_stop
             if store.has_fused_gate_up:
-                w_gate_up = store.materialize_segment(
-                    MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop,
-                    dtype=x_rows.dtype, device=x_rows.device,
-                )
-                if prefetch is not None:
-                    prefetch("W_down", segment.group_start, segment.group_stop)
-                gate, up = _segment_routed_projection(
-                    x_rows, w_gate_up, local_offsets, gather_rows=local_rows,
-                    max_group_rows=max_group_rows,
-                ).chunk(2, dim=-1)
-                del w_gate_up
+                with _expert_weight_lease(store, MAGI2_FUSED_GATE_UP, start, stop, x_rows) as weight:
+                    if prefetch is not None:
+                        prefetch("W_down", start, stop)
+                    gate, up = _segment_routed_projection(
+                        x_rows, weight, local_offsets, gather_rows=local_rows,
+                        max_group_rows=max_group_rows,
+                    ).chunk(2, dim=-1)
+                del weight
             else:
-                w_gate = store.materialize_segment(
-                    "W_gate", segment.group_start, segment.group_stop,
-                    dtype=x_rows.dtype, device=x_rows.device,
-                )
-                if prefetch is not None:
-                    prefetch("W_up", segment.group_start, segment.group_stop)
-                gate = _segment_routed_projection(
-                    x_rows, w_gate, local_offsets, gather_rows=local_rows,
-                    max_group_rows=max_group_rows,
-                )
-                del w_gate
-                w_up = store.materialize_segment(
-                    "W_up", segment.group_start, segment.group_stop,
-                    dtype=x_rows.dtype, device=x_rows.device,
-                )
-                if prefetch is not None:
-                    prefetch("W_down", segment.group_start, segment.group_stop)
-                up = _segment_routed_projection(
-                    x_rows, w_up, local_offsets, gather_rows=local_rows,
-                    max_group_rows=max_group_rows,
-                )
-                del w_up
+                with _expert_weight_lease(store, "W_gate", start, stop, x_rows) as weight:
+                    if prefetch is not None:
+                        prefetch("W_up", start, stop)
+                    gate = _segment_routed_projection(
+                        x_rows, weight, local_offsets, gather_rows=local_rows,
+                        max_group_rows=max_group_rows,
+                    )
+                del weight
+                with _expert_weight_lease(store, "W_up", start, stop, x_rows) as weight:
+                    if prefetch is not None:
+                        prefetch("W_down", start, stop)
+                    up = _segment_routed_projection(
+                        x_rows, weight, local_offsets, gather_rows=local_rows,
+                        max_group_rows=max_group_rows,
+                    )
+                del weight
             hidden = _swiglu7_forward(
                 gate, up, output_dtype=x_rows.dtype, backend=str(activation_backend)
             )
             del gate, up
-            w_down = store.materialize_segment(
-                "W_down", segment.group_start, segment.group_stop,
-                dtype=x_rows.dtype, device=x_rows.device,
-            )
-            _prefetch_next_routed_segment(prefetch, segments, index, store.has_fused_gate_up)
-            outputs.append(_segment_routed_projection(
-                hidden, w_down, local_offsets, max_group_rows=max_group_rows
-            ))
-            del hidden, w_down
+            with _expert_weight_lease(store, "W_down", start, stop, x_rows) as weight:
+                _prefetch_next_routed_segment(prefetch, segments, index, store.has_fused_gate_up)
+                outputs.append(_segment_routed_projection(
+                    hidden, weight, local_offsets, max_group_rows=max_group_rows
+                ))
+            del hidden, weight
         if not outputs:
             output = x_rows.new_empty((0, int(x_rows.shape[-1])))
         elif len(outputs) == 1:
@@ -1509,71 +1497,66 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
             ).contiguous()
             local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
             grad_rows = grad_output[segment.row_start : segment.row_stop].contiguous()
-            if store.has_fused_gate_up:
-                w_gate_up = store.materialize_segment(
-                    MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop,
-                    dtype=x_rows.dtype, device=x_rows.device,
-                )
-                if prefetch is not None:
-                    prefetch("W_down", segment.group_start, segment.group_stop)
-                gate, up = _segment_routed_projection(
-                    x_rows, w_gate_up, local_offsets, gather_rows=local_rows,
-                    max_group_rows=max_group_rows,
-                ).chunk(2, dim=-1)
-            else:
-                w_gate = store.materialize_segment(
-                    "W_gate", segment.group_start, segment.group_stop,
-                    dtype=x_rows.dtype, device=x_rows.device,
-                )
-                if prefetch is not None:
-                    prefetch("W_up", segment.group_start, segment.group_stop)
-                gate = _segment_routed_projection(
-                    x_rows, w_gate, local_offsets, gather_rows=local_rows,
-                    max_group_rows=max_group_rows,
-                )
-                w_up = store.materialize_segment(
-                    "W_up", segment.group_start, segment.group_stop,
-                    dtype=x_rows.dtype, device=x_rows.device,
-                )
-                if prefetch is not None:
-                    prefetch("W_down", segment.group_start, segment.group_stop)
-                up = _segment_routed_projection(
-                    x_rows, w_up, local_offsets, gather_rows=local_rows,
-                    max_group_rows=max_group_rows,
-                )
-            w_down = store.materialize_segment(
-                "W_down", segment.group_start, segment.group_stop,
-                dtype=x_rows.dtype, device=x_rows.device,
-            )
-            _prefetch_next_routed_segment(prefetch, segments, index, store.has_fused_gate_up)
-            grad_hidden = _segment_routed_projection(
-                grad_rows, w_down.transpose(-2, -1), local_offsets,
-                max_group_rows=max_group_rows,
-            )
-            grad_gate, grad_up = _swiglu7_backward(
-                gate, up, grad_hidden, backend=ctx.activation_backend
-            )
-            if store.has_fused_gate_up:
-                grad_grouped = _segment_routed_projection(
-                    torch.cat((grad_gate, grad_up), dim=-1),
-                    w_gate_up.transpose(-2, -1), local_offsets,
-                    max_group_rows=max_group_rows,
-                )
-                del w_gate_up
-            else:
-                grad_grouped = _segment_routed_projection(
-                    grad_gate.contiguous(), w_gate.transpose(-2, -1), local_offsets,
-                    max_group_rows=max_group_rows,
-                )
-                grad_grouped.add_(
-                    _segment_routed_projection(
-                        grad_up.contiguous(), w_up.transpose(-2, -1), local_offsets,
+            start, stop = segment.group_start, segment.group_stop
+            with ExitStack() as gate_lease, ExitStack() as up_lease:
+                if store.has_fused_gate_up:
+                    w_gate_up = gate_lease.enter_context(
+                        _expert_weight_lease(store, MAGI2_FUSED_GATE_UP, start, stop, x_rows)
+                    )
+                    if prefetch is not None:
+                        prefetch("W_down", start, stop)
+                    gate, up = _segment_routed_projection(
+                        x_rows, w_gate_up, local_offsets, gather_rows=local_rows,
+                        max_group_rows=max_group_rows,
+                    ).chunk(2, dim=-1)
+                else:
+                    w_gate = gate_lease.enter_context(_expert_weight_lease(store, "W_gate", start, stop, x_rows))
+                    if prefetch is not None:
+                        prefetch("W_up", start, stop)
+                    gate = _segment_routed_projection(
+                        x_rows, w_gate, local_offsets, gather_rows=local_rows,
                         max_group_rows=max_group_rows,
                     )
+                    w_up = up_lease.enter_context(_expert_weight_lease(store, "W_up", start, stop, x_rows))
+                    if prefetch is not None:
+                        prefetch("W_down", start, stop)
+                    up = _segment_routed_projection(
+                        x_rows, w_up, local_offsets, gather_rows=local_rows,
+                        max_group_rows=max_group_rows,
+                    )
+                with _expert_weight_lease(store, "W_down", start, stop, x_rows) as w_down:
+                    _prefetch_next_routed_segment(prefetch, segments, index, store.has_fused_gate_up)
+                    grad_hidden = _segment_routed_projection(
+                        grad_rows, w_down.transpose(-2, -1), local_offsets,
+                        max_group_rows=max_group_rows,
+                    )
+                del w_down
+                grad_gate, grad_up = _swiglu7_backward(
+                    gate, up, grad_hidden, backend=ctx.activation_backend
                 )
-                del w_gate, w_up
+                if store.has_fused_gate_up:
+                    grad_grouped = _segment_routed_projection(
+                        torch.cat((grad_gate, grad_up), dim=-1),
+                        w_gate_up.transpose(-2, -1), local_offsets,
+                        max_group_rows=max_group_rows,
+                    )
+                    del w_gate_up
+                else:
+                    grad_grouped = _segment_routed_projection(
+                        grad_gate.contiguous(), w_gate.transpose(-2, -1), local_offsets,
+                        max_group_rows=max_group_rows,
+                    )
+                    del w_gate
+                    gate_lease.close()
+                    grad_grouped.add_(
+                        _segment_routed_projection(
+                            grad_up.contiguous(), w_up.transpose(-2, -1), local_offsets,
+                            max_group_rows=max_group_rows,
+                        )
+                    )
+                    del w_up
             grad_input.index_add_(0, local_rows.to(torch.int64), grad_grouped)
-            del w_down, gate, up, grad_hidden, grad_gate, grad_up, grad_grouped
+            del gate, up, grad_hidden, grad_gate, grad_up, grad_grouped
         return grad_input, None, None, None, None
 
 

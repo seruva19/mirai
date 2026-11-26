@@ -131,7 +131,8 @@ def test_packed_segment_metadata_matches_full_host_layout(span: int) -> None:
 
 
 @pytest.mark.parametrize("use_lease", [False, True])
-def test_segmented_backward_releases_weights_after_their_last_use(monkeypatch, use_lease) -> None:
+@pytest.mark.parametrize("routed", [False, True])
+def test_segmented_backward_releases_weights_after_their_last_use(monkeypatch, use_lease, routed) -> None:
     from contextlib import contextmanager
 
     weights = {
@@ -174,9 +175,23 @@ def test_segmented_backward_releases_weights_after_their_last_use(monkeypatch, u
 
     monkeypatch.setattr(grouped_moe, "_grouped_linear_dx", check_lifetimes)
     x = torch.randn(3, 8, requires_grad=True)
-    output = grouped_moe._SegmentedQuantizedExpertMlp.apply(
-        x, torch.tensor([3], dtype=torch.int32), Store(), "bmm", "bmm", "torch"
-    )
+    offsets = torch.tensor([3], dtype=torch.int32)
+    if routed:
+        def project(rows, weight, offsets, *, gather_rows=None, max_group_rows=None):
+            if gather_rows is not None:
+                rows = rows.index_select(0, gather_rows)
+            elif weight._base is not None and weight._base is materialized["W_gate"]():
+                assert materialized["W_down"]() is None
+            elif weight._base is not None and weight._base is materialized["W_up"]():
+                assert materialized["W_gate"]() is None
+            return grouped_moe._grouped_linear(rows, weight, offsets, "bmm")
+
+        monkeypatch.setattr(grouped_moe, "_segment_routed_projection", project)
+        output = grouped_moe._SegmentedRoutedQuantizedExpertMlp.apply(
+            x, offsets, torch.arange(3), Store(), "torch"
+        )
+    else:
+        output = grouped_moe._SegmentedQuantizedExpertMlp.apply(x, offsets, Store(), "bmm", "bmm", "torch")
     output.sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
     assert all(reference() is None for reference in materialized.values())
