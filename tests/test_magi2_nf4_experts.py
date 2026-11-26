@@ -3227,3 +3227,229 @@ def test_streaming_load_packs_every_routed_tensor_from_its_shard(tmp_path) -> No
         assert float(error) < 0.1 * float(expected.float().abs().mean())
     # The packed payload is host-resident, exactly where the shards were read to.
     assert all(buffer.device.type == "cpu" for buffer in store.buffers())
+
+
+def test_magi2_hybrid_experts_reuse_cold_worker_thread(monkeypatch) -> None:
+    import threading
+
+    torch.manual_seed(223)
+    module = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    store = quantize_magi2_experts_in_place(_container(module), quant_format="fp8")["mlp.moe_mlp"]
+    store.set_expert_weight_access_policy(expert_weight_access="active_group_dequant", expert_dequant_chunk_size=1)
+    rows = torch.randn(12, module.d_head, dtype=torch.float32)
+    offsets = torch.tensor([1, 4, 4, 6, 10, 11, 11, 12], dtype=torch.int32)
+    materialize = store.materialize_segment
+    worker_tids: list[int] = []
+
+    def trace(*args, **kwargs):
+        if threading.current_thread().name.startswith("mirai-magi2-cold"):
+            worker_tids.append(threading.get_ident())
+        return materialize(*args, **kwargs)
+
+    monkeypatch.setattr(store, "materialize_segment", trace)
+    for _ in range(2):
+        grouped_moe._hybrid_expert_features(
+            rows, offsets, store, cpu_max_tokens=2,
+            forward_backend="bmm", dx_backend="bmm", activation_backend="torch",
+        )
+    assert len(worker_tids) >= 2
+    assert len(set(worker_tids)) == 1
+
+
+@pytest.mark.skipif(not _CUDA, reason="requires CUDA")
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_grouped_fp4_projection_matches_dequantized_reference(fmt: str, persistent: bool) -> None:
+    pytest.importorskip("triton")
+    from mirai.core.models.compressed_weights.quantization.grouped_fp4_triton import grouped_fp4_projection
+    from mirai.core.models.compressed_weights.quantization.microscaling_quant import (
+        dequantize_microscaling, quantize_microscaling,
+    )
+
+    torch.manual_seed(301)
+    device = torch.device("cuda")
+    x = torch.randn(25, 64, device=device, dtype=torch.bfloat16)
+    ends = torch.tensor([7, 7, 19, 25], dtype=torch.int32, device=device)
+    weights = torch.randn(4, 64, 96, device=device, dtype=torch.float32)
+    codes_list, scales_list, global_list, metas = [], [], [], []
+    for index in range(4):
+        codes, scales, global_scale, meta = quantize_microscaling(fmt, weights[index])
+        codes_list.append(codes)
+        scales_list.append(scales)
+        global_list.append(global_scale)
+        metas.append(meta)
+    actual = grouped_fp4_projection(
+        x,
+        torch.stack(codes_list),
+        torch.stack(scales_list),
+        torch.stack(global_list),
+        ends,
+        columns=96,
+        max_group_rows=12,
+        transposed_storage=False,
+        format=fmt,
+        persistent=persistent,
+    )
+    expected = torch.empty_like(actual)
+    starts = [0, 7, 7, 19]
+    for group, (start, stop) in enumerate(zip(starts, ends.tolist(), strict=True)):
+        if start < stop:
+            decoded = dequantize_microscaling(
+                codes_list[group], scales_list[group], global_list[group], metas[group],
+                dtype=torch.bfloat16, device=device,
+            )
+            expected[start:stop] = x[start:stop] @ decoded
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not _CUDA, reason="requires CUDA")
+@pytest.mark.parametrize("fmt", ["gguf_iq2", "gguf_iq3", "gguf_iq4"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_grouped_gguf_projection_matches_dequantized_reference(fmt: str, persistent: bool) -> None:
+    pytest.importorskip("triton")
+    from mirai.core.models.compressed_weights.quantization.gguf_quant import dequantize_gguf, quantize_gguf
+    from mirai.core.models.compressed_weights.quantization.grouped_fp4_triton import grouped_gguf_projection
+
+    torch.manual_seed(307)
+    device = torch.device("cuda")
+    x = torch.randn(25, 64, device=device, dtype=torch.bfloat16)
+    ends = torch.tensor([7, 7, 19, 25], dtype=torch.int32, device=device)
+    weights = torch.randn(4, 64, 128, dtype=torch.float32)
+    codes = torch.stack([quantize_gguf(fmt, weights[index]) for index in range(4)]).to(device)
+    actual = grouped_gguf_projection(
+        x, codes, ends, columns=128, max_group_rows=12, transposed=False, format=fmt, persistent=persistent,
+    )
+    expected = torch.empty_like(actual)
+    starts = [0, 7, 7, 19]
+    for group, (start, stop) in enumerate(zip(starts, ends.tolist(), strict=True)):
+        if start < stop:
+            decoded = dequantize_gguf(fmt, codes[group].cpu(), shape=(64, 128), dtype=torch.bfloat16, device=device)
+            expected[start:stop] = x[start:stop] @ decoded
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not _CUDA, reason="requires CUDA")
+@pytest.mark.parametrize(
+    "fmt,flags",
+    [
+        ("nvfp4", {"fused_fp4": True}),
+        ("mxfp4", {"fused_fp4": True}),
+        ("gguf_iq2", {"fused_gguf": True}),
+        ("gguf_iq3", {"fused_gguf": True}),
+        ("gguf_iq4", {"fused_gguf": True}),
+        ("int4", {"fused_int4": True}),
+    ],
+)
+def test_magi2_backend_fused_packed_modes_match_reference(fmt: str, flags: dict[str, bool]) -> None:
+    pytest.importorskip("triton")
+    torch.manual_seed(313)
+    device = torch.device("cuda")
+    store = quantized_experts.Magi2PackedExpertStore(num_groups=4, quant_format=fmt)
+    for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+        shape = (4, 64, 128) if key != "W_down" else (4, 128, 64)
+        store.quantize_dense(key, torch.randn(shape, device=device, dtype=torch.bfloat16))
+    moe = torch.nn.Module()
+    setattr(moe, quantized_experts.MAGI2_NF4_STORE_ATTR, store)
+    x_heads = torch.randn(7, 2, 64, device=device, dtype=torch.bfloat16)
+    sorted_rows = torch.randperm(14, device=device)
+    offsets = torch.tensor([3, 3, 9, 14], dtype=torch.int32, device=device)
+
+    reference_backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"), expert_autograd="standard"
+    )
+    fused_backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"), expert_autograd="standard", **flags
+    )
+    with torch.no_grad():
+        expected = reference_backend.branch_features(moe, x_heads, sorted_rows, offsets, "bmm", "bmm")
+        actual = fused_backend.branch_features(moe, x_heads, sorted_rows, offsets, "bmm", "bmm")
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+
+
+def test_packed_mlp_graph_cache_validates_capacity() -> None:
+    from mirai.core.models.magi2_preview.packed_mlp_graph import PackedMlpGraphCache
+
+    with pytest.raises(ValueError, match="capacity"):
+        PackedMlpGraphCache(0)
+    with pytest.raises(ValueError, match="capacity"):
+        PackedMlpGraphCache(9)
+
+
+@pytest.mark.skipif(not _CUDA, reason="requires CUDA")
+def test_packed_mlp_graph_cache_captures_replays_and_evicts() -> None:
+    pytest.importorskip("triton")
+    from mirai.core.models.compressed_weights.quantization.grouped_fp4_triton import grouped_int4_projection
+    from mirai.core.models.compressed_weights.quantization.int4_quant import quantize_int4
+    from mirai.core.models.magi2_preview.packed_mlp_graph import PackedMlpGraphCache
+
+    torch.manual_seed(331)
+    device = torch.device("cuda")
+    parts = [quantize_int4(w) for w in torch.randn(4, 64, 96, device=device)]
+    codes, scales = (torch.stack(part).contiguous() for part in zip(*parts, strict=True))
+    cache = PackedMlpGraphCache(capacity=2)
+    capture_calls = 0
+    orig_capture = cache._capture
+
+    def counting_capture(*args, **kwargs):
+        nonlocal capture_calls
+        capture_calls += 1
+        return orig_capture(*args, **kwargs)
+
+    cache._capture = counting_capture  # type: ignore[method-assign]
+
+    def execute(rows, ends):
+        return grouped_int4_projection(
+            rows, codes, scales, ends, columns=96, max_group_rows=rows.shape[0], transposed=False, persistent=True,
+        )
+
+    for count, ends_vals, expected_captures, expected_len in [
+        (5, [1, 2, 2, 5], 1, 1),     # captures bucket 8
+        (6, [0, 3, 4, 6], 1, 1),     # reuses bucket 8
+        (9, [2, 5, 7, 9], 2, 2),     # captures bucket 16
+        (17, [4, 9, 13, 17], 3, 2),  # captures bucket 32, evicts bucket 8
+    ]:
+        rows = torch.randn(count, 64, device=device, dtype=torch.bfloat16)
+        ends = torch.tensor(ends_vals, dtype=torch.int32, device=device)
+        actual = cache.run(rows, ends, (codes, scales), execute)
+        expected = execute(rows, ends)
+        assert capture_calls == expected_captures
+        assert len(cache._entries) == expected_len
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not _CUDA, reason="requires CUDA")
+def test_magi2_backend_packed_graph_cache_matches_eager() -> None:
+    pytest.importorskip("triton")
+    torch.manual_seed(337)
+    device = torch.device("cuda")
+    store = quantized_experts.Magi2PackedExpertStore(num_groups=4, quant_format="int4")
+    for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+        shape = (4, 32, 48) if key != "W_down" else (4, 48, 32)
+        store.quantize_dense(key, torch.randn(shape, device=device, dtype=torch.bfloat16))
+    moe = torch.nn.Module()
+    setattr(moe, quantized_experts.MAGI2_NF4_STORE_ATTR, store)
+
+    eager_backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"),
+        expert_autograd="standard",
+        fused_int4=True,
+        persistent_packed=True,
+    )
+    cached_backend = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"),
+        expert_autograd="standard",
+        fused_int4=True,
+        persistent_packed=True,
+        packed_graph_cache_size=2,
+    )
+    for route in ([0, 1, 3, 5], [3, 4, 10, 14]):
+        count = route[-1]
+        x_heads = torch.randn(count, 1, 32, device=device, dtype=torch.bfloat16)
+        sorted_rows = torch.randperm(count, device=device)
+        offsets = torch.tensor(route, dtype=torch.int32, device=device)
+        with torch.no_grad():
+            expected = eager_backend.branch_features(moe, x_heads, sorted_rows, offsets, "bmm", "bmm")
+            actual = cached_backend.branch_features(moe, x_heads, sorted_rows, offsets, "bmm", "bmm")
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert cached_backend._packed_graph_cache is not None
+    assert len(cached_backend._packed_graph_cache._entries) == 2

@@ -33,9 +33,11 @@ rejected rather than reinterpreted.
 
 from __future__ import annotations
 
+import atexit
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, fields
+from threading import Lock
 from typing import Any, Callable, ContextManager
 
 import torch
@@ -1108,6 +1110,29 @@ class _CpuExpertRecompute(torch.autograd.Function):
         return grad_rows, None, None, None
 
 
+_COLD_EXPERT_EXECUTOR: ThreadPoolExecutor | None = None
+_COLD_EXPERT_EXECUTOR_LOCK = Lock()
+
+
+def _shutdown_cold_expert_executor() -> None:
+    global _COLD_EXPERT_EXECUTOR
+    with _COLD_EXPERT_EXECUTOR_LOCK:
+        executor, _COLD_EXPERT_EXECUTOR = _COLD_EXPERT_EXECUTOR, None
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+
+def _cold_expert_executor() -> ThreadPoolExecutor:
+    global _COLD_EXPERT_EXECUTOR
+    with _COLD_EXPERT_EXECUTOR_LOCK:
+        if _COLD_EXPERT_EXECUTOR is None:
+            _COLD_EXPERT_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mirai-magi2-cold"
+            )
+            atexit.register(_shutdown_cold_expert_executor)
+        return _COLD_EXPERT_EXECUTOR
+
+
 def _hybrid_expert_features(
     x_sorted, offsets, store, *, cpu_max_tokens, forward_backend, dx_backend, activation_backend,
 ):
@@ -1145,8 +1170,8 @@ def _hybrid_expert_features(
         with torch.no_grad():
             return _SegmentedQuantizedExpertMlp.apply(cold_rows, cold_offsets, cold_store, "bmm", "bmm", "torch")
 
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mirai-magi2-cold") as executor:
-        pending = executor.submit(execute_cold)
+    pending = _cold_expert_executor().submit(execute_cold)
+    try:
         output = torch.empty_like(x_sorted)
         if hot:
             positions, local_offsets, active_store = subset(hot)
@@ -1156,6 +1181,13 @@ def _hybrid_expert_features(
             )
             output.index_copy_(0, positions, hot_output)
         cold_output = pending.result()
+    except BaseException:
+        if not pending.cancel():
+            try:
+                pending.result()
+            except Exception:
+                pass
+        raise
     if cold_rows.requires_grad:
         cold_output = _CpuExpertRecompute.apply(cold_rows, cold_offsets, cold_store, cold_output)
     return output.index_copy_(0, cold_positions, cold_output.to(device=output.device))
