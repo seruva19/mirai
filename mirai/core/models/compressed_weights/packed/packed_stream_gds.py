@@ -115,6 +115,7 @@ class KvikioGdsReader:
         offset: int,
         nbytes: int,
         device: Any,
+        destination: Any | None = None,
     ) -> Any:
         """Read one byte range and wait only for its issuing storage stream."""
 
@@ -146,6 +147,17 @@ class KvikioGdsReader:
         started = time.perf_counter()
         if window.read_bytes > self._slot_bytes:
             raise ValueError("GPUDirect Storage range exceeds its aligned slot capacity.")
+        consumer = None
+        writable = None
+        if destination is not None:
+            consumer = torch.cuda.current_stream(target)
+            if (
+                destination.device != consumer.device or destination.dtype != torch.uint8
+                or destination.shape != (window.payload_bytes,) or not destination.is_contiguous()
+            ):
+                raise ValueError("GPUDirect Storage destination must be a contiguous CUDA byte range.")
+            writable = torch.cuda.Event()
+            writable.record(consumer)
         read_async = getattr(handle, "raw_read_async", None)
         with self._acquire_slot(device_index) as (index, slot):
             if slot.stream is None:
@@ -174,11 +186,21 @@ class KvikioGdsReader:
                     raise EOFError(
                         f"GPUDirect Storage read returned {count} of {window.read_bytes} aligned bytes."
                     )
-                # The next I/O uses this same stream. Its write follows this
-                # copy, while the owning result can outlive the staging slot.
-                payload = buffer[window.payload_offset:window.payload_offset + window.payload_bytes].clone()
-                ready = torch.cuda.Event()
-                ready.record(stream)
+                view = buffer[window.payload_offset:window.payload_offset + window.payload_bytes]
+                try:
+                    if writable is None:
+                        payload = view.clone()
+                    else:
+                        stream.wait_event(writable)
+                        destination.copy_(view)
+                        payload = destination
+                    ready = torch.cuda.Event()
+                    ready.record(stream)
+                    if consumer is not None:
+                        consumer.wait_event(ready)
+                except BaseException:
+                    stream.synchronize()
+                    raise
         elapsed = time.perf_counter() - started
         with self._stats_lock:
             self._read_ops += 1

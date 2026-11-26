@@ -141,6 +141,7 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         reader._closed = False
         reader._raw_staging = True
         reader._backend = "staged"
+        reader._gds = None
         reader._prefetch = None
         reader._staging_lock = reader._stats_lock = mock.MagicMock()
         reader._h2d_ops = reader._h2d_bytes = 0
@@ -289,25 +290,60 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
 
         handle.raw_read_async.side_effect = submit
         ready = mock.Mock()
+        consumer = mock.Mock(device=torch.device("cpu"))
+        destination = torch.empty(12, dtype=torch.uint8)
         with mock.patch("torch.cuda.Stream", return_value=stream), mock.patch(
             "torch.cuda.stream", side_effect=lambda _: contextlib.nullcontext()
         ), mock.patch("torch.empty", side_effect=lambda size, **_: empty(size, dtype=torch.uint8)) as allocate, mock.patch(
             "torch.cuda.Event", return_value=ready,
-        ):
+        ), mock.patch("torch.cuda.current_stream", return_value=consumer):
             result = reader.read_device("shard", offset=4093, nbytes=12, device="cuda:0")
             second = reader.read_device("shard", offset=4093, nbytes=12, device="cuda:0")
+            borrowed = reader.read_device("shard", offset=4093, nbytes=12, device="cuda:0", destination=destination)
             allocate.assert_called_once()
         torch.testing.assert_close(result.tensor, torch.arange(4093, 4105).to(torch.uint8))
         torch.testing.assert_close(second.tensor, torch.arange(4100, 4112).to(torch.uint8))
         self.assertEqual(pointers[0], pointers[1])
-        self.assertEqual(pending.check_bytes_done.call_count, 2)
-        self.assertEqual(ready.record.call_args_list, [mock.call(stream), mock.call(stream)])
+        self.assertIs(borrowed.tensor, destination)
+        torch.testing.assert_close(destination, torch.arange(4107, 4119).to(torch.uint8))
+        self.assertEqual(pending.check_bytes_done.call_count, 3)
+        self.assertEqual(ready.record.call_args_list, [mock.call(stream), mock.call(stream), mock.call(consumer), mock.call(stream)])
+        stream.wait_event.assert_called_once_with(ready)
+        consumer.wait_event.assert_called_once_with(ready)
         stream.synchronize.assert_not_called()
         handle.read.assert_not_called()
-        self.assertEqual(reader._async_ops, 2)
+        self.assertEqual(reader._async_ops, 3)
         reader.close()
         stream.synchronize.assert_called_once_with()
         handle.close.assert_called_once_with()
+
+    def test_borrowed_gds_field_assembles_duplicate_indices_in_request_order(self) -> None:
+        import threading
+
+        from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
+        from mirai.core.models.compressed_weights.packed.packed_stream_layout import PackedTensorRegion
+
+        reader = StreamingPackedTensorMapping.__new__(StreamingPackedTensorMapping)
+        reader._closed = True
+        reader._stats_lock = threading.Lock()
+        reader._read_ops = reader._read_bytes = 0
+        region = PackedTensorRegion("shard", "I32", (4, 2), 4096, 32)
+        reader._region = mock.Mock(return_value=region)
+        reader._gds = mock.Mock()
+        payload = torch.arange(8, dtype=torch.int32).view(torch.uint8)
+
+        def read(shard, *, offset, nbytes, device, destination):
+            self.assertEqual(shard, "shard")
+            self.assertEqual(device, "cuda:0")
+            start = offset - region.offset
+            destination.copy_(payload[start:start + nbytes])
+
+        reader._gds.read_device.side_effect = read
+        slot = torch.empty(32, dtype=torch.uint8)
+        field = reader._read_borrowed_gds_field("weight", region, (2, 0, 1, 2), slot, "cuda:0")
+        self.assertEqual(field.data_ptr(), slot.data_ptr())
+        torch.testing.assert_close(field, torch.tensor([[4, 5], [0, 1], [2, 3], [4, 5]], dtype=torch.int32))
+        self.assertEqual((reader._read_ops, reader._read_bytes), (2, 32))
 
     def test_prefetch_ring_supports_disk_and_preloaded_ram(self) -> None:
         with self.assertRaisesRegex(ValueError, "between 0 and 16"):

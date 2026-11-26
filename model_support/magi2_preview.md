@@ -249,10 +249,12 @@ of aligned CUDA slots. The requested bytes are copied within VRAM into an
 owning tensor before a slot can be overwritten, and the packed payload
 bypasses host RAM.
 Set `MIRAI_PACKED_CUDA_ARENA=raw` to back the GDS slots with one aligned
-allocation outside the PyTorch caching allocator. Host-backed streams use
-the same option for four fixed 32 MiB slots. With prefetch disabled,
+allocation outside the PyTorch caching allocator. Both GDS and host-backed
+streams use four fixed 32 MiB slots for packed fields and dense
+weights. With prefetch disabled,
 dequantization reads borrowed packed fields directly from a slot when the
-batch fits. A CUDA event orders reuse after the consumer finishes. Larger
+batch fits. GDS copies from its aligned read slot directly into the borrowed
+field within VRAM. A CUDA event orders reuse after the consumer finishes. Larger
 batches and prefetched reads use owning CUDA tensors. Eligible segmented
 grouped projections can also write the dense weights into a second slot
 and hold it until the grouped matrix multiplication finishes. FP8 decodes

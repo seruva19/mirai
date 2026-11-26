@@ -123,7 +123,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._pin_cap_bytes = max(0, _pin_budget_bytes() - self._uring_fixed_bytes)
         self._staging_lock = threading.RLock()
         self._staging_pool = None
-        self._raw_staging = self._backend != "gds" and os.environ.get("MIRAI_PACKED_CUDA_ARENA", "") == "raw"
+        self._raw_staging = os.environ.get("MIRAI_PACKED_CUDA_ARENA", "") == "raw"
         self._staging_arena = None
         self._staging_arena_device = None
         self._staging_unavailable = False
@@ -289,7 +289,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
     @contextmanager
     def borrow_cuda_weight(self, shape, *, dtype, device):
         target = torch.device(device)
-        if not self._raw_staging or target.type != "cuda" or self._backend == "gds" or self.prefetch_enabled:
+        if not self._raw_staging or target.type != "cuda" or self.prefetch_enabled:
             yield None
             return
         size = torch.Size(shape).numel() * torch.empty((), device="meta", dtype=dtype).element_size()
@@ -307,23 +307,31 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
     def borrow_packed_fields(self, keys, indices, *, device):
         """Supply short-lived packed fields on the current CUDA stream."""
         target = torch.device(device)
-        if self._raw_staging and target.type == "cuda" and self._backend != "gds" and not self.prefetch_enabled:
+        if self._raw_staging and target.type == "cuda" and not self.prefetch_enabled:
             indices = tuple(indices)
+            regions = [self._region(key) for key in keys]
             offsets = []
             size = 0
-            for key in keys:
-                region = self._region(key)
+            for key, region in zip(keys, regions, strict=True):
+                if not region.shape:
+                    raise IndexError(f"Packed tensor {key!r} is scalar and cannot be sliced.")
                 size = (size + 15) // 16 * 16
                 offsets.append(size)
-                size += region.nbytes // region.shape[0] * len(indices)
+                size += region.nbytes // max(region.shape[0], 1) * len(indices)
             if size <= _MAX_RANGE_BYTES:
                 with self._staging_lock:
                     if self._closed:
                         raise RuntimeError("Packed stream mapping is closed.")
-                    sources = [self.get_slices_to_device(key, indices, device="cpu") for key in keys]
                     stream = torch.cuda.current_stream(target)
                     arena = self._cuda_staging_arena(target, stream)
                     with arena.lease(stream) as slot:
+                        if self._gds is not None:
+                            yield [
+                                self._read_borrowed_gds_field(key, region, indices, slot[offset:], target)
+                                for key, region, offset in zip(keys, regions, offsets, strict=True)
+                            ]
+                            return
+                        sources = [self.get_slices_to_device(key, indices, device="cpu") for key in keys]
                         fields = []
                         for source, offset in zip(sources, offsets, strict=True):
                             packed_bytes = source.numel() * source.element_size()
@@ -336,6 +344,25 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                         yield fields
                 return
         yield [self.get_slices_to_device(key, indices, device=target) for key in keys]
+
+    def _read_borrowed_gds_field(self, key, region, indices, slot, device):
+        requested = self._normalize_indices(key, indices)
+        if not requested:
+            raise ValueError("Packed stream batch requires at least one expert index.")
+        slice_bytes = region.nbytes // region.shape[0]
+        destination = slot[:len(requested) * slice_bytes]
+        cursor = 0
+        for start, count in self._bounded_runs(key, requested):
+            nbytes = count * slice_bytes
+            self._gds.read_device(
+                region.shard, offset=region.offset + start * slice_bytes, nbytes=nbytes, device=device,
+                destination=destination[cursor:cursor + nbytes],
+            )
+            cursor += nbytes
+            with self._stats_lock:
+                self._read_ops += 1
+                self._read_bytes += nbytes
+        return destination.view(torch_dtype(region.dtype_name)).reshape(len(requested), *region.shape[1:])
 
     def _host_expert_slice_batch(self, key, indices):
         cache_keys = {index: packed_stream_cache_key(key, (index,), access="slice") for index in indices}
