@@ -75,22 +75,14 @@ def _gguf_value(Codes, Grid, Signs, group, flat, valid, BLOCKS: tl.constexpr, GG
 
 
 @triton.jit
-def _grouped_fp4(
-    X, Codes, Scales, Global, Ends, Y,
+def _packed_tile(
+    X, Codes, Scales, Global, Y, group, row_start, end, column_tile,
     K: tl.constexpr, N: tl.constexpr, BLOCKS: tl.constexpr, SCALE_WIDTH: tl.constexpr,
     TRANSPOSED_STORAGE: tl.constexpr, MX: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-    GGUF_BYTES: tl.constexpr = 0,
-    INT4: tl.constexpr = False,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GGUF_BYTES: tl.constexpr, INT4: tl.constexpr,
 ):
-    group = tl.program_id(0)
-    begin = tl.load(Ends + group - 1, mask=group > 0, other=0)
-    end = tl.load(Ends + group)
-    row_start = begin + tl.program_id(1) * BM
-    if row_start >= end:
-        return
     rows = row_start + tl.arange(0, BM)
-    cols = tl.program_id(2) * BN + tl.arange(0, BN)
+    cols = column_tile * BN + tl.arange(0, BN)
     if GGUF_BYTES == 0 and not INT4:
         group_scale = tl.load(Global + group)
     acc = tl.full((BM, BN), 0, tl.float32)
@@ -117,9 +109,77 @@ def _grouped_fp4(
     tl.store(Y + rows[:, None] * N + cols[None, :], acc, (rows[:, None] < end) & (cols[None, :] < N))
 
 
+@triton.jit
+def _grouped_fp4(
+    X, Codes, Scales, Global, Ends, Y,
+    K: tl.constexpr, N: tl.constexpr, BLOCKS: tl.constexpr, SCALE_WIDTH: tl.constexpr,
+    TRANSPOSED_STORAGE: tl.constexpr, MX: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    GGUF_BYTES: tl.constexpr = 0,
+    INT4: tl.constexpr = False,
+):
+    group = tl.program_id(0)
+    begin = tl.load(Ends + group - 1, mask=group > 0, other=0)
+    end = tl.load(Ends + group)
+    row_start = begin + tl.program_id(1) * BM
+    if row_start < end:
+        _packed_tile(
+            X, Codes, Scales, Global, Y, group, row_start, end, tl.program_id(2),
+            K, N, BLOCKS, SCALE_WIDTH, TRANSPOSED_STORAGE, MX, BM, BN, BK, GGUF_BYTES, INT4,
+        )
+
+
+@triton.jit
+def _persistent_grouped_packed(
+    X, Codes, Scales, Global, Ends, TileEnds, Y,
+    GROUPS: tl.constexpr, K: tl.constexpr, N: tl.constexpr, BLOCKS: tl.constexpr, SCALE_WIDTH: tl.constexpr,
+    TRANSPOSED_STORAGE: tl.constexpr, MX: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GGUF_BYTES: tl.constexpr, INT4: tl.constexpr,
+):
+    column_tiles: tl.constexpr = tl.cdiv(N, BN)
+    tile_count = tl.load(TileEnds + GROUPS - 1)
+    for task in range(tl.program_id(0), tile_count * column_tiles, tl.num_programs(0)):
+        row_tile = task // column_tiles
+        low = 0
+        high = GROUPS - 1
+        while low < high:
+            middle = (low + high) // 2
+            if tl.load(TileEnds + middle) <= row_tile:
+                low = middle + 1
+            else:
+                high = middle
+        begin = tl.load(Ends + low - 1, mask=low > 0, other=0)
+        end = tl.load(Ends + low)
+        tile_begin = tl.load(TileEnds + low - 1, mask=low > 0, other=0)
+        row_start = begin + (row_tile - tile_begin) * BM
+        _packed_tile(
+            X, Codes, Scales, Global, Y, low, row_start, end, task % column_tiles,
+            K, N, BLOCKS, SCALE_WIDTH, TRANSPOSED_STORAGE, MX, BM, BN, BK, GGUF_BYTES, INT4,
+        )
+
+
+def _launch_packed_projection(
+    x, codes, scales, global_scales, ends, result, *, columns, blocks, width,
+    transposed, mx=False, gguf_bytes=0, int4=False, max_group_rows, persistent,
+):
+    groups = ends.numel()
+    args = (x.contiguous(), codes.contiguous(), scales.contiguous(), global_scales.contiguous(), ends.contiguous())
+    dimensions = (x.shape[1], columns, blocks, width, transposed, mx, 16, 32, 32, gguf_bytes, int4)
+    if persistent:
+        rows = ends.diff(prepend=ends.new_zeros(1))
+        tile_ends = torch.cumsum((rows + 15) // 16, dim=0, dtype=torch.int32)
+        programs = min(x.shape[0] * triton.cdiv(columns, 32), torch.cuda.get_device_properties(x.device).multi_processor_count)
+        _persistent_grouped_packed[(programs,)](
+            *args, tile_ends, result, groups, *dimensions, num_warps=4, enable_fp_fusion=not gguf_bytes,
+        )
+    else:
+        grid = (groups, triton.cdiv(max_group_rows, 16), triton.cdiv(columns, 32))
+        _grouped_fp4[grid](*args, result, *dimensions, num_warps=4, enable_fp_fusion=not gguf_bytes)
+
+
 def grouped_fp4_projection(
     x, codes, scales, global_scales, ends, *, columns: int, max_group_rows: int,
-    transposed_storage: bool, format: str,
+    transposed_storage: bool, format: str, persistent: bool = False,
 ):
     """Apply packed FP4 matrices to sorted rows delimited by cumulative group ends."""
     if format not in {"nvfp4", "mxfp4"}:
@@ -140,17 +200,16 @@ def grouped_fp4_projection(
     result = x.new_empty((x.shape[0], columns))
     if x.shape[0] == 0:
         return result
-    if min(groups, columns, x.shape[1], max_group_rows) <= 0:
+    if min(groups, columns, x.shape[1]) <= 0 or (not persistent and max_group_rows <= 0):
         raise ValueError("Grouped FP4 projection dimensions must be positive.")
-    grid = (groups, triton.cdiv(max_group_rows, 16), triton.cdiv(columns, 32))
-    _grouped_fp4[grid](
-        x.contiguous(), codes.contiguous(), scales.contiguous(), global_scales.contiguous(), ends.contiguous(), result,
-        x.shape[1], columns, blocks, width, transposed_storage, format == "mxfp4", 16, 32, 32, num_warps=4,
+    _launch_packed_projection(
+        x, codes, scales, global_scales, ends, result, columns=columns, blocks=blocks, width=width,
+        transposed=transposed_storage, mx=format == "mxfp4", max_group_rows=max_group_rows, persistent=persistent,
     )
     return result
 
 
-def grouped_gguf_projection(x, codes, ends, *, columns, max_group_rows, transposed, format):
+def grouped_gguf_projection(x, codes, ends, *, columns, max_group_rows, transposed, format, persistent=False):
     """Apply IQ2_XS, IQ3_XXS or IQ4_XS blocks to sorted expert rows."""
     grids = {"gguf_iq2": "grid_iq2xs", "gguf_iq3": "grid", "gguf_iq4": "kvalues"}
     if format not in grids:
@@ -169,20 +228,19 @@ def grouped_gguf_projection(x, codes, ends, *, columns, max_group_rows, transpos
     result = x.new_empty((x.shape[0], columns))
     if not x.shape[0]:
         return result
-    if min(groups, columns, x.shape[1], max_group_rows) <= 0:
+    if min(groups, columns, x.shape[1]) <= 0 or (not persistent and max_group_rows <= 0):
         raise ValueError("Grouped GGUF projection dimensions must be positive.")
     table = _table(grids[format], x.device)
     # IQ4 carries signed magnitudes in the codebook itself.
     signs = table if format == "gguf_iq4" else _table("ksigns", x.device)
-    grid = (groups, triton.cdiv(max_group_rows, 16), triton.cdiv(columns, 32))
-    _grouped_fp4[grid](
-        x.contiguous(), codes.contiguous(), table, signs, ends.contiguous(), result,
-        x.shape[1], columns, blocks, 256, transposed, False, 16, 32, 32, width, num_warps=4, enable_fp_fusion=False,
+    _launch_packed_projection(
+        x, codes, table, signs, ends, result, columns=columns, blocks=blocks, width=256, transposed=transposed,
+        gguf_bytes=width, max_group_rows=max_group_rows, persistent=persistent,
     )
     return result
 
 
-def grouped_int4_projection(x, codes, scales, ends, *, columns, max_group_rows, transposed):
+def grouped_int4_projection(x, codes, scales, ends, *, columns, max_group_rows, transposed, persistent=False):
     """Apply signed block-scaled INT4 to sorted expert rows."""
     if not x.is_cuda or x.ndim != 2 or x.dtype not in {torch.float16, torch.bfloat16}:
         raise ValueError("Grouped INT4 needs a CUDA FP16 or BF16 activation matrix.")
@@ -197,12 +255,10 @@ def grouped_int4_projection(x, codes, scales, ends, *, columns, max_group_rows, 
     result = x.new_empty((x.shape[0], columns))
     if not x.shape[0]:
         return result
-    if min(groups, columns, x.shape[1], max_group_rows) <= 0:
+    if min(groups, columns, x.shape[1]) <= 0 or (not persistent and max_group_rows <= 0):
         raise ValueError("Grouped INT4 projection dimensions must be positive.")
-    grid = (groups, triton.cdiv(max_group_rows, 16), triton.cdiv(columns, 32))
-    scales = scales.contiguous()
-    _grouped_fp4[grid](
-        x.contiguous(), codes.contiguous(), scales, scales, ends.contiguous(), result,
-        x.shape[1], columns, codes.shape[1], INT4_BLOCK_SIZE, transposed, False, 16, 32, 32, 0, True, num_warps=4,
+    _launch_packed_projection(
+        x, codes, scales, scales, ends, result, columns=columns, blocks=codes.shape[1],
+        width=INT4_BLOCK_SIZE, transposed=transposed, int4=True, max_group_rows=max_group_rows, persistent=persistent,
     )
     return result

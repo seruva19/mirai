@@ -297,6 +297,9 @@ provides the same execution mode for IQ2_XS, IQ3_XXS and IQ4_XS. Select
 For signed linear INT4 experts, select `memory.frozen_weight_quantization="int4"`
 and set `model.params.family_params.expert_fused_int4 = true`. The packed
 artifact stores one FP32 scale per 32 weights.
+Set `model.params.family_params.expert_persistent_packed = true` with one
+of these fused modes to use a persistent Triton grid. It schedules tiles
+from cumulative group row counts on CUDA and skips empty groups.
 
 For new uniform NVFP4 exports, set
 `model.params.family_params.expert_nvfp4_native_layout = true` while packing

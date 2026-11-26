@@ -1195,13 +1195,17 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
     ) -> torch.Tensor:
         _groups, rows, cols = store.expert_weight_shape(key)
         span = _expert_group_span(store, x_sorted)
-        fused_packed = forward_backend == "triton_grouped_packed"
-        metadata = _packed_group_segments(offsets, max_groups=span, routed=fused_packed)
+        persistent = forward_backend == "triton_persistent_packed"
+        fused_packed = persistent or forward_backend == "triton_grouped_packed"
+        if persistent and offsets.numel() <= span:
+            metadata = ((GroupedMMSegment(0, offsets.numel(), 0, x_sorted.shape[0]), 0),)
+        else:
+            metadata = _packed_group_segments(offsets, max_groups=span, routed=fused_packed and not persistent)
         segments = tuple(segment for segment, _ in metadata)
         if forward_backend == "scaled_mm_fp4":
             output = _native_fp4_grouped_projection(x_sorted, offsets, store, key, cols)
         elif fused_packed:
-            output = _fused_packed_grouped_projection(x_sorted, offsets, store, key, cols, metadata)
+            output = _fused_packed_grouped_projection(x_sorted, offsets, store, key, cols, metadata, persistent=persistent)
         else:
             output = run_segmented_grouped_linear(
                 x_sorted,
@@ -1228,6 +1232,7 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         ctx.dx_backend = dx_backend
         ctx.segments = segments
         ctx.fused_packed_metadata = metadata if fused_packed else None
+        ctx.persistent_packed = persistent
         ctx.segment_span = int(span)
         ctx.weight_rows = int(rows)
         return output
@@ -1241,7 +1246,8 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
             key = ctx.key
             if ctx.fused_packed_metadata is not None and not torch.is_grad_enabled():
                 grad_x = _fused_packed_grouped_projection(
-                    grad_output, offsets, store, key, ctx.weight_rows, ctx.fused_packed_metadata, transposed=True,
+                    grad_output, offsets, store, key, ctx.weight_rows, ctx.fused_packed_metadata,
+                    transposed=True, persistent=ctx.persistent_packed,
                 )
                 return grad_x, None, None, None, None, None
             grad_x = run_segmented_grouped_linear(
@@ -1267,7 +1273,7 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         return grad_x, None, None, None, None, None
 
 
-def _fused_packed_grouped_projection(x_sorted, offsets, store, key, columns, segments, *, transposed=False):
+def _fused_packed_grouped_projection(x_sorted, offsets, store, key, columns, segments, *, transposed=False, persistent=False):
     physical_store = store.store if isinstance(store, _ActiveExpertGroups) else store
     if not isinstance(physical_store, Magi2PackedExpertStore) or physical_store.quant_format not in (
         "nvfp4", "mxfp4", "int4", *MAGI2_FUSED_GGUF_FORMATS,
@@ -1283,7 +1289,7 @@ def _fused_packed_grouped_projection(x_sorted, offsets, store, key, columns, seg
             store.prefetch_segment(key, upcoming.group_start, upcoming.group_stop, device=x_sorted.device)
         outputs.append(physical_store.fused_packed_projection(
             key, start, stop, x_sorted[segment.row_start:segment.row_stop], offsets[start:stop] - segment.row_start,
-            max_group_rows=maximum, transposed=transposed, group_ids=group_ids,
+            max_group_rows=maximum, transposed=transposed, group_ids=group_ids, persistent=persistent,
         ))
     if not outputs:
         return x_sorted.new_empty((0, columns))
@@ -1631,6 +1637,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         fused_fp4: bool = False,
         fused_gguf: bool = False,
         fused_int4: bool = False,
+        persistent_packed: bool = False,
     ) -> None:
         super().__init__(
             plan,
@@ -1647,6 +1654,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         self.fused_formats = (
             ("nvfp4", "mxfp4") * fused_fp4 + MAGI2_FUSED_GGUF_FORMATS * fused_gguf + ("int4",) * fused_int4
         )
+        if persistent_packed and not self.fused_formats:
+            raise Magi2GroupedMoEPolicyError("Persistent packed GEMM requires a fused packed expert mode.")
+        self.fused_backend = "triton_persistent_packed" if persistent_packed else "triton_grouped_packed"
         if self.fused_formats and (
             self.expert_autograd != "standard" or plan.routed_gemm != "disabled"
             or cpu_expert_max_tokens or plan.forward_backend == "scaled_mm_fp4"
@@ -1732,7 +1742,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
     ) -> torch.Tensor:
         store, offsets = _packed_expert_layout(self._store(module), offsets)
         if self.fused_formats:
-            forward_backend = "triton_grouped_packed"
+            forward_backend = self.fused_backend
         return _QuantizedGroupedExpertLinear.apply(
             x_sorted, offsets, store, key, forward_backend, dx_backend
         )
@@ -1740,7 +1750,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
     def _project_gate_up(self, module, x_sorted, offsets, forward_backend, dx_backend):
         store, offsets = _packed_expert_layout(self._store(module), offsets)
         if self.fused_formats:
-            forward_backend = "triton_grouped_packed"
+            forward_backend = self.fused_backend
         keys = (MAGI2_FUSED_GATE_UP,) if store.has_fused_gate_up else ("W_gate", "W_up")
         projections = tuple(
             _QuantizedGroupedExpertLinear.apply(x_sorted, offsets, store, key, forward_backend, dx_backend)
@@ -1876,7 +1886,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         adapters = getattr(module, "_mirai_expert_lora", None)
         if adapters is not None:
             if self.fused_formats:
-                forward_backend = "triton_grouped_packed"
+                forward_backend = self.fused_backend
             return self._expert_lora_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend, adapters)
         if self.fused_formats or forward_backend == "scaled_mm_fp4":
             return super().branch_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend)

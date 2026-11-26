@@ -121,3 +121,30 @@ def test_routed_projection_cuda_graph_replays_updated_static_inputs() -> None:
     graph.replay()
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
     assert not torch.equal(first, captured)
+
+
+@pytest.mark.skipif(not _REMOTE_GPU, reason="requires leased remote CUDA GPU")
+def test_persistent_int4_graph_replays_changed_ragged_groups() -> None:
+    from mirai.core.models.compressed_weights.quantization.grouped_fp4_triton import grouped_int4_projection
+    from mirai.core.models.compressed_weights.quantization.int4_quant import quantize_int4
+
+    activations = torch.randn(625, 64, dtype=torch.bfloat16, device="cuda")
+    ends = torch.tensor([0, 40, 610, 625], dtype=torch.int32, device="cuda")
+    parts = [quantize_int4(weight) for weight in torch.randn(4, 64, 96, device="cuda")]
+    codes, scales = (torch.stack(part) for part in zip(*parts, strict=True))
+
+    def project(persistent):
+        return grouped_int4_projection(
+            activations, codes, scales, ends, columns=96, max_group_rows=625,
+            transposed=False, persistent=persistent,
+        )
+
+    torch.testing.assert_close(project(True), project(False), rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = project(True)
+    for route in ([507, 507, 507, 625], [111, 305, 625, 625]):
+        ends.copy_(torch.tensor(route, dtype=ends.dtype, device=ends.device))
+        activations.normal_()
+        graph.replay()
+        torch.testing.assert_close(captured, project(False), rtol=0, atol=0)

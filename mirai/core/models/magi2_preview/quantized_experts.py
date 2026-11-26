@@ -890,7 +890,7 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         fields = self._packed_segment(key, group, group + 1, device=x.device)
         return native_fp4_linear(x, *(field[0] for field in fields), self._fp4_meta(self._shapes[key][1:]))
 
-    def fused_packed_projection(self, key, start, stop, x, ends, *, max_group_rows, transposed, group_ids=None):
+    def fused_packed_projection(self, key, start, stop, x, ends, *, max_group_rows, transposed, group_ids=None, persistent=False):
         from mirai.core.models.compressed_weights.quantization.grouped_fp4_triton import (
             grouped_fp4_projection, grouped_gguf_projection, grouped_int4_projection,
         )
@@ -901,16 +901,16 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
             if self.quant_format == "int4":
                 return grouped_int4_projection(
                     x, *packed, ends, columns=rows if transposed else columns,
-                    max_group_rows=max_group_rows, transposed=transposed,
+                    max_group_rows=max_group_rows, transposed=transposed, persistent=persistent,
                 )
             if self.quant_format in MAGI2_FUSED_GGUF_FORMATS:
                 return grouped_gguf_projection(
                     x, packed[0], ends, columns=rows if transposed else columns,
-                    max_group_rows=max_group_rows, transposed=transposed, format=self.quant_format,
+                    max_group_rows=max_group_rows, transposed=transposed, format=self.quant_format, persistent=persistent,
                 )
             return grouped_fp4_projection(
                 x, *packed, ends, columns=rows if transposed else columns, max_group_rows=max_group_rows,
-                transposed_storage=self.has_native_fp4_layout != transposed, format=self.quant_format,
+                transposed_storage=self.has_native_fp4_layout != transposed, format=self.quant_format, persistent=persistent,
             )
 
     def _packed_segment(self, key, group_start, group_stop, *, device, group_ids=None, leases=None):

@@ -351,6 +351,13 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("MAGI-2 expert_fused_int4 must be a boolean.")
         if self._fused_int4_experts and self._frozen_weight_quantization != "int4":
             raise ValueError("MAGI-2 expert_fused_int4 requires INT4 experts.")
+        self._persistent_packed_experts = family.get("expert_persistent_packed", False)
+        if type(self._persistent_packed_experts) is not bool:
+            raise ValueError("MAGI-2 expert_persistent_packed must be a boolean.")
+        if self._persistent_packed_experts and not (
+            self._fused_fp4_experts or self._fused_gguf_experts or self._fused_int4_experts
+        ):
+            raise ValueError("MAGI-2 expert_persistent_packed requires a fused packed expert mode.")
         self._cpu_expert_max_tokens = family.get("expert_cpu_max_tokens", 0)
         if type(self._cpu_expert_max_tokens) is not int or not 0 <= self._cpu_expert_max_tokens <= 10:
             raise ValueError("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")
@@ -1205,6 +1212,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 fused_fp4=getattr(self, "_fused_fp4_experts", False),
                 fused_gguf=getattr(self, "_fused_gguf_experts", False),
                 fused_int4=getattr(self, "_fused_int4_experts", False),
+                persistent_packed=getattr(self, "_persistent_packed_experts", False),
             )
         else:
             backend = Magi2GroupedMoEBackend(
@@ -2551,6 +2559,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "expert_fused_fp4",
         "expert_fused_gguf",
         "expert_fused_int4",
+        "expert_persistent_packed",
         "expert_nvfp4_native_layout",
         "expert_pruning_plan_path",
         "expert_consolidation_plan_path",
@@ -2667,6 +2676,12 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             errors.append("MAGI-2 expert_fused_gguf must be a boolean.")
         if type(params.get("expert_fused_int4", False)) is not bool:
             errors.append("MAGI-2 expert_fused_int4 must be a boolean.")
+        if type(params.get("expert_persistent_packed", False)) is not bool:
+            errors.append("MAGI-2 expert_persistent_packed must be a boolean.")
+        elif params.get("expert_persistent_packed") and not any(
+            params.get(key) is True for key in ("expert_fused_fp4", "expert_fused_gguf", "expert_fused_int4")
+        ):
+            errors.append("MAGI-2 expert_persistent_packed requires a fused packed expert mode.")
         cpu_max = params.get("expert_cpu_max_tokens", 0)
         if type(cpu_max) is not int or not 0 <= cpu_max <= 10:
             errors.append("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")
