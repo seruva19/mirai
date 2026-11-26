@@ -254,8 +254,10 @@ the same option for four fixed 32 MiB slots. With prefetch disabled,
 dequantization reads borrowed packed fields directly from a slot when the
 batch fits. A CUDA event orders reuse after the consumer finishes. Larger
 batches and prefetched reads use owning CUDA tensors. Eligible segmented
-NF4 grouped projections can also write the dense weights into a second
-slot and hold it until the grouped matrix multiplication finishes. This
+grouped projections can also write the dense weights into a second slot
+and hold it until the grouped matrix multiplication finishes. FP8 decodes
+one tile at a time into the slot. FP4 and GGUF use per-expert decode scratch.
+For NF4, this
 includes the forward and first-order backward passes of the segmented MLP,
 including routed Triton execution and fused gate/up when both layouts fit.
 This experimental

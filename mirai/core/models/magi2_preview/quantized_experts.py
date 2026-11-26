@@ -800,27 +800,53 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         self._shapes = restored_shapes
         self._dtypes = restored_dtypes
 
+    @contextmanager
+    def borrow_segment(self, key, start, stop, *, dtype, device, group_ids=None):
+        reader = getattr(self, "_packed_range_reader", None)
+        options = {"dtype": dtype, "device": device, "group_ids": group_ids}
+        if reader is not None and not torch.is_grad_enabled():
+            _, rows, cols = self.expert_weight_shape(key)
+            with reader.borrow_cuda_weight((stop - start, rows, cols), dtype=dtype, device=device) as out:
+                yield self.materialize_segment(key, start, stop, out=out, **options)
+            return
+        yield self.materialize_segment(key, start, stop, **options)
+
     @torch.no_grad()
-    def materialize_segment(self, key, group_start, group_stop, *, dtype, device, group_ids=None):
+    def materialize_segment(self, key, group_start, group_stop, *, dtype, device, group_ids=None, out=None):
         with ExitStack() as leases:
             fields = self._packed_segment(key, group_start, group_stop, device=device, group_ids=group_ids, leases=leases)
-            return self._dequantize_segment(key, fields, dtype=dtype, device=device)
+            return self._dequantize_segment(key, fields, dtype=dtype, device=device, out=out)
 
-    def _dequantize_segment(self, key, fields, *, dtype, device):
+    def _dequantize_segment(self, key, fields, *, dtype, device, out=None):
         shape = self._shapes[key][1:]
+        if out is not None and (
+            out.shape != (len(fields[0]), *shape) or out.dtype != dtype
+            or out.device != fields[0].device or not out.is_contiguous()
+        ):
+            raise ValueError("Packed expert output must be contiguous and match the target shape, device, and dtype.")
         if self.quant_format == "fp8":
-            return dequantize_blockwise_fp8_weight(*fields, BlockwiseFP8Meta(shape), dtype=dtype, device=device)
+            return dequantize_blockwise_fp8_weight(*fields, BlockwiseFP8Meta(shape), dtype=dtype, device=device, out=out)
         if self.quant_format in {"nvfp4", "mxfp4"}:
             meta = self._fp4_meta(shape)
-            weights = torch.stack([
+            groups = (
                 dequantize_microscaling(*group, meta, dtype=dtype, device=device)
                 for group in zip(*fields, strict=True)
-            ])
+            )
+            if out is not None:
+                for destination, weight in zip(out, groups, strict=True):
+                    destination.copy_(weight.T if self.has_native_fp4_layout else weight)
+                return out
+            weights = torch.stack(list(groups))
             return weights.transpose(-2, -1).contiguous() if self.has_native_fp4_layout else weights
-        return torch.stack([
+        groups = (
             dequantize_gguf(self.quant_format, group, shape=shape, dtype=dtype, device=device)
             for group in fields[0]
-        ])
+        )
+        if out is not None:
+            for destination, weight in zip(out, groups, strict=True):
+                destination.copy_(weight)
+            return out
+        return torch.stack(list(groups))
 
     def native_fp4_projection(self, key, group, x):
         from mirai.core.models.compressed_weights.quantization.native_fp4 import native_fp4_linear

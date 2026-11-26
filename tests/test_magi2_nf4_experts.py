@@ -2275,6 +2275,10 @@ def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -
         whole = store.materialize_segment(key, 0, 2, **kwargs)
         actual = restored.materialize_segment(key, 0, 1, group_ids=torch.tensor([1]), **kwargs)
         torch.testing.assert_close(actual, whole[1:], rtol=0, atol=0)
+        out = torch.empty_like(whole, memory_format=torch.contiguous_format)
+        decoded = restored.materialize_segment(key, 0, 2, group_ids=torch.tensor([1, 0]), out=out, **kwargs)
+        assert decoded is out
+        torch.testing.assert_close(out, whole.flip(0), rtol=0, atol=0)
     x = torch.randn(3, 16, requires_grad=True)
     offsets = torch.tensor([0, 3], dtype=torch.int32)
     actual = grouped_moe._SegmentedQuantizedExpertMlp.apply(

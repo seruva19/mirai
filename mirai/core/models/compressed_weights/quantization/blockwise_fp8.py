@@ -130,6 +130,7 @@ def dequantize_blockwise_fp8_weight(
     *,
     dtype: "torch.dtype",
     device: "torch.device",
+    out: "torch.Tensor | None" = None,
 ) -> "torch.Tensor":
     """Decode one matrix or a leading batch of matrices."""
     _require_torch()
@@ -138,6 +139,16 @@ def dequantize_blockwise_fp8_weight(
     padded_out, padded_in = _padded_shape(meta)
     block = BLOCKWISE_FP8_BLOCK_SIZE
     stored = codes.to(device=target)
+    if out is not None:
+        if out.shape != codes.shape or out.dtype != dtype or out.device != stored.device or not out.is_contiguous():
+            raise ValueError("FP8 output must be contiguous and match the target shape, device, and dtype.")
+        scales = scales.to(device=target)
+        for row in range(0, meta.shape[0], block):
+            for col in range(0, meta.shape[1], block):
+                decoded = _decode_e4m3(stored[..., row:row + block, col:col + block])
+                scale = scales[..., row // block, col // block, None, None]
+                torch.mul(decoded, scale, out=out[..., row:row + block, col:col + block])
+        return out
     padded = F.pad(
         stored,
         (0, padded_in - meta.shape[1], 0, padded_out - meta.shape[0]),
