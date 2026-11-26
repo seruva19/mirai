@@ -97,6 +97,13 @@ class Modality(IntEnum):
 # ============================================================
 
 
+def _swiglu7_clamp(gate: torch.Tensor, up: torch.Tensor, limit: float):
+    # Use the same inclusive boundary derivative as the grouped CUDA kernels.
+    gate = torch.where(gate > limit, limit, gate)
+    up = torch.where(up < -limit, -limit, torch.where(up > limit, limit, up))
+    return gate, up
+
+
 @torch.compile
 def swiglu7(
     x, alpha: float = 1.702, limit: float = 7.0, out_dtype: Optional[torch.dtype] = None
@@ -105,8 +112,7 @@ def swiglu7(
     x = x.to(torch.float32)
     x_glu, x_linear = x[..., ::2], x[..., 1::2]
     # Clamp the input values
-    x_glu = x_glu.clamp(min=None, max=limit)
-    x_linear = x_linear.clamp(min=-limit, max=limit)
+    x_glu, x_linear = _swiglu7_clamp(x_glu, x_linear, limit)
     out_glu = x_glu * torch.sigmoid(alpha * x_glu)
     # Note we add an extra bias of 1 to the linear layer (from GPT-OSS)
     return (out_glu * (x_linear + 1)).to(out_dtype)
@@ -2811,8 +2817,7 @@ class CoreMultiHeadMoE(nn.Module):
                 values = head_input.index_select(0, token_indices)
                 gate = values @ self.W_gate[physical_expert]
                 up = values @ self.W_up[physical_expert]
-                gate = gate.float().clamp(max=7.0)
-                up = up.float().clamp(min=-7.0, max=7.0)
+                gate, up = _swiglu7_clamp(gate.float(), up.float(), 7.0)
                 hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
                 down_input = hidden.to(self.W_down.dtype)
                 if observer is not None:
