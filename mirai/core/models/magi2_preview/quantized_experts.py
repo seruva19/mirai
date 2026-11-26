@@ -872,6 +872,17 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         fields = self._packed_segment(key, group, group + 1, device=x.device)
         return native_fp4_linear(x, *(field[0] for field in fields), self._fp4_meta(self._shapes[key][1:]))
 
+    def fused_fp4_projection(self, key, start, stop, x, ends, *, max_group_rows, transposed, group_ids=None):
+        from mirai.core.models.compressed_weights.quantization.grouped_fp4_triton import grouped_fp4_projection
+
+        _, rows, columns = self.expert_weight_shape(key)
+        with ExitStack() as leases:
+            packed = self._packed_segment(key, start, stop, device=x.device, group_ids=group_ids, leases=leases)
+            return grouped_fp4_projection(
+                x, *packed, ends, columns=rows if transposed else columns, max_group_rows=max_group_rows,
+                transposed_storage=self.has_native_fp4_layout != transposed, format=self.quant_format,
+            )
+
     def _packed_segment(self, key, group_start, group_stop, *, device, group_ids=None, leases=None):
         self._require_loaded(key)
         count = self.num_groups if group_ids is None else group_ids.numel()

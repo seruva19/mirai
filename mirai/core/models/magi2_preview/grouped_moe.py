@@ -1194,9 +1194,13 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
     ) -> torch.Tensor:
         _groups, rows, cols = store.expert_weight_shape(key)
         span = _expert_group_span(store, x_sorted)
-        segments = tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=span))
+        fused_fp4 = forward_backend == "triton_grouped_fp4"
+        metadata = _packed_group_segments(offsets, max_groups=span, routed=fused_fp4)
+        segments = tuple(segment for segment, _ in metadata)
         if forward_backend == "scaled_mm_fp4":
             output = _native_fp4_grouped_projection(x_sorted, offsets, store, key, cols)
+        elif fused_fp4:
+            output = _fused_fp4_grouped_projection(x_sorted, offsets, store, key, cols, metadata)
         else:
             output = run_segmented_grouped_linear(
                 x_sorted,
@@ -1222,6 +1226,7 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         ctx.key = str(key)
         ctx.dx_backend = dx_backend
         ctx.segments = segments
+        ctx.fused_fp4_metadata = metadata if fused_fp4 else None
         ctx.segment_span = int(span)
         ctx.weight_rows = int(rows)
         return output
@@ -1233,6 +1238,11 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             store = ctx.store
             key = ctx.key
+            if ctx.fused_fp4_metadata is not None and not torch.is_grad_enabled():
+                grad_x = _fused_fp4_grouped_projection(
+                    grad_output, offsets, store, key, ctx.weight_rows, ctx.fused_fp4_metadata, transposed=True,
+                )
+                return grad_x, None, None, None, None, None
             grad_x = run_segmented_grouped_linear(
                 grad_output,
                 offsets,
@@ -1254,6 +1264,27 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
                 transposed=True,
             )
         return grad_x, None, None, None, None, None
+
+
+def _fused_fp4_grouped_projection(x_sorted, offsets, store, key, columns, segments, *, transposed=False):
+    physical_store = store.store if isinstance(store, _ActiveExpertGroups) else store
+    if not isinstance(physical_store, Magi2PackedExpertStore) or physical_store.quant_format not in {"nvfp4", "mxfp4"}:
+        raise Magi2GroupedMoEPolicyError("Fused FP4 requires uniform NVFP4 or MXFP4 experts.")
+    group_ids = store.group_ids if isinstance(store, _ActiveExpertGroups) else None
+    active = [(segment, maximum) for segment, maximum in segments if segment.row_count]
+    outputs = []
+    for index, (segment, maximum) in enumerate(active):
+        start, stop = segment.group_start, segment.group_stop
+        if index + 1 < len(active) and store.packed_prefetch_enabled:
+            upcoming, _ = active[index + 1]
+            store.prefetch_segment(key, upcoming.group_start, upcoming.group_stop, device=x_sorted.device)
+        outputs.append(physical_store.fused_fp4_projection(
+            key, start, stop, x_sorted[segment.row_start:segment.row_stop], offsets[start:stop] - segment.row_start,
+            max_group_rows=maximum, transposed=transposed, group_ids=group_ids,
+        ))
+    if not outputs:
+        return x_sorted.new_empty((0, columns))
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
 
 def _native_fp4_grouped_projection(x_sorted, offsets, store, key, columns):
@@ -1594,6 +1625,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         int8_expert_checkpoint: bool = False,
         int8_expert_checkpoint_offload: bool = False,
         int8_expert_checkpoint_lz4: bool = False,
+        fused_fp4: bool = False,
     ) -> None:
         super().__init__(
             plan,
@@ -1605,6 +1637,14 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         self.int8_expert_checkpoint = int8_expert_checkpoint
         self.int8_expert_checkpoint_offload = int8_expert_checkpoint_offload
         self.int8_expert_checkpoint_lz4 = int8_expert_checkpoint_lz4
+        self.fused_fp4 = fused_fp4
+        if fused_fp4 and (
+            self.expert_autograd != "standard" or plan.routed_gemm != "disabled"
+            or cpu_expert_max_tokens or plan.forward_backend == "scaled_mm_fp4"
+        ):
+            raise Magi2GroupedMoEPolicyError(
+                "Fused FP4 requires standard autograd, CUDA experts, and grouped execution without another packed kernel."
+            )
         if int8_expert_checkpoint_lz4 and not int8_expert_checkpoint_offload:
             raise Magi2GroupedMoEPolicyError("LZ4 expert checkpoints require int8 checkpoint offload.")
         if int8_expert_checkpoint_offload and not int8_expert_checkpoint:
@@ -1647,6 +1687,10 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         if self._resolved:
             return self.alignment_violations
         store = self._store(module)
+        if self.fused_fp4 and (
+            not isinstance(store, Magi2PackedExpertStore) or store.quant_format not in {"nvfp4", "mxfp4"}
+        ):
+            raise Magi2GroupedMoEPolicyError("Fused FP4 requires uniform NVFP4 or MXFP4 experts.")
         if self.plan.forward_backend == "scaled_mm_fp4":
             if not isinstance(store, Magi2PackedExpertStore) or not store.has_native_fp4_layout:
                 raise Magi2GroupedMoEPolicyError("Native MAGI-2 FP4 GEMM requires uniform contraction-major FP4 weights.")
@@ -1678,12 +1722,16 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         dx_backend: str,
     ) -> torch.Tensor:
         store, offsets = _packed_expert_layout(self._store(module), offsets)
+        if self.fused_fp4:
+            forward_backend = "triton_grouped_fp4"
         return _QuantizedGroupedExpertLinear.apply(
             x_sorted, offsets, store, key, forward_backend, dx_backend
         )
 
     def _project_gate_up(self, module, x_sorted, offsets, forward_backend, dx_backend):
         store, offsets = _packed_expert_layout(self._store(module), offsets)
+        if self.fused_fp4:
+            forward_backend = "triton_grouped_fp4"
         keys = (MAGI2_FUSED_GATE_UP,) if store.has_fused_gate_up else ("W_gate", "W_up")
         projections = tuple(
             _QuantizedGroupedExpertLinear.apply(x_sorted, offsets, store, key, forward_backend, dx_backend)
@@ -1818,8 +1866,10 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
     ) -> torch.Tensor:
         adapters = getattr(module, "_mirai_expert_lora", None)
         if adapters is not None:
+            if self.fused_fp4:
+                forward_backend = "triton_grouped_fp4"
             return self._expert_lora_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend, adapters)
-        if forward_backend == "scaled_mm_fp4":
+        if self.fused_fp4 or forward_backend == "scaled_mm_fp4":
             return super().branch_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend)
         if self.plan.routed_gemm != "disabled":
             supported = (

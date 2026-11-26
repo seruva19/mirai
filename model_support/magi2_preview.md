@@ -286,6 +286,12 @@ requires input widths divisible by 32 for MXFP4 or 16 for NVFP4, standard expert
 dequantizing backward backend. Use the same packed artifact with
 `memory.moe_gemm_backend_forward="bmm"` to compare quality and latency.
 
+Set `model.params.family_params.expert_fused_fp4 = true` to decode
+uniform NVFP4 or MXFP4 weights inside Triton grouped GEMM. The path accepts
+both NVFP4 storage layouts and avoids materializing dense weights for
+forward and first-order input gradients. It requires FP16 or BF16 CUDA
+activations, standard expert autograd, and `memory.moe_routed_gemm="disabled"`.
+
 For new uniform NVFP4 exports, set
 `model.params.family_params.expert_nvfp4_native_layout = true` while packing
 from the source weights. The resulting version 9 artifact identifies the
