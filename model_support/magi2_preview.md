@@ -842,6 +842,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   and 1000 steps. `expert_mixture_basis_down_format` defaults to `fp8` and
   controls packing of the down projection. The fitter processes one projection
   at a time and uses a CPU FP32 copy of that projection.
+  To reload exported factors, set `memory.frozen_weight_packed_state_path`
+  and use the same checkpoint, rank, basis count, and down projection format.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group

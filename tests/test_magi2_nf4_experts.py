@@ -874,9 +874,25 @@ def test_magi2_mixture_basis_preserves_packed_down_and_selected_group_order(tmp_
             torch.testing.assert_close(whole, store.down.materialize_segment(key, 0, 2, **kwargs), rtol=0, atol=0)
     assert store.is_fully_loaded()
     layer.add_module(MAGI2_NF4_STORE_ATTR, store)
+    artifact = save_magi2_nf4_packed_state(tmp_path / "mixture", _container(layer))
+    with pytest.raises(ValueError, match="Invalid MAGI-2 mixture-basis factors"):
+        load_magi2_nf4_packed_state(
+            artifact, skeleton, blocksize=64, quant_format="mixture_basis",
+            expected_mixture_basis=(3, 2, "fp8"),
+        )
+    restored = load_magi2_nf4_packed_state(
+        artifact, skeleton, blocksize=64, quant_format="mixture_basis",
+        expected_mixture_basis=(2, 2, "fp8"),
+    )["mlp.moe_mlp"]
+    assert dict(restored.named_buffers()).keys() == dict(store.named_buffers()).keys()
+    for name, value in store.named_buffers():
+        torch.testing.assert_close(dict(restored.named_buffers())[name], value, rtol=0, atol=0)
     x = torch.randn(3, 1, 16, requires_grad=True)
     backend = Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
     output = backend.execute(layer, x, *layer._route(x))
+    torch.testing.assert_close(
+        backend.execute(skeleton.mlp.moe_mlp, x, *layer._route(x)), output, rtol=0, atol=0,
+    )
     assert torch.isfinite(output).all()
     assert torch.isfinite(torch.autograd.grad(output.sum(), x)[0]).all()
 

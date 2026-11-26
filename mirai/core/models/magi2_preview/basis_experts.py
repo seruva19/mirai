@@ -148,6 +148,59 @@ class Magi2MixtureBasisExpertStore(Magi2Nf4ExpertStore):
         self.down = _new_expert_store(num_groups=num_groups, blocksize=blocksize, quant_format=down_format)
         self._activations: dict[str, str] = {}
 
+    def packed_state_descriptor(self):
+        if not self.is_fully_loaded():
+            raise ValueError("MAGI-2 mixture-basis store is incomplete.")
+        return {
+            "num_groups": self.num_groups, "expert_shapes": self._shapes,
+            "expert_dtypes": {key: str(dtype).removeprefix("torch.") for key, dtype in self._dtypes.items()},
+            "activations": self._activations, "down_format": self.down.quant_format,
+            "down": self.down.packed_state_descriptor(keys=("W_down",)),
+        }
+
+    def restore_mixture_state(self, descriptor, buffers, *, expected_rank=None, expected_count=None):
+        from mirai.core.models.compressed_weights.factorization.mixture_basis import MIXTURE_BASIS_ACTIVATIONS
+
+        keys = ("W_gate", "W_up")
+        shapes = descriptor["expert_shapes"]
+        activations = descriptor["activations"]
+        down_spec = descriptor["down"]
+        names = {f"{key}_{part}" for key in keys for part in ("transforms", "bases", "coefficients")}
+        if (
+            descriptor["num_groups"] != self.num_groups or set(activations) != set(keys)
+            or tuple(down_spec["expert_shapes"]["W_down"]) != tuple(shapes["W_down"])
+            or set(buffers) != names | {f"down.{name}" for name in down_spec["buffers"]}
+        ):
+            raise ValueError("Invalid MAGI-2 mixture-basis inventory.")
+        dtypes = {key: getattr(torch, str(descriptor["expert_dtypes"][key]), None) for key in shapes}
+        allowed = {torch.float16, torch.bfloat16, torch.float32}
+        if any(dtype not in allowed for dtype in dtypes.values()):
+            raise ValueError("Invalid MAGI-2 mixture-basis projection dtype.")
+        for key in keys:
+            groups, inputs, outputs = shapes[key]
+            transforms, bases, coefficients = (buffers[f"{key}_{part}"] for part in ("transforms", "bases", "coefficients"))
+            count, rank, _ = bases.shape
+            if (
+                not 0 < count <= groups or not 0 < rank <= min(inputs, outputs)
+                or (expected_rank is not None and rank != expected_rank)
+                or (expected_count is not None and count != expected_count)
+                or bases.shape != (count, rank, inputs)
+                or transforms.shape != (groups, outputs, rank) or coefficients.shape != (groups, count)
+                or activations[key] not in MIXTURE_BASIS_ACTIVATIONS
+                or any(t.dtype not in allowed or not torch.isfinite(t).all() for t in (transforms, bases, coefficients))
+                or (coefficients < 0).any() or (coefficients.float().sum(dim=1) <= 0).any()
+            ):
+                raise ValueError(f"Invalid MAGI-2 mixture-basis factors for {key!r}.")
+        down_buffers = {name.removeprefix("down."): value for name, value in buffers.items() if name.startswith("down.")}
+        self.down.restore_packed_state(descriptor=down_spec, buffers=down_buffers, keys=("W_down",))
+        if self.down.expert_weight_dtype("W_down") != dtypes["W_down"]:
+            raise ValueError("Invalid MAGI-2 mixture-basis down projection dtype.")
+        for name in names:
+            self._set_buffer(name, buffers[name])
+        self._shapes = {key: tuple(shape) for key, shape in shapes.items()}
+        self._dtypes = dtypes
+        self._activations = dict(activations)
+
     def factorize_projection(self, key: str, source: torch.Tensor, **factor_options) -> None:
         if key not in MAGI2_ROUTED_EXPERT_TENSOR_NAMES or source.ndim != 3 or source.shape[0] != self.num_groups:
             raise ValueError("MAGI-2 mixture-basis projection has incompatible shape or key.")

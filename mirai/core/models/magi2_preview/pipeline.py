@@ -357,8 +357,6 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             or self._frozen_weight_quantization not in {"", "none", "off", "disabled"}
         ):
             raise ValueError("MAGI-2 basis factorization requires an original dense checkpoint and no other expert storage policy.")
-        if self._expert_mixture_basis_rank and self._packed_expert_state_path:
-            raise ValueError("MAGI-2 mixture-basis factors require building from the original checkpoint.")
         default_config = (
             Path(__file__).resolve().parents[3]
             / "vendors"
@@ -497,13 +495,21 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     transformer, checkpoint_dir=str(checkpoint_dir), rank=shared_basis_rank,
                 )
         elif mixture_basis_rank:
-            from mirai.core.models.magi2_preview.basis_experts import stream_factorize_magi2_mixture_basis_experts
-
-            self._expert_stores = stream_factorize_magi2_mixture_basis_experts(
-                transformer, checkpoint_dir=str(checkpoint_dir), rank=mixture_basis_rank,
-                basis_count=self._expert_mixture_basis_count, optimization_steps=self._expert_mixture_basis_steps,
-                down_format=self._expert_mixture_basis_down_format, blocksize=self._nf4_blocksize,
+            from mirai.core.models.magi2_preview.basis_experts import (
+                fingerprint_magi2_basis_checkpoint, stream_factorize_magi2_mixture_basis_experts,
             )
+
+            self._expert_basis_source_sha256 = fingerprint_magi2_basis_checkpoint(str(checkpoint_dir))
+            if self._packed_expert_state_path:
+                self._restore_packed_experts(transformer, mixture_basis=(
+                    mixture_basis_rank, self._expert_mixture_basis_count, self._expert_mixture_basis_down_format,
+                ))
+            else:
+                self._expert_stores = stream_factorize_magi2_mixture_basis_experts(
+                    transformer, checkpoint_dir=str(checkpoint_dir), rank=mixture_basis_rank,
+                    basis_count=self._expert_mixture_basis_count, optimization_steps=self._expert_mixture_basis_steps,
+                    down_format=self._expert_mixture_basis_down_format, blocksize=self._nf4_blocksize,
+                )
         elif consolidation_plan_path:
             from mirai.core.models.magi2_preview.expert_pruning import (
                 Magi2ExpertConsolidationPlan,
@@ -580,7 +586,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
             self._packed_norms = pack_magi2_norm_weights(transformer)
         if (
-            packed_experts and not mixed_stream and not consolidation_plan_path and not shared_basis_rank
+            packed_experts and not mixed_stream and not consolidation_plan_path and not shared_basis_rank and not mixture_basis_rank
             and (not pruning_plan_path or self._packed_expert_state_path)
         ):
             if self._packed_expert_state_path:
@@ -863,7 +869,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             expert_weight_access_policy=True,
             quantize_experts_on_load=True,
             expert_on_load_formats=MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS,
-            family_packed_weight_format=bool(getattr(self, "_expert_shared_basis_rank", 0)),
+            family_packed_weight_format=bool(
+                getattr(self, "_expert_shared_basis_rank", 0) or getattr(self, "_expert_mixture_basis_rank", 0)
+            ),
             router_quantization_policy=True,
             moe_kernel_backend=True,
         )
@@ -872,6 +880,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self, transformer: nn.Module, *,
         pruning_digest: bytes | None = None, consolidation_digest: bytes | None = None,
         shared_basis_rank: int | None = None,
+        mixture_basis: tuple[int, int, str] | None = None,
     ) -> None:
         from mirai.core.models.magi2_preview.packed_experts import load_magi2_nf4_packed_state
 
@@ -879,14 +888,18 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             "model_variant": str(self.model_config.params.variant),
             "denoiser_subfolder": str(getattr(self.model_config.params, "denoiser_subfolder", "transformer") or "transformer"),
         }
-        if shared_basis_rank is not None:
+        quant_format = self._frozen_weight_quantization if shared_basis_rank is None and mixture_basis is None else (
+            "shared_basis" if shared_basis_rank is not None else "mixture_basis"
+        )
+        if shared_basis_rank is not None or mixture_basis is not None:
             from mirai.core.models.magi2_preview.basis_experts import MAGI2_BASIS_SOURCE_METADATA
 
             expected_metadata[MAGI2_BASIS_SOURCE_METADATA] = self._expert_basis_source_sha256
         self._expert_stores = load_magi2_nf4_packed_state(
             self._packed_expert_state_path, transformer, blocksize=self._nf4_blocksize,
-            quant_format="shared_basis" if shared_basis_rank is not None else self._frozen_weight_quantization,
+            quant_format=quant_format,
             expected_shared_basis_rank=shared_basis_rank,
+            expected_mixture_basis=mixture_basis,
             expected_pruning_digest=pruning_digest, expected_consolidation_digest=consolidation_digest,
             expected_metadata=expected_metadata,
         )
@@ -902,13 +915,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         *,
         metadata: dict[str, str] | None = None,
     ) -> Any:
-        if getattr(self, "_expert_mixture_basis_rank", 0):
-            raise ValueError("MAGI-2 mixture-basis factors currently load from the source checkpoint.")
         from mirai.core.models.magi2_preview.packed_experts import (
             save_magi2_nf4_packed_state,
         )
 
-        if getattr(self, "_expert_shared_basis_rank", 0):
+        if getattr(self, "_expert_shared_basis_rank", 0) or getattr(self, "_expert_mixture_basis_rank", 0):
             from mirai.core.models.magi2_preview.basis_experts import MAGI2_BASIS_SOURCE_METADATA
 
             metadata = {**(metadata or {}), MAGI2_BASIS_SOURCE_METADATA: self._expert_basis_source_sha256}
