@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mirai.core.training.residency.activation_compression import training_cuda_copy_streams
+from mirai.core.training.residency.zero_bitpack import pack_zero_bitmap, unpack_zero_bitmap
 
 try:
     import torch
@@ -65,30 +66,16 @@ class _GradientPayload:
         if self.mask is None:
             output = torch.empty_like(self.values, dtype=torch.float32, pin_memory=False)
             return output.copy_(self.values)
-        output = torch.zeros(self.shape, dtype=torch.float32)
-        flat = output.view(-1)
-        bits = torch.arange(8, dtype=torch.uint8)
-        selected = ((self.mask[:, None] >> bits) & 1).flatten()[:flat.numel()].bool()
-        flat.masked_scatter_(selected, self.values.float())
-        return output
+        return unpack_zero_bitmap(self.values, self.mask, self.shape, dtype=torch.float32)
 
 
 def _pack_sparse_gradient(grad):
-    integer_dtype = {
-        torch.float16: torch.int16, torch.bfloat16: torch.int16,
-        torch.float32: torch.int32, torch.float64: torch.int64,
-    }.get(grad.dtype)
-    if integer_dtype is None or grad.numel() * grad.element_size() < 65536:
+    if grad.dtype not in {torch.float16, torch.bfloat16, torch.float32, torch.float64} or grad.nbytes < 65536:
         return _GradientPayload(grad, grad.shape)
-    flat = grad.contiguous().view(-1)
-    # Test the representation so negative zeros and NaN payloads are retained.
-    selected = flat.view(integer_dtype).ne(0)
-    values = flat.masked_select(selected)
-    if values.numel() * grad.element_size() + (flat.numel() + 7) // 8 >= flat.numel() * grad.element_size():
+    packed = pack_zero_bitmap(grad)
+    if packed is None:
         return _GradientPayload(grad, grad.shape)
-    padded = torch.nn.functional.pad(selected, (0, (-flat.numel()) % 8))
-    shifts = torch.arange(8, dtype=torch.uint8, device=grad.device)
-    mask = (padded.view(-1, 8).to(torch.uint8) << shifts).sum(dim=1, dtype=torch.uint8)
+    values, mask = packed
     return _GradientPayload(values, grad.shape, mask)
 
 

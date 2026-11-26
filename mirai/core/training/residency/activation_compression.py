@@ -34,6 +34,7 @@ class _Int8SavedRows:
     device: Any = None
     host_ready: Any = None
     code_shape: tuple[int, ...] | None = None
+    mask: Any = None
 
 
 @lru_cache(maxsize=None)
@@ -41,7 +42,7 @@ def training_cuda_copy_streams(device):
     return torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
 
 
-def _pack_int8_saved_rows(tensor, *, offload=False, lz4=False):
+def _pack_int8_saved_rows(tensor, *, offload=False, lz4=False, bitpack=False):
     if tensor.ndim != 2 or tensor.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
         return tensor.detach()
     rows, width = tensor.shape
@@ -54,6 +55,14 @@ def _pack_int8_saved_rows(tensor, *, offload=False, lz4=False):
     codes = (values / scales).round_().clamp_(-127, 127).to(torch.int8)
     if offload and tensor.is_cuda:
         code_shape = None
+        mask = None
+        if bitpack and codes.numel() >= 65536:
+            from .zero_bitpack import pack_zero_bitmap
+
+            packed = pack_zero_bitmap(codes)
+            if packed is not None:
+                code_shape = tuple(codes.shape)
+                codes, mask = packed
         if lz4 and codes.numel() >= 65536:
             from .nvcomp_lz4 import encode_cuda_lz4
 
@@ -69,10 +78,15 @@ def _pack_int8_saved_rows(tensor, *, offload=False, lz4=False):
             host_scales = torch.empty_like(scales, device="cpu", pin_memory=True)
             host_codes.copy_(codes, non_blocking=True)
             host_scales.copy_(scales, non_blocking=True)
+            host_mask = None
+            if mask is not None:
+                host_mask = torch.empty_like(mask, device="cpu", pin_memory=True)
+                host_mask.copy_(mask, non_blocking=True)
+                mask.record_stream(d2h)
             codes.record_stream(d2h)
             scales.record_stream(d2h)
             ready = d2h.record_event()
-        return _Int8SavedRows(host_codes, host_scales, tensor.dtype, device, ready, code_shape)
+        return _Int8SavedRows(host_codes, host_scales, tensor.dtype, device, ready, code_shape, host_mask)
     return _Int8SavedRows(codes, scales, tensor.dtype)
 
 
@@ -80,6 +94,7 @@ def _unpack_int8_saved_rows(value):
     if not isinstance(value, _Int8SavedRows):
         return value
     codes, scales = value.codes, value.scales
+    mask = value.mask
     if value.host_ready is not None:
         _, h2d = training_cuda_copy_streams(value.device)
         compute = torch.cuda.current_stream(value.device)
@@ -87,11 +102,19 @@ def _unpack_int8_saved_rows(value):
             h2d.wait_event(value.host_ready)
             codes = codes.to(value.device, non_blocking=True)
             scales = scales.to(value.device, non_blocking=True)
+            if mask is not None:
+                mask = mask.to(value.device, non_blocking=True)
             ready = h2d.record_event()
         compute.wait_event(ready)
         codes.record_stream(compute)
         scales.record_stream(compute)
-    if value.code_shape is not None:
+        if mask is not None:
+            mask.record_stream(compute)
+    if mask is not None:
+        from .zero_bitpack import unpack_zero_bitmap
+
+        codes = unpack_zero_bitmap(codes, mask, value.code_shape, dtype=torch.int8)
+    elif value.code_shape is not None:
         from .nvcomp_lz4 import decode_cuda_lz4
 
         decoded = torch.empty(value.code_shape, device=value.device, dtype=torch.int8)
@@ -100,11 +123,11 @@ def _unpack_int8_saved_rows(value):
     return (codes.float() * scales).to(value.dtype)
 
 
-def int8_saved_rows_context(*, offload=False, lz4=False):
+def int8_saved_rows_context(*, offload=False, lz4=False, bitpack=False):
     """Compress saved activation rows in a scope with no saved float weights."""
-    if lz4 and not offload:
-        raise ValueError("LZ4 activation compression requires checkpoint offload.")
-    pack = partial(_pack_int8_saved_rows, offload=True, lz4=lz4) if offload else _pack_int8_saved_rows
+    if (lz4 or bitpack) and not offload or (lz4 and bitpack):
+        raise ValueError("Select one activation compression codec with checkpoint offload enabled.")
+    pack = partial(_pack_int8_saved_rows, offload=True, lz4=lz4, bitpack=bitpack) if offload else _pack_int8_saved_rows
     return torch.autograd.graph.saved_tensors_hooks(pack, _unpack_int8_saved_rows)
 
 

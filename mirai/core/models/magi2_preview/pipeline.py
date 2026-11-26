@@ -336,6 +336,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("MAGI-2 expert_int8_checkpoint_lz4 must be a boolean.")
         if self._int8_expert_checkpoint_lz4 and not self._int8_expert_checkpoint_offload:
             raise ValueError("MAGI-2 expert_int8_checkpoint_lz4 requires expert_int8_checkpoint_offload.")
+        self._int8_expert_checkpoint_bitpack = family.get("expert_int8_checkpoint_bitpack", False)
+        if type(self._int8_expert_checkpoint_bitpack) is not bool:
+            raise ValueError("MAGI-2 expert_int8_checkpoint_bitpack must be a boolean.")
+        if self._int8_expert_checkpoint_bitpack and (self._int8_expert_checkpoint_lz4 or not self._int8_expert_checkpoint_offload):
+            raise ValueError("MAGI-2 expert_int8_checkpoint_bitpack requires checkpoint offload without LZ4.")
         self._fused_fp4_experts = family.get("expert_fused_fp4", False)
         if type(self._fused_fp4_experts) is not bool:
             raise ValueError("MAGI-2 expert_fused_fp4 must be a boolean.")
@@ -1214,6 +1219,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 int8_expert_checkpoint=getattr(self, "_int8_expert_checkpoint", False),
                 int8_expert_checkpoint_offload=getattr(self, "_int8_expert_checkpoint_offload", False),
                 int8_expert_checkpoint_lz4=getattr(self, "_int8_expert_checkpoint_lz4", False),
+                int8_expert_checkpoint_bitpack=getattr(self, "_int8_expert_checkpoint_bitpack", False),
                 fused_fp4=getattr(self, "_fused_fp4_experts", False),
                 fused_gguf=getattr(self, "_fused_gguf_experts", False),
                 fused_int4=getattr(self, "_fused_int4_experts", False),
@@ -2569,6 +2575,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "expert_int8_checkpoint",
         "expert_int8_checkpoint_offload",
         "expert_int8_checkpoint_lz4",
+        "expert_int8_checkpoint_bitpack",
         "expert_fused_fp4",
         "expert_fused_gguf",
         "expert_fused_int4",
@@ -2684,6 +2691,12 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             errors.append("MAGI-2 expert_int8_checkpoint_lz4 must be a boolean.")
         elif params.get("expert_int8_checkpoint_lz4") and params.get("expert_int8_checkpoint_offload") is not True:
             errors.append("MAGI-2 expert_int8_checkpoint_lz4 requires expert_int8_checkpoint_offload.")
+        if type(params.get("expert_int8_checkpoint_bitpack", False)) is not bool:
+            errors.append("MAGI-2 expert_int8_checkpoint_bitpack must be a boolean.")
+        elif params.get("expert_int8_checkpoint_bitpack") and (
+            params.get("expert_int8_checkpoint_lz4") or params.get("expert_int8_checkpoint_offload") is not True
+        ):
+            errors.append("MAGI-2 expert_int8_checkpoint_bitpack requires checkpoint offload without LZ4.")
         if type(params.get("expert_fused_fp4", False)) is not bool:
             errors.append("MAGI-2 expert_fused_fp4 must be a boolean.")
         if type(params.get("expert_fused_gguf", False)) is not bool:

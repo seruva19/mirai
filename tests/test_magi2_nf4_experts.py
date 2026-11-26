@@ -2012,6 +2012,19 @@ def test_int8_checkpoint_lz4_reduces_transferred_bytes() -> None:
     torch.testing.assert_close(_unpack_int8_saved_rows(compressed), _unpack_int8_saved_rows(reference), rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Pinned activation transfer requires CUDA")
+def test_int8_checkpoint_bitmap_reduces_sparse_transfer() -> None:
+    from mirai.core.training.residency.activation_compression import _pack_int8_saved_rows, _unpack_int8_saved_rows
+
+    rows = torch.zeros((129, 1025), dtype=torch.bfloat16, device="cuda")
+    rows[:, ::2] = 1
+    reference = _pack_int8_saved_rows(rows, offload=True)
+    compressed = _pack_int8_saved_rows(rows, offload=True, bitpack=True)
+    assert compressed.mask is not None and compressed.mask.is_pinned()
+    assert compressed.codes.nbytes + compressed.mask.nbytes < reference.codes.nbytes
+    torch.testing.assert_close(_unpack_int8_saved_rows(compressed), _unpack_int8_saved_rows(reference), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("block_checkpoint", [False, True])
 def test_magi2_int8_checkpoint_saves_only_expert_activations(monkeypatch, block_checkpoint) -> None:
     from torch.utils.checkpoint import checkpoint

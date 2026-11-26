@@ -1634,6 +1634,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         int8_expert_checkpoint: bool = False,
         int8_expert_checkpoint_offload: bool = False,
         int8_expert_checkpoint_lz4: bool = False,
+        int8_expert_checkpoint_bitpack: bool = False,
         fused_fp4: bool = False,
         fused_gguf: bool = False,
         fused_int4: bool = False,
@@ -1650,6 +1651,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         self.int8_expert_checkpoint = int8_expert_checkpoint
         self.int8_expert_checkpoint_offload = int8_expert_checkpoint_offload
         self.int8_expert_checkpoint_lz4 = int8_expert_checkpoint_lz4
+        self.int8_expert_checkpoint_bitpack = int8_expert_checkpoint_bitpack
+        if int8_expert_checkpoint_bitpack and (int8_expert_checkpoint_lz4 or not int8_expert_checkpoint_offload):
+            raise Magi2GroupedMoEPolicyError("Bit-packed expert checkpoints require offload without LZ4.")
         if sum((fused_fp4, fused_gguf, fused_int4)) > 1:
             raise Magi2GroupedMoEPolicyError("Select one fused packed expert format family.")
         self.fused_formats = (
@@ -1994,6 +1998,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
 
             with int8_saved_rows_context(
                 offload=self.int8_expert_checkpoint_offload, lz4=self.int8_expert_checkpoint_lz4,
+                bitpack=self.int8_expert_checkpoint_bitpack,
             ):
                 return operation.apply(*args)
         return operation.apply(*args)
@@ -2037,6 +2042,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                 context = (
                     int8_saved_rows_context(
                         offload=self.int8_expert_checkpoint_offload, lz4=self.int8_expert_checkpoint_lz4,
+                        bitpack=self.int8_expert_checkpoint_bitpack,
                     )
                     if self.int8_expert_checkpoint else nullcontext()
                 )

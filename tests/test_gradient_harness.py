@@ -15,6 +15,16 @@ except ModuleNotFoundError:  # pragma: no cover
 
 @unittest.skipIf(torch is None, "torch not installed")
 class GradientHarnessTests(unittest.TestCase):
+    def test_zero_bitmap_maps_every_byte_pattern_and_pads_tail(self) -> None:
+        from mirai.core.training.residency.zero_bitpack import pack_zero_bitmap, unpack_zero_bitmap
+
+        patterns = torch.arange(256, dtype=torch.int16)
+        lanes = ((patterns[:, None] >> torch.arange(8)) & 1).flatten().to(torch.int8)
+        values = torch.cat((lanes, torch.tensor([1, 0, 1], dtype=torch.int8)))
+        stored, mask = pack_zero_bitmap(values)
+        torch.testing.assert_close(mask, torch.cat((patterns.to(torch.uint8), torch.tensor([5], dtype=torch.uint8))))
+        torch.testing.assert_close(unpack_zero_bitmap(stored, mask, values.shape, dtype=torch.int8), values)
+
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA required")
     def test_sparse_gradient_bitpacking_preserves_bits_and_skips_dense_payloads(self) -> None:
         grad = torch.zeros(16385, device="cuda", dtype=torch.float32)
