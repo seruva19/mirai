@@ -576,7 +576,9 @@ class CompressedWeightQuantizationTests(unittest.TestCase):
         if not status.available:
             self.skipTest(status.reason)
         formats = ["nvfp4"]
-        if hasattr(torch.nn.functional, "scaled_mm") and hasattr(torch, "float8_e8m0fnu"):
+        if torch.cuda.get_device_capability(device)[0] == 12 or (
+            hasattr(torch.nn.functional, "scaled_mm") and hasattr(torch, "float8_e8m0fnu")
+        ):
             formats.append("mxfp4")
         torch.manual_seed(107)
         for fmt in formats:

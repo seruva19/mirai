@@ -285,6 +285,7 @@ requires input widths divisible by 32 for MXFP4 or 16 for NVFP4, standard expert
 `memory.moe_routed_gemm="disabled"`. Input gradients use the configured
 dequantizing backward backend. Use the same packed artifact with
 `memory.moe_gemm_backend_forward="bmm"` to compare quality and latency.
+On consumer Blackwell, the MXFP4 path uses K-packed Triton block-scaled MMA.
 
 Set `model.params.family_params.expert_fused_fp4 = true` to decode
 uniform NVFP4 or MXFP4 weights inside Triton grouped GEMM. The path accepts

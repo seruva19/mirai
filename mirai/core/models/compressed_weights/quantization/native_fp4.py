@@ -53,6 +53,14 @@ class _NativeFP4Linear(torch.autograd.Function):
         a_codes, a_scales, a_global, _ = quantize_microscaling(
             meta.format, x.reshape(rows, columns)
         )
+        if meta.format == "mxfp4" and torch.cuda.get_device_capability(x.device)[0] == 12:
+            from .native_mxfp4_triton import native_mxfp4_matmul
+
+            out = native_mxfp4_matmul(
+                a_codes, codes.to(x.device).contiguous(), a_scales, scales.to(x.device).contiguous(),
+                rows=rows, features=features, columns=columns,
+            )
+            return out.reshape(*x.shape[:-1], features).to(x.dtype)
         scale_dtype = torch.float8_e4m3fn if meta.format == "nvfp4" else torch.float8_e8m0fnu
         a, sa = _native_payload(
             a_codes, a_scales, rows, columns, block_size=block,
@@ -90,7 +98,7 @@ def native_fp4_linear(x, codes, scales, global_scale, meta: MicroscalingMeta):
         raise ValueError("Native FP4 requires an NVFP4 or MXFP4 matrix.")
     if x.shape[-1] != meta.shape[1] or meta.shape[1] % meta.block_size:
         raise ValueError("Native FP4 requires matching input width aligned to the stored scale block.")
-    if meta.format == "mxfp4" and not (
+    if meta.format == "mxfp4" and (not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] != 12) and not (
         callable(getattr(F, "scaled_mm", None)) and hasattr(torch, "float8_e8m0fnu")
     ):
         raise RuntimeError("Native MXFP4 requires PyTorch scaled_mm with E8M0 scales.")
