@@ -1269,7 +1269,9 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
 
 def _fused_packed_grouped_projection(x_sorted, offsets, store, key, columns, segments, *, transposed=False):
     physical_store = store.store if isinstance(store, _ActiveExpertGroups) else store
-    if not isinstance(physical_store, Magi2PackedExpertStore) or physical_store.quant_format not in ("nvfp4", "mxfp4", *MAGI2_FUSED_GGUF_FORMATS):
+    if not isinstance(physical_store, Magi2PackedExpertStore) or physical_store.quant_format not in (
+        "nvfp4", "mxfp4", "int4", *MAGI2_FUSED_GGUF_FORMATS,
+    ):
         raise Magi2GroupedMoEPolicyError("Fused grouped GEMM requires a supported uniform packed expert format.")
     group_ids = store.group_ids if isinstance(store, _ActiveExpertGroups) else None
     active = [(segment, maximum) for segment, maximum in segments if segment.row_count]
@@ -1628,6 +1630,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         int8_expert_checkpoint_lz4: bool = False,
         fused_fp4: bool = False,
         fused_gguf: bool = False,
+        fused_int4: bool = False,
     ) -> None:
         super().__init__(
             plan,
@@ -1639,9 +1642,11 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         self.int8_expert_checkpoint = int8_expert_checkpoint
         self.int8_expert_checkpoint_offload = int8_expert_checkpoint_offload
         self.int8_expert_checkpoint_lz4 = int8_expert_checkpoint_lz4
-        if fused_fp4 and fused_gguf:
+        if sum((fused_fp4, fused_gguf, fused_int4)) > 1:
             raise Magi2GroupedMoEPolicyError("Select one fused packed expert format family.")
-        self.fused_formats = ("nvfp4", "mxfp4") if fused_fp4 else (MAGI2_FUSED_GGUF_FORMATS if fused_gguf else ())
+        self.fused_formats = (
+            ("nvfp4", "mxfp4") * fused_fp4 + MAGI2_FUSED_GGUF_FORMATS * fused_gguf + ("int4",) * fused_int4
+        )
         if self.fused_formats and (
             self.expert_autograd != "standard" or plan.routed_gemm != "disabled"
             or cpu_expert_max_tokens or plan.forward_backend == "scaled_mm_fp4"

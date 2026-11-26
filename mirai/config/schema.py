@@ -3318,6 +3318,7 @@ class TrainingConfig:
             "none",
             "fp8",
             "int8",
+            "int4",
             "nf4",
             "w4a8",
             "gguf_iq4",
@@ -3337,10 +3338,11 @@ class TrainingConfig:
         _refiner_fwq_raw = str(
             memory_table.get("refiner_frozen_weight_quantization", "")
         ).strip().lower()
-        if _refiner_fwq_raw not in _fwq_allowed:
+        _refiner_fwq_allowed = _fwq_allowed - {"int4"}
+        if _refiner_fwq_raw not in _refiner_fwq_allowed:
             raise ValueError(
                 "memory.refiner_frozen_weight_quantization must be empty or one of: "
-                + ", ".join(sorted(v for v in _fwq_allowed if v))
+                + ", ".join(sorted(v for v in _refiner_fwq_allowed if v))
                 + f"; got {_refiner_fwq_raw!r}."
             )
         _fwq_strategy = str(

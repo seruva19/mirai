@@ -7,6 +7,7 @@ import triton.language as tl
 import torch
 
 from .gguf_quant import GGUF_TYPE_SIZE, _table, gguf_num_superblocks
+from .int4_quant import INT4_BLOCK_SIZE, validate_int4_layout
 
 
 @triton.jit
@@ -80,6 +81,7 @@ def _grouped_fp4(
     TRANSPOSED_STORAGE: tl.constexpr, MX: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     GGUF_BYTES: tl.constexpr = 0,
+    INT4: tl.constexpr = False,
 ):
     group = tl.program_id(0)
     begin = tl.load(Ends + group - 1, mask=group > 0, other=0)
@@ -89,7 +91,7 @@ def _grouped_fp4(
         return
     rows = row_start + tl.arange(0, BM)
     cols = tl.program_id(2) * BN + tl.arange(0, BN)
-    if GGUF_BYTES == 0:
+    if GGUF_BYTES == 0 and not INT4:
         group_scale = tl.load(Global + group)
     acc = tl.full((BM, BN), 0, tl.float32)
     for start in range(tl.cdiv(K, BK)):
@@ -105,7 +107,11 @@ def _grouped_fp4(
             packed = tl.load(Codes + group * (BLOCKS * SCALE_WIDTH // 2) + flat // 2, valid, 0)
             nibble = (packed >> (4 * (flat & 1))) & 15
             scale = tl.load(Scales + group * BLOCKS + flat // SCALE_WIDTH, valid, 0)
-            weights = _fp4_value(nibble) * _fp4_scale(scale, group_scale, MX)
+            if INT4:
+                signed = nibble.to(tl.int32)
+                weights = tl.where(signed < 8, signed, signed - 16).to(tl.float32) * scale
+            else:
+                weights = _fp4_value(nibble) * _fp4_scale(scale, group_scale, MX)
         x = tl.load(X + rows[:, None] * K + inputs[None, :], (rows[:, None] < end) & (inputs[None, :] < K), 0)
         acc = tl.dot(x, weights.to(X.dtype.element_ty), acc)
     tl.store(Y + rows[:, None] * N + cols[None, :], acc, (rows[:, None] < end) & (cols[None, :] < N))
@@ -172,5 +178,31 @@ def grouped_gguf_projection(x, codes, ends, *, columns, max_group_rows, transpos
     _grouped_fp4[grid](
         x.contiguous(), codes.contiguous(), table, signs, ends.contiguous(), result,
         x.shape[1], columns, blocks, 256, transposed, False, 16, 32, 32, width, num_warps=4, enable_fp_fusion=False,
+    )
+    return result
+
+
+def grouped_int4_projection(x, codes, scales, ends, *, columns, max_group_rows, transposed):
+    """Apply signed block-scaled INT4 to sorted expert rows."""
+    if not x.is_cuda or x.ndim != 2 or x.dtype not in {torch.float16, torch.bfloat16}:
+        raise ValueError("Grouped INT4 needs a CUDA FP16 or BF16 activation matrix.")
+    validate_int4_layout(codes, scales, (x.shape[1], columns))
+    groups = ends.numel()
+    if (
+        codes.ndim != 3 or codes.shape[0] != groups
+        or ends.ndim != 1 or ends.dtype not in {torch.int32, torch.int64}
+        or any(tensor.device != x.device for tensor in (codes, scales, ends))
+    ):
+        raise ValueError("Grouped INT4 payload layout does not match the projection.")
+    result = x.new_empty((x.shape[0], columns))
+    if not x.shape[0]:
+        return result
+    if min(groups, columns, x.shape[1], max_group_rows) <= 0:
+        raise ValueError("Grouped INT4 projection dimensions must be positive.")
+    grid = (groups, triton.cdiv(max_group_rows, 16), triton.cdiv(columns, 32))
+    scales = scales.contiguous()
+    _grouped_fp4[grid](
+        x.contiguous(), codes.contiguous(), scales, scales, ends.contiguous(), result,
+        x.shape[1], columns, codes.shape[1], INT4_BLOCK_SIZE, transposed, False, 16, 32, 32, 0, True, num_warps=4,
     )
     return result

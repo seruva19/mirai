@@ -2299,7 +2299,7 @@ def test_magi2_native_fp4_dispatches_active_groups_and_preserves_input_gradient(
         torch.testing.assert_close(actual_grad, expected_grad)
 
 
-@pytest.mark.parametrize("fmt", ["gguf_iq1", "gguf_iq2", "gguf_iq3", "gguf_iq4", "fp8", "nvfp4", "mxfp4"])
+@pytest.mark.parametrize("fmt", ["gguf_iq1", "gguf_iq2", "gguf_iq3", "gguf_iq4", "fp8", "nvfp4", "mxfp4", "int4"])
 def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -> None:
     def model():
         return _container(_reduced_moe(

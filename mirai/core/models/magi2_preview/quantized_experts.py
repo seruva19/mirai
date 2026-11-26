@@ -41,6 +41,11 @@ from mirai.core.models.compressed_weights.quantization.gguf_quant import (
     quantize_gguf,
     validate_gguf_blocks,
 )
+from mirai.core.models.compressed_weights.quantization.int4_quant import (
+    dequantize_int4,
+    quantize_int4,
+    validate_int4_layout,
+)
 from mirai.core.models.compressed_weights.quantization.microscaling_quant import (
     MicroscalingMeta,
     dequantize_microscaling,
@@ -81,7 +86,7 @@ MAGI2_EXPERT_ACCESS_POLICIES = ("full_dequant", "chunked_dequant", "active_group
 MAGI2_FUSED_GATE_UP = "W_gate_up"
 MAGI2_NF4_GROUP_FIELDS = ("nf4", "nf4_absmax", "nf4_nabsmax", "nf4_offset")
 MAGI2_NF4_CODE_FIELDS = ("nf4_code", "nf4_ncode")
-MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq1", "gguf_iq2", "gguf_iq3", "gguf_iq4", "fp8", "nvfp4", "mxfp4")
+MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq1", "gguf_iq2", "gguf_iq3", "gguf_iq4", "fp8", "nvfp4", "mxfp4", "int4")
 MAGI2_FUSED_GGUF_FORMATS = ("gguf_iq2", "gguf_iq3", "gguf_iq4")
 
 
@@ -718,7 +723,7 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
 
     def _buffer_names(self, key: str) -> tuple[str, ...]:
         suffixes = ("codes",)
-        if self.quant_format == "fp8":
+        if self.quant_format in {"fp8", "int4"}:
             suffixes += ("scales",)
         elif self.quant_format in {"nvfp4", "mxfp4"}:
             suffixes += ("scales", "global_scale")
@@ -749,6 +754,8 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
                 group = transform(group)
             if self.quant_format == "fp8":
                 values = quantize_blockwise_fp8_weight(group)[:2]
+            elif self.quant_format == "int4":
+                values = quantize_int4(group)
             elif self.quant_format in {"nvfp4", "mxfp4"}:
                 values = quantize_microscaling(self.quant_format, group.t() if self.has_native_fp4_layout else group)[:3]
             else:
@@ -803,6 +810,10 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
                 raise Magi2QuantizedExpertError(f"Invalid packed group axis for '{key}'.")
             if self.quant_format == "fp8":
                 validate_blockwise_fp8_payload(*fields, BlockwiseFP8Meta(group_shape))
+            elif self.quant_format == "int4":
+                validate_int4_layout(*fields, group_shape)
+                if not bool((torch.isfinite(fields[1]) & (fields[1] > 0)).all()):
+                    raise Magi2QuantizedExpertError("INT4 scales must be finite and positive.")
             elif self.quant_format in {"nvfp4", "mxfp4"}:
                 validate_microscaling_payload(*fields, self._fp4_meta(group_shape))
             else:
@@ -843,6 +854,12 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
             raise ValueError("Packed expert output must be contiguous and match the target shape, device, and dtype.")
         if self.quant_format == "fp8":
             return dequantize_blockwise_fp8_weight(*fields, BlockwiseFP8Meta(shape), dtype=dtype, device=device, out=out)
+        if self.quant_format == "int4":
+            if out is None:
+                return dequantize_int4(*fields, shape, dtype=dtype, device=device)
+            for destination, codes, scales in zip(out, *fields, strict=True):
+                destination.copy_(dequantize_int4(codes, scales, shape, dtype=dtype, device=device))
+            return out
         if self.quant_format in {"nvfp4", "mxfp4"}:
             meta = self._fp4_meta(shape)
             groups = (
@@ -875,12 +892,17 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
 
     def fused_packed_projection(self, key, start, stop, x, ends, *, max_group_rows, transposed, group_ids=None):
         from mirai.core.models.compressed_weights.quantization.grouped_fp4_triton import (
-            grouped_fp4_projection, grouped_gguf_projection,
+            grouped_fp4_projection, grouped_gguf_projection, grouped_int4_projection,
         )
 
         _, rows, columns = self.expert_weight_shape(key)
         with ExitStack() as leases:
             packed = self._packed_segment(key, start, stop, device=x.device, group_ids=group_ids, leases=leases)
+            if self.quant_format == "int4":
+                return grouped_int4_projection(
+                    x, *packed, ends, columns=rows if transposed else columns,
+                    max_group_rows=max_group_rows, transposed=transposed,
+                )
             if self.quant_format in MAGI2_FUSED_GGUF_FORMATS:
                 return grouped_gguf_projection(
                     x, packed[0], ends, columns=rows if transposed else columns,

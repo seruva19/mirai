@@ -3193,7 +3193,7 @@ Opt-in resolution from `config/defaults/hardware_tiers.toml`. `tiered` matches c
 
 - **Type:** str
 - **Default:** `"none"`
-- **Allowed / range:** `none`, `fp8`, `int8`, `nf4`, `w4a8`, `gguf_iq4`, `gguf_iq3`, `gguf_iq2`, `gguf_iq1`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`
+- **Allowed / range:** `none`, `fp8`, `int8`, `int4`, `nf4`, `w4a8`, `gguf_iq4`, `gguf_iq3`, `gguf_iq2`, `gguf_iq1`, `mxfp8_e4m3`, `mxfp4`, `nvfp4`. Check the model's supported formats before selecting a scheme.
 
 Frozen-weight quant scheme ([`quantization.py`](mirai/core/models/quantization.py), compressed_weights). `fp8` is DeepSeek-style E4M3 W8A8 reference execution: 128×128 FP32 weight scales, online per-token-per-128-channel activation scales, FP32 K=128 accumulation, and high-precision input gradients; packed dense and routed-expert artifacts use separate `*_fp8`/`*_fp8_scale` roles. `nf4` requires bitsandbytes. GGUF expert formats include `gguf_iq4`, `gguf_iq3`, `gguf_iq2`, and `gguf_iq1`. IQ1_M uses 56-byte blocks (1.75 bits/weight). IQ2_XS uses canonical 74-byte blocks (2.3125 bits/weight), uniform code assignment, and imatrix-weighted calibration for per-projection format selection. It does not claim to reproduce llama.cpp's imatrix encoder. `mxfp8_e4m3` is the distinct OCP microscaling format with 32-value E4M3 blocks and round-up UE8M0 scales (`ceil(log2(amax / 448))`). `mxfp4` implements OCP E2M1 with 32-value E8M0-scaled blocks; `nvfp4` implements E2M1 with 16-value E4M3 block scales and a tensor FP32 scale. The portable paths are default-off and make no native-kernel speed claim.
 
