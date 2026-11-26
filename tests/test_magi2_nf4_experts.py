@@ -1981,16 +1981,16 @@ def test_magi2_fp4_packs_contiguous_contraction_blocks(fmt) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Pinned activation transfer requires CUDA")
 def test_int8_checkpoint_offload_preserves_reconstructed_rows() -> None:
     from mirai.core.training.residency.activation_compression import (
-        _activation_copy_streams,
         _pack_int8_saved_rows,
         _unpack_int8_saved_rows,
+        training_cuda_copy_streams,
     )
 
     rows = torch.randn(17, 32, dtype=torch.bfloat16, device="cuda")
     expected = _unpack_int8_saved_rows(_pack_int8_saved_rows(rows))
     packed = _pack_int8_saved_rows(rows, offload=True)
     assert packed.codes.is_pinned() and packed.scales.is_pinned()
-    d2h, h2d = _activation_copy_streams(rows.device)
+    d2h, h2d = training_cuda_copy_streams(rows.device)
     compute = torch.cuda.Stream(device=rows.device)
     assert len({stream.cuda_stream for stream in (compute, d2h, h2d)}) == 3
     with torch.cuda.stream(compute):

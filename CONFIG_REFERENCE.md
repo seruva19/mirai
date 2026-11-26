@@ -1551,7 +1551,10 @@ Offload optimizer state to CPU ([`device_placement.py`](mirai/core/training/resi
 - **Default:** `False`
 - **Allowed / range:** —
 
-Offload grads to CPU ([`gradients.py`](mirai/core/training/optim/gradients.py)).
+Offload gradients to CPU. CUDA gradients transfer on a dedicated stream after
+each microbatch and accumulate in FP32 on the host. The optimizer receives the
+completed accumulation after the final transfer drains
+([`gradients.py`](mirai/core/training/optim/gradients.py)).
 
 ### `activation_cpu_offload`
 

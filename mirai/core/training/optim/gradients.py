@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from mirai.core.training.residency.activation_compression import training_cuda_copy_streams
+
 try:
     import torch
 except ModuleNotFoundError as exc:  # pragma: no cover
@@ -43,18 +45,57 @@ def clip_grad_norm_with_offload(params, *, max_norm: float) -> float:
     return float(total_norm.item())
 
 
-def offload_gradients_to_cpu(params) -> int:
+def _accumulate_cpu_gradient(param, cpu_grad):
+    existing = getattr(param, "_mirai_cpu_grad", None)
+    if isinstance(existing, torch.Tensor):
+        existing.add_(cpu_grad)
+    else:
+        param._mirai_cpu_grad = cpu_grad
+
+
+class PendingGradientOffload:
+    """Keep at most one microbatch's pinned gradient transfers in flight."""
+
+    def __init__(self):
+        self._pending = []
+        self._last_event = {}
+
+    def submit(self, param, grad) -> bool:
+        try:
+            host = torch.empty_like(grad, device="cpu", pin_memory=True)
+        except RuntimeError:
+            return False
+        d2h, _ = training_cuda_copy_streams(grad.device)
+        d2h.wait_stream(torch.cuda.current_stream(grad.device))
+        with torch.cuda.stream(d2h):
+            host.copy_(grad, non_blocking=True)
+            grad.record_stream(d2h)
+            self._last_event[grad.device] = d2h.record_event()
+        self._pending.append((param, host))
+        return True
+
+    def finish(self):
+        for event in self._last_event.values():
+            event.synchronize()
+        for param, host in self._pending:
+            # Keep the accumulated gradients in pageable FP32 memory.
+            cpu_grad = torch.empty_like(host, dtype=torch.float32, pin_memory=False)
+            cpu_grad.copy_(host)
+            _accumulate_cpu_gradient(param, cpu_grad)
+        self._pending.clear()
+        self._last_event.clear()
+
+
+def offload_gradients_to_cpu(params, *, pending=None) -> int:
     moved = 0
     for param in params:
         grad = getattr(param, "grad", None)
         if grad is None:
             continue
-        cpu_grad = grad.detach().to(device="cpu", dtype=torch.float32).clone()
-        existing = getattr(param, "_mirai_cpu_grad", None)
-        if isinstance(existing, torch.Tensor):
-            existing.add_(cpu_grad)
-        else:
-            param._mirai_cpu_grad = cpu_grad  # type: ignore[attr-defined]
+        queued = pending is not None and grad.is_cuda and grad.layout == torch.strided and pending.submit(param, grad.detach())
+        if not queued:
+            cpu_grad = grad.detach().to(device="cpu", dtype=torch.float32).clone()
+            _accumulate_cpu_gradient(param, cpu_grad)
         # Always release the autograd-owned buffer. In particular, exposing the
         # CPU accumulator as ``param.grad`` would make the next backward update
         # that same storage before it is added here, doubling prior microbatches.

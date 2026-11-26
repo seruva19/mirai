@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from mirai.core.moe.runtime.touch_guard import enforce_expert_touch_guard
 from mirai.core.tensors import to_jsonable, to_list, to_python_scalar
-from mirai.core.training.optim.gradients import offload_gradients_to_cpu
+from mirai.core.training.optim.gradients import PendingGradientOffload, offload_gradients_to_cpu
 from mirai.core.training.optim.gradients import resolve_non_finite_policy
 from mirai.core.training.optim.gradients import clip_grad_norm_with_offload
 from mirai.core.training.objectives.engine import TrainingLossResult
@@ -103,6 +103,7 @@ def accumulate_training_gradients(
 ) -> GradientAccumulationResult:
     gradient_offload_ops = 0
     last_metrics: dict[str, Any] = {}
+    gradient_transfers = PendingGradientOffload() if gradient_cpu_offload else None
     try:
         for micro_batch_index in range(int(grad_accum)):
             batch = build_batch(micro_batch_index)
@@ -138,8 +139,9 @@ def accumulate_training_gradients(
                 finish_backward_offloads()
             if callable(on_backward_completed):
                 on_backward_completed(loss_value)
-            if gradient_cpu_offload:
-                gradient_offload_ops += offload_gradients_to_cpu(params)
+            if gradient_transfers is not None:
+                gradient_transfers.finish()
+                gradient_offload_ops += offload_gradients_to_cpu(params, pending=gradient_transfers)
             if callable(on_microstep_completed):
                 on_microstep_completed(int(micro_batch_index))
             last_metrics = {
@@ -164,6 +166,9 @@ def accumulate_training_gradients(
             report_fatal_training_error(exc)
             raise SystemExit(oom_guidance_message(original_error=str(exc))) from exc
         raise
+    finally:
+        if gradient_transfers is not None:
+            gradient_transfers.finish()
     return GradientAccumulationResult(
         last_metrics=last_metrics,
         gradient_offload_ops=int(gradient_offload_ops),

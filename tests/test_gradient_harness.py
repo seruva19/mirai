@@ -5,7 +5,7 @@ import unittest
 from mirai.config.schema import ModelConfig, ModelParams, StrategyConfig, TrainingConfig, TrainingSection
 from mirai.core.builtins import register_builtin_components
 from mirai.core.parity.gradient_harness import run_gradient_harness
-from mirai.core.training.optim.gradients import offload_gradients_to_cpu
+from mirai.core.training.optim.gradients import PendingGradientOffload, offload_gradients_to_cpu
 
 try:
     import torch
@@ -15,6 +15,24 @@ except ModuleNotFoundError:  # pragma: no cover
 
 @unittest.skipIf(torch is None, "torch not installed")
 class GradientHarnessTests(unittest.TestCase):
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA required")
+    def test_cuda_gradient_offload_drains_previous_microbatch_in_order(self) -> None:
+        parameter = torch.nn.Parameter(torch.ones(5, device="cuda", dtype=torch.bfloat16))
+        transfers = PendingGradientOffload()
+        (parameter * 2).sum().backward()
+        self.assertEqual(offload_gradients_to_cpu([parameter], pending=transfers), 1)
+        self.assertIsNone(parameter.grad)
+        self.assertFalse(hasattr(parameter, "_mirai_cpu_grad"))
+
+        (parameter * 3).sum().backward()
+        transfers.finish()
+        self.assertEqual(offload_gradients_to_cpu([parameter], pending=transfers), 1)
+        transfers.finish()
+        transfers.finish()
+        self.assertIsNone(parameter.grad)
+        self.assertFalse(parameter._mirai_cpu_grad.is_pinned())
+        torch.testing.assert_close(parameter._mirai_cpu_grad, torch.full((5,), 5.0), rtol=0, atol=0)
+
     def test_cpu_gradient_offload_accumulates_each_microbatch_once(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         (parameter * 2.0).backward()

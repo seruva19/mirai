@@ -36,7 +36,7 @@ class _Int8SavedRows:
 
 
 @lru_cache(maxsize=None)
-def _activation_copy_streams(device):
+def training_cuda_copy_streams(device):
     return torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
 
 
@@ -53,7 +53,7 @@ def _pack_int8_saved_rows(tensor, *, offload=False):
     codes = (values / scales).round_().clamp_(-127, 127).to(torch.int8)
     if offload and tensor.is_cuda:
         device = tensor.device
-        d2h, _ = _activation_copy_streams(device)
+        d2h, _ = training_cuda_copy_streams(device)
         d2h.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(d2h):
             host_codes = torch.empty_like(codes, device="cpu", pin_memory=True)
@@ -72,7 +72,7 @@ def _unpack_int8_saved_rows(value):
         return value
     codes, scales = value.codes, value.scales
     if value.host_ready is not None:
-        _, h2d = _activation_copy_streams(value.device)
+        _, h2d = training_cuda_copy_streams(value.device)
         compute = torch.cuda.current_stream(value.device)
         with torch.cuda.stream(h2d):
             h2d.wait_event(value.host_ready)
