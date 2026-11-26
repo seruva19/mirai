@@ -13,7 +13,8 @@ from mirai.core.models.compressed_weights.factorization.mixture_basis import (
 )
 
 from .quantized_experts import (
-    MAGI2_NF4_STORE_ATTR, MAGI2_ROUTED_EXPERT_TENSOR_NAMES, Magi2Nf4ExpertStore, _new_expert_store, iter_magi2_moe_layers,
+    MAGI2_NF4_STORE_ATTR, MAGI2_ROUTED_EXPERT_TENSOR_NAMES, Magi2Nf4ExpertStore, PackedExpertRangeView,
+    _new_expert_store, iter_magi2_moe_layers,
 )
 
 MAGI2_BASIS_SOURCE_METADATA = "magi2_basis_source_sha256"
@@ -36,6 +37,9 @@ class Magi2SharedBasisExpertStore(Magi2Nf4ExpertStore):
     """Keep frozen projection factors and reconstruct only requested groups."""
 
     quant_format = "shared_basis"
+
+    def bind_packed_range_reader(self, reader) -> None:
+        super().bind_packed_range_reader(reader, retain={f"{key}_basis" for key in self._shapes})
 
     def __init__(self, *, num_groups: int) -> None:
         super().__init__(num_groups=num_groups)
@@ -77,13 +81,10 @@ class Magi2SharedBasisExpertStore(Magi2Nf4ExpertStore):
         count = self.num_groups if group_ids is None else group_ids.numel()
         if not 0 <= group_start < group_stop <= count:
             raise ValueError("MAGI-2 shared-basis segment is out of bounds.")
-        coefficients = getattr(self, f"{key}_coefficients")
-        if group_ids is None:
-            selected = coefficients[group_start:group_stop]
-        else:
-            selected = coefficients.index_select(0, group_ids[group_start:group_stop].to(coefficients.device))
+        selected = self._select_group_buffer(
+            f"{key}_coefficients", group_start, group_stop, device=device, dtype=dtype, group_ids=group_ids,
+        )
         basis = getattr(self, f"{key}_basis").to(device=device, dtype=dtype)
-        selected = selected.to(device=device, dtype=dtype)
         dense = selected @ basis if self._axes[key] == "right" else basis @ selected
         return dense.transpose(-1, -2).contiguous()
 
@@ -142,6 +143,10 @@ class Magi2MixtureBasisExpertStore(Magi2Nf4ExpertStore):
     """Factorize gate/up and retain the ordinary packed down projection."""
 
     quant_format = "mixture_basis"
+
+    def bind_packed_range_reader(self, reader) -> None:
+        super().bind_packed_range_reader(reader, retain={"W_gate_bases", "W_up_bases"})
+        self.down.bind_packed_range_reader(PackedExpertRangeView(reader, "down."))
 
     def __init__(self, *, num_groups: int, down_format: str, blocksize: int = 64) -> None:
         super().__init__(num_groups=num_groups, blocksize=blocksize)
@@ -232,20 +237,16 @@ class Magi2MixtureBasisExpertStore(Magi2Nf4ExpertStore):
         count = self.num_groups if group_ids is None else group_ids.numel()
         if not 0 <= group_start < group_stop <= count:
             raise ValueError("MAGI-2 mixture-basis segment is out of bounds.")
-        transforms = getattr(self, f"{key}_transforms")
-        coefficients = getattr(self, f"{key}_coefficients")
-        if group_ids is None:
-            transforms = transforms[group_start:group_stop]
-            coefficients = coefficients[group_start:group_stop]
-        else:
-            ids = group_ids[group_start:group_stop].to(transforms.device, dtype=torch.long)
-            transforms = transforms.index_select(0, ids)
-            coefficients = coefficients.index_select(0, ids.to(coefficients.device))
-        coefficients = coefficients.to(device=device, dtype=torch.float32)
+        transforms = self._select_group_buffer(
+            f"{key}_transforms", group_start, group_stop, device=device, dtype=dtype, group_ids=group_ids,
+        )
+        coefficients = self._select_group_buffer(
+            f"{key}_coefficients", group_start, group_stop, device=device, dtype=torch.float32, group_ids=group_ids,
+        )
         coefficients = coefficients / coefficients.sum(dim=1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
         bases = getattr(self, f"{key}_bases").to(device=device, dtype=dtype)
         mixed = torch.einsum("gk,kri->gri", coefficients.to(dtype), bases)
-        dense = transforms.to(device=device, dtype=dtype) @ _activate(mixed, self._activations[key])
+        dense = transforms @ _activate(mixed, self._activations[key])
         return dense.transpose(-1, -2).contiguous()
 
 

@@ -236,7 +236,8 @@ with `memory.packed_stream_backend="gds"` align each shard file to 4096 bytes.
 With `memory.weight_residency_strategy="stream_disk"` and
 `memory.packed_stream_backend="staged"`, uniform NF4, FP8, NVFP4, and GGUF expert
 stores and mixed-precision buckets read requested groups from the artifact
-during execution.
+during execution. Shared-basis and mixture-basis stores keep shared bases
+resident and fetch per-expert factors on demand.
 The
 provider-owned schema stores a versioned manifest and one NF4 safetensors shard
 per routed-expert layer. Restore checks model variant, denoiser subfolder,

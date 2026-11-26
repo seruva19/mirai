@@ -904,6 +904,17 @@ def test_magi2_mixture_basis_preserves_packed_down_and_selected_group_order(tmp_
     assert dict(restored.named_buffers()).keys() == dict(store.named_buffers()).keys()
     for name, value in store.named_buffers():
         torch.testing.assert_close(dict(restored.named_buffers())[name], value, rtol=0, atol=0)
+    streamed_restore = load_magi2_nf4_packed_state(
+        artifact, skeleton, blocksize=64, quant_format="mixture_basis",
+        expected_mixture_basis=(2, 2, "fp8"), staged_range_reads=True,
+    )["mlp.moe_mlp"]
+    assert set(dict(streamed_restore.named_buffers())) == {"W_gate_bases", "W_up_bases"}
+    for key in ("W_gate", "W_up", "W_down"):
+        options = dict(device="cpu", dtype=torch.float32, group_ids=torch.tensor([1, 0, 1]))
+        torch.testing.assert_close(
+            streamed_restore.materialize_segment(key, 0, 3, **options),
+            restored.materialize_segment(key, 0, 3, **options), rtol=0, atol=0,
+        )
     x = torch.randn(3, 1, 16, requires_grad=True)
     backend = Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
     output = backend.execute(layer, x, *layer._route(x))
@@ -984,6 +995,16 @@ def test_magi2_shared_basis_reconstructs_selected_native_groups(tmp_path) -> Non
     )["mlp.moe_mlp"]
     for key, value in installed.named_buffers():
         torch.testing.assert_close(dict(loaded.named_buffers())[key], value, rtol=0, atol=0)
+    ranged = load_magi2_nf4_packed_state(
+        artifact, target, blocksize=64, quant_format="shared_basis",
+        expected_shared_basis_rank=2, staged_range_reads=True,
+    )["mlp.moe_mlp"]
+    assert all(name.endswith("_basis") for name, _ in ranged.named_buffers())
+    options = dict(device="cpu", dtype=torch.float32, group_ids=torch.tensor([7, 0, 7]))
+    torch.testing.assert_close(
+        ranged.materialize_segment("W_up", 0, 3, **options),
+        loaded.materialize_segment("W_up", 0, 3, **options), rtol=0, atol=0,
+    )
     pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.transformer = transformer

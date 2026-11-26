@@ -86,6 +86,20 @@ MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq1", "gguf_iq2", "gguf_iq3", "fp8",
 class Magi2QuantizedExpertError(ValueError):
     """Raised when quantized MAGI-2 expert storage cannot be built or served."""
 
+class PackedExpertRangeView:
+    def __init__(self, reader, prefix):
+        self.reader = reader
+        self.prefix = prefix
+
+    def __iter__(self):
+        return (key.removeprefix(self.prefix) for key in self.reader if key.startswith(self.prefix))
+
+    def get_slices_to_device(self, key, indices, **kwargs):
+        return self.reader.get_slices_to_device(self.prefix + key, indices, **kwargs)
+
+    def tensor_nbytes(self, key):
+        return self.reader.tensor_nbytes(self.prefix + key)
+
 
 class Magi2Nf4ExpertStore(nn.Module):
     """NF4 payload for the three routed expert tensors of one MoE layer.
@@ -373,11 +387,22 @@ class Magi2Nf4ExpertStore(nn.Module):
 
         self.bind_packed_range_reader(StreamingPackedTensorMapping(shard_path, backend="staged"))
 
-    def bind_packed_range_reader(self, reader) -> None:
+    def bind_packed_range_reader(self, reader, *, retain=()) -> None:
         self._packed_range_reader = reader
         for name in tuple(self._buffers):
-            if not name.endswith(("_nf4_code", "_nf4_ncode")):
+            if name not in retain and not name.endswith(("_nf4_code", "_nf4_ncode")):
                 delattr(self, name)
+
+    def _select_group_buffer(self, name, start, stop, *, device, dtype, group_ids):
+        reader = getattr(self, "_packed_range_reader", None)
+        if reader is not None:
+            ids = range(start, stop) if group_ids is None else group_ids[start:stop].tolist()
+            return reader.get_slices_to_device(name, ids, device=device, dtype=dtype)
+        value = getattr(self, name)
+        selected = value[start:stop] if group_ids is None else value.index_select(
+            0, group_ids[start:stop].to(device=value.device, dtype=torch.long),
+        )
+        return selected.to(device=device, dtype=dtype)
 
     def quantized_numel(self) -> int:
         return int(
