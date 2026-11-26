@@ -814,6 +814,9 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   Clustering and weight averaging operate within each head while routing
   retains the original expert IDs. Reference and grouped execution resolve
   those IDs against the compacted weights.
+  Set `memory.quantize_experts_on_load=true` with a supported format to
+  pack each merged projection as it is read. The compact pool is built from
+  the same checkpoint and merge plan on each load.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group

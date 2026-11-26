@@ -59,6 +59,8 @@ def save_magi2_nf4_packed_state(
 
     from safetensors.torch import save_file
 
+    if any(getattr(layer, "_mirai_expert_aliases", None) is not None for _, layer in iter_magi2_moe_layers(transformer)):
+        raise Magi2PackedExpertStateError("Packed MAGI-2 consolidation must be rebuilt from its source plan.")
     _validate_pruning_topology(transformer, pruning_digest)
     target = Path(path).expanduser()
     if target.exists() and any(target.iterdir()):

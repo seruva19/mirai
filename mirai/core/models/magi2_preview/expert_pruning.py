@@ -348,7 +348,8 @@ def _attach_merge_aliases(layer, aliases, physical_count):
 @torch.no_grad()
 def stream_merge_magi2_experts(
     transformer: nn.Module, plan: Magi2ExpertConsolidationPlan, checkpoint_dir: str | Path,
-) -> set[str]:
+    *, quant_format: str | None = None, blocksize: int = NF4_BLOCKSIZE,
+) -> tuple[set[str], dict[str, Magi2Nf4ExpertStore]]:
     """Read and merge one original projection at a time before publishing the new pool."""
     from safetensors import safe_open
 
@@ -371,6 +372,11 @@ def stream_merge_magi2_experts(
         raise ValueError(f"MAGI-2 checkpoint is missing consolidation source tensors: {missing[:4]}.")
     digest = hashlib.sha256()
     staged = {}
+    stores = {}
+    if quant_format is not None:
+        for name, layer in layers.items():
+            groups = len(layouts[name][1]) if name in layouts else layer.local_flatten_num_experts
+            stores[name] = _new_expert_store(num_groups=groups, blocksize=blocksize, quant_format=quant_format)
     for full_key, (name, owner, key, source_key) in sorted(sources.items()):
         target = getattr(owner, key)
         with safe_open(weight_map[source_key], framework="pt", device="cpu") as shard:
@@ -382,6 +388,10 @@ def stream_merge_magi2_experts(
                 update_router_tensor_fingerprints((digest,), full_key, value)
                 if key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
                     value = _merge_projection(value, layouts[name][1])
+            if name in stores and key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+                stores[name].quantize_dense(key, value)
+                del value
+                continue
             if isinstance(target, nn.Parameter):
                 merged_projection = name in layouts and key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES
                 value = nn.Parameter(value, requires_grad=target.requires_grad and not merged_projection)
@@ -393,7 +403,12 @@ def stream_merge_magi2_experts(
         setattr(owner, key, value)
     for name, (aliases, clusters) in layouts.items():
         _attach_merge_aliases(layers[name], aliases, len(clusters))
-    return set(staged)
+    for name, store in stores.items():
+        layer = layers[name]
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            del layer._parameters[key]
+        layer.add_module(MAGI2_NF4_STORE_ATTR, store)
+    return set(staged), stores
 
 
 def build_magi2_expert_pruning_plan(

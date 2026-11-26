@@ -328,8 +328,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("MAGI-2 pruning with a mixed precision plan requires quantize_experts_on_load.")
         if self._expert_consolidation_plan_path and (
             self._expert_pruning_plan_path or self._expert_pruning_adapter_source_plan_path
-            or self._quantize_experts_on_load or self._packed_expert_state_path
-            or self._expert_precision_plan_path or self._frozen_weight_quantization not in {"", "none", "off", "disabled"}
+            or self._packed_expert_state_path or self._expert_precision_plan_path
+            or (
+                not self._quantizes_experts_on_load()
+                and self._frozen_weight_quantization not in {"", "none", "off", "disabled"}
+            )
         ):
             raise ValueError("MAGI-2 hierarchical consolidation requires a dense source and no pruning plan.")
         default_config = (
@@ -461,7 +464,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
 
             consolidation_plan = Magi2ExpertConsolidationPlan.load(consolidation_plan_path)
-            preloaded_keys = stream_merge_magi2_experts(transformer, consolidation_plan, checkpoint_dir)
+            preloaded_keys, self._expert_stores = stream_merge_magi2_experts(
+                transformer, consolidation_plan, checkpoint_dir,
+                quant_format=self._frozen_weight_quantization if self._quantizes_experts_on_load() else None,
+                blocksize=self._nf4_blocksize,
+            )
             self._expert_pruning_digest = consolidation_plan.topology_digest()
         elif mixed_stream:
             from mirai.core.models.magi2_preview.mixed_experts import stream_quantize_magi2_mixed_experts
@@ -518,7 +525,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             from mirai.core.models.magi2_preview.companion_weights import pack_magi2_norm_weights
 
             self._packed_norms = pack_magi2_norm_weights(transformer)
-        if packed_experts and not mixed_stream and (not pruning_plan_path or self._packed_expert_state_path):
+        if (
+            packed_experts and not mixed_stream and not consolidation_plan_path
+            and (not pruning_plan_path or self._packed_expert_state_path)
+        ):
             if self._packed_expert_state_path:
                 from mirai.core.models.magi2_preview.packed_experts import (
                     load_magi2_nf4_packed_state,

@@ -882,7 +882,8 @@ def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(t
     with pytest.raises(ValueError, match="fingerprint mismatch"):
         stream_merge_magi2_experts(skeleton, replace(plan, source_weight_fingerprint="sha256:wrong"), tmp_path)
     assert skeleton.mlp.moe_mlp.W_gate.is_meta
-    preloaded = stream_merge_magi2_experts(skeleton, restored, tmp_path)
+    preloaded, stores = stream_merge_magi2_experts(skeleton, restored, tmp_path)
+    assert not stores
     assert preloaded == set(skeleton.state_dict())
     apply_magi2_hierarchical_merge(transformer, restored)
     assert layer.num_experts == 4
@@ -919,6 +920,27 @@ def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(t
         branch_plan.combine_branch_features(branch_plan.compute_branch_features(None)),
         expected.detach(), rtol=2e-5, atol=1e-5,
     )
+    from mirai.core.models.magi2_preview.quantized_experts import _new_expert_store
+
+    packed = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, routed_weight_device="meta",
+    ))
+    preloaded, stores = stream_merge_magi2_experts(packed, restored, tmp_path, quant_format="fp8")
+    packed_layer = packed.mlp.moe_mlp
+    store = stores["mlp.moe_mlp"]
+    assert set(packed.state_dict()) == preloaded
+    assert store.num_groups == 4
+    reference_store = _new_expert_store(num_groups=4, blocksize=64, quant_format="fp8")
+    for key in ("W_gate", "W_up", "W_down"):
+        reference_store.quantize_dense(key, getattr(layer, key))
+        args = dict(device=torch.device("cpu"), dtype=torch.float32)
+        weights = store.materialize_segment(key, 0, 4, **args)
+        torch.testing.assert_close(weights, reference_store.materialize_segment(key, 0, 4, **args), rtol=0, atol=0)
+        getattr(reference, key).data.copy_(weights[list(layer._mirai_expert_aliases)])
+    packed_backend = Magi2QuantizedGroupedMoEBackend(backend.plan)
+    packed_output = packed_backend.execute(packed_layer, tokens, *packed_layer._route(tokens))
+    dense_output = backend.execute(reference, tokens, *reference._route(tokens))
+    torch.testing.assert_close(packed_output, dense_output, rtol=2e-5, atol=1e-5)
 
 
 def test_magi2_diet_head_replay_matches_native_expert_deletion() -> None:
