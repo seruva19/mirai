@@ -3432,13 +3432,22 @@ Byte-bounded host LRU for expert-slice and canonical active-expert-set requests 
 
 - **Type:** str
 - **Default:** `"staged"`
-- **Allowed / range:** `staged`, `direct_io`, `gds`. GDS requires `packed_state_preload="off"` and `packed_stream_cache_gib=0`.
+- **Allowed / range:** `staged`, `direct_io`, `io_uring`, `gds`. GDS requires `packed_state_preload="off"` and `packed_stream_cache_gib=0`.
 
 `direct_io` opens 4 KiB-aligned exports with Linux `O_DIRECT` and uses
 `preadv` into aligned host memory. Unsupported platforms, unaligned artifacts,
 and failed direct reads raise an error.
 The reader reports aligned bytes as `direct_io_read_bytes` and bytes read
 beyond the requested tensor range as `direct_io_overread_bytes`.
+
+`io_uring` submits the same aligned Linux host reads through liburing. With
+the Linux liburing development headers installed, build the optional bridge
+from the repository root and set the library path before loading the model.
+
+```sh
+cc -shared -fPIC mirai/core/models/compressed_weights/packed/packed_io_uring.c -luring -o libmirai_uring.so
+export MIRAI_PACKED_IO_URING_LIBRARY="$PWD/libmirai_uring.so"
+```
 
 Storage transport for explicit packed disk mode. `staged` uses the bounded POSIX→host→CUDA path. `gds` uses optional KvikIO/cuFile and fails closed unless compatibility is disabled, cuFile reports true GDS, every shard mount supports direct I/O, and every shard has Mirai's validated 4 KiB layout. The export script pads safetensors header whitespace for `gds`; artifacts without the aligned layout require re-export. Reads expand to aligned file/device ranges and trim to the exact tensor payload. Telemetry separates logical `gds_requested_bytes` from physical `gds_read_bytes` and reports overread/trim counts. Runtime is read-only; alignment adds at most one sequential export rewrite per shard and no SSD cache.
 

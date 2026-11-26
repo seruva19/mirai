@@ -203,7 +203,7 @@ def load_magi2_nf4_packed_state(
     alignment = manifest.get("storage_alignment_bytes", 0)
     if type(alignment) is not int or alignment not in {0, GDS_STORAGE_ALIGNMENT_BYTES}:
         raise Magi2PackedExpertStateError("Packed MAGI-2 expert state has invalid shard alignment.")
-    if range_read_backend in {"gds", "direct_io"} and alignment != GDS_STORAGE_ALIGNMENT_BYTES:
+    if range_read_backend in {"gds", "direct_io", "io_uring"} and alignment != GDS_STORAGE_ALIGNMENT_BYTES:
         raise Magi2PackedExpertStateError(f"MAGI-2 {range_read_backend} requires a 4096-byte-aligned packed export.")
     if (
         manifest.get("schema") != MAGI2_PACKED_EXPERT_SCHEMA

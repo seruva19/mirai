@@ -1929,8 +1929,10 @@ def test_magi2_staged_layers_share_one_packed_reader(tmp_path, monkeypatch) -> N
     assert events == ["allocate", "copy", "copy", "close"]
 
 
-def test_linux_direct_packed_reads_trim_aligned_windows(tmp_path) -> None:
+@pytest.mark.parametrize("backend", ["direct_io", "io_uring"])
+def test_linux_direct_packed_reads_trim_aligned_windows(tmp_path, backend) -> None:
     import errno
+    import os
     import sys
 
     from safetensors.torch import save_file
@@ -1938,10 +1940,12 @@ def test_linux_direct_packed_reads_trim_aligned_windows(tmp_path) -> None:
     from mirai.core.models.compressed_weights.packed.packed_storage_alignment import (
         read_safetensors_storage_alignment, save_safetensors_with_storage_alignment,
     )
-    from mirai.core.models.compressed_weights.packed.packed_stream_io import DirectPackedShardReader
+    from mirai.core.models.compressed_weights.packed.packed_stream_io import DirectPackedShardReader, IoUringPackedShardReader
 
     if sys.platform != "linux":
         pytest.skip("O_DIRECT requires Linux")
+    if backend == "io_uring" and not os.environ.get("MIRAI_PACKED_IO_URING_LIBRARY"):
+        pytest.skip("io_uring bridge is unavailable")
     payload = torch.arange(6144).to(torch.uint8)
     path = tmp_path / "direct.safetensors"
     save_safetensors_with_storage_alignment(
@@ -1950,7 +1954,8 @@ def test_linux_direct_packed_reads_trim_aligned_windows(tmp_path) -> None:
     size = read_safetensors_storage_alignment(path).file_size
     payload_offset = size - payload.numel()
     try:
-        reader = DirectPackedShardReader(path)
+        reader_type = IoUringPackedShardReader if backend == "io_uring" else DirectPackedShardReader
+        reader = reader_type(path)
         try:
             target = bytearray(200)
             physical_bytes = reader.readinto(memoryview(target), payload_offset + 1990)

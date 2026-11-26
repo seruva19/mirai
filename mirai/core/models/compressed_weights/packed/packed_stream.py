@@ -17,7 +17,7 @@ from .packed_stream_prefetch import PackedStreamPrefetchRing
 from .packed_stream_cache import PackedStreamHostCache
 from .packed_stream_cache import packed_stream_cache_key
 from .packed_stream_io import contiguous_runs as _contiguous_runs
-from .packed_stream_io import DirectPackedShardReader, PackedShardReader
+from .packed_stream_io import DirectPackedShardReader, IoUringPackedShardReader, PackedShardReader
 from .packed_stream_io import pin_budget_bytes as _pin_budget_bytes
 from .packed_stream_io import restore_order as _restore_order
 from .packed_stream_io import stack_tensors as _stack_tensors
@@ -61,7 +61,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 "memory.packed_stream_backend='gds'."
             )
         self._shards = {}
-        shard_reader = DirectPackedShardReader if self._backend == "direct_io" else PackedShardReader
+        shard_reader = {"direct_io": DirectPackedShardReader, "io_uring": IoUringPackedShardReader}.get(
+            self._backend, PackedShardReader,
+        )
         try:
             for name, shard_path in shard_paths.items():
                 self._shards[name] = shard_reader(shard_path)
@@ -304,7 +306,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                     int(shard.random_advice) for shard in self._shards.values()
                 ),
             }
-            if self._backend == "direct_io":
+            if self._backend in {"direct_io", "io_uring"}:
                 snapshot["direct_io_read_bytes"] = self._direct_io_read_bytes
                 snapshot["direct_io_overread_bytes"] = self._direct_io_read_bytes - self._read_bytes
         snapshot.update(self._cache.snapshot())
@@ -383,7 +385,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         with self._stats_lock:
             self._read_ops += 1
             self._read_bytes += int(nbytes)
-            if self._backend == "direct_io":
+            if self._backend in {"direct_io", "io_uring"}:
                 self._direct_io_read_bytes += int(physical_bytes)
             self._read_seconds += float(elapsed)
         dtype = torch_dtype(region.dtype_name)
@@ -494,6 +496,6 @@ def _normalize_backend(value: str) -> str:
     normalized = str(value).strip().lower()
     aliases = {"direct_range": "staged", "kvikio": "gds"}
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {"staged", "direct_io", "gds"}:
-        raise ValueError("memory.packed_stream_backend must be one of: staged, direct_io, gds.")
+    if normalized not in {"staged", "direct_io", "io_uring", "gds"}:
+        raise ValueError("memory.packed_stream_backend must be one of: staged, direct_io, io_uring, gds.")
     return normalized

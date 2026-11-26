@@ -82,18 +82,64 @@ class DirectPackedShardReader:
             alignment_bytes=self.alignment.alignment_bytes,
         )
         with mmap.mmap(-1, window.read_bytes) as scratch, memoryview(scratch) as aligned:
-            count = os.preadv(self.fd, [aligned], window.file_offset)
+            count = self._read_aligned(aligned, window.file_offset)
             if count != window.read_bytes:
                 raise EOFError(f"Packed O_DIRECT read returned {count} of {window.read_bytes} bytes.")
             start = window.payload_offset
             target[:] = aligned[start:start + len(target)]
         return window.read_bytes
 
+    def _read_aligned(self, buffer: memoryview, offset: int) -> int:
+        return os.preadv(self.fd, [buffer], offset)
+
     def close(self) -> None:
         os.close(self.fd)
 
     def evict_file_cache(self) -> bool:
         return False
+
+
+class IoUringPackedShardReader(DirectPackedShardReader):
+    def __init__(self, path: Path) -> None:
+        import ctypes
+
+        super().__init__(path)
+        try:
+            library = os.environ.get("MIRAI_PACKED_IO_URING_LIBRARY")
+            if not library:
+                raise RuntimeError("Set MIRAI_PACKED_IO_URING_LIBRARY to the compiled liburing bridge path.")
+            self._bridge = ctypes.CDLL(library)
+            self._bridge.mirai_uring_open.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+            self._bridge.mirai_uring_open.restype = ctypes.c_int
+            self._bridge.mirai_uring_read.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint64,
+            ]
+            self._bridge.mirai_uring_read.restype = ctypes.c_int
+            self._bridge.mirai_uring_close.argtypes = [ctypes.c_void_p]
+            self._bridge.mirai_uring_close.restype = None
+            self._handle = ctypes.c_void_p()
+            result = self._bridge.mirai_uring_open(ctypes.byref(self._handle))
+            if result < 0:
+                raise OSError(-result, f"io_uring initialization failed: {os.strerror(-result)}")
+            self._ring_lock = threading.Lock()
+        except BaseException:
+            super().close()
+            raise
+
+    def _read_aligned(self, buffer: memoryview, offset: int) -> int:
+        import ctypes
+
+        with self._ring_lock:
+            address = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
+            result = self._bridge.mirai_uring_read(self._handle, self.fd, address, len(buffer), offset)
+        if result < 0:
+            raise OSError(-result, f"io_uring read failed: {os.strerror(-result)}")
+        return result
+
+    def close(self) -> None:
+        with self._ring_lock:
+            self._bridge.mirai_uring_close(self._handle)
+            super().close()
 
 
 def pin_budget_bytes() -> int:

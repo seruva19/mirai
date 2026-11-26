@@ -51,7 +51,7 @@ EXPERT_WEIGHT_ACCESS_POLICIES = {
 ROUTER_QUANTIZATION_POLICIES = {"disabled", "int8_per_channel"}
 
 PACKED_STATE_PRELOAD_MODES = ("off", "ram", "pinned")
-PACKED_STREAM_BACKENDS = ("staged", "direct_io", "gds")
+PACKED_STREAM_BACKENDS = ("staged", "direct_io", "io_uring", "gds")
 MOE_EXPERT_AUTOGRAD_MODES = ("standard", "segmented_recompute")
 MOE_ACTIVATION_BACKENDS = ("torch", "triton")
 
