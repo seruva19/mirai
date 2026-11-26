@@ -248,6 +248,10 @@ storage stream and reports `gds_async_read_ops`. Reads reuse a bounded ring
 of aligned CUDA slots. The requested bytes are copied within VRAM into an
 owning tensor before a slot can be overwritten, and the packed payload
 bypasses host RAM.
+Set `MIRAI_PACKED_CUDA_ARENA=raw` to back the GDS slots with one aligned
+allocation outside the PyTorch caching allocator. This experimental mode
+requires CuPy for the active CUDA version. Compare with the variable unset
+using the same synthetic shard, reader depth, and device.
 With `memory.weight_residency_strategy="stream_disk"` and
 `memory.packed_stream_backend="staged"`, uniform NF4, FP8, NVFP4, MXFP4, and GGUF expert
 stores and mixed-precision buckets read requested groups from the artifact

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import threading
+import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -60,6 +61,9 @@ class KvikioGdsReader:
         self._stats_lock = threading.Lock()
         self._slots = [_GdsSlot() for _ in range(slots)]
         self._slot_bytes = slot_bytes
+        self._raw_arena = os.environ.get("MIRAI_PACKED_CUDA_ARENA", "") == "raw"
+        self._arena = None
+        self._arena_lock = threading.Lock()
         self._slot_device: int | None = None
         self._slot_condition = threading.Condition()
         self._async_ops = 0
@@ -143,18 +147,13 @@ class KvikioGdsReader:
         if window.read_bytes > self._slot_bytes:
             raise ValueError("GPUDirect Storage range exceeds its aligned slot capacity.")
         read_async = getattr(handle, "raw_read_async", None)
-        with self._acquire_slot(device_index) as slot:
+        with self._acquire_slot(device_index) as (index, slot):
             if slot.stream is None:
                 slot.stream = torch.cuda.Stream(device=device_index)
             stream = slot.stream
             with torch.cuda.stream(stream):
                 if slot.buffer is None:
-                    allocation = torch.empty(
-                        self._slot_bytes + GDS_STORAGE_ALIGNMENT_BYTES - 1,
-                        dtype=torch.uint8, device=target,
-                    )
-                    padding = -allocation.data_ptr() % GDS_STORAGE_ALIGNMENT_BYTES
-                    slot.buffer = allocation[padding:padding + self._slot_bytes]
+                    slot.buffer = self._allocate_slot(index, target)
                 buffer = slot.buffer[:window.read_bytes]
                 try:
                     if callable(read_async):
@@ -200,14 +199,34 @@ class KvikioGdsReader:
             if self._closed:
                 raise RuntimeError("GPUDirect Storage reader is closed.")
             self._slot_device = device_index
-            slot = next(slot for slot in self._slots if not slot.busy)
+            index, slot = next((index, slot) for index, slot in enumerate(self._slots) if not slot.busy)
             slot.busy = True
         try:
-            yield slot
+            yield index, slot
         finally:
             with self._slot_condition:
                 slot.busy = False
                 self._slot_condition.notify_all()
+
+    def _allocate_slot(self, index: int, target: Any):
+        if self._raw_arena:
+            from .fixed_cuda_arena import FixedCudaArena
+
+            with self._arena_lock:
+                if self._arena is None:
+                    self._arena = FixedCudaArena(
+                        device=target, slots=len(self._slots), slot_bytes=self._slot_bytes,
+                        alignment=GDS_STORAGE_ALIGNMENT_BYTES,
+                    )
+                return self._arena.slot(index)
+        import torch
+
+        allocation = torch.empty(
+            self._slot_bytes + GDS_STORAGE_ALIGNMENT_BYTES - 1,
+            dtype=torch.uint8, device=target,
+        )
+        padding = -allocation.data_ptr() % GDS_STORAGE_ALIGNMENT_BYTES
+        return allocation[padding:padding + self._slot_bytes]
 
     def snapshot(self) -> dict[str, int | float | str]:
         version = self._kvikio.cufile_driver.libcufile_version()
@@ -228,6 +247,7 @@ class KvikioGdsReader:
                 "gds_trimmed_ops": int(self._trimmed_ops),
                 "gds_ring_slots": len(self._slots),
                 "gds_ring_slot_bytes": self._slot_bytes,
+                "gds_raw_arena": int(self._raw_arena),
             }
 
     def close(self) -> None:
@@ -243,6 +263,7 @@ class KvikioGdsReader:
                     slot.stream.synchronize()
         finally:
             self._slots.clear()
+            self._arena = None
             for handle in self._files.values():
                 try:
                     handle.close()

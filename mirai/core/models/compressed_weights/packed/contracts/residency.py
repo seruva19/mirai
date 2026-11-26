@@ -22,6 +22,34 @@ _GIB = 1024**3
 
 
 class PackedStateResidencyPolicyTests(unittest.TestCase):
+    def test_raw_cuda_arena_subdivides_one_allocation_into_aligned_slots(self) -> None:
+        from contextlib import nullcontext
+        import sys
+        from types import SimpleNamespace
+
+        from mirai.core.models.compressed_weights.packed.fixed_cuda_arena import FixedCudaArena
+
+        cuda = SimpleNamespace(
+            Device=mock.Mock(side_effect=lambda _: nullcontext()),
+            ExternalStream=mock.Mock(side_effect=lambda _: nullcontext()),
+            Memory=mock.Mock(return_value=SimpleNamespace(ptr=4099)),
+            MemoryPointer=mock.Mock(),
+        )
+        cupy = SimpleNamespace(cuda=cuda, uint8=object(), ndarray=mock.Mock())
+        stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=12)
+        storage = torch.zeros(8192, dtype=torch.uint8)
+        with mock.patch.dict(sys.modules, {"cupy": cupy}), mock.patch(
+            "torch.cuda.current_stream", return_value=stream,
+        ), mock.patch("torch.from_dlpack", return_value=storage):
+            arena = FixedCudaArena(device="cuda:0", slots=2, slot_bytes=4096, alignment=4096)
+        cuda.Memory.assert_called_once_with(8192 + 4095)
+        cuda.MemoryPointer.assert_called_once_with(cuda.Memory.return_value, 4093)
+        cuda.ExternalStream.assert_called_once_with(12)
+        self.assertEqual(arena.slot(1).data_ptr() - arena.slot(0).data_ptr(), 4096)
+        self.assertIs(arena.slot(0).untyped_storage(), arena.slot(1).untyped_storage())
+        with self.assertRaises(IndexError):
+            arena.slot(2)
+
     def test_uring_fixed_window_reuses_one_buffer_across_chunks(self) -> None:
         import ctypes
         import threading
@@ -107,6 +135,8 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         reader._slot_bytes = 8192
         reader._slot_device = None
         reader._slot_condition = threading.Condition()
+        reader._raw_arena = False
+        reader._arena = None
         reader._compat_context = None
         reader._stats_lock = threading.Lock()
         for counter in ("_read_ops", "_read_bytes", "_requested_bytes", "_overread_bytes",
