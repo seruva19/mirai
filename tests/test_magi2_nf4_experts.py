@@ -1917,6 +1917,50 @@ def test_magi2_fp4_packs_contiguous_contraction_blocks(fmt) -> None:
     )
 
 
+@pytest.mark.parametrize("block_checkpoint", [False, True])
+def test_magi2_int8_checkpoint_saves_only_expert_activations(monkeypatch, block_checkpoint) -> None:
+    from torch.utils.checkpoint import checkpoint
+
+    from mirai.core.training.residency import activation_compression
+
+    module = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    quantize_magi2_experts_in_place(_container(module), quant_format="fp8")
+    plan = Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm")
+    reference = Magi2QuantizedGroupedMoEBackend(plan, expert_autograd="segmented_recompute")
+    compressed = Magi2QuantizedGroupedMoEBackend(
+        plan, expert_autograd="segmented_recompute", int8_expert_checkpoint=True,
+    )
+    pack = activation_compression._pack_int8_saved_rows
+    observed = []
+
+    def inspect(tensor):
+        result = pack(tensor)
+        observed.append((tensor.dtype, tensor.numel() * tensor.element_size(), result))
+        return result
+
+    monkeypatch.setattr(activation_compression, "_pack_int8_saved_rows", inspect)
+    rows = torch.randn(5, 2, module.d_head, requires_grad=True)
+    def execute(backend, inputs):
+        return backend.execute(module, inputs, *module._route(inputs))
+
+    if block_checkpoint:
+        expected = checkpoint(lambda inputs: execute(reference, inputs), rows, use_reentrant=False)
+        actual = checkpoint(lambda inputs: execute(compressed, inputs), rows, use_reentrant=False)
+    else:
+        expected = execute(reference, rows)
+        actual = execute(compressed, rows)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert len(observed) == 2
+    dtype, original_bytes, packed = observed[0]
+    assert dtype == rows.dtype
+    assert packed.codes.dtype == torch.int8
+    assert packed.codes.numel() + 4 * packed.scales.numel() < original_bytes
+    assert not observed[1][2].is_floating_point()
+    expected_dx = torch.autograd.grad(expected.square().sum(), rows, retain_graph=True)[0]
+    actual_dx = torch.autograd.grad(actual.square().sum(), rows)[0]
+    assert (actual_dx - expected_dx).norm() < 0.02 * expected_dx.norm()
+
+
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not _CUDA, reason="requires CUDA"))])
 def test_magi2_hybrid_experts_preserve_interleaved_rows_and_gradients(monkeypatch, device) -> None:
     module = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)

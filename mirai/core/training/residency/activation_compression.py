@@ -25,6 +25,38 @@ class _LowRankSavedTensor:
     dtype: Any
 
 
+@dataclass(frozen=True)
+class _Int8SavedRows:
+    codes: Any
+    scales: Any
+    dtype: Any
+
+
+def _pack_int8_saved_rows(tensor):
+    if tensor.ndim != 2 or tensor.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        return tensor.detach()
+    rows, width = tensor.shape
+    if rows == 0 or width + 4 >= width * tensor.element_size():
+        return tensor.detach()
+    values = tensor.detach().float()
+    if not bool(torch.isfinite(values).all()):
+        return tensor.detach()
+    scales = (values.abs().amax(dim=1, keepdim=True) / 127).clamp_min_(torch.finfo(torch.float32).tiny)
+    codes = (values / scales).round_().clamp_(-127, 127).to(torch.int8)
+    return _Int8SavedRows(codes, scales, tensor.dtype)
+
+
+def _unpack_int8_saved_rows(value):
+    if not isinstance(value, _Int8SavedRows):
+        return value
+    return (value.codes.float() * value.scales).to(value.dtype)
+
+
+def int8_saved_rows_context():
+    """Compress saved activation rows in a scope with no saved float weights."""
+    return torch.autograd.graph.saved_tensors_hooks(_pack_int8_saved_rows, _unpack_int8_saved_rows)
+
+
 class LowRankActivationCompression:
     """Saved-tensor hook using a deterministic randomized range projection."""
 

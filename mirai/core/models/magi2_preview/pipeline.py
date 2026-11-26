@@ -302,6 +302,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        self._int8_expert_checkpoint = family.get("expert_int8_checkpoint", False)
+        if type(self._int8_expert_checkpoint) is not bool:
+            raise ValueError("MAGI-2 expert_int8_checkpoint must be a boolean.")
+        if self._int8_expert_checkpoint and self._frozen_weight_quantization not in MAGI2_PACKED_EXPERT_FORMATS:
+            raise ValueError("MAGI-2 expert_int8_checkpoint requires packed expert weights.")
         self._cpu_expert_max_tokens = family.get("expert_cpu_max_tokens", 0)
         if type(self._cpu_expert_max_tokens) is not int or not 0 <= self._cpu_expert_max_tokens <= 10:
             raise ValueError("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")
@@ -1139,6 +1144,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     getattr(policy, "moe_activation_backend", "torch")
                 ),
                 cpu_expert_max_tokens=getattr(self, "_cpu_expert_max_tokens", 0),
+                int8_expert_checkpoint=getattr(self, "_int8_expert_checkpoint", False),
             )
         else:
             backend = Magi2GroupedMoEBackend(
@@ -2338,6 +2344,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
         "nf4_fuse_gate_up",
         "expert_cpu_max_tokens",
+        "expert_int8_checkpoint",
         "expert_nvfp4_native_layout",
         "expert_pruning_plan_path",
         "expert_consolidation_plan_path",
@@ -2433,6 +2440,8 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
 
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        if type(params.get("expert_int8_checkpoint", False)) is not bool:
+            errors.append("MAGI-2 expert_int8_checkpoint must be a boolean.")
         cpu_max = params.get("expert_cpu_max_tokens", 0)
         if type(cpu_max) is not int or not 0 <= cpu_max <= 10:
             errors.append("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")

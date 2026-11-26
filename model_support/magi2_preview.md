@@ -275,6 +275,14 @@ larger expert groups run on CUDA. Use a host-backed packed stream with
 compute device. Compare latency and packed-transfer bytes against threshold `0`
 using identical routes and the same artifact.
 
+Set `model.params.family_params.expert_int8_checkpoint = true` with packed
+experts and `memory.moe_expert_autograd="segmented_recompute"` to save routed
+activations as INT8 rows with FP32 scales. Forward routing uses uncompressed
+inputs. Input gradients are approximate because backward reconstructs the
+saved activations. This experimental option is disabled by default and
+requires `expert_cpu_max_tokens = 0`. Compare gradient error, held-out loss,
+and peak memory with the same artifact and the option disabled.
+
 For experimental LoRA training with a host-backed packed stream, a positive
 host cache, and `memory.expert_weight_access="active_group_dequant"`, set
 `model.params.family_params.expert_working_set_fraction` below
@@ -911,6 +919,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   router candidates to a deterministic set per head for several optimizer steps.
 - **Hybrid CPU/CUDA packed expert execution** — Execute low-token expert
   groups on a CPU worker and preserve the routed output order.
+- **INT8 expert activation checkpointing** — Compress the activations saved
+  by segmented expert recomputation.
 - **MAGI-2 mixture-basis expert storage** — Set the family parameter
   `expert_mixture_basis_rank` to a positive rank to fit gate and up projections
   as the original checkpoint loads. Set `expert_mixture_basis_count` and

@@ -1588,6 +1588,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         expert_autograd: str = "standard",
         activation_backend: str = "torch",
         cpu_expert_max_tokens: int = 0,
+        int8_expert_checkpoint: bool = False,
     ) -> None:
         super().__init__(
             plan,
@@ -1596,6 +1597,11 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         )
         self.expert_autograd = str(expert_autograd)
         self.cpu_expert_max_tokens = cpu_expert_max_tokens
+        self.int8_expert_checkpoint = int8_expert_checkpoint
+        if int8_expert_checkpoint and (self.expert_autograd != "segmented_recompute" or cpu_expert_max_tokens):
+            raise Magi2GroupedMoEPolicyError(
+                "MAGI-2 INT8 expert checkpointing requires segmented_recompute with CUDA expert execution."
+            )
         if cpu_expert_max_tokens and (
             plan.routed_gemm != "disabled" or plan.forward_backend == "scaled_mm_fp4"
             or self.expert_autograd != "segmented_recompute"
@@ -1819,7 +1825,8 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                 num_heads = int(x_heads.shape[1])
                 d_head = int(x_heads.shape[2])
                 store, offsets = _packed_expert_layout(self._store(module), offsets)
-                return _SegmentedRoutedQuantizedExpertMlp.apply(
+                return self._segmented_expert_apply(
+                    _SegmentedRoutedQuantizedExpertMlp,
                     x_heads.reshape(tokens * num_heads, d_head),
                     offsets,
                     sorted_rows,
@@ -1852,7 +1859,8 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             )
         store, offsets = _packed_expert_layout(self._store(module), offsets)
         if torch.is_grad_enabled():
-            return _SegmentedQuantizedExpertMlp.apply(
+            return self._segmented_expert_apply(
+                _SegmentedQuantizedExpertMlp,
                 x_sorted,
                 offsets,
                 store,
@@ -1873,6 +1881,14 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             fused_gate_up=store.has_fused_gate_up,
             prefetch=_expert_projection_prefetch(store, x_sorted),
         )
+
+    def _segmented_expert_apply(self, operation, *args):
+        if self.int8_expert_checkpoint and torch.is_grad_enabled():
+            from mirai.core.training.residency.activation_compression import int8_saved_rows_context
+
+            with int8_saved_rows_context():
+                return operation.apply(*args)
+        return operation.apply(*args)
 
 
 # The only MoEOptimizationPolicy fields MAGI-2 grouped execution reads. Every
