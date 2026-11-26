@@ -44,6 +44,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         backend: str = "staged",
         prefetch_depth: int = 0,
         tensor_aliases: Mapping[str, tuple[str, str]] | None = None,
+        cache_expert_slices: bool = False,
     ):
         if torch is None:  # pragma: no cover
             raise RuntimeError("torch is required for packed tensor streaming.")
@@ -82,6 +83,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._stream_lock = threading.Lock()
         self._streams: dict[str, Any] = {}
         self._cache = PackedStreamHostCache(cache_capacity_bytes)
+        self._cache_expert_slices = bool(cache_expert_slices)
         self._prefetch: Any | None = None
         if depth:
             self._prefetch = PackedStreamPrefetchRing(depth)
@@ -205,17 +207,18 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 )
             return stacked
 
-        cache_key = packed_stream_cache_key(str(key), unique_indices)
-        cached = self._cache.get(cache_key)
-        if cached is None:
-            futures = [
-                self._executor.submit(self._read_slice_run, str(key), start, count)
-                for start, count in runs
-            ]
-            host_tensors = tuple(future.result() for future in futures)
-            self._cache.put(cache_key, host_tensors)
+        if self._cache_expert_slices and self._cache.enabled:
+            host_tensors = (self._host_expert_slice_batch(str(key), unique_indices),)
         else:
-            host_tensors = cached
+            cache_key = packed_stream_cache_key(str(key), unique_indices)
+            host_tensors = self._cache.get(cache_key)
+            if host_tensors is None:
+                futures = [
+                    self._executor.submit(self._read_slice_run, str(key), start, count)
+                    for start, count in runs
+                ]
+                host_tensors = tuple(future.result() for future in futures)
+                self._cache.put(cache_key, host_tensors)
         if target.type != "cuda":
             stacked = _stack_tensors(host_tensors)
             if reordered:
@@ -254,6 +257,24 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             self._h2d_ops += len(host_tensors)
             self._h2d_bytes += transferred
         return stacked
+
+    def _host_expert_slice_batch(self, key, indices):
+        cache_keys = {index: packed_stream_cache_key(key, (index,), access="slice") for index in indices}
+        tensors = {index: self._cache.get(cache_key) for index, cache_key in cache_keys.items()}
+        missing = tuple(index for index in indices if tensors[index] is None)
+        runs = [
+            (start, self._executor.submit(self._read_slice_run, key, start, count))
+            for start, count in self._bounded_runs(key, missing)
+        ]
+        for start, future in runs:
+            for offset, tensor in enumerate(future.result()):
+                index = start + offset
+                # Each cached slice must own its storage so byte accounting
+                # stays accurate after other slices from the same run expire.
+                entry = (tensor.clone(),)
+                tensors[index] = entry
+                self._cache.put(cache_keys[index], entry)
+        return torch.stack([tensors[index][0] for index in indices])
 
     def snapshot(self) -> dict[str, int | float | str]:
         with self._stats_lock:

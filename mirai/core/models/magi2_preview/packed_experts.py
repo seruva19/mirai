@@ -361,7 +361,7 @@ def load_magi2_nf4_packed_state(
 
         reader = StreamingPackedTensorMapping(
             manifest_path, tensor_aliases=tensor_aliases, cache_capacity_bytes=stream_cache_bytes,
-            prefetch_depth=stream_prefetch_depth, backend=range_read_backend,
+            prefetch_depth=stream_prefetch_depth, backend=range_read_backend, cache_expert_slices=True,
         )
         try:
             for module_name, store in stores.items():

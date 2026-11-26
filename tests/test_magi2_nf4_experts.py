@@ -1910,6 +1910,15 @@ def test_magi2_staged_layers_share_one_packed_reader(tmp_path, monkeypatch) -> N
 
     monkeypatch.setattr(tensor_residency, "PinnedHostStagingPool", DummyPool)
     reader = active._packed_range_reader.reader
+    key = "mlp.moe_mlp:W_gate_scales"
+    reader.get_slices_to_device(key, [3, 4], device="cpu")
+    before = reader.snapshot()
+    overlapping = reader.get_slices_to_device(key, [4, 5, 4], device="cpu")
+    after = reader.snapshot()
+    assert after["read_bytes"] - before["read_bytes"] == reader.tensor_nbytes(key) // active.num_groups
+    assert after["cache_hits"] - before["cache_hits"] == 1
+    assert after["cache_peak_bytes"] <= 1024
+    torch.testing.assert_close(overlapping[0], overlapping[2])
     reader._pin_cap_bytes = 1024
     for _ in range(2):
         output, = reader._copy_staged_to_device([torch.ones(2)], "cpu", torch.float64, None)

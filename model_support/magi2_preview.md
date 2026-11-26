@@ -241,7 +241,8 @@ stores and mixed-precision buckets read requested groups from the artifact
 during execution. Shared-basis and mixture-basis stores keep shared bases
 resident and fetch per-expert factors on demand.
 All expert layers share one range reader and one
-`memory.packed_stream_cache_gib` host-cache budget.
+`memory.packed_stream_cache_gib` host-cache budget. The cache keeps individual
+packed expert slices, so overlapping route sets can reuse cached experts.
 Staged CUDA uploads reuse a pinned host ring sized by the host pin budget
 and the reader's maximum transfer size.
 For segmented grouped linear and expert MLP execution with a uniform packed format,
