@@ -238,7 +238,7 @@ align each shard file to 4096 bytes.
 With `stream_disk`, the GDS backend requires an aligned export and a CUDA
 target. It routes packed expert reads through the shared KvikIO reader.
 With `memory.weight_residency_strategy="stream_disk"` and
-`memory.packed_stream_backend="staged"`, uniform NF4, FP8, NVFP4, and GGUF expert
+`memory.packed_stream_backend="staged"`, uniform NF4, FP8, NVFP4, MXFP4, and GGUF expert
 stores and mixed-precision buckets read requested groups from the artifact
 during execution. Shared-basis and mixture-basis stores keep shared bases
 resident and fetch per-expert factors on demand.

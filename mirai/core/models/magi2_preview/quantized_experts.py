@@ -80,7 +80,7 @@ MAGI2_EXPERT_ACCESS_POLICIES = ("full_dequant", "chunked_dequant", "active_group
 MAGI2_FUSED_GATE_UP = "W_gate_up"
 MAGI2_NF4_GROUP_FIELDS = ("nf4", "nf4_absmax", "nf4_nabsmax", "nf4_offset")
 MAGI2_NF4_CODE_FIELDS = ("nf4_code", "nf4_ncode")
-MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq1", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4")
+MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq1", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4", "mxfp4")
 
 
 class Magi2QuantizedExpertError(ValueError):
@@ -651,15 +651,21 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         suffixes = ("codes",)
         if self.quant_format == "fp8":
             suffixes += ("scales",)
-        elif self.quant_format == "nvfp4":
+        elif self.quant_format in {"nvfp4", "mxfp4"}:
             suffixes += ("scales", "global_scale")
         return tuple(f"{key}_{suffix}" for suffix in suffixes)
 
     def expected_buffers(self, *, keys=MAGI2_ROUTED_EXPERT_TENSOR_NAMES) -> set[str]:
         return {name for key in keys for name in self._buffer_names(key)}
 
-    def _nvfp4_meta(self, shape):
-        return MicroscalingMeta("nvfp4", 16, shape, (-prod(shape)) % 16)
+    def _fp4_meta(self, shape):
+        if self.quant_format == "mxfp4":
+            # Native GEMM contracts along contiguous input columns.
+            shape = shape[::-1]
+            block_size = 32
+        else:
+            block_size = 16
+        return MicroscalingMeta(self.quant_format, block_size, shape, (-prod(shape)) % block_size)
 
     @torch.no_grad()
     def quantize_dense(
@@ -678,6 +684,8 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
                 values = quantize_blockwise_fp8_weight(group)[:2]
             elif self.quant_format == "nvfp4":
                 values = quantize_microscaling(self.quant_format, group)[:3]
+            elif self.quant_format == "mxfp4":
+                values = quantize_microscaling(self.quant_format, group.t())[:3]
             else:
                 values = (quantize_gguf(self.quant_format, group),)
             if payload is None:
@@ -730,8 +738,8 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
                 raise Magi2QuantizedExpertError(f"Invalid packed group axis for '{key}'.")
             if self.quant_format == "fp8":
                 validate_blockwise_fp8_payload(*fields, BlockwiseFP8Meta(group_shape))
-            elif self.quant_format == "nvfp4":
-                validate_microscaling_payload(*fields, self._nvfp4_meta(group_shape))
+            elif self.quant_format in {"nvfp4", "mxfp4"}:
+                validate_microscaling_payload(*fields, self._fp4_meta(group_shape))
             else:
                 blocks = fields[0]
                 if blocks.ndim != 3 or blocks.shape[1] != gguf_num_superblocks(prod(group_shape)):
@@ -767,12 +775,13 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         shape = self._shapes[key][1:]
         if self.quant_format == "fp8":
             return dequantize_blockwise_fp8_weight(*fields, BlockwiseFP8Meta(shape), dtype=dtype, device=device)
-        if self.quant_format == "nvfp4":
-            meta = self._nvfp4_meta(shape)
-            return torch.stack([
+        if self.quant_format in {"nvfp4", "mxfp4"}:
+            meta = self._fp4_meta(shape)
+            weights = torch.stack([
                 dequantize_microscaling(*group, meta, dtype=dtype, device=device)
                 for group in zip(*fields, strict=True)
             ])
+            return weights.transpose(-2, -1).contiguous() if self.quant_format == "mxfp4" else weights
         return torch.stack([
             dequantize_gguf(self.quant_format, group, shape=shape, dtype=dtype, device=device)
             for group in fields[0]

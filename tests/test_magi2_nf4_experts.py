@@ -1895,7 +1895,26 @@ def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tm
         load_magi2_nf4_packed_state(artifact, restored_model, blocksize=64, quant_format="fp8")
 
 
-@pytest.mark.parametrize("fmt", ["gguf_iq1", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4"])
+def test_magi2_mxfp4_packs_contiguous_contraction_blocks() -> None:
+    from mirai.core.models.compressed_weights.quantization.microscaling_quant import (
+        dequantize_microscaling, quantize_microscaling,
+    )
+
+    weights = torch.randn(2, 32, 64)
+    store = quantized_experts.Magi2PackedExpertStore(num_groups=2, quant_format="mxfp4")
+    store.quantize_dense("W_gate", weights)
+    payload = quantize_microscaling("mxfp4", weights[1].t().contiguous())
+    for actual, expected in zip((store.W_gate_codes[1], store.W_gate_scales[1],
+                                store.W_gate_global_scale[1]), payload[:3], strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    expected = dequantize_microscaling(*payload, dtype=torch.float32, device=torch.device("cpu")).t()
+    torch.testing.assert_close(
+        store.materialize_segment("W_gate", 1, 2, dtype=torch.float32, device="cpu")[0],
+        expected, rtol=0, atol=0,
+    )
+
+
+@pytest.mark.parametrize("fmt", ["gguf_iq1", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4", "mxfp4"])
 def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -> None:
     def model():
         return _container(_reduced_moe(
