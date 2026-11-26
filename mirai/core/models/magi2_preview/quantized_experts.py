@@ -412,7 +412,7 @@ class Magi2Nf4ExpertStore(nn.Module):
         )
         return selected.to(device=device, dtype=dtype)
 
-    def prefetch_segment(self, key, start, stop, *, device, group_ids=None) -> None:
+    def prefetch_segment(self, key, start, stop, *, device, dtype=None, group_ids=None) -> None:
         reader = getattr(self, "_packed_range_reader", None)
         if reader is None or self.quant_format != "nf4":
             return
@@ -425,8 +425,7 @@ class Magi2Nf4ExpertStore(nn.Module):
     def packed_prefetch_enabled(self) -> bool:
         reader = getattr(self, "_packed_range_reader", None)
         return (
-            self.quant_format in MAGI2_PACKED_EXPERT_FORMATS and not getattr(self, "is_mixed_precision", False)
-            and reader is not None and reader.prefetch_enabled
+            reader is not None and reader.prefetch_enabled
         )
 
     def quantized_numel(self) -> int:
@@ -779,7 +778,7 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
             for group in fields[0]
         ])
 
-    def prefetch_segment(self, key, start, stop, *, device, group_ids=None) -> None:
+    def prefetch_segment(self, key, start, stop, *, device, dtype=None, group_ids=None) -> None:
         reader = getattr(self, "_packed_range_reader", None)
         if reader is None:
             return

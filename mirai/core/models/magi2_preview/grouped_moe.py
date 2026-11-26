@@ -1056,8 +1056,8 @@ class _ActiveExpertGroups:
             key, start, stop, dtype=dtype, device=device, group_ids=self.group_ids
         )
 
-    def prefetch_segment(self, key, start, stop, *, device) -> None:
-        self.store.prefetch_segment(key, start, stop, device=device, group_ids=self.group_ids)
+    def prefetch_segment(self, key, start, stop, *, device, dtype) -> None:
+        self.store.prefetch_segment(key, start, stop, device=device, dtype=dtype, group_ids=self.group_ids)
 
     @property
     def packed_prefetch_enabled(self) -> bool:
@@ -1107,7 +1107,7 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
                 key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
             ),
             prefetch=(
-                (lambda start, stop: store.prefetch_segment(key, start, stop, device=x_sorted.device))
+                (lambda start, stop: store.prefetch_segment(key, start, stop, device=x_sorted.device, dtype=x_sorted.dtype))
                 if getattr(store, "packed_prefetch_enabled", False) else None
             ),
             backend=forward_backend,
@@ -1138,7 +1138,7 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
                     key, start, stop, dtype=grad_output.dtype, device=grad_output.device
                 ),
                 prefetch=(
-                    (lambda start, stop: store.prefetch_segment(key, start, stop, device=grad_output.device))
+                    (lambda start, stop: store.prefetch_segment(key, start, stop, device=grad_output.device, dtype=grad_output.dtype))
                     if getattr(store, "packed_prefetch_enabled", False) else None
                 ),
                 backend=ctx.dx_backend,
@@ -1149,10 +1149,10 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         return grad_x, None, None, None, None, None
 
 
-def _expert_projection_prefetch(store, device):
+def _expert_projection_prefetch(store, x):
     if not getattr(store, "packed_prefetch_enabled", False):
         return None
-    return lambda key, start, stop: store.prefetch_segment(key, start, stop, device=device)
+    return lambda key, start, stop: store.prefetch_segment(key, start, stop, device=x.device, dtype=x.dtype)
 
 
 class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
@@ -1182,7 +1182,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
             output_columns=int(x_sorted.shape[-1]),
             activation_backend=str(activation_backend),
             fused_gate_up=store.has_fused_gate_up,
-            prefetch=_expert_projection_prefetch(store, x_sorted.device),
+            prefetch=_expert_projection_prefetch(store, x_sorted),
         )
         ctx.save_for_backward(x_sorted, offsets)
         ctx.store = store
@@ -1197,7 +1197,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         x_sorted, offsets = ctx.saved_tensors
         grad_segments: list[torch.Tensor] = []
         store = ctx.store
-        prefetch = _expert_projection_prefetch(store, x_sorted.device)
+        prefetch = _expert_projection_prefetch(store, x_sorted)
         segments = tuple(segment for segment in ctx.segments if segment.row_count)
         for index, segment in enumerate(segments):
             if segment.row_count == 0:
@@ -1316,7 +1316,7 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
     ) -> torch.Tensor:
         segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
         outputs: list[torch.Tensor] = []
-        prefetch = _expert_projection_prefetch(store, x_rows.device)
+        prefetch = _expert_projection_prefetch(store, x_rows)
         segments = tuple((segment, rows) for segment, rows in segments if segment.row_count)
         for index, (segment, max_group_rows) in enumerate(segments):
             local_offsets = (
@@ -1382,7 +1382,7 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
         x_rows, offsets, sorted_rows = ctx.saved_tensors
         grad_input = torch.zeros_like(x_rows)
         store = ctx.store
-        prefetch = _expert_projection_prefetch(store, x_rows.device)
+        prefetch = _expert_projection_prefetch(store, x_rows)
         segments = ctx.segments
         for index, (segment, max_group_rows) in enumerate(segments):
             local_offsets = (
@@ -1566,7 +1566,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         store, offsets = _packed_expert_layout(self._store(module), offsets)
         output = x_rows.new_zeros((tokens * num_heads, d_head))
         segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
-        prefetch = _expert_projection_prefetch(store, x_rows.device)
+        prefetch = _expert_projection_prefetch(store, x_rows)
         segments = tuple((segment, rows) for segment, rows in segments if segment.row_count)
         for index, (segment, max_group_rows) in enumerate(segments):
             local_offsets = (
@@ -1721,7 +1721,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             output_columns=d_head,
             activation_backend=self.activation_backend,
             fused_gate_up=store.has_fused_gate_up,
-            prefetch=_expert_projection_prefetch(store, x_sorted.device),
+            prefetch=_expert_projection_prefetch(store, x_sorted),
         )
 
 

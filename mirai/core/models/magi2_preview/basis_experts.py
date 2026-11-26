@@ -41,6 +41,11 @@ class Magi2SharedBasisExpertStore(Magi2Nf4ExpertStore):
     def bind_packed_range_reader(self, reader) -> None:
         super().bind_packed_range_reader(reader, retain={f"{key}_basis" for key in self._shapes})
 
+    def prefetch_segment(self, key, start, stop, *, device, dtype=None, group_ids=None):
+        if self.packed_prefetch_enabled:
+            ids = range(start, stop) if group_ids is None else group_ids[start:stop].tolist()
+            self._packed_range_reader.prefetch_slices_to_device(f"{key}_coefficients", ids, device=device, dtype=dtype)
+
     def __init__(self, *, num_groups: int) -> None:
         super().__init__(num_groups=num_groups)
         self._axes: dict[str, str] = {}
@@ -147,6 +152,16 @@ class Magi2MixtureBasisExpertStore(Magi2Nf4ExpertStore):
     def bind_packed_range_reader(self, reader) -> None:
         super().bind_packed_range_reader(reader, retain={"W_gate_bases", "W_up_bases"})
         self.down.bind_packed_range_reader(PackedExpertRangeView(reader, "down."))
+
+    def prefetch_segment(self, key, start, stop, *, device, dtype=None, group_ids=None):
+        if not self.packed_prefetch_enabled:
+            return
+        if key == "W_down":
+            self.down.prefetch_segment(key, start, stop, device=device, dtype=dtype, group_ids=group_ids)
+            return
+        ids = range(start, stop) if group_ids is None else group_ids[start:stop].tolist()
+        self._packed_range_reader.prefetch_slices_to_device(f"{key}_transforms", ids, device=device, dtype=dtype)
+        self._packed_range_reader.prefetch_slices_to_device(f"{key}_coefficients", ids, device=device, dtype=torch.float32)
 
     def __init__(self, *, num_groups: int, down_format: str, blocksize: int = 64) -> None:
         super().__init__(num_groups=num_groups, blocksize=blocksize)

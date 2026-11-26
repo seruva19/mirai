@@ -247,7 +247,7 @@ All expert layers share one range reader and one
 packed expert slices, so overlapping route sets can reuse cached experts.
 Staged CUDA uploads reuse a pinned host ring sized by the host pin budget
 and the reader's maximum transfer size.
-For segmented grouped linear and expert MLP execution with a uniform packed format,
+For segmented grouped linear and expert MLP execution,
 `memory.packed_stream_prefetch_depth` enables reads of the next segment
 during the current matmul, including input-gradient recomputation.
 The

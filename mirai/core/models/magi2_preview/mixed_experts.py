@@ -110,6 +110,11 @@ class _Bf16Groups(nn.Module):
         self._packed_range_reader = reader
         del self.weight
 
+    def prefetch_segment(self, key, start, stop, *, device, dtype, group_ids):
+        self._packed_range_reader.prefetch_slices_to_device(
+            "weight", group_ids[start:stop].tolist(), device=device, dtype=dtype,
+        )
+
 
 class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
     """Compact format buckets with a stable mapping to the logical group IDs."""
@@ -119,6 +124,19 @@ class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
         super().bind_packed_range_reader(reader)
         for name, bucket in self.buckets.items():
             bucket.bind_packed_range_reader(PackedExpertRangeView(reader, f"buckets.{name}."))
+
+    def prefetch_segment(self, key, start, stop, *, device, dtype=None, group_ids=None):
+        if not self.packed_prefetch_enabled:
+            return
+        ids = range(start, stop) if group_ids is None else group_ids[start:stop].tolist()
+        by_bucket = {}
+        for index in ids:
+            name, local = self._locations[key][index]
+            by_bucket.setdefault(name, []).append(local)
+        for name, local_ids in by_bucket.items():
+            self.buckets[name].prefetch_segment(
+                key, 0, len(local_ids), device=device, dtype=dtype, group_ids=torch.tensor(local_ids),
+            )
 
     def __init__(self, *, num_groups: int, blocksize: int, base_format: str, formats, lineage, rotation_group_size=0) -> None:
         super().__init__(num_groups=num_groups, blocksize=blocksize)
