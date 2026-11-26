@@ -902,6 +902,23 @@ def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(t
         layer._forward_impl(tokens.flatten(1)), reference._forward_impl(tokens.flatten(1)),
         rtol=0, atol=0,
     )
+    backend = Magi2GroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
+    x = tokens.detach().requires_grad_(True)
+    probs, ids = layer._route(x)
+    grouped = backend.execute(layer, x, probs, ids)
+    expected = reference._forward_impl(x.flatten(1)).view_as(x)
+    torch.testing.assert_close(grouped, expected, rtol=2e-5, atol=1e-5)
+    actual_dx = torch.autograd.grad(grouped.square().sum(), x)[0]
+    reference_probs, reference_ids = reference._route(x)
+    grouped_reference = backend.execute(reference, x, reference_probs, reference_ids)
+    expected_dx = torch.autograd.grad(grouped_reference.square().sum(), x)[0]
+    torch.testing.assert_close(actual_dx, expected_dx, rtol=5e-5, atol=5e-5)
+    branch_plan = backend.plan_branches(layer, x.detach(), probs.detach(), ids)
+    assert branch_plan.groups == 4
+    torch.testing.assert_close(
+        branch_plan.combine_branch_features(branch_plan.compute_branch_features(None)),
+        expected.detach(), rtol=2e-5, atol=1e-5,
+    )
 
 
 def test_magi2_diet_head_replay_matches_native_expert_deletion() -> None:

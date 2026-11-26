@@ -809,10 +809,11 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   with `Magi2ExpertConsolidationPlan`.
   Set `model.params.family_params.expert_consolidation_plan_path` to load
   a saved plan from the original checkpoint, merging one source projection
-  at a time. Use dense reference expert execution and the `attn_only` adapter
+  at a time. Use dense expert execution and the `attn_only` adapter
   preset for training with this plan.
   Clustering and weight averaging operate within each head while routing
-  retains the original expert IDs. The merged model uses reference execution.
+  retains the original expert IDs. Reference and grouped execution resolve
+  those IDs against the compacted weights.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group

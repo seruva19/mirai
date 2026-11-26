@@ -2839,8 +2839,6 @@ class CoreMultiHeadMoE(nn.Module):
             # when no backend is attached, and it needs CUDA and no autograd
             # graph; otherwise the vendored per-expert loop is the reference.
             kernel_backend = self._mirai_moe_kernel_backend
-            if kernel_backend is not None and getattr(self, "_mirai_expert_aliases", None) is not None:
-                raise RuntimeError("MAGI-2 consolidated experts require native reference execution.")
             pruning_observer = self.get_expert_output_observer()
             if pruning_observer is not None and topk_indices.numel():
                 head_offsets = torch.arange(self.num_heads, device=topk_indices.device) * self.num_experts

@@ -582,6 +582,13 @@ class Magi2GroupedMoEBackend:
             scatter_rows=scatter_rows,
         )
 
+    @staticmethod
+    def _physical_expert_layout(module, flat_experts, groups):
+        aliases = getattr(module, "_mirai_expert_alias_indices", None)
+        if aliases is None:
+            return flat_experts, groups
+        return aliases.to(flat_experts.device).index_select(0, flat_experts.long()), module._mirai_physical_expert_count
+
     def plan_branches(
         self,
         module: Any,
@@ -604,14 +611,17 @@ class Magi2GroupedMoEBackend:
         num_experts = int(module.num_experts)
         head_axis = torch.arange(num_heads, device=device).view(num_heads, 1, 1)
         token_axis = torch.arange(tokens, device=device).view(1, tokens, 1)
+        flat_experts, groups = self._physical_expert_layout(
+            module, (topk_indices + head_axis * num_experts).reshape(-1), num_heads * num_experts,
+        )
         return Magi2ExpertBranchPlan(
             backend=self,
             module=module,
             x_heads=x_heads,
             topk_probs=topk_probs,
-            flat_experts=(topk_indices + head_axis * num_experts).reshape(-1),
+            flat_experts=flat_experts,
             rows=(token_axis * num_heads + head_axis).expand_as(topk_indices).reshape(-1),
-            groups=num_heads * num_experts,
+            groups=groups,
             forward_backend=forward_backend,
             dx_backend=dx_backend,
         )
@@ -694,6 +704,7 @@ class Magi2GroupedMoEBackend:
         head_axis = torch.arange(num_heads, device=device).view(num_heads, 1, 1)
         token_axis = torch.arange(tokens, device=device).view(1, tokens, 1)
         flat_experts = (topk_indices + head_axis * num_experts).reshape(-1)
+        flat_experts, groups = self._physical_expert_layout(module, flat_experts, groups)
         rows = (token_axis * num_heads + head_axis).expand_as(topk_indices).reshape(-1)
         order = flat_experts.argsort(stable=True)
         sorted_rows = rows[order]
@@ -1469,6 +1480,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         head_axis = torch.arange(num_heads, device=device).view(num_heads, 1, 1)
         token_axis = torch.arange(tokens, device=device).view(1, tokens, 1)
         flat_experts = (topk_indices + head_axis * num_experts).reshape(-1)
+        flat_experts, groups = self._physical_expert_layout(module, flat_experts, groups)
         assignment_to_row = (
             token_axis * num_heads + head_axis
         ).expand_as(topk_indices).reshape(-1)

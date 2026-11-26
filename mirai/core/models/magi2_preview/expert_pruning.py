@@ -292,7 +292,7 @@ def apply_magi2_hierarchical_merge(
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             compact = _merge_projection(layer._parameters[key], clusters)
             setattr(layer, key, nn.Parameter(compact, requires_grad=False))
-        layer._mirai_expert_aliases = aliases
+        _attach_merge_aliases(layer, aliases, len(clusters))
 
 
 def _merge_layouts(layers, plan):
@@ -334,6 +334,15 @@ def _merge_projection(weight, clusters):
             merged.add_(weight[expert].float(), alpha=coefficient)
         compact[physical].copy_(merged)
     return compact
+
+
+def _attach_merge_aliases(layer, aliases, physical_count):
+    layer._mirai_expert_aliases = aliases
+    layer._mirai_physical_expert_count = physical_count
+    layer.register_buffer(
+        "_mirai_expert_alias_indices", torch.tensor(aliases, device=layer.gate.device),
+        persistent=False,
+    )
 
 
 @torch.no_grad()
@@ -382,8 +391,8 @@ def stream_merge_magi2_experts(
     for full_key, value in staged.items():
         _, owner, key, _ = sources[full_key]
         setattr(owner, key, value)
-    for name, (aliases, _) in layouts.items():
-        layers[name]._mirai_expert_aliases = aliases
+    for name, (aliases, clusters) in layouts.items():
+        _attach_merge_aliases(layers[name], aliases, len(clusters))
     return set(staged)
 
 

@@ -960,8 +960,6 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             getattr(getattr(self, "_moe_token_chunk_policy", None), "token_chunk_size", 0)
         )
         plan = resolve_magi2_moe_execution(policy, quantized_experts=quantized)
-        if plan is not None and getattr(self, "_expert_consolidation_plan_path", ""):
-            raise ValueError("MAGI-2 consolidated experts require native reference execution.")
         if plan is not None:
             validate_grouped_moe_backend_support(
                 plan, device=self._transformer_device()
