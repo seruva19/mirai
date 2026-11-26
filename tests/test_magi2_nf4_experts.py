@@ -1636,7 +1636,10 @@ def test_magi2_precision_calibration_uses_native_projection_layout(tmp_path, rot
     restored = load_magi2_nf4_packed_state(
         artifact, restore_model, blocksize=64, quant_format="fp8",
         expected_pruning_digest=pruning_plan.topology_digest(),
+        staged_range_reads=True,
     )[name]
+    assert restored.payload_bytes() == pruned_stores[name].payload_bytes()
+    assert not list(restored.buffers())
     for key in ("W_gate", "W_up", "W_down"):
         kwargs = dict(device=torch.device("cpu"), dtype=torch.float32)
         original_rows = pruned_stores[name].materialize_segment(key, 0, 4, **kwargs)

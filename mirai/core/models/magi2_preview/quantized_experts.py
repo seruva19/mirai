@@ -187,7 +187,7 @@ class Magi2Nf4ExpertStore(nn.Module):
                 "nested_dtype": str(meta.nested_dtype).removeprefix("torch."),
                 "weight_dtype": str(meta.weight_dtype).removeprefix("torch."),
             },
-            "buffers": sorted(name for name, _value in self.named_buffers(recurse=False)),
+            "buffers": sorted(getattr(self, "_packed_range_reader", None) or self._buffers),
         }
 
     def fused_gate_up_buffers(self) -> dict[str, torch.Tensor]:
@@ -371,7 +371,10 @@ class Magi2Nf4ExpertStore(nn.Module):
     def enable_packed_range_reads(self, shard_path) -> None:
         from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
 
-        self._packed_range_reader = StreamingPackedTensorMapping(shard_path, backend="staged")
+        self.bind_packed_range_reader(StreamingPackedTensorMapping(shard_path, backend="staged"))
+
+    def bind_packed_range_reader(self, reader) -> None:
+        self._packed_range_reader = reader
         for name in tuple(self._buffers):
             if not name.endswith(("_nf4_code", "_nf4_ncode")):
                 delattr(self, name)

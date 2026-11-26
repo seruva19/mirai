@@ -99,13 +99,40 @@ class _Bf16Groups(nn.Module):
         self.register_buffer("weight", weight.to(torch.bfloat16).contiguous(), persistent=False)
 
     def materialize_segment(self, key, start, stop, *, dtype, device, group_ids):
+        reader = getattr(self, "_packed_range_reader", None)
+        if reader is not None:
+            return reader.get_slices_to_device("weight", group_ids[start:stop].tolist(), device=device, dtype=dtype)
         selected = group_ids[start:stop].to(self.weight.device)
         return self.weight.index_select(0, selected).to(device=device, dtype=dtype)
+
+    def bind_packed_range_reader(self, reader) -> None:
+        self._packed_range_reader = reader
+        del self.weight
+
+
+class _BucketRangeReader:
+    def __init__(self, reader, name):
+        self.reader = reader
+        self.prefix = f"buckets.{name}."
+
+    def __iter__(self):
+        return (key.removeprefix(self.prefix) for key in self.reader if key.startswith(self.prefix))
+
+    def get_slices_to_device(self, key, indices, **kwargs):
+        return self.reader.get_slices_to_device(self.prefix + key, indices, **kwargs)
+
+    def tensor_nbytes(self, key):
+        return self.reader.tensor_nbytes(self.prefix + key)
 
 
 class Magi2MixedExpertStore(Magi2Nf4ExpertStore):
     """Compact format buckets with a stable mapping to the logical group IDs."""
     is_mixed_precision = True
+
+    def bind_packed_range_reader(self, reader) -> None:
+        super().bind_packed_range_reader(reader)
+        for name, bucket in self.buckets.items():
+            bucket.bind_packed_range_reader(_BucketRangeReader(reader, name))
 
     def __init__(self, *, num_groups: int, blocksize: int, base_format: str, formats, lineage, rotation_group_size=0) -> None:
         super().__init__(num_groups=num_groups, blocksize=blocksize)

@@ -347,7 +347,7 @@ def load_magi2_nf4_packed_state(
                         store.restore_packed_state(descriptor=spec, buffers=restored_buffers)
                 except (KeyError, TypeError, ValueError) as exc:
                     raise Magi2PackedExpertStateError(f"Invalid packed MAGI-2 layer '{module_name}': {exc}") from exc
-        if staged_range_reads and not (mixed or shared_basis or mixture_basis):
+        if staged_range_reads and not (shared_basis or mixture_basis):
             store.enable_packed_range_reads(shard_path)
         stores[module_name] = store
     for module_name, layer in layers.items():
