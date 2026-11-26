@@ -64,6 +64,41 @@ _NF4 = _CUDA and _has_bitsandbytes()
 _requires_nf4 = pytest.mark.skipif(not _NF4, reason="NF4 storage requires CUDA and bitsandbytes")
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not _CUDA, reason="requires CUDA"))])
+def test_grouped_fallback_combines_in_fixed_slot_order(monkeypatch, device):
+    from types import SimpleNamespace
+
+    backend = Magi2GroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
+    module = SimpleNamespace(num_experts=3)
+    rows = torch.arange(30, device=device, dtype=torch.float32).reshape(5, 2, 3).requires_grad_()
+    selected = torch.tensor([[[2, 0], [1, 1], [0, 2], [0, 1], [2, 1]]] * 2, device=device)
+    probs = torch.full_like(selected, 0.5, dtype=torch.float32, requires_grad=True)
+
+    def features(_module, inputs, sorted_rows, experts, order, offsets, forward, dx):
+        return inputs.flatten(0, 1)[sorted_rows] * (experts[order, None] + 1)
+
+    monkeypatch.setattr(backend, "_grouped_branch_features", features)
+    monkeypatch.setattr(backend, "_resolve", lambda *args: ("bmm", "bmm"))
+    previous = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        actual = backend._execute_routed_chunk(module, rows, probs, selected)
+        again = backend._execute_routed_chunk(module, rows, probs, selected)
+        factors = selected + torch.arange(2, device=device)[:, None, None] * module.num_experts + 1
+        expected = (rows.transpose(0, 1)[:, :, None, :] * (factors * probs)[..., None]).sum(2).transpose(0, 1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(actual, again, rtol=0, atol=0)
+        for got, want in zip(
+            torch.autograd.grad(actual.sum(), (rows, probs)),
+            torch.autograd.grad(expected.sum(), (rows, probs)),
+            strict=True,
+        ):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=warn_only)
+
+
 @pytest.mark.parametrize("normalize", [False, True])
 def test_triton_expert_router_matches_sigmoid_selection_and_normalization(normalize):
     import sys

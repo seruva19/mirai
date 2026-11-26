@@ -803,6 +803,18 @@ class Magi2GroupedMoEBackend:
         expert_output = self._grouped_branch_features(
             module, x_heads, sorted_rows, flat_experts, order, offsets, forward_backend, dx_backend,
         )
+        if torch.are_deterministic_algorithms_enabled():
+            # Each slot has one grouped row. Accumulate in canonical slot
+            # order without having multiple routes write to the same row.
+            inverse = torch.empty_like(order)
+            inverse.scatter_(0, order, torch.arange(order.numel(), device=device, dtype=order.dtype))
+            inverse = inverse.reshape_as(topk_indices)
+            accumulator = torch.zeros((num_heads, tokens, d_head), device=device, dtype=torch.float32)
+            for slot in range(topk_indices.shape[-1]):
+                selected = expert_output.index_select(0, inverse[..., slot].reshape(-1))
+                contribution = selected.reshape_as(accumulator).float() * topk_probs[..., slot, None].float()
+                accumulator = accumulator + contribution
+            return accumulator.transpose(0, 1).contiguous().to(x_heads.dtype)
         weighted = expert_output * sorted_probs.to(expert_output.dtype)[:, None]
         output = torch.zeros(
             tokens * num_heads, d_head, device=device, dtype=x_heads.dtype

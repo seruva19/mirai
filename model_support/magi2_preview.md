@@ -1169,7 +1169,7 @@ listed here. Shared training, MoE, adapter, memory, and inference keys remain in
 | `memory.expert_dequant_chunk_size` | Groups per dequantization on the flattened `head * num_experts + expert` axis, not experts of one head. Required to be positive with `chunked_dequant`. |
 | `memory.moe_activation_backend` | `torch` or `triton`. `triton` fuses the exact FP32 SwiGLU7 clamp, sigmoid, and backward operations and requires CUDA plus Triton. |
 | `memory.quantize_experts_on_load` | Packs each routed expert tensor as its shard is read, avoiding dense routed-weight allocations. Requires a supported frozen expert format. With `memory.expert_precision_plan_path`, applies the verified per-group formats from the plan. |
-| `memory.moe_kernel_backend` | `auto`, `torch`, or `grouped`. With NF4 experts `torch` is rejected: the vendored per-expert reference loop reads dense expert tensors that packed storage replaces. |
+| `memory.moe_kernel_backend` | `auto`, `torch`, or `grouped`. With NF4 experts `torch` is rejected: the vendored per-expert reference loop reads dense expert tensors that packed storage replaces. When PyTorch deterministic algorithms are enabled, the grouped fallback sums each token's contributions in route-slot order using FP32 accumulation. |
 | `adapter.type` | `lora` only. |
 | `adapter.target_preset` | `attn_only` or `attn_router`. |
 | `dataset.caption_format` | `raw`; captions are encoded by the native Qwen3.5 path at cache time. |
