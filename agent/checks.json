@@ -325,9 +325,9 @@
     },
     {
       "name": "dataset",
-      "paths": ["mirai/core/dataset/", "mirai/core/training/data/", "scripts/cache.py", "scripts/tools/register_dataset.py", "scripts/tools/lr_find.py"],
+      "paths": ["mirai/core/dataset/", "mirai/core/training/data/", "scripts/cache.py", "scripts/tools/register_dataset.py", "scripts/tools/lr_find.py", "scripts/tools/calibrate_routing_batches.py"],
       "commands": [
-        "python -m pytest tests/test_dataset_sampling_contract.py tests/test_dataset_bucketing.py tests/test_indexed_cache.py tests/test_cache_recovery_and_variants.py tests/test_cache_registration_lineage.py tests/test_dataset_split.py mirai/core/training/data/contracts/progressive_curriculum.py -q"
+        "python -m pytest tests/test_dataset_sampling_contract.py tests/test_dataset_bucketing.py tests/test_indexed_cache.py tests/test_cache_recovery_and_variants.py tests/test_cache_registration_lineage.py tests/test_dataset_split.py mirai/core/training/data/contracts/progressive_curriculum.py mirai/core/training/data/contracts/routing_batches.py -q"
         ,"python -m pytest tests/test_joint_media_training.py -q"
       ],
       "invariants": [
