@@ -1929,6 +1929,41 @@ def test_magi2_staged_layers_share_one_packed_reader(tmp_path, monkeypatch) -> N
     assert events == ["allocate", "copy", "copy", "close"]
 
 
+def test_linux_direct_packed_reads_trim_aligned_windows(tmp_path) -> None:
+    import errno
+    import sys
+
+    from safetensors.torch import save_file
+
+    from mirai.core.models.compressed_weights.packed.packed_storage_alignment import (
+        read_safetensors_storage_alignment, save_safetensors_with_storage_alignment,
+    )
+    from mirai.core.models.compressed_weights.packed.packed_stream_io import DirectPackedShardReader
+
+    if sys.platform != "linux":
+        pytest.skip("O_DIRECT requires Linux")
+    payload = torch.arange(6144).to(torch.uint8)
+    path = tmp_path / "direct.safetensors"
+    save_safetensors_with_storage_alignment(
+        save_file, {"weights": payload}, path, metadata=None, alignment_bytes=4096,
+    )
+    size = read_safetensors_storage_alignment(path).file_size
+    payload_offset = size - payload.numel()
+    try:
+        reader = DirectPackedShardReader(path)
+        try:
+            target = bytearray(200)
+            physical_bytes = reader.readinto(memoryview(target), payload_offset + 1990)
+        finally:
+            reader.close()
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.EOPNOTSUPP}:
+            pytest.skip("Temporary filesystem does not support O_DIRECT")
+        raise
+    assert physical_bytes == 8192
+    assert target == payload[1990:2190].numpy().tobytes()
+
+
 def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, monkeypatch) -> None:
     import json
     from contextlib import contextmanager
