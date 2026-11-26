@@ -45,7 +45,7 @@ from mirai.core.models.magi2_preview.triton_swiglu import (
     triton_swiglu7,
     triton_swiglu7_backward,
 )
-from mirai.core.moe.runtime.gemm import grouped_mm_stride_violations, grouped_mm_operand
+from mirai.core.moe.runtime.gemm import grouped_mm_stride_violations, grouped_mm_operand, probe_backend
 from mirai.core.moe.runtime.specs import MoEOptimizationPolicy
 
 
@@ -3010,10 +3010,15 @@ def test_nf4_grouped_execution_stays_within_quantization_error_of_bf16() -> None
 
 
 @_requires_nf4
-def test_token_chunked_nf4_backward_supports_sparse_production_group_count() -> None:
+@pytest.mark.parametrize("backend", ["bmm", "torch_grouped"])
+def test_token_chunked_nf4_backward_supports_sparse_production_group_count(backend: str) -> None:
+    device = torch.device("cuda")
+    status = probe_backend(backend, device=device)
+    if not status.available:
+        pytest.skip(status.reason)
     hidden_size = 96
     module = _reduced_moe(
-        device=torch.device("cuda"),
+        device=device,
         dtype=torch.bfloat16,
         hidden_size=hidden_size,
         expert_intermediate_size=16,
@@ -3029,8 +3034,8 @@ def test_token_chunked_nf4_backward_supports_sparse_production_group_count() -> 
     adapter = _attach_router_lora(module)
     module._mirai_moe_kernel_backend = Magi2QuantizedGroupedMoEBackend(
         Magi2GroupedMoEPlan(
-            forward_backend="torch_grouped",
-            dx_backend="torch_grouped",
+            forward_backend=backend,
+            dx_backend=backend,
         ),
         expert_autograd="segmented_recompute",
     )
