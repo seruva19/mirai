@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import sys
 
 try:
     import torch
@@ -143,6 +144,17 @@ def dequantize_blockwise_fp8_weight(
         if out.shape != codes.shape or out.dtype != dtype or out.device != stored.device or not out.is_contiguous():
             raise ValueError("FP8 output must be contiguous and match the target shape, device, and dtype.")
         scales = scales.to(device=target)
+        if (
+            sys.platform == "linux" and out.is_cuda and stored.is_contiguous() and scales.is_contiguous()
+            and dtype in {torch.float16, torch.bfloat16, torch.float32}
+        ):
+            try:
+                from .blockwise_fp8_triton import decode_fp8_out
+            except ImportError:
+                pass
+            else:
+                decode_fp8_out(stored, scales, out)
+                return out
         for row in range(0, meta.shape[0], block):
             for col in range(0, meta.shape[1], block):
                 decoded = _decode_e4m3(stored[..., row:row + block, col:col + block])

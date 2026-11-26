@@ -264,8 +264,9 @@ consumer finishes or the queue closes. A request missed by prefetch reads
 into a demand slot if the fields fit. Callers that retain a prefetched tensor receive
 an owning copy. Eligible segmented
 grouped projections can also write the dense weights into a second slot
-and hold it until the grouped matrix multiplication finishes. FP8 decodes
-one tile at a time into the slot. FP4 and GGUF use per-expert decode scratch.
+and hold it until the grouped matrix multiplication finishes. With Triton
+on Linux, FP8 uses one CUDA kernel to decode directly into the slot.
+FP4 and GGUF use per-expert decode scratch on the dequantizing path.
 For NF4, this
 includes the forward and first-order backward passes of the segmented MLP,
 including routed Triton execution and fused gate/up when both layouts fit.

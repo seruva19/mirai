@@ -60,6 +60,7 @@ from mirai.core.models.compressed_weights.quantization.microscaling_quant import
     validate_microscaling_payload,
 )
 from mirai.core.models.compressed_weights.quantization.blockwise_fp8 import (
+    BlockwiseFP8Meta,
     blockwise_fp8_batched_linear,
     blockwise_fp8_linear,
     dequantize_blockwise_fp8_weight,
@@ -639,6 +640,19 @@ class CompressedWeightQuantizationTests(unittest.TestCase):
         expected = blockwise_fp8_linear(inputs, codes, scales, meta)
         actual = blockwise_fp8_linear(inputs, codes, scales, meta, native=True)
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-3)
+
+    def test_blockwise_fp8_writes_the_exact_tail_tiles_into_supplied_output(self) -> None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        codes = (torch.arange(3 * 129 * 257, device=device) % 256).to(torch.uint8).view(3, 129, 257)
+        scales = torch.linspace(0.05, 1.0, 18, device=device).view(3, 2, 3)
+        meta = BlockwiseFP8Meta((129, 257))
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            out = torch.empty(codes.shape, device=device, dtype=dtype)
+            actual = dequantize_blockwise_fp8_weight(codes, scales, meta, dtype=dtype, device=device, out=out)
+            expected = dequantize_blockwise_fp8_weight(codes, scales, meta, dtype=dtype, device=device)
+            self.assertIs(actual, out)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+            self.assertTrue(torch.equal(actual.signbit()[expected == 0], expected.signbit()[expected == 0]))
 
     def test_blockwise_fp8_matches_e4m3_tile_oracle_and_high_precision_dgrad(
         self,
