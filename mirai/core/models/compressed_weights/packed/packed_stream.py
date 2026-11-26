@@ -17,7 +17,7 @@ from .packed_stream_prefetch import PackedStreamPrefetchRing
 from .packed_stream_cache import PackedStreamHostCache
 from .packed_stream_cache import packed_stream_cache_key
 from .packed_stream_io import contiguous_runs as _contiguous_runs
-from .packed_stream_io import PackedShardReader
+from .packed_stream_io import DirectPackedShardReader, PackedShardReader
 from .packed_stream_io import pin_budget_bytes as _pin_budget_bytes
 from .packed_stream_io import restore_order as _restore_order
 from .packed_stream_io import stack_tensors as _stack_tensors
@@ -60,10 +60,15 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 "memory.packed_stream_cache_gib must be 0 when "
                 "memory.packed_stream_backend='gds'."
             )
-        self._shards = {
-            name: PackedShardReader(shard_path)
-            for name, shard_path in shard_paths.items()
-        }
+        self._shards = {}
+        shard_reader = DirectPackedShardReader if self._backend == "direct_io" else PackedShardReader
+        try:
+            for name, shard_path in shard_paths.items():
+                self._shards[name] = shard_reader(shard_path)
+        except Exception:
+            for shard in self._shards.values():
+                shard.close()
+            raise
         self._gds: Any | None = None
         if self._backend == "gds":
             from .packed_stream_gds import KvikioGdsReader
@@ -279,7 +284,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
     def snapshot(self) -> dict[str, int | float | str]:
         with self._stats_lock:
             snapshot: dict[str, int | float | str] = {
-                "backend": "gds" if self._backend == "gds" else "direct_range",
+                "backend": "direct_range" if self._backend == "staged" else self._backend,
                 "read_ops": int(self._read_ops),
                 "read_bytes": int(self._read_bytes),
                 "read_seconds": float(self._read_seconds),
@@ -483,6 +488,6 @@ def _normalize_backend(value: str) -> str:
     normalized = str(value).strip().lower()
     aliases = {"direct_range": "staged", "kvikio": "gds"}
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {"staged", "gds"}:
-        raise ValueError("memory.packed_stream_backend must be one of: staged, gds.")
+    if normalized not in {"staged", "direct_io", "gds"}:
+        raise ValueError("memory.packed_stream_backend must be one of: staged, direct_io, gds.")
     return normalized

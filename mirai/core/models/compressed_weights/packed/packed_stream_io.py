@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import errno
 import io
+import mmap
 import os
+import sys
 import threading
 from collections.abc import Sequence
 from pathlib import Path
@@ -53,6 +55,44 @@ class PackedShardReader:
             return False
         advise(self.file.fileno(), 0, 0, advice)
         return True
+
+
+class DirectPackedShardReader:
+    """Linux O_DIRECT reader using aligned anonymous memory for each read."""
+
+    noatime = False
+    random_advice = False
+
+    def __init__(self, path: Path) -> None:
+        from .packed_storage_alignment import read_safetensors_storage_alignment
+
+        if sys.platform != "linux" or not hasattr(os, "O_DIRECT") or not hasattr(os, "preadv"):
+            raise RuntimeError("Packed direct_io requires Linux with O_DIRECT and preadv.")
+        self.alignment = read_safetensors_storage_alignment(path)
+        self.fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+
+    def readinto(self, buffer: memoryview, offset: int) -> None:
+        from .packed_storage_alignment import plan_aligned_read
+
+        target = buffer.cast("B")
+        if not len(target):
+            return
+        window = plan_aligned_read(
+            offset=offset, nbytes=len(target), file_size=self.alignment.file_size,
+            alignment_bytes=self.alignment.alignment_bytes,
+        )
+        with mmap.mmap(-1, window.read_bytes) as scratch, memoryview(scratch) as aligned:
+            count = os.preadv(self.fd, [aligned], window.file_offset)
+            if count != window.read_bytes:
+                raise EOFError(f"Packed O_DIRECT read returned {count} of {window.read_bytes} bytes.")
+            start = window.payload_offset
+            target[:] = aligned[start:start + len(target)]
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+    def evict_file_cache(self) -> bool:
+        return False
 
 
 def pin_budget_bytes() -> int:

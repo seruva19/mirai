@@ -2005,6 +2005,35 @@ def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, 
     assert not list(gds.buffers())
     with pytest.raises(ValueError, match="requires a CUDA target"):
         gds.materialize_segment("W_gate", 0, 1, dtype=torch.float32, device="cpu")
+    import ctypes
+    from types import SimpleNamespace
+
+    from mirai.core.models.compressed_weights.packed import packed_stream_io
+
+    calls = []
+    shard_bytes = shard.read_bytes()
+
+    def preadv(fd, buffers, offset):
+        target, = buffers
+        assert fd == 7
+        assert ctypes.addressof(ctypes.c_char.from_buffer(target)) % 4096 == 0
+        assert len(target) % 4096 == offset % 4096 == 0
+        calls.append((offset, len(target)))
+        target[:] = shard_bytes[offset:offset + len(target)]
+        return len(target)
+
+    monkeypatch.setattr(packed_stream_io, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(packed_stream_io, "os", SimpleNamespace(
+        O_RDONLY=0, O_DIRECT=16384, open=lambda path, flags: 7 if flags == 16384 else None,
+        preadv=preadv, close=lambda fd: None,
+    ))
+    direct = load_magi2_nf4_packed_state(
+        artifact, model(), blocksize=64, quant_format="fp8", range_read_backend="direct_io",
+    )["mlp.moe_mlp"]
+    torch.testing.assert_close(
+        direct.materialize_segment("W_gate", 1, 3, dtype=torch.float32, device="cpu"), expected, rtol=0, atol=0,
+    )
+    assert calls
     unaligned = save_magi2_nf4_packed_state(tmp_path / "unaligned", source)
     with pytest.raises(ValueError, match="4096-byte-aligned"):
         load_magi2_nf4_packed_state(

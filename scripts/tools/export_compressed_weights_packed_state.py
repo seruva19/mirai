@@ -205,7 +205,7 @@ def export_compressed_weights_packed_state_from_config(
             training_model,
             storage_alignment_bytes=(
                 GDS_STORAGE_ALIGNMENT_BYTES
-                if config.memory.packed_stream_backend == "gds" else 0
+                if config.memory.packed_stream_backend in {"direct_io", "gds"} else 0
             ),
             metadata=artifact_metadata,
         )
@@ -224,7 +224,7 @@ def export_compressed_weights_packed_state_from_config(
         ),
         "storage_alignment_bytes": (
             GDS_STORAGE_ALIGNMENT_BYTES
-            if config.memory.packed_stream_backend == "gds" else 0
+            if config.memory.packed_stream_backend in {"direct_io", "gds"} else 0
         ),
         "quantized_report": report,
     }

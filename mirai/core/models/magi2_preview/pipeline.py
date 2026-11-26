@@ -911,7 +911,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             retain_mapped_buffers=getattr(self, "_retain_mapped_expert_buffers", False),
             range_read_backend=(
                 self._packed_stream_backend
-                if getattr(self, "_stream_expert_artifact", False) and self._packed_stream_backend in {"staged", "gds"}
+                if getattr(self, "_stream_expert_artifact", False) and self._packed_stream_backend in {"staged", "direct_io", "gds"}
                 else None
             ),
             stream_cache_bytes=getattr(self, "_packed_stream_cache_bytes", 0),
@@ -943,7 +943,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return save_magi2_nf4_packed_state(
             path, self.transformer, metadata=metadata,
             storage_alignment_bytes=(
-                GDS_STORAGE_ALIGNMENT_BYTES if getattr(self, "_packed_stream_backend", "auto") == "gds" else 0
+                GDS_STORAGE_ALIGNMENT_BYTES if getattr(self, "_packed_stream_backend", "auto") in {"direct_io", "gds"} else 0
             ),
             pruning_digest=self._expert_pruning_digest if self._expert_pruning_plan_path else None,
             consolidation_digest=(
