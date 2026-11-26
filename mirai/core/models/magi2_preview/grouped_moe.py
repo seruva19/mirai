@@ -978,6 +978,7 @@ def run_segmented_grouped_expert_mlp(
     fused_gate_up: bool = False,
     segments: tuple[GroupedMMSegment, ...] | None = None,
     prefetch: Callable[[str, int, int], None] | None = None,
+    borrow: Callable[[str, int, int], ContextManager[torch.Tensor]] | None = None,
 ) -> torch.Tensor:
     """Evaluate one frozen SwiGLU7 expert segment end-to-end.
 
@@ -986,6 +987,9 @@ def run_segmented_grouped_expert_mlp(
     group range before advancing keeps only the final narrow expert output while
     materializing every packed weight range exactly once.
     """
+
+    def weight_lease(key, start, stop):
+        return nullcontext(materialize(key, start, stop)) if borrow is None else borrow(key, start, stop)
 
     outputs: list[torch.Tensor] = []
     if segments is None:
@@ -999,27 +1003,26 @@ def run_segmented_grouped_expert_mlp(
     for index, segment in enumerate(segments):
         if segment.row_count == 0:
             continue
-        local_offsets = (
-            offsets[segment.group_start : segment.group_stop] - segment.row_start
-        ).contiguous()
+        start, stop = segment.group_start, segment.group_stop
+        local_offsets = (offsets[start:stop] - segment.row_start).contiguous()
         rows = x_sorted[segment.row_start : segment.row_stop]
 
         if fused_gate_up:
-            weight = materialize(MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop)
-            if prefetch is not None:
-                prefetch("W_down", segment.group_start, segment.group_stop)
-            gate, up = _grouped_linear(rows, weight, local_offsets, backend).chunk(2, dim=-1)
+            with weight_lease(MAGI2_FUSED_GATE_UP, start, stop) as weight:
+                if prefetch is not None:
+                    prefetch("W_down", start, stop)
+                gate, up = _grouped_linear(rows, weight, local_offsets, backend).chunk(2, dim=-1)
             del weight
         else:
-            weight = materialize("W_gate", segment.group_start, segment.group_stop)
-            if prefetch is not None:
-                prefetch("W_up", segment.group_start, segment.group_stop)
-            gate = _grouped_linear(rows, weight, local_offsets, backend)
+            with weight_lease("W_gate", start, stop) as weight:
+                if prefetch is not None:
+                    prefetch("W_up", start, stop)
+                gate = _grouped_linear(rows, weight, local_offsets, backend)
             del weight
-            weight = materialize("W_up", segment.group_start, segment.group_stop)
-            if prefetch is not None:
-                prefetch("W_down", segment.group_start, segment.group_stop)
-            up = _grouped_linear(rows, weight, local_offsets, backend)
+            with weight_lease("W_up", start, stop) as weight:
+                if prefetch is not None:
+                    prefetch("W_down", start, stop)
+                up = _grouped_linear(rows, weight, local_offsets, backend)
             del weight
 
         hidden = _swiglu7_forward(
@@ -1030,14 +1033,14 @@ def run_segmented_grouped_expert_mlp(
         )
         del gate, up
 
-        weight = materialize("W_down", segment.group_start, segment.group_stop)
-        if prefetch is not None and index + 1 < len(segments):
-            next_segment = segments[index + 1]
-            prefetch(
-                MAGI2_FUSED_GATE_UP if fused_gate_up else "W_gate",
-                next_segment.group_start, next_segment.group_stop,
-            )
-        outputs.append(_grouped_linear(hidden.to(weight.dtype), weight, local_offsets, backend))
+        with weight_lease("W_down", start, stop) as weight:
+            if prefetch is not None and index + 1 < len(segments):
+                next_segment = segments[index + 1]
+                prefetch(
+                    MAGI2_FUSED_GATE_UP if fused_gate_up else "W_gate",
+                    next_segment.group_start, next_segment.group_stop,
+                )
+            outputs.append(_grouped_linear(hidden.to(weight.dtype), weight, local_offsets, backend))
         del hidden, weight
     if not outputs:
         return x_sorted.new_empty((0, int(output_columns)))
@@ -1297,6 +1300,10 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
             activation_backend=str(activation_backend),
             fused_gate_up=store.has_fused_gate_up,
             prefetch=_expert_projection_prefetch(store, x_sorted),
+            borrow=(
+                (lambda key, start, stop: store.borrow_segment(key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device))
+                if hasattr(store, "borrow_segment") else None
+            ),
         )
         ctx.save_for_backward(x_sorted, offsets)
         ctx.store = store

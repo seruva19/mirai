@@ -272,6 +272,7 @@ def test_segmented_execution_visits_every_group_exactly_once() -> None:
 
 def test_segmented_expert_mlp_matches_projection_wide_schedule() -> None:
     """Fusing the three projections by group range retains the released math."""
+    from contextlib import contextmanager
 
     torch.manual_seed(13)
     groups = 7
@@ -321,6 +322,27 @@ def test_segmented_expert_mlp_matches_projection_wide_schedule() -> None:
         for start, stop in ((0, 3), (3, 6), (6, 7))
         for key in ("W_gate", "W_up", "W_down")
     ]
+    weights["W_gate_up"] = torch.cat((weights["W_gate"], weights["W_up"]), dim=-1)
+    live = False
+
+    @contextmanager
+    def borrow(key, start, stop):
+        nonlocal live
+        assert not live
+        live = True
+        weight = weights[key][start:stop].clone()
+        try:
+            yield weight
+        finally:
+            weight.fill_(float("nan"))
+            live = False
+
+    borrowed = run_segmented_grouped_expert_mlp(
+        x_sorted, offsets, boundaries=boundaries, materialize=materialize,
+        backend="bmm", max_groups=3, output_columns=6, fused_gate_up=True, borrow=borrow,
+    )
+    torch.testing.assert_close(borrowed, expected)
+    assert not live
 
 
 def test_dequantized_segment_layout_satisfies_the_grouped_precondition() -> None:

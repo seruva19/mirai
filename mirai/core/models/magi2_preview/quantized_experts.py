@@ -523,11 +523,15 @@ class Magi2Nf4ExpertStore(nn.Module):
         if (
             self.quant_format == "nf4" and reader is not None and not torch.is_grad_enabled()
             and torch.device(device).type == "cuda" and self._meta is not None
-            and dtype == self._meta.weight_dtype and key != MAGI2_FUSED_GATE_UP
+            and dtype == self._meta.weight_dtype
         ):
             _, rows, cols = self.expert_weight_shape(key)
-            if stop - start > 1 and nf4_stack_dequant_supported(elements=rows * cols, meta=self._meta):
-                with reader.borrow_cuda_weight((stop - start, rows, cols), dtype=dtype, device=device) as out:
+            fused = key == MAGI2_FUSED_GATE_UP and self.has_fused_gate_up
+            lane_columns = cols // 2 if fused else cols
+            count = (stop - start) * (2 if fused else 1)
+            if nf4_stack_dequant_supported(elements=rows * lane_columns, meta=self._meta):
+                shape = (2, count, rows, lane_columns) if fused else (count, rows, lane_columns)
+                with reader.borrow_cuda_weight(shape, dtype=dtype, device=device) as out:
                     yield self.materialize_segment(key, start, stop, dtype=dtype, device=device, group_ids=group_ids, out=out)
                 return
         yield self.materialize_segment(key, start, stop, dtype=dtype, device=device, group_ids=group_ids)
@@ -623,7 +627,7 @@ class Magi2Nf4ExpertStore(nn.Module):
             offsets = select("_offset")
             code = getattr(self, f"{storage_key}_nf4_code").to(device=target)
             nested_code = getattr(self, f"{storage_key}_nf4_ncode").to(device=target)
-            if count > 1 and target.type == "cuda" and nf4_stack_dequant_supported(
+            if (count > 1 or out is not None) and target.type == "cuda" and nf4_stack_dequant_supported(
                 elements=int(out_features) * int(in_features), meta=meta
             ):
                 stacked = nf4_dequantize_stack(
@@ -638,9 +642,13 @@ class Magi2Nf4ExpertStore(nn.Module):
                     in_features=int(in_features),
                     dtype=dtype,
                     meta=meta,
-                    out=out,
+                    out=out[0] if both and out is not None else out,
                 )
                 if stacked is not None:
+                    if both and out is not None:
+                        combined = out[1].view(stop - start, rows, 2, cols)
+                        combined.copy_(stacked.view(stop - start, 2, rows, cols).transpose(1, 2))
+                        return combined.flatten(-2)
                     return projection_layout(stacked)
             codes = {"code": code, "nested_code": nested_code}
             return projection_layout(torch.stack(
