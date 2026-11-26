@@ -34,6 +34,7 @@ _DEFAULT_READ_WORKERS = 4
 _MAX_RANGE_BYTES = 32 * 1024 * 1024
 # Backward holds three dense projections while decoding the last packed input.
 _CUDA_STAGING_SLOTS = 4
+_CUDA_PREFETCH_DENSE_SLOTS = 3
 
 
 class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
@@ -126,6 +127,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._raw_staging = os.environ.get("MIRAI_PACKED_CUDA_ARENA", "") == "raw"
         self._staging_arena = None
         self._staging_arena_device = None
+        self._prefetch_dense_lock = threading.RLock()
+        self._prefetch_dense_arena = None
+        self._prefetch_dense_device = None
         self._staging_unavailable = False
         self._pinned_in_flight = 0
         self._pinned_peak = 0
@@ -289,23 +293,29 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
     @contextmanager
     def borrow_cuda_weight(self, shape, *, dtype, device):
         target = torch.device(device)
-        if not self._raw_staging or target.type != "cuda" or self.prefetch_enabled:
+        if not self._raw_staging or target.type != "cuda":
             yield None
             return
         size = torch.Size(shape).numel() * torch.empty((), device="meta", dtype=dtype).element_size()
         if size > _MAX_RANGE_BYTES:
             yield None
             return
-        with self._staging_lock:
+        # A demand consumer may wait for a prefetch worker that uses staging.
+        lock = self._prefetch_dense_lock if self.prefetch_enabled else self._staging_lock
+        with lock:
             if self._closed:
                 raise RuntimeError("Packed stream mapping is closed.")
             stream = torch.cuda.current_stream(target)
-            with self._cuda_staging_arena(target, stream).lease(stream) as slot:
+            arena = (
+                self._cuda_prefetch_dense_arena(target, stream)
+                if self.prefetch_enabled else self._cuda_staging_arena(target, stream)
+            )
+            with arena.lease(stream) as slot:
                 yield slot[:size].view(dtype).view(shape)
 
     @property
     def cuda_weight_slot_bytes(self) -> int:
-        return _MAX_RANGE_BYTES if self._raw_staging and not self.prefetch_enabled else 0
+        return _MAX_RANGE_BYTES if self._raw_staging else 0
 
     @contextmanager
     def borrow_packed_fields(self, keys, indices, *, device):
@@ -458,6 +468,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 snapshot["cuda_staging_arena_bytes"] = (
                     _CUDA_STAGING_SLOTS * _MAX_RANGE_BYTES if self._staging_arena is not None else 0
                 )
+                snapshot["cuda_prefetch_dense_arena_bytes"] = (
+                    _CUDA_PREFETCH_DENSE_SLOTS * _MAX_RANGE_BYTES if self._prefetch_dense_arena is not None else 0
+                )
         snapshot.update(self._cache.snapshot())
         if self._gds is not None:
             snapshot.update(self._gds.snapshot())
@@ -486,6 +499,10 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             warmer = self._warm_executor
         if warmer is not None:
             warmer.shutdown(wait=True, cancel_futures=True)
+        with self._prefetch_dense_lock:
+            if self._prefetch_dense_arena is not None:
+                self._prefetch_dense_arena.synchronize()
+                self._prefetch_dense_arena = None
         if self._prefetch is not None:
             self._prefetch.close()
         self._executor.shutdown(wait=True, cancel_futures=False)
@@ -654,6 +671,18 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         elif self._staging_arena_device != stream.device:
             raise ValueError("Packed CUDA staging slots are bound to one device.")
         return self._staging_arena
+
+    def _cuda_prefetch_dense_arena(self, target, stream):
+        from .fixed_cuda_arena import FixedCudaArena
+
+        if self._prefetch_dense_arena is None:
+            self._prefetch_dense_arena = FixedCudaArena(
+                device=target, slots=_CUDA_PREFETCH_DENSE_SLOTS, slot_bytes=_MAX_RANGE_BYTES, alignment=4096,
+            )
+            self._prefetch_dense_device = stream.device
+        elif self._prefetch_dense_device != stream.device:
+            raise ValueError("Packed CUDA prefetch dense slots are bound to one device.")
+        return self._prefetch_dense_arena
 
     def _copy_through_cuda_arena(self, host_tensors, target, dtype, stream):
         arena = self._cuda_staging_arena(target, stream)

@@ -174,6 +174,35 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         ])
         reader._closed = True
 
+    def test_prefetched_dense_lease_leaves_staging_lock_available(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from contextlib import nullcontext
+        from threading import RLock
+
+        from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
+
+        reader = StreamingPackedTensorMapping.__new__(StreamingPackedTensorMapping)
+        reader._closed = False
+        reader._raw_staging = True
+        reader._prefetch = mock.Mock()
+        reader._prefetch_dense_lock = RLock()
+        reader._staging_lock = RLock()
+        storage = torch.empty(32, dtype=torch.uint8)
+        arena = mock.Mock()
+        arena.lease.return_value = nullcontext(storage)
+        reader._cuda_prefetch_dense_arena = mock.Mock(return_value=arena)
+
+        def stage():
+            with reader._staging_lock:
+                return True
+
+        with ThreadPoolExecutor(max_workers=1) as worker, mock.patch("torch.cuda.current_stream"):
+            with reader.borrow_cuda_weight((2, 2), dtype=torch.float32, device="cuda:0") as weight:
+                self.assertTrue(worker.submit(stage).result(timeout=3))
+                self.assertEqual(weight.data_ptr(), storage.data_ptr())
+        reader._cuda_prefetch_dense_arena.assert_called_once()
+        reader._closed = True
+
     def test_uring_fixed_window_reuses_one_buffer_across_chunks(self) -> None:
         import ctypes
         import threading
