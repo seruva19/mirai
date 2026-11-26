@@ -57,6 +57,7 @@ from mirai.core.models.magi2_preview.quantized_experts import (
     MAGI2_FUSED_GATE_UP,
     MAGI2_ROUTED_EXPERT_TENSOR_NAMES,
     Magi2Nf4ExpertStore,
+    Magi2PackedExpertStore,
     magi2_expert_store,
 )
 from mirai.core.moe.runtime.specs import (
@@ -98,6 +99,9 @@ class Magi2GroupedMoEPlan:
             ("dx_backend", self.dx_backend),
         ):
             normalized = normalize_moe_gemm_backend(value)
+            if field == "forward_backend" and normalized == "scaled_mm_fp4":
+                object.__setattr__(self, field, normalized)
+                continue
             if normalized not in MAGI2_GROUPED_GEMM_BACKENDS:
                 raise Magi2GroupedMoEPolicyError(
                     "MAGI-2 grouped MoE execution supports "
@@ -1105,21 +1109,24 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         _groups, rows, cols = store.expert_weight_shape(key)
         span = store.segment_group_span()
         segments = tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=span))
-        output = run_segmented_grouped_linear(
-            x_sorted,
-            offsets,
-            segments=segments,
-            materialize=lambda start, stop: store.materialize_segment(
-                key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
-            ),
-            prefetch=(
-                (lambda start, stop: store.prefetch_segment(key, start, stop, device=x_sorted.device, dtype=x_sorted.dtype))
-                if getattr(store, "packed_prefetch_enabled", False) else None
-            ),
-            backend=forward_backend,
-            max_groups=span,
-            columns=int(cols),
-        )
+        if forward_backend == "scaled_mm_fp4":
+            output = _native_fp4_grouped_projection(x_sorted, offsets, store, key, cols)
+        else:
+            output = run_segmented_grouped_linear(
+                x_sorted,
+                offsets,
+                segments=segments,
+                materialize=lambda start, stop: store.materialize_segment(
+                    key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
+                ),
+                prefetch=(
+                    (lambda start, stop: store.prefetch_segment(key, start, stop, device=x_sorted.device, dtype=x_sorted.dtype))
+                    if getattr(store, "packed_prefetch_enabled", False) else None
+                ),
+                backend=forward_backend,
+                max_groups=span,
+                columns=int(cols),
+            )
         ctx.save_for_backward(offsets)
         ctx.store = store
         ctx.key = str(key)
@@ -1153,6 +1160,20 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
                 transposed=True,
             )
         return grad_x, None, None, None, None, None
+
+
+def _native_fp4_grouped_projection(x_sorted, offsets, store, key, columns):
+    physical_store = store.store if isinstance(store, _ActiveExpertGroups) else store
+    if not isinstance(physical_store, Magi2PackedExpertStore) or physical_store.quant_format != "mxfp4":
+        raise Magi2GroupedMoEPolicyError("Native MAGI-2 FP4 GEMM requires a uniform MXFP4 expert store.")
+    group_ids = store.group_ids.tolist() if isinstance(store, _ActiveExpertGroups) else range(offsets.numel())
+    boundaries = [0, *_grouped_boundaries(offsets)]
+    outputs = [
+        physical_store.native_fp4_projection(key, group, x_sorted[start:stop])
+        for group, start, stop in zip(group_ids, boundaries[:-1], boundaries[1:], strict=True)
+        if start < stop
+    ]
+    return torch.cat(outputs, dim=0) if outputs else x_sorted.new_empty((0, columns))
 
 
 def _expert_projection_prefetch(store, x):
@@ -1502,6 +1523,12 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             activation_backend=activation_backend,
         )
         self.expert_autograd = str(expert_autograd)
+        if plan.forward_backend == "scaled_mm_fp4" and (
+            self.expert_autograd != "standard" or plan.routed_gemm != "disabled"
+        ):
+            raise Magi2GroupedMoEPolicyError(
+                "Native MAGI-2 FP4 GEMM requires standard expert autograd and moe_routed_gemm='disabled'."
+            )
 
     @staticmethod
     def _store(module: Any) -> Magi2Nf4ExpertStore:
@@ -1523,6 +1550,11 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         if self._resolved:
             return self.alignment_violations
         store = self._store(module)
+        if self.plan.forward_backend == "scaled_mm_fp4":
+            if not isinstance(store, Magi2PackedExpertStore) or store.quant_format != "mxfp4":
+                raise Magi2GroupedMoEPolicyError("Native MAGI-2 FP4 GEMM requires a uniform MXFP4 expert store.")
+            if any(store.expert_weight_shape(key)[1] % 32 for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES):
+                raise Magi2GroupedMoEPolicyError("Native MAGI-2 MXFP4 GEMM requires input widths divisible by 32.")
         violations = magi2_grouped_mm_alignment_violations(
             w_gate=store.layout_probe("W_gate"),
             w_up=store.layout_probe("W_up"),
@@ -1693,6 +1725,8 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         forward_backend: str,
         dx_backend: str,
     ) -> torch.Tensor:
+        if forward_backend == "scaled_mm_fp4":
+            return super().branch_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend)
         if self.plan.routed_gemm != "disabled":
             supported = (
                 x_heads.device.type == "cuda"
@@ -1912,6 +1946,8 @@ def resolve_magi2_moe_execution(
     main = normalize_moe_gemm_backend(getattr(policy, "moe_gemm_backend", "auto"))
     forward = normalize_moe_gemm_role_backend(getattr(policy, "moe_gemm_backend_forward", ""))
     dx = normalize_moe_gemm_role_backend(getattr(policy, "moe_gemm_backend_dx", ""))
+    if (forward or main) == "scaled_mm_fp4" and not quantized_experts:
+        raise Magi2GroupedMoEPolicyError("Native MAGI-2 FP4 GEMM requires packed experts.")
     return Magi2GroupedMoEPlan(
         forward_backend=forward or main,
         dx_backend=dx or main,

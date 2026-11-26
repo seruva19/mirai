@@ -242,6 +242,13 @@ With `memory.weight_residency_strategy="stream_disk"` and
 stores and mixed-precision buckets read requested groups from the artifact
 during execution. Shared-basis and mixture-basis stores keep shared bases
 resident and fetch per-expert factors on demand.
+
+Uniform MXFP4 experts can use `memory.moe_gemm_backend_forward="scaled_mm_fp4"`
+on Blackwell with PyTorch block-scaled FP4 support. This experimental path
+requires input widths divisible by 32, standard expert autograd, and
+`memory.moe_routed_gemm="disabled"`. Input gradients use the configured
+dequantizing backward backend. Use the same packed artifact with
+`memory.moe_gemm_backend_forward="bmm"` to compare quality and latency.
 All expert layers share one range reader and one
 `memory.packed_stream_cache_gib` host-cache budget. The cache keeps individual
 packed expert slices, so overlapping route sets can reuse cached experts.

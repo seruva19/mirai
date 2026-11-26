@@ -754,6 +754,31 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
 
     @torch.no_grad()
     def materialize_segment(self, key, group_start, group_stop, *, dtype, device, group_ids=None):
+        fields = self._packed_segment(key, group_start, group_stop, device=device, group_ids=group_ids)
+        shape = self._shapes[key][1:]
+        if self.quant_format == "fp8":
+            return dequantize_blockwise_fp8_weight(*fields, BlockwiseFP8Meta(shape), dtype=dtype, device=device)
+        if self.quant_format in {"nvfp4", "mxfp4"}:
+            meta = self._fp4_meta(shape)
+            weights = torch.stack([
+                dequantize_microscaling(*group, meta, dtype=dtype, device=device)
+                for group in zip(*fields, strict=True)
+            ])
+            return weights.transpose(-2, -1).contiguous() if self.quant_format == "mxfp4" else weights
+        return torch.stack([
+            dequantize_gguf(self.quant_format, group, shape=shape, dtype=dtype, device=device)
+            for group in fields[0]
+        ])
+
+    def native_fp4_projection(self, key, group, x):
+        from mirai.core.models.compressed_weights.quantization.native_fp4 import native_fp4_linear
+
+        if self.quant_format != "mxfp4":
+            raise Magi2QuantizedExpertError("Native MAGI-2 FP4 GEMM requires contraction-major MXFP4 weights.")
+        fields = self._packed_segment(key, group, group + 1, device=x.device)
+        return native_fp4_linear(x, *(field[0] for field in fields), self._fp4_meta(self._shapes[key][1:]))
+
+    def _packed_segment(self, key, group_start, group_stop, *, device, group_ids=None):
         self._require_loaded(key)
         count = self.num_groups if group_ids is None else group_ids.numel()
         if not 0 <= group_start < group_stop <= count:
@@ -772,20 +797,7 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
             else:
                 value = value.index_select(0, group_ids[group_start:group_stop].to(value.device))
             fields.append(value.to(device=device))
-        shape = self._shapes[key][1:]
-        if self.quant_format == "fp8":
-            return dequantize_blockwise_fp8_weight(*fields, BlockwiseFP8Meta(shape), dtype=dtype, device=device)
-        if self.quant_format in {"nvfp4", "mxfp4"}:
-            meta = self._fp4_meta(shape)
-            weights = torch.stack([
-                dequantize_microscaling(*group, meta, dtype=dtype, device=device)
-                for group in zip(*fields, strict=True)
-            ])
-            return weights.transpose(-2, -1).contiguous() if self.quant_format == "mxfp4" else weights
-        return torch.stack([
-            dequantize_gguf(self.quant_format, group, shape=shape, dtype=dtype, device=device)
-            for group in fields[0]
-        ])
+        return fields
 
     def prefetch_segment(self, key, start, stop, *, device, dtype=None, group_ids=None) -> None:
         reader = getattr(self, "_packed_range_reader", None)

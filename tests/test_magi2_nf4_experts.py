@@ -1914,6 +1914,45 @@ def test_magi2_mxfp4_packs_contiguous_contraction_blocks() -> None:
     )
 
 
+def test_magi2_native_fp4_dispatches_active_groups_and_preserves_input_gradient(monkeypatch) -> None:
+    from mirai.core.models.compressed_weights.quantization import native_fp4
+
+    module = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    store = quantize_magi2_experts_in_place(_container(module), quant_format="mxfp4")["mlp.moe_mlp"]
+    store.set_expert_weight_access_policy(expert_weight_access="active_group_dequant", expert_dequant_chunk_size=1)
+    native = Magi2QuantizedGroupedMoEBackend(
+        Magi2GroupedMoEPlan(forward_backend="scaled_mm_fp4", dx_backend="bmm"),
+    )
+    reference = Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
+    monkeypatch.setattr(native, "_resolve", lambda *_: ("scaled_mm_fp4", "bmm"))
+    calls = []
+
+    def emulate(x, codes, scales, global_scale, meta):
+        calls.append(meta.shape)
+        weight = native_fp4.dequantize_microscaling(
+            codes, scales, global_scale, meta, dtype=x.dtype, device=x.device,
+        )
+        return x @ weight.t()
+
+    monkeypatch.setattr(native_fp4, "native_fp4_linear", emulate)
+    rows = torch.randn(3, 2, module.d_head, requires_grad=True)
+    groups = torch.tensor([[[3, 1]] * 3, [[2, 0]] * 3])
+    scores = torch.rand(2, 3, 2, requires_grad=True)
+    expected = reference.execute(module, rows, scores, groups)
+    with torch.no_grad():
+        output = native.execute(module, rows, scores, groups)
+    torch.testing.assert_close(output, expected)
+    assert len(calls) == 12
+    actual = native.execute(module, rows, scores, groups)
+    torch.testing.assert_close(actual, expected)
+    for actual_grad, expected_grad in zip(
+        torch.autograd.grad(actual.sum(), (rows, scores)),
+        torch.autograd.grad(expected.sum(), (rows, scores)),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
 @pytest.mark.parametrize("fmt", ["gguf_iq1", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4", "mxfp4"])
 def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -> None:
     def model():
