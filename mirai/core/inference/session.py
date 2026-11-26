@@ -799,7 +799,7 @@ class InferenceSession:
             print(f"[warning] {empty_negative_warning}", file=sys.stderr)
         rewritten = rewrite_inference_prompts(
             rewriter_name,
-            PromptRewriteRequest(prompt=prompt, negative_prompt=str(negative_prompt)),
+            PromptRewriteRequest(prompt=prompt, negative_prompt=str(negative_prompt), image=input_image),
         )
         original_prompt = prompt
         original_negative_prompt = str(negative_prompt)

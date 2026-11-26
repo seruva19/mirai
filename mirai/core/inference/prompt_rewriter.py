@@ -12,6 +12,7 @@ from mirai.core.registry import Registry
 class PromptRewriteRequest:
     prompt: str
     negative_prompt: str = ""
+    image: object | None = None
 
 
 @dataclass(frozen=True)

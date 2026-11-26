@@ -1520,6 +1520,57 @@ def test_magi2_scheduled_prediction_preserves_branch_order_and_refreshes() -> No
     torch.testing.assert_close(results[2][0][0], torch.tensor([[13.0], [4.0]]))
 
 
+def test_magi2_structured_rewriter_retries_and_caches_exact_image_content(tmp_path, monkeypatch):
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    from PIL import Image
+
+    from mirai.core.inference.prompt_rewriter import PromptRewriteRequest, rewrite_inference_prompts
+    from mirai.core.models.providers import get_model_family_provider
+
+    calls = []
+    caption = {"scene": "A square.", "action": "None.", "camera": "Locked.", "visual_style": "Flat."}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            calls.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            content = "unfinished" if len(calls) == 1 else json.dumps(caption)
+            body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        worker = Thread(target=server.serve_forever)
+        worker.start()
+        try:
+            monkeypatch.setenv("MIRAI_MAGI2_REWRITER_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1")
+            monkeypatch.setenv("MIRAI_MAGI2_REWRITER_MODEL", "local-caption")
+            monkeypatch.setenv("MIRAI_MAGI2_REWRITER_CACHE_DIR", str(tmp_path / "captions"))
+            monkeypatch.delenv("MIRAI_MAGI2_REWRITER_API_KEY", raising=False)
+            get_model_family_provider("magi2-preview").validate_inference_prompt_rewriter("magi2_structured")
+            image = tmp_path / "frame.png"
+            Image.new("RGB", (2, 2), "red").save(image)
+            request = PromptRewriteRequest("A square", "original negative", image=image)
+            first = rewrite_inference_prompts("magi2_structured", request)
+            assert first.negative_prompt == "original negative"
+            assert "Visual style: Flat." in first.prompt
+            assert rewrite_inference_prompts("magi2_structured", request) == first
+            assert len(calls) == 2
+            Image.new("RGB", (2, 2), "blue").save(image)
+            assert rewrite_inference_prompts("magi2_structured", request) == first
+            assert len(calls) == 3
+            assert calls[0]["messages"][1]["content"][1] != calls[2]["messages"][1]["content"][1]
+            assert rewrite_inference_prompts("none", request).prompt == "A square"
+            assert len(calls) == 3
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+
+
 def test_magi2_audio_ab_reuses_seeds_and_restores_options(tmp_path) -> None:
     from types import SimpleNamespace
 

@@ -2642,9 +2642,15 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             native_cache_encoding=True,
             config_defaults_name="magi2_preview",
             inference_tasks=("text_to_video",),
+            inference_prompt_rewriters=("magi2_structured",),
             dataset_caption_formats=("raw",),
             pipeline_type=Magi2PreviewPipeline,
         )
+
+    def validate_inference_prompt_rewriter(self, name: str) -> None:
+        super().validate_inference_prompt_rewriter(name)
+        if name.strip().lower() == "magi2_structured":
+            from . import prompt_enhancer  # noqa: F401  # Registers the opt-in rewriter.
 
     def build_diet_calibration_targets(self, pipeline: Any):
         from mirai.core.models.magi2_preview.expert_pruning import build_magi2_diet_calibration_targets
