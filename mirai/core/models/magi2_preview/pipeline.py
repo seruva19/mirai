@@ -267,6 +267,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     ) -> None:
         super().__init__()
         self.model_config = model_config
+        self._packed_stream_backend = getattr(memory_config, "packed_stream_backend", "auto")
         # The frozen-weight storage decision is read before the checkpoint is
         # touched: packing the routed experts is only a host-memory saving if the
         # released BF16 stack is never materialized in the first place.
@@ -915,6 +916,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         *,
         metadata: dict[str, str] | None = None,
     ) -> Any:
+        from mirai.core.models.compressed_weights.packed.packed_storage_alignment import GDS_STORAGE_ALIGNMENT_BYTES
         from mirai.core.models.magi2_preview.packed_experts import (
             save_magi2_nf4_packed_state,
         )
@@ -925,6 +927,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             metadata = {**(metadata or {}), MAGI2_BASIS_SOURCE_METADATA: self._expert_basis_source_sha256}
         return save_magi2_nf4_packed_state(
             path, self.transformer, metadata=metadata,
+            storage_alignment_bytes=(
+                GDS_STORAGE_ALIGNMENT_BYTES if getattr(self, "_packed_stream_backend", "auto") == "gds" else 0
+            ),
             pruning_digest=self._expert_pruning_digest if self._expert_pruning_plan_path else None,
             consolidation_digest=(
                 self._expert_pruning_digest if getattr(self, "_expert_consolidation_plan_path", "") else None

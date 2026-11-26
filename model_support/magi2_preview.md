@@ -231,7 +231,9 @@ safetensors shard, packed, and released before the next one is read. Peak host
 cost is one dense expert tensor rather than the expert stack.
 
 For repeated runs, export the already-quantized stores once and set
-`memory.frozen_weight_packed_state_path` to the resulting directory. The
+`memory.frozen_weight_packed_state_path` to the resulting directory. Exports
+with `memory.packed_stream_backend="gds"` align each shard file to 4096 bytes.
+The
 provider-owned schema stores a versioned manifest and one NF4 safetensors shard
 per routed-expert layer. Restore checks model variant, denoiser subfolder,
 topology, group count, block size, shapes, dtypes, and the complete buffer

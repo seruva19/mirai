@@ -1832,7 +1832,10 @@ def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path) 
 
     source = model()
     quantize_magi2_experts_in_place(source, quant_format="fp8")
-    artifact = save_magi2_nf4_packed_state(tmp_path / "packed", source)
+    artifact = save_magi2_nf4_packed_state(tmp_path / "packed", source, storage_alignment_bytes=4096)
+    shard = artifact / "layer_000.safetensors"
+    assert shard.stat().st_size % 4096 == 0
+    load_magi2_nf4_packed_state(artifact, model(), blocksize=64, quant_format="fp8")
     target = model(heads=1, experts=4)
     with pytest.raises(ValueError, match="head topology"):
         load_magi2_nf4_packed_state(artifact, target, blocksize=64, quant_format="fp8")

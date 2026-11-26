@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from mirai.core.models.compressed_weights.packed.packed_storage_alignment import (
+    GDS_STORAGE_ALIGNMENT_BYTES, read_safetensors_storage_alignment, save_safetensors_with_storage_alignment,
+)
 from mirai.core.models.magi2_preview.basis_experts import Magi2MixtureBasisExpertStore, Magi2SharedBasisExpertStore
 from mirai.core.models.magi2_preview.mixed_experts import Magi2MixedExpertStore
 from mirai.core.models.magi2_preview.quantized_experts import (
@@ -71,11 +74,14 @@ def save_magi2_nf4_packed_state(
     fuse_gate_up: bool = False,
     pruning_digest: bytes | None = None,
     consolidation_digest: bytes | None = None,
+    storage_alignment_bytes: int = 0,
 ) -> Path:
     """Write the already-quantized expert stores without dense reconstruction."""
 
     from safetensors.torch import save_file
 
+    if type(storage_alignment_bytes) is not int or storage_alignment_bytes not in {0, GDS_STORAGE_ALIGNMENT_BYTES}:
+        raise Magi2PackedExpertStateError("Packed MAGI-2 expert export requires zero or 4096-byte alignment.")
     consolidation_hex = _consolidation_digest_hex(transformer, consolidation_digest)
     _validate_pruning_topology(transformer, pruning_digest)
     target = Path(path).expanduser()
@@ -121,7 +127,9 @@ def save_magi2_nf4_packed_state(
         descriptor["buffers"] = sorted(tensors)
         descriptor["fused_gate_up"] = f"{MAGI2_FUSED_GATE_UP}_nf4" in tensors
         shard_name = f"layer_{layer_index:03d}.safetensors"
-        save_file(tensors, str(target / shard_name))
+        save_safetensors_with_storage_alignment(
+            save_file, tensors, target / shard_name, metadata=None, alignment_bytes=storage_alignment_bytes,
+        )
         layers[module_name] = {"shard": shard_name, "head_layout": _head_layout(module), **descriptor}
         aliases = getattr(module, "_mirai_expert_aliases", None)
         if aliases is not None:
@@ -148,6 +156,8 @@ def save_magi2_nf4_packed_state(
         manifest[_PRUNING_DIGEST_KEY] = pruning_digest.hex()
     if consolidation_hex is not None:
         manifest[_CONSOLIDATION_DIGEST_KEY] = consolidation_hex
+    if storage_alignment_bytes:
+        manifest["storage_alignment_bytes"] = storage_alignment_bytes
     (target / _MANIFEST_FILE).write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -180,6 +190,9 @@ def load_magi2_nf4_packed_state(
         )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     version = manifest.get("schema_version")
+    alignment = manifest.get("storage_alignment_bytes", 0)
+    if type(alignment) is not int or alignment not in {0, GDS_STORAGE_ALIGNMENT_BYTES}:
+        raise Magi2PackedExpertStateError("Packed MAGI-2 expert state has invalid shard alignment.")
     if (
         manifest.get("schema") != MAGI2_PACKED_EXPERT_SCHEMA
         or type(version) is not int
@@ -275,6 +288,8 @@ def load_magi2_nf4_packed_state(
             raise Magi2PackedExpertStateError(
                 f"Packed MAGI-2 layer '{module_name}' is missing shard '{shard_name}'."
             )
+        if alignment:
+            read_safetensors_storage_alignment(shard_path, required_alignment=alignment)
         with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
             expected_buffers = set(spec.get("buffers", []))
             expected_from_keys = {
