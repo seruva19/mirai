@@ -2355,11 +2355,21 @@ def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -
         load_magi2_nf4_packed_state(artifact, model(), blocksize=64)
 
 
-def test_magi2_lookahead_warms_future_hosts_without_changing_routes(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("storage_backend", ["staged", "io_uring"])
+def test_magi2_lookahead_warms_future_hosts_without_changing_routes(
+    tmp_path, monkeypatch, storage_backend,
+) -> None:
+    import os
+    import sys
     from threading import Event
     from types import SimpleNamespace
 
     from mirai.core.models.magi2_preview.expert_lookahead import attach_magi2_expert_lookahead
+
+    if storage_backend == "io_uring" and (
+        sys.platform != "linux" or not os.environ.get("MIRAI_PACKED_IO_URING_LIBRARY")
+    ):
+        pytest.skip("requires the Linux io_uring bridge")
 
     def model():
         root = torch.nn.Module()
@@ -2374,10 +2384,12 @@ def test_magi2_lookahead_warms_future_hosts_without_changing_routes(tmp_path, mo
 
     source = model()
     resident = quantize_magi2_experts_in_place(source, quant_format="fp8")
-    artifact = save_magi2_nf4_packed_state(tmp_path / "packed", source)
+    artifact = save_magi2_nf4_packed_state(
+        tmp_path / "packed", source, storage_alignment_bytes=4096 if storage_backend == "io_uring" else 0,
+    )
     target = model()
     ranged = load_magi2_nf4_packed_state(
-        artifact, target, blocksize=64, quant_format="fp8", range_read_backend="staged",
+        artifact, target, blocksize=64, quant_format="fp8", range_read_backend=storage_backend,
         stream_cache_bytes=16 << 20,
     )
     reader = ranged["block.layers.0.mlp.moe_mlp"]._packed_range_reader.reader
