@@ -233,6 +233,9 @@ cost is one dense expert tensor rather than the expert stack.
 For repeated runs, export the already-quantized stores once and set
 `memory.frozen_weight_packed_state_path` to the resulting directory. Exports
 with `memory.packed_stream_backend="gds"` align each shard file to 4096 bytes.
+With `memory.weight_residency_strategy="stream_disk"` and
+`memory.packed_stream_backend="staged"`, uniform FP8, NVFP4, and GGUF expert
+stores read requested expert groups from the artifact during execution.
 The
 provider-owned schema stores a versioned manifest and one NF4 safetensors shard
 per routed-expert layer. Restore checks model variant, denoiser subfolder,

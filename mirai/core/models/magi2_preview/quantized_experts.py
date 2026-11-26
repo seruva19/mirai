@@ -676,7 +676,13 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         if not 0 <= group_start < group_stop <= count:
             raise Magi2QuantizedExpertError("MAGI-2 packed expert segment is out of bounds.")
         fields = []
+        reader = getattr(self, "_packed_range_reader", None)
+        if reader is not None:
+            ids = range(group_start, group_stop) if group_ids is None else group_ids[group_start:group_stop].tolist()
         for name in self._buffer_names(key):
+            if reader is not None:
+                fields.append(reader.get_slices_to_device(name, ids, device=device))
+                continue
             value = getattr(self, name)
             if group_ids is None:
                 value = value[group_start:group_stop]
@@ -696,6 +702,19 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
             dequantize_gguf(self.quant_format, group, shape=shape, dtype=dtype, device=device)
             for group in fields[0]
         ])
+
+    def enable_packed_range_reads(self, shard_path) -> None:
+        from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
+
+        self._packed_range_reader = StreamingPackedTensorMapping(shard_path, backend="staged")
+        for name in self.expected_buffers():
+            delattr(self, name)
+
+    def payload_bytes(self) -> int:
+        reader = getattr(self, "_packed_range_reader", None)
+        if reader is None:
+            return super().payload_bytes()
+        return sum(reader.tensor_nbytes(key) for key in self.expected_buffers())
 
 
 def _new_expert_store(*, num_groups: int, blocksize: int, quant_format: str) -> Magi2Nf4ExpertStore:

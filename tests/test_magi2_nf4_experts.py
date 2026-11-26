@@ -1867,6 +1867,17 @@ def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, 
         resident.materialize_segment("W_gate", 1, 3, dtype=torch.float32, device="cpu"),
         expected, rtol=0, atol=0,
     )
+    ranged = load_magi2_nf4_packed_state(
+        artifact, model(), blocksize=64, quant_format="fp8", staged_range_reads=True,
+    )["mlp.moe_mlp"]
+    assert not list(ranged.buffers())
+    assert ranged.payload_bytes() == resident.payload_bytes()
+    torch.testing.assert_close(
+        ranged.materialize_segment(
+            "W_gate", 0, 3, dtype=torch.float32, device="cpu", group_ids=torch.tensor([2, 1, 2]),
+        ),
+        expected[[1, 0, 1]], rtol=0, atol=0,
+    )
     target = model(heads=1, experts=4)
     with pytest.raises(ValueError, match="head topology"):
         load_magi2_nf4_packed_state(artifact, target, blocksize=64, quant_format="fp8")

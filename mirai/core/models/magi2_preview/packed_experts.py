@@ -117,7 +117,10 @@ def save_magi2_nf4_packed_state(
             raise Magi2PackedExpertStateError("Mixed MAGI-2 layers must share one precision plan.")
         descriptor = store.packed_state_descriptor()
         tensors: dict[str, torch.Tensor] = {}
+        reader = getattr(store, "_packed_range_reader", None)
         buffers = (
+            ((name, reader[name]) for name in sorted(store.expected_buffers()))
+            if reader is not None else
             store.fused_gate_up_buffers().items()
             if fuse_gate_up and not store.has_fused_gate_up
             else store.named_buffers(recurse=bool(mixed) or isinstance(store, Magi2MixtureBasisExpertStore))
@@ -176,6 +179,7 @@ def load_magi2_nf4_packed_state(
     expected_shared_basis_rank: int | None = None,
     expected_mixture_basis: tuple[int, int, str] | None = None,
     retain_mapped_buffers: bool = False,
+    staged_range_reads: bool = False,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Restore NF4 stores directly and reject topology or schema mismatches."""
 
@@ -318,7 +322,7 @@ def load_magi2_nf4_packed_state(
                     raise Magi2PackedExpertStateError(
                         f"Packed MAGI-2 layer '{module_name}' is missing '{buffer_name}'."
                     ) from exc
-                restored_buffers[buffer_name] = value if retain_mapped_buffers else value.clone().contiguous()
+                restored_buffers[buffer_name] = value if retain_mapped_buffers or staged_range_reads else value.clone().contiguous()
             if mixed:
                 try:
                     packed = Magi2MixedExpertStore.from_packed_state(
@@ -341,6 +345,8 @@ def load_magi2_nf4_packed_state(
                         store.restore_packed_state(descriptor=spec, buffers=restored_buffers)
                 except (KeyError, TypeError, ValueError) as exc:
                     raise Magi2PackedExpertStateError(f"Invalid packed MAGI-2 layer '{module_name}': {exc}") from exc
+        if staged_range_reads and isinstance(store, Magi2PackedExpertStore):
+            store.enable_packed_range_reads(shard_path)
         stores[module_name] = store
     for module_name, layer in layers.items():
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:

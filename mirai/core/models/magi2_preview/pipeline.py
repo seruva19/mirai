@@ -906,6 +906,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             expected_shared_basis_rank=shared_basis_rank,
             expected_mixture_basis=mixture_basis,
             retain_mapped_buffers=getattr(self, "_retain_mapped_expert_buffers", False),
+            staged_range_reads=(
+                getattr(self, "_retain_mapped_expert_buffers", False)
+                and getattr(self, "_packed_stream_backend", "auto") == "staged"
+            ),
             expected_pruning_digest=pruning_digest, expected_consolidation_digest=consolidation_digest,
             expected_metadata=expected_metadata,
         )
