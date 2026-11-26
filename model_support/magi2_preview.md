@@ -291,6 +291,9 @@ uniform NVFP4 or MXFP4 weights inside Triton grouped GEMM. The path accepts
 both NVFP4 storage layouts and avoids materializing dense weights for
 forward and first-order input gradients. It requires FP16 or BF16 CUDA
 activations, standard expert autograd, and `memory.moe_routed_gemm="disabled"`.
+For uniform GGUF experts, `model.params.family_params.expert_fused_gguf = true`
+provides the same execution mode for IQ2_XS, IQ3_XXS and IQ4_XS. Select
+`gguf_iq2`, `gguf_iq3` or `gguf_iq4` as the frozen weight format.
 
 For new uniform NVFP4 exports, set
 `model.params.family_params.expert_nvfp4_native_layout = true` while packing

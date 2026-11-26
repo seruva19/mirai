@@ -25,6 +25,7 @@ from mirai.core.models.base import (
     SyntheticBatchSpec,
 )
 from mirai.core.models.magi2_preview.quantized_experts import (
+    MAGI2_FUSED_GGUF_FORMATS,
     MAGI2_PACKED_EXPERT_FORMATS,
     MAGI2_ROUTED_EXPERT_TENSORS,
     Magi2Nf4ExpertStore,
@@ -340,6 +341,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("MAGI-2 expert_fused_fp4 must be a boolean.")
         if self._fused_fp4_experts and self._frozen_weight_quantization not in {"nvfp4", "mxfp4"}:
             raise ValueError("MAGI-2 expert_fused_fp4 requires NVFP4 or MXFP4 experts.")
+        self._fused_gguf_experts = family.get("expert_fused_gguf", False)
+        if type(self._fused_gguf_experts) is not bool:
+            raise ValueError("MAGI-2 expert_fused_gguf must be a boolean.")
+        if self._fused_gguf_experts and self._frozen_weight_quantization not in MAGI2_FUSED_GGUF_FORMATS:
+            raise ValueError("MAGI-2 expert_fused_gguf requires IQ2_XS, IQ3_XXS or IQ4_XS experts.")
         self._cpu_expert_max_tokens = family.get("expert_cpu_max_tokens", 0)
         if type(self._cpu_expert_max_tokens) is not int or not 0 <= self._cpu_expert_max_tokens <= 10:
             raise ValueError("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")
@@ -1192,6 +1198,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 int8_expert_checkpoint_offload=getattr(self, "_int8_expert_checkpoint_offload", False),
                 int8_expert_checkpoint_lz4=getattr(self, "_int8_expert_checkpoint_lz4", False),
                 fused_fp4=getattr(self, "_fused_fp4_experts", False),
+                fused_gguf=getattr(self, "_fused_gguf_experts", False),
             )
         else:
             backend = Magi2GroupedMoEBackend(
@@ -2536,6 +2543,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "expert_int8_checkpoint_offload",
         "expert_int8_checkpoint_lz4",
         "expert_fused_fp4",
+        "expert_fused_gguf",
         "expert_nvfp4_native_layout",
         "expert_pruning_plan_path",
         "expert_consolidation_plan_path",
@@ -2648,6 +2656,8 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             errors.append("MAGI-2 expert_int8_checkpoint_lz4 requires expert_int8_checkpoint_offload.")
         if type(params.get("expert_fused_fp4", False)) is not bool:
             errors.append("MAGI-2 expert_fused_fp4 must be a boolean.")
+        if type(params.get("expert_fused_gguf", False)) is not bool:
+            errors.append("MAGI-2 expert_fused_gguf must be a boolean.")
         cpu_max = params.get("expert_cpu_max_tokens", 0)
         if type(cpu_max) is not int or not 0 <= cpu_max <= 10:
             errors.append("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")

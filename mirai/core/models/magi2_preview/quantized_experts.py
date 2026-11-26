@@ -81,7 +81,8 @@ MAGI2_EXPERT_ACCESS_POLICIES = ("full_dequant", "chunked_dequant", "active_group
 MAGI2_FUSED_GATE_UP = "W_gate_up"
 MAGI2_NF4_GROUP_FIELDS = ("nf4", "nf4_absmax", "nf4_nabsmax", "nf4_offset")
 MAGI2_NF4_CODE_FIELDS = ("nf4_code", "nf4_ncode")
-MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq1", "gguf_iq2", "gguf_iq3", "fp8", "nvfp4", "mxfp4")
+MAGI2_PACKED_EXPERT_FORMATS = ("nf4", "gguf_iq1", "gguf_iq2", "gguf_iq3", "gguf_iq4", "fp8", "nvfp4", "mxfp4")
+MAGI2_FUSED_GGUF_FORMATS = ("gguf_iq2", "gguf_iq3", "gguf_iq4")
 
 
 class Magi2QuantizedExpertError(ValueError):
@@ -872,12 +873,19 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         fields = self._packed_segment(key, group, group + 1, device=x.device)
         return native_fp4_linear(x, *(field[0] for field in fields), self._fp4_meta(self._shapes[key][1:]))
 
-    def fused_fp4_projection(self, key, start, stop, x, ends, *, max_group_rows, transposed, group_ids=None):
-        from mirai.core.models.compressed_weights.quantization.grouped_fp4_triton import grouped_fp4_projection
+    def fused_packed_projection(self, key, start, stop, x, ends, *, max_group_rows, transposed, group_ids=None):
+        from mirai.core.models.compressed_weights.quantization.grouped_fp4_triton import (
+            grouped_fp4_projection, grouped_gguf_projection,
+        )
 
         _, rows, columns = self.expert_weight_shape(key)
         with ExitStack() as leases:
             packed = self._packed_segment(key, start, stop, device=x.device, group_ids=group_ids, leases=leases)
+            if self.quant_format in MAGI2_FUSED_GGUF_FORMATS:
+                return grouped_gguf_projection(
+                    x, packed[0], ends, columns=rows if transposed else columns,
+                    max_group_rows=max_group_rows, transposed=transposed, format=self.quant_format,
+                )
             return grouped_fp4_projection(
                 x, *packed, ends, columns=rows if transposed else columns, max_group_rows=max_group_rows,
                 transposed_storage=self.has_native_fp4_layout != transposed, format=self.quant_format,
