@@ -1884,6 +1884,14 @@ def test_magi2_staged_layers_share_one_packed_reader(tmp_path) -> None:
     snapshot = active._packed_range_reader.reader.snapshot()
     assert snapshot["prefetch_consumed"] >= 4
     assert snapshot["prefetch_peak_queued"] <= 2
+    before = snapshot["prefetch_consumed"]
+    actual = grouped_moe._SegmentedQuantizedExpertMlp.apply(x, offsets, active, "bmm", "bmm", "torch")
+    expected = grouped_moe._SegmentedQuantizedExpertMlp.apply(x, offsets, reference, "bmm", "bmm", "torch")
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual.sum(), x)[0], torch.autograd.grad(expected.sum(), x)[0], rtol=0, atol=0,
+    )
+    assert active._packed_range_reader.reader.snapshot()["prefetch_consumed"] > before
 
 
 def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, monkeypatch) -> None:

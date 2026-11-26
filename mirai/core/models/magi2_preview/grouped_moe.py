@@ -970,6 +970,7 @@ def run_segmented_grouped_expert_mlp(
     activation_backend: str = "torch",
     fused_gate_up: bool = False,
     segments: tuple[GroupedMMSegment, ...] | None = None,
+    prefetch: Callable[[str, int, int], None] | None = None,
 ) -> torch.Tensor:
     """Evaluate one frozen SwiGLU7 expert segment end-to-end.
 
@@ -986,7 +987,9 @@ def run_segmented_grouped_expert_mlp(
             if boundaries is not None
             else tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=max_groups))
         )
-    for segment in segments:
+    if prefetch is not None:
+        segments = tuple(segment for segment in segments if segment.row_count)
+    for index, segment in enumerate(segments):
         if segment.row_count == 0:
             continue
         local_offsets = (
@@ -1015,6 +1018,12 @@ def run_segmented_grouped_expert_mlp(
         del gate, up
 
         weight = materialize("W_down", segment.group_start, segment.group_stop)
+        if prefetch is not None and index + 1 < len(segments):
+            next_segment = segments[index + 1]
+            prefetch(
+                MAGI2_FUSED_GATE_UP if fused_gate_up else "W_gate",
+                next_segment.group_start, next_segment.group_stop,
+            )
         outputs.append(_grouped_linear(hidden.to(weight.dtype), weight, local_offsets, backend))
         del hidden, weight
     if not outputs:
@@ -1140,6 +1149,12 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         return grad_x, None, None, None, None, None
 
 
+def _expert_projection_prefetch(store, device):
+    if not getattr(store, "packed_prefetch_enabled", False):
+        return None
+    return lambda key, start, stop: store.prefetch_segment(key, start, stop, device=device)
+
+
 class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
     """Rematerialize one NF4 expert segment at a time in forward and backward."""
 
@@ -1167,6 +1182,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
             output_columns=int(x_sorted.shape[-1]),
             activation_backend=str(activation_backend),
             fused_gate_up=store.has_fused_gate_up,
+            prefetch=_expert_projection_prefetch(store, x_sorted.device),
         )
         ctx.save_for_backward(x_sorted, offsets)
         ctx.store = store
@@ -1181,7 +1197,9 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         x_sorted, offsets = ctx.saved_tensors
         grad_segments: list[torch.Tensor] = []
         store = ctx.store
-        for segment in ctx.segments:
+        prefetch = _expert_projection_prefetch(store, x_sorted.device)
+        segments = tuple(segment for segment in ctx.segments if segment.row_count)
+        for index, segment in enumerate(segments):
             if segment.row_count == 0:
                 continue
             local_offsets = (
@@ -1220,6 +1238,12 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
                 dtype=rows.dtype,
                 device=rows.device,
             )
+            if prefetch is not None and index + 1 < len(segments):
+                next_segment = segments[index + 1]
+                prefetch(
+                    MAGI2_FUSED_GATE_UP if store.has_fused_gate_up else "W_gate",
+                    next_segment.group_start, next_segment.group_stop,
+                )
             grad_hidden = _grouped_linear_dx(grad_rows, w_down, local_offsets, ctx.dx_backend)
             del w_down
             grad_gate, grad_up = _swiglu7_backward(
@@ -1685,6 +1709,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             output_columns=d_head,
             activation_backend=self.activation_backend,
             fused_gate_up=store.has_fused_gate_up,
+            prefetch=_expert_projection_prefetch(store, x_sorted.device),
         )
 
 

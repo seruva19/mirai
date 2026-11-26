@@ -240,7 +240,7 @@ during execution. Shared-basis and mixture-basis stores keep shared bases
 resident and fetch per-expert factors on demand.
 All expert layers share one range reader and one
 `memory.packed_stream_cache_gib` host-cache budget.
-For segmented grouped linear execution with a uniform packed format,
+For segmented grouped linear and expert MLP execution with a uniform packed format,
 `memory.packed_stream_prefetch_depth` enables reads of the next segment
 during the current matmul, including input-gradient recomputation.
 The
