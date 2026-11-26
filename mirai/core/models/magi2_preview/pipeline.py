@@ -7,6 +7,7 @@ imports remain lazy so the rest of Mirai is usable without them.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -1390,8 +1391,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             not self._expert_stores or getattr(self, "_expert_consolidation_plan_path", "")
         ):
             raise ValueError("MAGI-2 routed expert LoRA requires fully packed, unconsolidated experts.")
-        if str(getattr(adapter_config, "expert_selection", "all")).strip().lower() == "routing_topk":
-            raise ValueError("MAGI-2 expert LoRA does not yet support routing_topk calibration.")
+        if str(getattr(adapter_config, "expert_selection", "all")).strip().lower() == "routing_topk" and not expert_targets:
+            raise ValueError("MAGI-2 routing_topk requires adapter.target_preset='attn_router_routed_experts'.")
         if expert_targets and getattr(adapter_config, "sparse_expert_export", False):
             raise ValueError("MAGI-2 expert LoRA requires full adapter checkpoint tensors.")
         for parameter in self.transformer.parameters():
@@ -1450,6 +1451,37 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         if not matched:
             raise ValueError(f"MAGI-2 LoRA preset '{preset}' matched no parameters.")
         self._adapter_configured = True
+
+    def expert_selection_layers(self):
+        from mirai.core.moe.calibration.selection import ExpertSelectionLayer
+
+        return tuple(
+            ExpertSelectionLayer(name, module.local_flatten_num_experts, tuple(adapters.values()))
+            for name, module in iter_magi2_moe_layers(self.transformer)
+            if (adapters := getattr(module, "_mirai_expert_lora", None)) is not None
+        )
+
+    @contextmanager
+    def expert_selection_context(self, accumulator):
+        from mirai.core.moe.calibration.selection import add_expert_selection_counts
+
+        previous = []
+        try:
+            for name, module in iter_magi2_moe_layers(self.transformer):
+                if getattr(module, "_mirai_expert_lora", None) is None:
+                    continue
+                previous.append((module, getattr(module, "_mirai_expert_selection_observer", None)))
+
+                def observe(indices, layer_name=name, layer=module):
+                    heads = torch.arange(indices.shape[0], device=indices.device)[:, None, None]
+                    flat_ids = indices + heads * layer.num_experts
+                    add_expert_selection_counts(accumulator, layer_name, flat_ids, layer.local_flatten_num_experts)
+
+                module._mirai_expert_selection_observer = observe
+            yield
+        finally:
+            for module, observer in previous:
+                module._mirai_expert_selection_observer = observer
 
     def set_adapter_type(self, adapter_type: str) -> None:
         if str(adapter_type).strip().lower() != "lora":

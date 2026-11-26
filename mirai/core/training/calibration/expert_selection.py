@@ -9,6 +9,7 @@ well within the training memory envelope.
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from typing import Any
 
 from mirai.core.moe.calibration.selection import (
@@ -54,7 +55,9 @@ def maybe_calibrate_expert_selection(session: Any) -> ExpertSelectionReport | No
     transformer = getattr(pipeline, "transformer", None)
     if transformer is None:
         return None
-    blocks = list(iter_expert_lora_blocks(transformer))
+    provider_layers = getattr(pipeline, "expert_selection_layers", None)
+    layers = provider_layers() if callable(provider_layers) else None
+    blocks = layers if layers is not None else list(iter_expert_lora_blocks(transformer))
     if not blocks:
         _log(
             session,
@@ -85,9 +88,10 @@ def maybe_calibrate_expert_selection(session: Any) -> ExpertSelectionReport | No
     )
     # Router forward hooks capture routed counts before the pipeline clears the
     # per-forward routing state at the end of each compute_loss.
-    handles = register_calibration_hooks(transformer, accumulator)
+    handles = register_calibration_hooks(transformer, accumulator) if layers is None else ()
+    context = pipeline.expert_selection_context(accumulator) if layers is not None else nullcontext()
     try:
-        with torch.no_grad():
+        with context, torch.no_grad():
             for i in range(steps):
                 batch = build_batch(i)
                 trainer.compute_loss(batch, training=True)
@@ -99,11 +103,17 @@ def maybe_calibrate_expert_selection(session: Any) -> ExpertSelectionReport | No
         if hasattr(transformer, "train"):
             transformer.train(was_training)
 
+    if layers is not None:
+        missing = [layer.name for layer in layers if layer.name not in accumulator]
+        if missing:
+            raise RuntimeError(f"Expert selection saw no routes for layers {missing[:4]}.")
+
     report = apply_routing_topk_selection(
         transformer,
         accumulator,
         fraction=fraction,
         calibration_steps=steps,
+        layers=layers,
     )
     _emit_report(session, report)
     setattr(session, "expert_selection_report", report)

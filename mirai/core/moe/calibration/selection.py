@@ -103,6 +103,13 @@ class ExpertSelectionReport:
         }
 
 
+@dataclass(frozen=True)
+class ExpertSelectionLayer:
+    name: str
+    num_experts: int
+    adapters: tuple[Any, ...]
+
+
 def iter_expert_lora_blocks(model: Any) -> Iterator[tuple[str, Any, Any]]:
     """Yield ``(layer_name, router, experts)`` for MoE blocks with expert LoRA.
 
@@ -138,11 +145,11 @@ def accumulate_routing_counts(
         top = getattr(router, "last_top_indices", None)
         if top is None:
             continue
-        _add_counts(accumulator, name, top, int(router.num_experts))
+        add_expert_selection_counts(accumulator, name, top, int(router.num_experts))
     return accumulator
 
 
-def _add_counts(
+def add_expert_selection_counts(
     accumulator: dict[str, Any], name: str, indices: Any, num_experts: int
 ) -> None:
     counts = torch.bincount(
@@ -174,7 +181,7 @@ def register_calibration_hooks(
         def _hook(module, _inp, _out, _name=name, _num=num_experts):
             top = getattr(module, "last_top_indices", None)
             if top is not None:
-                _add_counts(accumulator, _name, top, _num)
+                add_expert_selection_counts(accumulator, _name, top, _num)
 
         handles.append(router.register_forward_hook(_hook))
     return handles
@@ -196,17 +203,6 @@ def select_hot_experts(counts: Any, fraction: float) -> list[int]:
     return sorted(order[:k])
 
 
-def _expert_adapter_param_numel(experts: Any) -> int:
-    total = 0
-    expert_lora = getattr(experts, "expert_lora", {})
-    for key in _EXPERT_LORA_KEYS:
-        adapter = expert_lora[key] if key in expert_lora else None
-        if adapter is None:
-            continue
-        total += int(adapter.lora_a.numel()) + int(adapter.lora_b.numel())
-    return total
-
-
 def _count_trainable_params(model: Any) -> int:
     return int(
         sum(int(p.numel()) for p in model.parameters() if bool(p.requires_grad))
@@ -219,6 +215,7 @@ def apply_routing_topk_selection(
     *,
     fraction: float,
     calibration_steps: int = 0,
+    layers: tuple[ExpertSelectionLayer, ...] | None = None,
 ) -> ExpertSelectionReport:
     """Set the ``active_expert_mask`` on every expert adapter from calibration.
 
@@ -233,16 +230,23 @@ def apply_routing_topk_selection(
     report.trainable_params_before = _count_trainable_params(model)
     active_params = 0
     total_params = 0
-    for name, router, experts in iter_expert_lora_blocks(model):
-        num_experts = int(router.num_experts)
+    if layers is None:
+        layers = tuple(
+            ExpertSelectionLayer(
+                name, int(router.num_experts),
+                tuple(experts.expert_lora[key] for key in _EXPERT_LORA_KEYS if key in experts.expert_lora),
+            )
+            for name, router, experts in iter_expert_lora_blocks(model)
+        )
+    for layer in layers:
+        name, num_experts = layer.name, layer.num_experts
         counts = counts_by_layer.get(name)
         if counts is None:
             counts = torch.zeros(num_experts, dtype=torch.float64)
         selected = select_hot_experts(counts, fraction)
-        for key in _EXPERT_LORA_KEYS:
-            if key in experts.expert_lora:
-                experts.expert_lora[key].set_active_experts(selected)
-        per_expert_numel = _expert_adapter_param_numel(experts)
+        for adapter in layer.adapters:
+            adapter.set_active_experts(selected)
+        per_expert_numel = sum(adapter.lora_a.numel() + adapter.lora_b.numel() for adapter in layer.adapters)
         per_one = per_expert_numel / num_experts if num_experts else 0.0
         total_params += per_expert_numel
         active_params += int(round(per_one * len(selected)))

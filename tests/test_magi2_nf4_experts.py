@@ -2064,6 +2064,39 @@ def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute() -> None
     torch.testing.assert_close(reference.execute(restored_module, rows, scores, routes), expected)
 
 
+def test_magi2_routing_topk_calibration_reaches_head_local_adapters(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from mirai.core.moe.calibration.selection import select_hot_experts
+    from mirai.core.training.calibration import expert_selection
+
+    module = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = _container(module)
+    pipeline._expert_stores = quantize_magi2_experts_in_place(pipeline.transformer, quant_format="fp8")
+    config = SimpleNamespace(
+        target_preset="attn_router_routed_experts", rank=2, alpha=2.0,
+        expert_selection="routing_topk", expert_calibration_steps=1, expert_topk_fraction=0.25,
+    )
+    pipeline.set_adapter_config(config)
+    inputs = torch.randn(11, 2, module.d_head)
+    _, indices = module._route(inputs)
+    flat = indices + torch.arange(2)[:, None, None] * module.num_experts
+    expected = select_hot_experts(torch.bincount(flat.flatten(), minlength=8), 0.25)
+    monkeypatch.setattr(expert_selection, "resolve_step_sampling_context", lambda _: None)
+    monkeypatch.setattr(expert_selection, "_build_training_batch_factory", lambda **_: lambda _: inputs)
+    trainer = SimpleNamespace(pipeline=pipeline, compute_loss=lambda batch, **_: module._route(batch))
+    session = SimpleNamespace(config=SimpleNamespace(adapter=config), trainer=trainer, log_on_this_rank=False)
+
+    report = expert_selection.maybe_calibrate_expert_selection(session)
+    assert report.layers[0].routed_tokens == indices.numel()
+    assert report.layers[0].selected_expert_ids == tuple(expected)
+    assert report.expert_adapter_params_active < report.expert_adapter_params_total
+    assert all(adapter.active_expert_ids() == expected for adapter in module._mirai_expert_lora.values())
+    assert module._mirai_expert_selection_observer is None
+
+
 @pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
 def test_magi2_native_fp4_dispatches_active_groups_and_preserves_input_gradient(monkeypatch, tmp_path, fmt) -> None:
     from mirai.core.models.compressed_weights.quantization import native_fp4

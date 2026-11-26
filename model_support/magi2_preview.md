@@ -927,6 +927,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   Use the grouped device execution path with `memory.moe_routed_gemm="disabled"`
   and `expert_cpu_max_tokens = 0`. With segmented recomputation, the expert
   LoRA path can also use INT8 saved activations.
+  Set `adapter.expert_selection="routing_topk"` to profile the training routes
+  and train expert LoRA on the selected fraction of head-local experts.
 - **MAGI-2 mixture-basis expert storage** — Set the family parameter
   `expert_mixture_basis_rank` to a positive rank to fit gate and up projections
   as the original checkpoint loads. Set `expert_mixture_basis_count` and

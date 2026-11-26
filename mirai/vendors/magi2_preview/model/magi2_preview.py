@@ -2761,6 +2761,9 @@ class CoreMultiHeadMoE(nn.Module):
         )
         if candidates is not None:
             topk_indices = candidates.gather(2, topk_indices)
+        observer = getattr(self, "_mirai_expert_selection_observer", None)
+        if observer is not None:
+            observer(topk_indices)
         topk_probs = topk_probs * self.config.route_scale
         return topk_probs, topk_indices
 
