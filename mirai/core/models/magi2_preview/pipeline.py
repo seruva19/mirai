@@ -1920,6 +1920,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         )
         return value, lengths
 
+    def observe_routing_profile(self):
+        from .routing_profile import observe_magi2_expert_ids
+
+        return observe_magi2_expert_ids(self.transformer)
+
     def forward(self, noisy_latents: Any, timesteps: Any, text_embeds: Any, **kwargs: Any) -> Any:
         _ = kwargs
         from mirai.vendors.magi2_preview.pipeline.preview_data_proxy import ModelInput

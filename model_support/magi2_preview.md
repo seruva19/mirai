@@ -308,6 +308,18 @@ GEMM, `memory.expert_weight_access="full_dequant"`, and GPU-resident weights.
 Block swapping is incompatible with this cache because captured graphs retain
 references to their packed weight buffers.
 
+Generate a clip/timestep routing profile with the same model, cache, and
+router configuration used for training:
+
+```sh
+python -m scripts.tools.calibrate_routing_batches --config train.toml \
+  --output routes.json --max-samples 256 --cache-experts 128 --timestep-bins 8
+```
+
+Set `training.routing_batch_profile = "routes.json"` for text-to-video flow
+matching. Calibration records the experts reached by one clip at a time at
+each bin midpoint. `--trials` unions routes across independent noise draws.
+
 For new uniform NVFP4 exports, set
 `model.params.family_params.expert_nvfp4_native_layout = true` while packing
 from the source weights. The resulting version 9 artifact identifies the
