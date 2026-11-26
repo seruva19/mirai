@@ -216,6 +216,7 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         first = torch.tensor([7, 5], dtype=torch.int32)
         second = torch.tensor([2.5, 1.5], dtype=torch.float32)
         reader._get_slices_to_device_now = mock.Mock(side_effect=[first, second])
+        reader._upload_packed_slot = lambda source, tensor, _target: tensor.copy_(source)
         slot = torch.empty(32, dtype=torch.uint8)
         released = mock.Mock()
 

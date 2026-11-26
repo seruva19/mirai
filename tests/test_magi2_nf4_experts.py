@@ -2707,6 +2707,7 @@ def test_nf4_restore_rejects_incompatible_statistics_without_mutation() -> None:
 @pytest.mark.parametrize("depth", [0, 4])
 def test_raw_cuda_expert_slots_match_owning_stream(tmp_path, monkeypatch, fmt, depth) -> None:
     pytest.importorskip("cupy")
+    from mirai.core.training.residency.activation_compression import training_cuda_copy_streams
 
     def model(device):
         return _container(_reduced_moe(
@@ -2727,6 +2728,7 @@ def test_raw_cuda_expert_slots_match_owning_stream(tmp_path, monkeypatch, fmt, d
     reader = candidate._packed_range_reader.reader
     offsets = torch.tensor([2, 4, 6, 8], device="cuda", dtype=torch.int32)
     values = torch.randn(8, candidate.expert_weight_shape("W_gate")[1], device="cuda", dtype=torch.bfloat16)
+    assert reader._cuda_stream(values.device) == training_cuda_copy_streams(values.device)[1]
 
     def execute(store):
         rows = values.clone().requires_grad_()

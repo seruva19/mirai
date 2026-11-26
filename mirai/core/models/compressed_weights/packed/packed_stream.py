@@ -415,11 +415,29 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             return self._read_borrowed_gds_field(key, region, indices, slot, target)
         source = self._get_slices_to_device_now(key, indices, device="cpu")
         tensor = slot[:nbytes].view(source.dtype).view(source.shape)
-        tensor.copy_(source)
+        self._upload_packed_slot(source, tensor, target)
         with self._stats_lock:
             self._h2d_ops += 1
             self._h2d_bytes += nbytes
         return tensor
+
+    def _upload_packed_slot(self, source, tensor, target):
+        consumer = torch.cuda.current_stream(target)
+        producer = self._cuda_stream(target)
+        if producer != consumer:
+            producer.wait_stream(consumer)
+        try:
+            with self._staging_lock, torch.cuda.stream(producer):
+                pool = self._pinned_staging_pool()
+                if pool is None:
+                    tensor.copy_(source)
+                else:
+                    pool.copy_into([source], [tensor], stream=producer)
+            if producer != consumer:
+                consumer.wait_stream(producer)
+        except BaseException:
+            producer.synchronize()
+            raise
 
     def _read_borrowed_gds_field(self, key, region, indices, slot, device):
         requested = self._normalize_indices(key, indices)
@@ -706,27 +724,29 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             normalized.append(resolved)
         return tuple(normalized)
 
-    def _copy_staged_to_device(self, host_tensors, target, dtype, stream):
+    def _pinned_staging_pool(self):
         from mirai.core.training.residency.tensor_residency import PinnedHostStagingPool
 
+        budget = min(self._pin_cap_bytes, 3 * _MAX_RANGE_BYTES)
+        if self._staging_pool is None and budget >= 3 and not self._staging_unavailable:
+            try:
+                self._staging_pool = PinnedHostStagingPool(budget)
+            except (RuntimeError, MemoryError, OSError):
+                self._staging_unavailable = True
+            else:
+                with self._stats_lock:
+                    self._pinned_in_flight = self._staging_pool.pinned_bytes
+                    self._pinned_peak = self._pinned_in_flight
+        return self._staging_pool
+
+    def _copy_staged_to_device(self, host_tensors, target, dtype, stream):
         with self._staging_lock:
-            budget = min(self._pin_cap_bytes, 3 * _MAX_RANGE_BYTES)
-            if self._staging_pool is None and budget >= 3 and not self._staging_unavailable:
-                try:
-                    self._staging_pool = PinnedHostStagingPool(budget)
-                except (RuntimeError, MemoryError, OSError):
-                    self._staging_unavailable = True
-                else:
-                    with self._stats_lock:
-                        self._pinned_in_flight = self._staging_pool.pinned_bytes
-                        self._pinned_peak = self._pinned_in_flight
-            if self._staging_pool is not None:
-                if self._raw_staging:
-                    return self._copy_through_cuda_arena(host_tensors, target, dtype, stream)
-                copies = self._staging_pool.copy_to_device(list(host_tensors), device=target, stream=stream)
-                return copies if dtype is None else [tensor.to(dtype=dtype) for tensor in copies]
+            pool = self._pinned_staging_pool()
             if self._raw_staging:
                 return self._copy_through_cuda_arena(host_tensors, target, dtype, stream)
+            if pool is not None:
+                copies = pool.copy_to_device(list(host_tensors), device=target, stream=stream)
+                return copies if dtype is None else [tensor.to(dtype=dtype) for tensor in copies]
         return [tensor.to(device=target, dtype=dtype) for tensor in host_tensors]
 
     def _cuda_staging_arena(self, target, stream):
@@ -773,11 +793,16 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         return copies
 
     def _cuda_stream(self, device: Any) -> Any:
+        from mirai.core.training.residency.activation_compression import training_cuda_copy_streams
+
+        device = torch.device(device)
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         key = str(device)
         with self._stream_lock:
             stream = self._streams.get(key)
             if stream is None:
-                stream = torch.cuda.Stream(device=device)
+                _, stream = training_cuda_copy_streams(device)
                 self._streams[key] = stream
             return stream
 
