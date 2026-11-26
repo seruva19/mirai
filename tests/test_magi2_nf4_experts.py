@@ -835,6 +835,35 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
         verify_magi2_pruning_source(transformer, plan)
 
 
+def test_magi2_shared_basis_reconstructs_selected_native_groups() -> None:
+    from mirai.core.models.magi2_preview.basis_experts import (
+        Magi2SharedBasisExpertStore, factorize_magi2_shared_basis_experts,
+    )
+
+    generator = torch.Generator().manual_seed(7)
+    store = Magi2SharedBasisExpertStore(num_groups=4)
+    for key, shape in {"W_gate": (8, 16), "W_up": (8, 16), "W_down": (16, 8)}.items():
+        if shape[0] < shape[1]:
+            source = torch.randn(4, 8, 2, generator=generator) @ torch.randn(2, 16, generator=generator)
+        else:
+            source = torch.randn(16, 2, generator=generator) @ torch.randn(4, 2, 8, generator=generator)
+        store.factorize_projection(key, source, rank=2, factor_dtype="float32")
+        actual = store.materialize_segment(
+            key, 1, 4, dtype=torch.float32, device="cpu", group_ids=torch.tensor([0, 3, 1, 3]),
+        )
+        torch.testing.assert_close(actual, source[[3, 1, 3]], rtol=2e-5, atol=1e-5)
+    assert store.is_fully_loaded()
+    assert store.payload_bytes() < 3 * 4 * 8 * 16 * 4
+    layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+    installed = factorize_magi2_shared_basis_experts(_container(layer), rank=2)["mlp.moe_mlp"]
+    assert installed.is_fully_loaded()
+    tokens = torch.rand(2, layer.num_heads, layer.d_head, requires_grad=True)
+    backend = Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
+    output = backend.execute(layer, tokens, *layer._route(tokens))
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(torch.autograd.grad(output.sum(), tokens)[0]).all()
+
+
 def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(tmp_path, monkeypatch) -> None:
     from copy import deepcopy
     from dataclasses import replace
