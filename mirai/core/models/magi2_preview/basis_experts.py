@@ -66,6 +66,56 @@ class Magi2SharedBasisExpertStore(Magi2Nf4ExpertStore):
         dense = selected @ basis if self._axes[key] == "right" else basis @ selected
         return dense.transpose(-1, -2).contiguous()
 
+    def expected_buffers(self) -> set[str]:
+        return {f"{key}_{part}" for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES for part in ("basis", "coefficients")}
+
+    def packed_state_descriptor(self):
+        if not self.is_fully_loaded():
+            raise ValueError("MAGI-2 shared-basis store is incomplete.")
+        return {
+            "num_groups": self.num_groups,
+            "expert_shapes": self._shapes,
+            "expert_dtypes": {key: str(dtype).removeprefix("torch.") for key, dtype in self._dtypes.items()},
+            "axes": self._axes,
+            "buffers": sorted(self.expected_buffers()),
+        }
+
+    def restore_packed_state(self, *, descriptor, buffers, expected_rank=None):
+        shapes = descriptor["expert_shapes"]
+        dtypes = descriptor["expert_dtypes"]
+        axes = descriptor["axes"]
+        keys = set(MAGI2_ROUTED_EXPERT_TENSOR_NAMES)
+        if (
+            descriptor["num_groups"] != self.num_groups or set(buffers) != self.expected_buffers()
+            or set(shapes) != keys or set(dtypes) != keys or set(axes) != keys
+        ):
+            raise ValueError("MAGI-2 shared-basis artifact has incompatible projection metadata.")
+        allowed = {torch.float32, torch.float16, torch.bfloat16}
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            groups, inputs, outputs = shapes[key]
+            axis = axes[key]
+            basis = buffers[f"{key}_basis"]
+            coefficients = buffers[f"{key}_coefficients"]
+            dtype = getattr(torch, str(dtypes[key]), None)
+            if basis.ndim != 2 or axis not in {"left", "right"}:
+                raise ValueError(f"Invalid shared basis for {key!r}.")
+            rank = basis.shape[0 if axis == "right" else 1]
+            basis_shape = (rank, inputs) if axis == "right" else (outputs, rank)
+            coeff_shape = (groups, outputs, rank) if axis == "right" else (groups, rank, inputs)
+            if (
+                groups != self.num_groups or not 0 < rank <= min(inputs, outputs)
+                or (expected_rank is not None and rank != expected_rank)
+                or basis.shape != basis_shape or coefficients.shape != coeff_shape
+                or dtype not in allowed or basis.dtype not in allowed or coefficients.dtype != basis.dtype
+                or not torch.isfinite(basis).all() or not torch.isfinite(coefficients).all()
+            ):
+                raise ValueError(f"Invalid shared-basis factors for {key!r}.")
+        for name, value in buffers.items():
+            self._set_buffer(name, value)
+        self._axes = dict(axes)
+        self._shapes = {key: tuple(shape) for key, shape in shapes.items()}
+        self._dtypes = {key: getattr(torch, dtypes[key]) for key in keys}
+
 
 def factorize_magi2_shared_basis_experts(
     transformer: torch.nn.Module, *, rank: int, factor_dtype: str = "bfloat16",

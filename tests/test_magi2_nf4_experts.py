@@ -888,6 +888,20 @@ def test_magi2_shared_basis_reconstructs_selected_native_groups(tmp_path) -> Non
     assert not hasattr(skeleton.mlp.moe_mlp, "W_gate")
     for key, value in installed.named_buffers():
         torch.testing.assert_close(dict(streamed.named_buffers())[key], value, rtol=0, atol=0)
+    artifact = save_magi2_nf4_packed_state(tmp_path / "basis", transformer)
+    target = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, routed_weight_device="meta",
+    ))
+    with pytest.raises(ValueError, match="Invalid shared-basis factors"):
+        load_magi2_nf4_packed_state(
+            artifact, target, blocksize=64, quant_format="shared_basis", expected_shared_basis_rank=3,
+        )
+    assert target.mlp.moe_mlp.W_gate.is_meta
+    loaded = load_magi2_nf4_packed_state(
+        artifact, target, blocksize=64, quant_format="shared_basis", expected_shared_basis_rank=2,
+    )["mlp.moe_mlp"]
+    for key, value in installed.named_buffers():
+        torch.testing.assert_close(dict(loaded.named_buffers())[key], value, rtol=0, atol=0)
     tokens = torch.rand(2, layer.num_heads, layer.d_head, requires_grad=True)
     backend = Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
     output = backend.execute(layer, tokens, *layer._route(tokens))

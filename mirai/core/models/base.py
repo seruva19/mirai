@@ -55,6 +55,7 @@ class MemoryFeatureCapabilities:
     moe_kernel_backend: bool = False
     trainable_parameter_offload: bool = False
     expert_on_load_formats: tuple[str, ...] = ()
+    family_packed_weight_format: bool = False
 
 
 @dataclass(frozen=True)

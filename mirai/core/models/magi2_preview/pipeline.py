@@ -341,7 +341,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         if self._expert_shared_basis_rank and (
             self._expert_pruning_plan_path or self._expert_pruning_adapter_source_plan_path
             or self._expert_consolidation_plan_path or self._expert_precision_plan_path
-            or self._packed_expert_state_path or self._quantize_experts_on_load
+            or self._quantize_experts_on_load
             or self._frozen_weight_quantization not in {"", "none", "off", "disabled"}
         ):
             raise ValueError("MAGI-2 shared-basis rank requires an original dense checkpoint and no other expert storage policy.")
@@ -470,11 +470,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
             pruning_plan = Magi2ExpertPruningPlan.load(pruning_plan_path)
         if shared_basis_rank:
-            from mirai.core.models.magi2_preview.basis_experts import stream_factorize_magi2_shared_basis_experts
+            if self._packed_expert_state_path:
+                self._restore_packed_experts(transformer, shared_basis_rank=shared_basis_rank)
+            else:
+                from mirai.core.models.magi2_preview.basis_experts import stream_factorize_magi2_shared_basis_experts
 
-            self._expert_stores = stream_factorize_magi2_shared_basis_experts(
-                transformer, checkpoint_dir=str(checkpoint_dir), rank=shared_basis_rank,
-            )
+                self._expert_stores = stream_factorize_magi2_shared_basis_experts(
+                    transformer, checkpoint_dir=str(checkpoint_dir), rank=shared_basis_rank,
+                )
         elif consolidation_plan_path:
             from mirai.core.models.magi2_preview.expert_pruning import (
                 Magi2ExpertConsolidationPlan,
@@ -551,7 +554,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
             self._packed_norms = pack_magi2_norm_weights(transformer)
         if (
-            packed_experts and not mixed_stream and not consolidation_plan_path
+            packed_experts and not mixed_stream and not consolidation_plan_path and not shared_basis_rank
             and (not pruning_plan_path or self._packed_expert_state_path)
         ):
             if self._packed_expert_state_path:
@@ -834,6 +837,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             expert_weight_access_policy=True,
             quantize_experts_on_load=True,
             expert_on_load_formats=MAGI2_FROZEN_WEIGHT_QUANTIZATION_FORMATS,
+            family_packed_weight_format=bool(getattr(self, "_expert_shared_basis_rank", 0)),
             router_quantization_policy=True,
             moe_kernel_backend=True,
         )
@@ -841,12 +845,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     def _restore_packed_experts(
         self, transformer: nn.Module, *,
         pruning_digest: bytes | None = None, consolidation_digest: bytes | None = None,
+        shared_basis_rank: int | None = None,
     ) -> None:
         from mirai.core.models.magi2_preview.packed_experts import load_magi2_nf4_packed_state
 
         self._expert_stores = load_magi2_nf4_packed_state(
             self._packed_expert_state_path, transformer, blocksize=self._nf4_blocksize,
-            quant_format=self._frozen_weight_quantization,
+            quant_format="shared_basis" if shared_basis_rank is not None else self._frozen_weight_quantization,
+            expected_shared_basis_rank=shared_basis_rank,
             expected_pruning_digest=pruning_digest, expected_consolidation_digest=consolidation_digest,
             expected_metadata={
                 "model_variant": str(self.model_config.params.variant),
@@ -865,8 +871,6 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         *,
         metadata: dict[str, str] | None = None,
     ) -> Any:
-        if getattr(self, "_expert_shared_basis_rank", 0):
-            raise ValueError("MAGI-2 shared-basis factors currently load from the source checkpoint.")
         from mirai.core.models.magi2_preview.packed_experts import (
             save_magi2_nf4_packed_state,
         )

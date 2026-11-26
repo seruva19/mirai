@@ -457,7 +457,7 @@ def _configure_pipeline_runtime(
             f"model.type='{config.model.type}' does not implement "
             "weight residency / block swap controls."
         )
-    if frozen_weight_packed_state_path and frozen_weight_quantization not in {
+    if frozen_weight_packed_state_path and not memory_caps.family_packed_weight_format and frozen_weight_quantization not in {
         "fp8",
         "int8",
         "nf4",

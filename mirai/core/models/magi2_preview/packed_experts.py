@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from mirai.core.models.magi2_preview.basis_experts import Magi2SharedBasisExpertStore
 from mirai.core.models.magi2_preview.mixed_experts import Magi2MixedExpertStore
 from mirai.core.models.magi2_preview.quantized_experts import (
     MAGI2_NF4_STORE_ATTR,
@@ -27,6 +28,7 @@ MAGI2_PACKED_EXPERT_SCHEMA_VERSION = 3
 _MULTIFORMAT_SCHEMA_VERSION = 4
 _MIXED_SCHEMA_VERSION = 5
 _ROTATED_MIXED_SCHEMA_VERSION = 6
+_SHARED_BASIS_SCHEMA_VERSION = 7
 _MANIFEST_FILE = "manifest.json"
 _PRUNING_DIGEST_KEY = "head_expert_pruning_digest"
 _CONSOLIDATION_DIGEST_KEY = "head_expert_consolidation_digest"
@@ -129,6 +131,7 @@ def save_magi2_nf4_packed_state(
     manifest = {
         "schema": MAGI2_PACKED_EXPERT_SCHEMA,
         "schema_version": (
+            _SHARED_BASIS_SCHEMA_VERSION if quant_format == "shared_basis" else
             _ROTATED_MIXED_SCHEMA_VERSION if rotation_group_size else
             _MIXED_SCHEMA_VERSION if mixed else _MULTIFORMAT_SCHEMA_VERSION
             if quant_format != "nf4"
@@ -157,6 +160,7 @@ def load_magi2_nf4_packed_state(
     expected_metadata: dict[str, str] | None = None,
     expected_pruning_digest: bytes | None = None,
     expected_consolidation_digest: bytes | None = None,
+    expected_shared_basis_rank: int | None = None,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Restore NF4 stores directly and reject topology or schema mismatches."""
 
@@ -175,7 +179,7 @@ def load_magi2_nf4_packed_state(
     if (
         manifest.get("schema") != MAGI2_PACKED_EXPERT_SCHEMA
         or type(version) is not int
-        or version not in (2, MAGI2_PACKED_EXPERT_SCHEMA_VERSION, _MULTIFORMAT_SCHEMA_VERSION, _MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION)
+        or version not in (2, MAGI2_PACKED_EXPERT_SCHEMA_VERSION, _MULTIFORMAT_SCHEMA_VERSION, _MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION, _SHARED_BASIS_SCHEMA_VERSION)
     ):
         raise Magi2PackedExpertStateError(
             "Packed MAGI-2 expert state has an unsupported schema or version."
@@ -187,8 +191,9 @@ def load_magi2_nf4_packed_state(
     consolidation_hex = _consolidation_digest_hex(transformer, expected_consolidation_digest)
     if manifest.get(_CONSOLIDATION_DIGEST_KEY) != consolidation_hex:
         raise Magi2PackedExpertStateError("Packed MAGI-2 expert state has incompatible consolidation lineage.")
-    if manifest.get("quant_format") != quant_format or (
-        version not in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION}
+    shared_basis = version == _SHARED_BASIS_SCHEMA_VERSION
+    if manifest.get("quant_format") != quant_format or shared_basis != (quant_format == "shared_basis") or (
+        version not in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION, _SHARED_BASIS_SCHEMA_VERSION}
         and (version == _MULTIFORMAT_SCHEMA_VERSION) != (quant_format != "nf4")
     ):
         raise Magi2PackedExpertStateError(
@@ -238,7 +243,10 @@ def load_magi2_nf4_packed_state(
         shapes = {"W_gate": gate, "W_up": gate, "W_down": down}
         if spec.get("expert_shapes") != {key: list(shape) for key, shape in shapes.items()}:
             raise Magi2PackedExpertStateError(f"Packed MAGI-2 layer '{module_name}' has incompatible projection shapes.")
-        store = _new_expert_store(num_groups=groups, blocksize=blocksize, quant_format=quant_format)
+        store = (
+            Magi2SharedBasisExpertStore(num_groups=groups) if shared_basis else
+            _new_expert_store(num_groups=groups, blocksize=blocksize, quant_format=quant_format)
+        )
         fused = spec.get("fused_gate_up", False)
         if not isinstance(fused, bool) or (version != MAGI2_PACKED_EXPERT_SCHEMA_VERSION and fused):
             raise Magi2PackedExpertStateError("Packed MAGI-2 layer has an invalid gate/up layout.")
@@ -261,7 +269,7 @@ def load_magi2_nf4_packed_state(
                 )
                 for suffix in (*MAGI2_NF4_GROUP_FIELDS, *MAGI2_NF4_CODE_FIELDS)
             }
-            if isinstance(store, Magi2PackedExpertStore):
+            if isinstance(store, (Magi2PackedExpertStore, Magi2SharedBasisExpertStore)):
                 expected_from_keys = store.expected_buffers()
             if not mixed and expected_buffers != expected_from_keys:
                 raise Magi2PackedExpertStateError(
@@ -291,7 +299,12 @@ def load_magi2_nf4_packed_state(
                 store = packed
             else:
                 try:
-                    store.restore_packed_state(descriptor=spec, buffers=restored_buffers)
+                    if shared_basis:
+                        store.restore_packed_state(
+                            descriptor=spec, buffers=restored_buffers, expected_rank=expected_shared_basis_rank,
+                        )
+                    else:
+                        store.restore_packed_state(descriptor=spec, buffers=restored_buffers)
                 except (KeyError, TypeError, ValueError) as exc:
                     raise Magi2PackedExpertStateError(f"Invalid packed MAGI-2 layer '{module_name}': {exc}") from exc
         stores[module_name] = store
