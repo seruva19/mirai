@@ -842,12 +842,28 @@ def test_magi2_mixture_basis_preserves_packed_down_and_selected_group_order(tmp_
         Magi2MixtureBasisExpertStore, stream_factorize_magi2_mixture_basis_experts,
     )
     from mirai.core.models.magi2_preview.quantized_experts import MAGI2_NF4_STORE_ATTR
+    from mirai.core.models.compressed_weights.factorization.mixture_basis import (
+        MixtureBasisBlockSource, factorize_mixture_basis_experts,
+    )
 
     layer = _reduced_moe(
         device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
         expert_intermediate_size=16, num_heads=1, num_experts=2, top_k=1,
     )
     save_file(_container(layer).state_dict(), str(tmp_path / "model.safetensors"))
+    gate = layer.W_gate.transpose(-1, -2)
+    reads = []
+
+    def read(groups, rows):
+        reads.append((groups.stop - groups.start, rows.stop - rows.start))
+        return gate[groups, rows]
+
+    options = dict(rank=2, basis_count=2, optimization_steps=1, expert_batch_size=1, row_chunk_size=5)
+    bounded = factorize_mixture_basis_experts(MixtureBasisBlockSource(tuple(gate.shape), read), **options)
+    dense = factorize_mixture_basis_experts(gate, **options)
+    assert reads and all(groups <= 1 and rows <= 5 for groups, rows in reads)
+    torch.testing.assert_close(bounded.transforms, dense.transforms, rtol=0, atol=0)
+    torch.testing.assert_close(bounded.bases, dense.bases, rtol=0, atol=0)
     skeleton = _container(_reduced_moe(
         device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
         expert_intermediate_size=16, num_heads=1, num_experts=2, top_k=1,

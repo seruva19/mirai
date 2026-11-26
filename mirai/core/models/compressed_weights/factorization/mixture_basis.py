@@ -153,6 +153,23 @@ class MixtureBasisFactors:
         return transform @ _activate(mixed, self.activation)
 
 
+@dataclass(frozen=True)
+class MixtureBasisBlockSource:
+    shape: tuple[int, int, int]
+    read: Any
+    _scale: float = 1.0
+
+    def __getitem__(self, indices):
+        experts, rows = indices
+        if isinstance(experts, int):
+            return self[slice(experts, experts + 1), rows][0]
+        block = self.read(experts, rows).detach().to(device="cpu", dtype=torch.float32)
+        expected = (experts.stop - experts.start, rows.stop - rows.start, self.shape[2])
+        if block.shape != expected:
+            raise ValueError("Mixture-basis source block has an incompatible shape.")
+        return block if self._scale == 1.0 else block / self._scale
+
+
 def factorize_mixture_basis_experts(
     weights: Any,
     *,
@@ -179,13 +196,11 @@ def factorize_mixture_basis_experts(
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("Mixture-basis factorization requires torch.")
-    dense = torch.as_tensor(weights).detach().to(device="cpu", dtype=torch.float32)
-    if dense.ndim != 3:
+    dense = weights if isinstance(weights, MixtureBasisBlockSource) else torch.as_tensor(weights).detach()
+    if len(dense.shape) != 3:
         raise ValueError(
             "Mixture-basis weights must have shape [experts, out, in]."
         )
-    if not bool(torch.isfinite(dense).all().item()):
-        raise ValueError("Mixture-basis source weights contain non-finite values.")
     experts, out_features, in_features = (int(value) for value in dense.shape)
     if experts < 1:
         raise ValueError("Mixture-basis factorization requires at least one expert.")
@@ -247,13 +262,31 @@ def factorize_mixture_basis_experts(
             f"max_optimizer_gib={max_optimizer_gib}."
         )
 
-    normalization_std = float(dense.std(unbiased=False).item())
+    source = dense if isinstance(dense, MixtureBasisBlockSource) else MixtureBasisBlockSource(
+        tuple(dense.shape), lambda groups, rows: dense[groups, rows],
+    )
+    count = 0
+    mean = 0.0
+    m2 = 0.0
+    for start in range(0, experts, batch_size):
+        for row in range(0, out_features, row_chunk):
+            block = source[start:min(start + batch_size, experts), row:min(row + row_chunk, out_features)]
+            if not torch.isfinite(block).all():
+                raise ValueError("Mixture-basis source weights contain non-finite values.")
+            variance, average = torch.var_mean(block.double(), unbiased=False)
+            size = block.numel()
+            delta = float(average) - mean
+            total = count + size
+            m2 += float(variance) * size + delta * delta * count * size / total
+            mean += delta * size / total
+            count = total
+    normalization_std = math.sqrt(m2 / count)
     if not math.isfinite(normalization_std) or normalization_std <= 0.0:
         raise ValueError(
             "Mixture-basis factorization requires non-zero finite weight variance."
         )
-    mean_to_std_ratio = abs(float(dense.mean().item())) / normalization_std
-    normalized = dense / normalization_std
+    mean_to_std_ratio = abs(mean) / normalization_std
+    normalized = MixtureBasisBlockSource(source.shape, source.read, normalization_std)
 
     bases = torch.empty(
         (resolved_basis_count, resolved_rank, in_features),
@@ -351,7 +384,7 @@ def factorize_mixture_basis_experts(
         (transforms, bases, logits),
         lr=lr,
     )
-    total_elements = int(normalized.numel())
+    total_elements = experts * out_features * in_features
     for step_index in range(steps):
         optimizer.zero_grad(set_to_none=True)
         for expert_start in range(0, experts, batch_size):
@@ -425,7 +458,7 @@ def factorize_mixture_basis_experts(
     ).contiguous()
     with torch.no_grad():
         stored_error = _relative_error(
-            dense,
+            source,
             stored_transforms.to(device=resolved_device, dtype=torch.float32),
             stored_bases.to(device=resolved_device, dtype=torch.float32),
             (

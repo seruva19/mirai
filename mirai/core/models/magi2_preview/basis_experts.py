@@ -9,7 +9,7 @@ import torch
 
 from mirai.core.models.compressed_weights.factorization.shared_basis import factorize_shared_basis_blocks
 from mirai.core.models.compressed_weights.factorization.mixture_basis import (
-    _activate, factorize_mixture_basis_experts,
+    MixtureBasisBlockSource, _activate, factorize_mixture_basis_experts,
 )
 
 from .quantized_experts import (
@@ -207,13 +207,20 @@ class Magi2MixtureBasisExpertStore(Magi2Nf4ExpertStore):
         if key == "W_down":
             self.down.quantize_dense(key, source)
         else:
-            with torch.enable_grad():
-                factors = factorize_mixture_basis_experts(source.detach().transpose(-1, -2), **factor_options)
-            for name in ("transforms", "bases", "coefficients"):
-                self._set_buffer(f"{key}_{name}", getattr(factors, name).detach())
-            self._activations[key] = factors.activation
+            self._fit_projection(key, source.detach().transpose(-1, -2), source.dtype, **factor_options)
+            return
         self._shapes[key] = tuple(source.shape)
         self._dtypes[key] = self.down.expert_weight_dtype(key) if key == "W_down" else source.dtype
+
+    def _fit_projection(self, key, source, source_dtype, **factor_options):
+        with torch.enable_grad():
+            factors = factorize_mixture_basis_experts(source, **factor_options)
+        for name in ("transforms", "bases", "coefficients"):
+            self._set_buffer(f"{key}_{name}", getattr(factors, name).detach())
+        self._activations[key] = factors.activation
+        groups, outputs, inputs = factors.shape
+        self._shapes[key] = (groups, inputs, outputs)
+        self._dtypes[key] = source_dtype
 
     @torch.no_grad()
     def materialize_segment(self, key, group_start, group_stop, *, dtype, device, group_ids=None):
@@ -289,6 +296,20 @@ def stream_factorize_magi2_mixture_basis_experts(
         return Magi2MixtureBasisExpertStore(num_groups=num_groups, down_format=down_format, blocksize=blocksize)
 
     def read_projection(store, key, source, target, full_key):
+        if key != "W_down":
+            groups, inputs, outputs = target.shape
+
+            def read_block(experts, rows):
+                value = source[experts, :, rows]
+                if not value.is_floating_point():
+                    raise ValueError(f"MAGI-2 mixture-basis projection {full_key!r} requires floating-point weights.")
+                return value.to(dtype=target.dtype).transpose(-1, -2)
+
+            store._fit_projection(
+                key, MixtureBasisBlockSource((groups, outputs, inputs), read_block),
+                target.dtype, rank=rank, basis_count=basis_count, optimization_steps=optimization_steps,
+            )
+            return
         value = source[:]
         if not value.is_floating_point():
             raise ValueError(f"MAGI-2 mixture-basis projection {full_key!r} requires floating-point weights.")
