@@ -451,6 +451,40 @@ def test_query_chunking_preserves_absolute_range_membership(chunk_size) -> None:
         torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("query_budget,key_budget", [(64, 64), (5, 7), (3, 2)])
+def test_range_flash4_bounds_gathers_and_deduplicates_keys(monkeypatch, query_budget, key_budget):
+    from mirai.core.models import attention_backends
+    from mirai.core.models.magi2_preview.refiner_attention import Magi2RefinerRangeFlash4Backend
+
+    query, key, value = _inputs(query_tokens=19, key_tokens=13, heads_q=4, heads_kv=2, seed=83)
+    q_ranges = _ranges([(2, 11), (5, 16), (18, 19)])
+    k_ranges = _ranges([(1, 8), (4, 12), (12, 12)])
+    calls = []
+
+    def packed(q, k, v, *, cu_seqlens_q, cu_seqlens_k, softcap):
+        assert 0 < len(q) <= query_budget
+        assert 0 < len(k) <= key_budget
+        calls.append((len(q), len(k)))
+        q_ranges = torch.stack((cu_seqlens_q[:-1], cu_seqlens_q[1:]), dim=1)
+        k_ranges = torch.stack((cu_seqlens_k[:-1], cu_seqlens_k[1:]), dim=1)
+        return _dense_range_attention(q, k, v, q_ranges, k_ranges)
+
+    monkeypatch.setattr(attention_backends, "flash4_varlen_with_lse", packed)
+    backend = Magi2RefinerRangeFlash4Backend(
+        query_budget=query_budget, key_budget=key_budget,
+    )
+    actual = backend.execute(
+        query, key, value, q_ranges=q_ranges, k_ranges=k_ranges,
+        attn_type_map=None, max_seqlen_q=None,
+    )
+    expected = _dense_range_attention(query, key, value, q_ranges, k_ranges)
+    assert calls
+    # The packed kernel rounds each partial output to BF16 before the LSE merge.
+    torch.testing.assert_close(actual[0], expected[0], rtol=0.01, atol=0.008)
+    torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-5)
+    assert isinstance(resolve_magi2_refiner_attention("range_flash4"), type(backend))
+
+
 def test_range_cache_invalidates_when_source_is_modified() -> None:
     query, key, value = _inputs(query_tokens=32, key_tokens=32, heads_q=4, heads_kv=2, seed=57)
     backend = Magi2RefinerFlexAttentionBackend(query_chunk_size=13)

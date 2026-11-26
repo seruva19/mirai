@@ -75,6 +75,7 @@ from mirai.core.models.attention_backends import (
 MAGI2_REFINER_ATTENTION_BACKENDS: tuple[str, ...] = (
     "auto",
     "native_flex",
+    "range_flash4",
     "vendor_eager",
 )
 MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT = "auto"
@@ -658,6 +659,95 @@ class Magi2RefinerFlexAttentionBackend:
         )
 
 
+@dataclass(frozen=True)
+class Magi2RefinerRangeFlash4Backend:
+    """Gather disjoint key intervals within each packed attention call."""
+
+    key_budget: int = 16384
+    query_budget: int = 8192
+
+    @torch.no_grad()
+    def execute(self, query, key, value, *, q_ranges, k_ranges, attn_type_map, max_seqlen_q):
+        from mirai.core.models.attention_backends import flash4_varlen_with_lse
+
+        _validate_attn_type_map(attn_type_map, ranges=int(q_ranges.shape[0]))
+        if self.key_budget < 1 or self.query_budget < 1:
+            raise ValueError("Refiner FlashAttention budgets must be positive.")
+        mask = build_range_union_mask(
+            q_ranges.cpu(), k_ranges.cpu(), query_tokens=len(query), key_tokens=len(key),
+        )
+        output = value.new_zeros((len(query), query.shape[1], value.shape[-1]), dtype=query.dtype)
+        lse = query.new_full(query.shape[:2], -float("inf"), dtype=torch.float32)
+        batch = []
+        query_rows = key_rows = 0
+
+        def attend(parts):
+            q_offsets, k_offsets = [0], [0]
+            q_parts, k_parts, v_parts = [], [], []
+            for start, stop, intervals in parts:
+                q_parts.append(query[start:stop])
+                q_offsets.append(q_offsets[-1] + stop - start)
+                k_offsets.append(k_offsets[-1] + sum(b - a for a, b in intervals))
+                k_parts.extend(key[a:b] for a, b in intervals)
+                v_parts.extend(value[a:b] for a, b in intervals)
+            return flash4_varlen_with_lse(
+                torch.cat(q_parts).to(value.dtype), torch.cat(k_parts).to(value.dtype), torch.cat(v_parts),
+                cu_seqlens_q=torch.tensor(q_offsets, device=query.device, dtype=torch.int32),
+                cu_seqlens_k=torch.tensor(k_offsets, device=query.device, dtype=torch.int32),
+                softcap=0.0,
+            )
+
+        def flush():
+            if batch:
+                values, logs = attend(batch)
+                cursor = 0
+                for start, stop, _ in batch:
+                    end = cursor + stop - start
+                    output[start:stop] = values[cursor:end]
+                    lse[start:stop] = logs[cursor:end]
+                    cursor = end
+                batch.clear()
+
+        boundaries = mask.boundaries.tolist()
+        for index, (start, stop) in enumerate(zip(boundaries, boundaries[1:])):
+            intervals = [
+                (a, b) for a, b in zip(mask.interval_starts[index].tolist(), mask.interval_ends[index].tolist())
+                if a < b
+            ]
+            if not intervals:
+                continue
+            count = sum(b - a for a, b in intervals)
+            for first in range(start, stop, self.query_budget):
+                last = min(first + self.query_budget, stop)
+                if query_rows + last - first > self.query_budget or key_rows + count > self.key_budget:
+                    flush()
+                    query_rows = key_rows = 0
+                if count <= self.key_budget:
+                    batch.append((first, last, intervals))
+                    query_rows += last - first
+                    key_rows += count
+                    continue
+
+                # Oversized unions use separate softmaxes over disjoint keys.
+                # Log-sum-exp weights reconstruct the single full softmax.
+                partial_output = torch.zeros_like(output[first:last], dtype=torch.float32)
+                partial_lse = lse[first:last]
+                for left, right in intervals:
+                    for lo in range(left, right, self.key_budget):
+                        hi = min(lo + self.key_budget, right)
+                        values, logs = attend([(first, last, [(lo, hi)])])
+                        combined = torch.logaddexp(partial_lse, logs)
+                        partial_output = (
+                            partial_output * (partial_lse - combined).exp().unsqueeze(-1)
+                            + values.float() * (logs - combined).exp().unsqueeze(-1)
+                        )
+                        partial_lse = combined
+                output[first:last] = partial_output
+                lse[first:last] = partial_lse
+        flush()
+        return output, lse
+
+
 def _magi_attention_hopper_kernel_available() -> bool:
     """Whether the authors' single-GPU flex kernel can serve ``auto``.
 
@@ -671,7 +761,7 @@ def _magi_attention_hopper_kernel_available() -> bool:
         major, _minor = torch.cuda.get_device_capability()
     except (AssertionError, RuntimeError):
         return False
-    if major < 9:
+    if (major, _minor) != (9, 0):
         return False
     from mirai.vendors.magi2_preview.common.magi_compiler_compat import (
         magi_attention_flex_flash_attn_func,
@@ -684,7 +774,7 @@ def resolve_magi2_refiner_attention(
     backend: Any = MAGI2_REFINER_ATTENTION_BACKEND_DEFAULT,
     *,
     query_chunk_size: int = 0,
-) -> Magi2RefinerFlexAttentionBackend | None:
+) -> Magi2RefinerFlexAttentionBackend | Magi2RefinerRangeFlash4Backend | None:
     """Select the refiner attention path, or ``None`` to keep the vendored one.
 
     Precedence under ``auto``: a registered ``torch.ops.magi2`` operator wins,
@@ -705,6 +795,8 @@ def resolve_magi2_refiner_attention(
         raise ValueError("Refiner query chunking requires refiner_attention_backend='native_flex'.")
     if name == "vendor_eager":
         return None
+    if name == "range_flash4":
+        return Magi2RefinerRangeFlash4Backend()
     if name == "auto" and not missing_magi2_custom_ops((MAGI2_REFINER_FLEX_OP,)):
         return None
     if name == "auto" and _magi_attention_hopper_kernel_available():
@@ -713,7 +805,7 @@ def resolve_magi2_refiner_attention(
 
 
 def attach_refiner_attention_backend(
-    transformer: Any, backend: Magi2RefinerFlexAttentionBackend | None
+    transformer: Any, backend: Magi2RefinerFlexAttentionBackend | Magi2RefinerRangeFlash4Backend | None
 ) -> int:
     """Bind (or clear) the attention execution seam on every refiner module."""
     from mirai.vendors.magi2_preview.model.magi2_refiner import Attention
@@ -732,7 +824,7 @@ def attach_refiner_attention_backend(
 
 
 def refiner_required_magi2_ops(
-    arch_config: Any, backend: Magi2RefinerFlexAttentionBackend | None
+    arch_config: Any, backend: Magi2RefinerFlexAttentionBackend | Magi2RefinerRangeFlash4Backend | None
 ) -> tuple[str, ...]:
     """Operators the configured refiner still dispatches through ``torch.ops.magi2``.
 

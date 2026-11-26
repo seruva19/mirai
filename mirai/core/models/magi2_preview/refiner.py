@@ -850,6 +850,8 @@ class Magi2Refiner:
         layers are all local never reaches the dense one.
         """
         from mirai.core.models.magi2_preview.refiner_attention import (
+            Magi2RefinerFlexAttentionBackend,
+            Magi2RefinerRangeFlash4Backend,
             attach_refiner_attention_backend,
             refiner_required_magi2_ops,
             resolve_magi2_refiner_attention,
@@ -863,8 +865,14 @@ class Magi2Refiner:
         backend = resolve_magi2_refiner_attention(
             self.attention_backend, query_chunk_size=self.query_chunk_size
         )
-        if backend is not None:
+        if isinstance(backend, Magi2RefinerFlexAttentionBackend):
             validate_refiner_flex_support()
+        elif isinstance(backend, Magi2RefinerRangeFlash4Backend):
+            from mirai.core.models.attention_backends import attention_backend_status
+
+            status = attention_backend_status("flash4", device=torch.device(device), varlen=True)
+            if not status.available:
+                raise ValueError(f"MAGI-2 Refiner range_flash4 is unavailable: {status.reason}")
         required = refiner_required_magi2_ops(
             config.magi2_refiner_arch_config, backend
         )
