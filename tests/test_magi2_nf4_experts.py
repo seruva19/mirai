@@ -2071,11 +2071,13 @@ def test_magi2_int8_checkpoint_saves_only_expert_activations(monkeypatch, block_
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not _CUDA, reason="requires CUDA"))])
-def test_magi2_hybrid_experts_preserve_interleaved_rows_and_gradients(monkeypatch, device) -> None:
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_magi2_hybrid_experts_preserve_interleaved_rows_and_gradients(monkeypatch, device, dtype) -> None:
+    torch.manual_seed(219)
     module = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
     store = quantize_magi2_experts_in_place(_container(module), quant_format="fp8")["mlp.moe_mlp"]
     store.set_expert_weight_access_policy(expert_weight_access="active_group_dequant", expert_dequant_chunk_size=1)
-    rows = torch.randn(12, module.d_head, device=device, requires_grad=True)
+    rows = torch.randn(12, module.d_head, device=device, dtype=dtype, requires_grad=True)
     offsets = torch.tensor([1, 4, 4, 6, 10, 11, 11, 12], dtype=torch.int32, device=device)
     active_store, active_offsets = grouped_moe._packed_expert_layout(store, offsets)
     expected = grouped_moe._SegmentedQuantizedExpertMlp.apply(
@@ -2096,12 +2098,13 @@ def test_magi2_hybrid_experts_preserve_interleaved_rows_and_gradients(monkeypatc
         rows, offsets, store, cpu_max_tokens=2,
         forward_backend="bmm", dx_backend="bmm", activation_backend="torch",
     )
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    tolerance = dict(rtol=1e-5, atol=1e-6) if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual, expected, **tolerance)
     assert worker_groups == {0, 3, 5, 7}
     grad = torch.randn_like(actual)
     torch.testing.assert_close(
         torch.autograd.grad(actual, rows, grad)[0],
-        torch.autograd.grad(expected, rows, grad)[0], rtol=1e-5, atol=1e-6,
+        torch.autograd.grad(expected, rows, grad)[0], **tolerance,
     )
 
 
