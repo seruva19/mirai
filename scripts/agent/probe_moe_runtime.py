@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import statistics
 import time
@@ -176,6 +177,8 @@ def benchmark_packed_expert_stream(
         raise ValueError("Packed benchmark requires positive dimensions, tokens >= groups, and positive iterations.")
     if not 0 <= prefetch_depth <= 16:
         raise ValueError("Packed benchmark prefetch depth must be in [0, 16].")
+    if backend == "gds" and device.type != "cuda":
+        raise ValueError("The GDS packed-stream probe requires a CUDA device.")
     directory.mkdir()
     shard = directory / "synthetic-experts.safetensors"
     source = Magi2PackedExpertStore(num_groups=groups, blocksize=64, quant_format="fp8")
@@ -204,13 +207,13 @@ def benchmark_packed_expert_stream(
         return end - start if stream is None else start.elapsed_time(end) / 1000
 
     class TimedReader(StreamingPackedTensorMapping):
-        def get_slices_to_device(self, key, indices, **kwargs):
-            if not recording:
-                return super().get_slices_to_device(key, indices, **kwargs)
-            started = mark()
-            tensor = super().get_slices_to_device(key, indices, **kwargs)
-            demand_intervals.append((started, mark()))
-            return tensor
+        @contextmanager
+        def borrow_packed_fields(self, keys, indices, **kwargs):
+            started = mark() if recording else None
+            with super().borrow_packed_fields(keys, indices, **kwargs) as fields:
+                if started is not None:
+                    demand_intervals.append((started, mark()))
+                yield fields
 
     reader = TimedReader(shard, backend=backend, prefetch_depth=prefetch_depth)
     try:
@@ -259,6 +262,7 @@ def benchmark_packed_expert_stream(
                 "read_seconds", "read_ops", "read_bytes", "direct_io_read_bytes",
                 "direct_io_overread_bytes", "h2d_bytes", "prefetch_wait_seconds",
                 "prefetch_submitted", "prefetch_consumed", "prefetch_misses", "prefetch_rejected",
+                "gds_read_ops", "gds_async_read_ops", "gds_read_bytes", "gds_overread_bytes",
             )
             phases[name] = {
                 "latency": _summarize_latency([value * 1000 for value in elapsed]),
@@ -605,7 +609,7 @@ def main() -> int:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--packed-stream-probe-dir", type=Path)
     parser.add_argument("--packed-stream-storage-label", default="unspecified")
-    parser.add_argument("--packed-stream-backend", choices=("staged", "direct_io", "io_uring"), default="staged")
+    parser.add_argument("--packed-stream-backend", choices=("staged", "direct_io", "io_uring", "gds"), default="staged")
     parser.add_argument("--packed-stream-prefetch-depth", type=int, default=2)
     parser.add_argument("--routed-gemm-warmup-cache", type=Path)
     parser.add_argument("--benchmark-routed-gemm", action="store_true")

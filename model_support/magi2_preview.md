@@ -400,6 +400,8 @@ and forward plus segmented input-gradient recomputation. The denominator is
 consumer-stream elapsed time outside packed demand intervals and includes
 kernel launch gaps. Compare this with summed reader service time and physical
 read bytes. Use depth `0` for a demand-only comparison.
+The probe also accepts `--packed-stream-backend gds` on a CUDA host with
+GPUDirect Storage available. It reports aligned GDS bytes and overreads.
 
 The
 provider-owned schema stores a versioned manifest and one NF4 safetensors shard
