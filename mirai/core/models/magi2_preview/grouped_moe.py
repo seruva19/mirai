@@ -909,6 +909,7 @@ def run_segmented_grouped_linear(
     columns: int,
     transposed: bool = False,
     segments: tuple[GroupedMMSegment, ...] | None = None,
+    prefetch: Callable[[int, int], None] | None = None,
 ) -> torch.Tensor:
     """Run the sorted-layout grouped matmul one contiguous group range at a time.
 
@@ -931,10 +932,15 @@ def run_segmented_grouped_linear(
             if boundaries is not None
             else tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=max_groups))
         )
-    for segment in segments:
+    if prefetch is not None:
+        segments = tuple(segment for segment in segments if segment.row_count)
+    for index, segment in enumerate(segments):
         if segment.row_count == 0:
             continue
         weight = materialize(segment.group_start, segment.group_stop)
+        if prefetch is not None and index + 1 < len(segments):
+            next_segment = segments[index + 1]
+            prefetch(next_segment.group_start, next_segment.group_stop)
         local_offsets = (
             offsets[segment.group_start : segment.group_stop] - segment.row_start
         ).contiguous()
@@ -1041,6 +1047,13 @@ class _ActiveExpertGroups:
             key, start, stop, dtype=dtype, device=device, group_ids=self.group_ids
         )
 
+    def prefetch_segment(self, key, start, stop, *, device) -> None:
+        self.store.prefetch_segment(key, start, stop, device=device, group_ids=self.group_ids)
+
+    @property
+    def packed_prefetch_enabled(self) -> bool:
+        return self.store.packed_prefetch_enabled
+
 
 def _packed_expert_layout(
     store: Magi2Nf4ExpertStore, offsets: torch.Tensor
@@ -1084,6 +1097,10 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
             materialize=lambda start, stop: store.materialize_segment(
                 key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
             ),
+            prefetch=(
+                (lambda start, stop: store.prefetch_segment(key, start, stop, device=x_sorted.device))
+                if getattr(store, "packed_prefetch_enabled", False) else None
+            ),
             backend=forward_backend,
             max_groups=span,
             columns=int(cols),
@@ -1110,6 +1127,10 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
                 segments=ctx.segments,
                 materialize=lambda start, stop: store.materialize_segment(
                     key, start, stop, dtype=grad_output.dtype, device=grad_output.device
+                ),
+                prefetch=(
+                    (lambda start, stop: store.prefetch_segment(key, start, stop, device=grad_output.device))
+                    if getattr(store, "packed_prefetch_enabled", False) else None
                 ),
                 backend=ctx.dx_backend,
                 max_groups=ctx.segment_span,

@@ -240,6 +240,9 @@ during execution. Shared-basis and mixture-basis stores keep shared bases
 resident and fetch per-expert factors on demand.
 All expert layers share one range reader and one
 `memory.packed_stream_cache_gib` host-cache budget.
+For segmented grouped linear execution with a uniform packed format,
+`memory.packed_stream_prefetch_depth` enables reads of the next segment
+during the current matmul, including input-gradient recomputation.
 The
 provider-owned schema stores a versioned manifest and one NF4 safetensors shard
 per routed-expert layer. Restore checks model variant, denoiser subfolder,

@@ -1868,6 +1868,22 @@ def test_magi2_staged_layers_share_one_packed_reader(tmp_path) -> None:
             store.materialize_segment("W_gate", 0, 1, **options),
             resident[name].materialize_segment("W_gate", 0, 1, **options), rtol=0, atol=0,
         )
+    name = "mlp.moe_mlp"
+    active = ranged[name]
+    reference = resident[name]
+    for store in (active, reference):
+        store.set_expert_weight_access_policy(expert_weight_access="chunked_dequant", expert_dequant_chunk_size=1)
+    x = torch.randn(3, active.expert_weight_shape("W_gate")[1], requires_grad=True)
+    offsets = torch.tensor([1, 2, 3] + [3] * (active.num_groups - 3), dtype=torch.int32)
+    actual = grouped_moe._QuantizedGroupedExpertLinear.apply(x, offsets, active, "W_gate", "bmm", "bmm")
+    expected = grouped_moe._QuantizedGroupedExpertLinear.apply(x, offsets, reference, "W_gate", "bmm", "bmm")
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual.sum(), x)[0], torch.autograd.grad(expected.sum(), x)[0], rtol=0, atol=0,
+    )
+    snapshot = active._packed_range_reader.reader.snapshot()
+    assert snapshot["prefetch_consumed"] >= 4
+    assert snapshot["prefetch_peak_queued"] <= 2
 
 
 def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, monkeypatch) -> None:

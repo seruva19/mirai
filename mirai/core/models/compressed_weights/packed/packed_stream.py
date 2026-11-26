@@ -146,6 +146,10 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
     def tensor_nbytes(self, key: str) -> int:
         return int(self._region(key).nbytes)
 
+    @property
+    def prefetch_enabled(self) -> bool:
+        return self._prefetch is not None
+
     def _get_slices_to_device_now(
         self,
         key: str,

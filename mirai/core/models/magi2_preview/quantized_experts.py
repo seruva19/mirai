@@ -100,6 +100,13 @@ class PackedExpertRangeView:
     def get_slices_to_device(self, key, indices, **kwargs):
         return self.reader.get_slices_to_device(self.prefix + key, indices, **kwargs)
 
+    def prefetch_slices_to_device(self, key, indices, **kwargs):
+        return self.reader.prefetch_slices_to_device(self.prefix + key, indices, **kwargs)
+
+    @property
+    def prefetch_enabled(self):
+        return self.reader.prefetch_enabled
+
     def tensor_nbytes(self, key):
         return self.reader.tensor_nbytes(self.prefix + key)
 
@@ -401,6 +408,23 @@ class Magi2Nf4ExpertStore(nn.Module):
             0, group_ids[start:stop].to(device=value.device, dtype=torch.long),
         )
         return selected.to(device=device, dtype=dtype)
+
+    def prefetch_segment(self, key, start, stop, *, device, group_ids=None) -> None:
+        reader = getattr(self, "_packed_range_reader", None)
+        if reader is None or self.quant_format != "nf4":
+            return
+        storage_key = MAGI2_FUSED_GATE_UP if self.has_fused_gate_up and key in {"W_gate", "W_up"} else key
+        ids = range(start, stop) if group_ids is None else group_ids[start:stop].tolist()
+        for suffix in MAGI2_NF4_GROUP_FIELDS:
+            reader.prefetch_slices_to_device(f"{storage_key}_{suffix}", ids, device=device)
+
+    @property
+    def packed_prefetch_enabled(self) -> bool:
+        reader = getattr(self, "_packed_range_reader", None)
+        return (
+            self.quant_format in MAGI2_PACKED_EXPERT_FORMATS and not getattr(self, "is_mixed_precision", False)
+            and reader is not None and reader.prefetch_enabled
+        )
 
     def quantized_numel(self) -> int:
         return int(
@@ -751,6 +775,14 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
             dequantize_gguf(self.quant_format, group, shape=shape, dtype=dtype, device=device)
             for group in fields[0]
         ])
+
+    def prefetch_segment(self, key, start, stop, *, device, group_ids=None) -> None:
+        reader = getattr(self, "_packed_range_reader", None)
+        if reader is None:
+            return
+        ids = range(start, stop) if group_ids is None else group_ids[start:stop].tolist()
+        for name in self._buffer_names(key):
+            reader.prefetch_slices_to_device(name, ids, device=device)
 
 
 
