@@ -62,13 +62,17 @@ class PinnedHostStagingPool:
         return staged
 
     def copy_to_device(self, sources: list[Any], *, device: Any, stream: Any) -> list[Any]:
+        copies = [torch.empty_like(source, device=device) for source in sources]
+        self.copy_into(sources, copies, stream=stream)
+        return copies
+
+    def copy_into(self, sources: list[Any], targets: list[Any], *, stream: Any) -> None:
         # The caller owns CUDA allocation and submission. A single CPU worker
         # prepares the next chunk while the transfer stream reads the previous one.
-        copies = [torch.empty_like(source, device=device) for source in sources]
         capacity = self._buffers[0].numel()
 
         def chunks():
-            for source, target in zip(sources, copies, strict=True):
+            for source, target in zip(sources, targets, strict=True):
                 source_bytes = source.view(-1).view(torch.uint8)
                 target_bytes = target.view(-1).view(torch.uint8)
                 for start in range(0, source_bytes.numel(), capacity):
@@ -99,7 +103,6 @@ class PinnedHostStagingPool:
             if pending is not None:
                 pending.exception()
             raise
-        return copies
 
     def close(self) -> None:
         self._worker.shutdown(wait=True)

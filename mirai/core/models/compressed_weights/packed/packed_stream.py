@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import os
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -30,6 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 _DEFAULT_READ_WORKERS = 4
 _MAX_RANGE_BYTES = 32 * 1024 * 1024
+_CUDA_STAGING_SLOTS = 2
 
 
 class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
@@ -119,6 +121,10 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._pin_cap_bytes = max(0, _pin_budget_bytes() - self._uring_fixed_bytes)
         self._staging_lock = threading.Lock()
         self._staging_pool = None
+        self._raw_staging = self._backend != "gds" and os.environ.get("MIRAI_PACKED_CUDA_ARENA", "") == "raw"
+        self._staging_arena = None
+        self._staging_arena_position = 0
+        self._staging_arena_device = None
         self._staging_unavailable = False
         self._pinned_in_flight = 0
         self._pinned_peak = 0
@@ -365,6 +371,10 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             if self._backend == "io_uring":
                 snapshot["io_uring_mode"] = next(iter(self._shards.values())).mode
                 snapshot["io_uring_fixed_buffer_bytes"] = self._uring_fixed_bytes
+            if self._raw_staging:
+                snapshot["cuda_staging_arena_bytes"] = (
+                    _CUDA_STAGING_SLOTS * _MAX_RANGE_BYTES if self._staging_arena is not None else 0
+                )
         snapshot.update(self._cache.snapshot())
         if self._gds is not None:
             snapshot.update(self._gds.snapshot())
@@ -397,6 +407,10 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             self._prefetch.close()
         self._executor.shutdown(wait=True, cancel_futures=False)
         with self._staging_lock:
+            if self._staging_arena is not None:
+                for stream in self._streams.values():
+                    stream.synchronize()
+                self._staging_arena = None
             if self._staging_pool is not None:
                 self._staging_pool.close()
                 self._staging_pool = None
@@ -537,9 +551,41 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                         self._pinned_in_flight = self._staging_pool.pinned_bytes
                         self._pinned_peak = self._pinned_in_flight
             if self._staging_pool is not None:
+                if self._raw_staging:
+                    return self._copy_through_cuda_arena(host_tensors, target, dtype, stream)
                 copies = self._staging_pool.copy_to_device(list(host_tensors), device=target, stream=stream)
                 return copies if dtype is None else [tensor.to(dtype=dtype) for tensor in copies]
+            if self._raw_staging:
+                return self._copy_through_cuda_arena(host_tensors, target, dtype, stream)
         return [tensor.to(device=target, dtype=dtype) for tensor in host_tensors]
+
+    def _copy_through_cuda_arena(self, host_tensors, target, dtype, stream):
+        from .fixed_cuda_arena import FixedCudaArena
+
+        if self._staging_arena is None:
+            self._staging_arena = FixedCudaArena(
+                device=target, slots=_CUDA_STAGING_SLOTS, slot_bytes=_MAX_RANGE_BYTES, alignment=4096,
+            )
+            self._staging_arena_device = stream.device
+        elif self._staging_arena_device != stream.device:
+            raise ValueError("Packed CUDA staging slots are bound to one device.")
+        copies = []
+        for source in host_tensors:
+            result = torch.empty_like(source, device=target)
+            source_bytes = source.view(-1).view(torch.uint8)
+            result_bytes = result.view(-1).view(torch.uint8)
+            for start in range(0, source_bytes.numel(), _MAX_RANGE_BYTES):
+                chunk = source_bytes[start:start + _MAX_RANGE_BYTES]
+                slot = self._staging_arena.slot(self._staging_arena_position)[:chunk.numel()]
+                self._staging_arena_position = (self._staging_arena_position + 1) % _CUDA_STAGING_SLOTS
+                if self._staging_pool is not None:
+                    self._staging_pool.copy_into([chunk], [slot], stream=stream)
+                else:
+                    slot.copy_(chunk)
+                # All slot writes and reads are submitted on the same staging stream.
+                result_bytes[start:start + chunk.numel()].copy_(slot)
+            copies.append(result if dtype is None else result.to(dtype=dtype))
+        return copies
 
     def _cuda_stream(self, device: Any) -> Any:
         key = str(device)

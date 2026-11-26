@@ -50,6 +50,38 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         with self.assertRaises(IndexError):
             arena.slot(2)
 
+    def test_raw_staged_upload_reuses_slots_without_aliasing_results(self) -> None:
+        from types import SimpleNamespace
+
+        from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
+
+        reader = StreamingPackedTensorMapping.__new__(StreamingPackedTensorMapping)
+        reader._closed = True
+        reader._staging_arena = None
+        reader._staging_arena_position = 0
+        reader._staging_arena_device = None
+        reader._staging_pool = mock.Mock()
+
+        def copy_into(sources, targets, *, stream):
+            targets[0].copy_(sources[0])
+
+        reader._staging_pool.copy_into.side_effect = copy_into
+        storage = torch.zeros(2, 8, dtype=torch.uint8)
+        arena = mock.Mock()
+        arena.slot.side_effect = lambda index: storage[index]
+        device = torch.device("cpu")
+        stream = SimpleNamespace(device=device)
+        module = "mirai.core.models.compressed_weights.packed"
+        with mock.patch(f"{module}.fixed_cuda_arena.FixedCudaArena", return_value=arena) as allocate, mock.patch(
+            f"{module}.packed_stream._MAX_RANGE_BYTES", 8,
+        ):
+            first = reader._copy_through_cuda_arena([torch.arange(5, dtype=torch.int32)], device, None, stream)[0]
+            second = reader._copy_through_cuda_arena([torch.tensor([23], dtype=torch.int32)], device, torch.float64, stream)[0]
+        allocate.assert_called_once()
+        self.assertEqual(arena.slot.call_args_list, [mock.call(0), mock.call(1), mock.call(0), mock.call(1)])
+        torch.testing.assert_close(first, torch.arange(5, dtype=torch.int32))
+        torch.testing.assert_close(second, torch.tensor([23], dtype=torch.float64))
+
     def test_uring_fixed_window_reuses_one_buffer_across_chunks(self) -> None:
         import ctypes
         import threading
