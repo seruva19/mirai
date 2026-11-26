@@ -15,6 +15,7 @@ from mirai.core.models.compressed_weights.packed.packed_residency import (
 from mirai.core.models.compressed_weights.packed.packed_preload_ring import (
     PrefetchedPreloadedPackedTensorMapping,
 )
+from mirai.core.models.compressed_weights.packed.packed_stream_prefetch import PackedCudaTransfer
 from mirai.core.training.residency.memory_safety import configure_memory_safety
 
 _GIB = 1024**3
@@ -86,6 +87,28 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
                 mapping.get_slices_to_device("experts", [2, 0], device="cpu"),
                 torch.tensor([[8, 9, 10, 11], [0, 1, 2, 3]]),
             )
+        finally:
+            mapping.close()
+
+    def test_cuda_prefetch_waits_for_its_request_only_at_consumption(self) -> None:
+        mapping, _ = PackedStateResidencyPolicy(
+            "ram", stream_prefetch_depth=2
+        ).materialize({"experts": torch.arange(12).reshape(3, 4)})
+        ready = mock.sentinel.ready
+        tensor = mock.Mock(device=torch.device("cuda:0"))
+        stream = mock.Mock()
+        request = dict(device="cpu")
+        try:
+            with mock.patch.object(
+                mapping, "_get_slices_to_device_now", return_value=PackedCudaTransfer(tensor, ready)
+            ) as load, mock.patch("torch.cuda.current_stream", return_value=stream):
+                self.assertTrue(mapping.prefetch_slices_to_device("experts", [2, 0], **request))
+                stream.wait_event.assert_not_called()
+                tensor.record_stream.assert_not_called()
+                self.assertIs(mapping.get_slices_to_device("experts", [2, 0], **request), tensor)
+                load.assert_called_once()
+                stream.wait_event.assert_called_once_with(ready)
+                tensor.record_stream.assert_called_once_with(stream)
         finally:
             mapping.close()
 

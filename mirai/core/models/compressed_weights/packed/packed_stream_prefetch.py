@@ -148,6 +148,12 @@ class PackedStreamPrefetchRing:
             pass
 
 
+@dataclass(frozen=True)
+class PackedCudaTransfer:
+    tensor: Any
+    ready: Any
+
+
 class PackedStreamPrefetchHost:
     """Request-consumption contract mixed into the packed stream mapping."""
 
@@ -164,17 +170,22 @@ class PackedStreamPrefetchHost:
         import torch
 
         requested = self._normalize_indices(str(key), indices)
+        found, value = False, None
         if self._prefetch is not None:
             identity = packed_prefetch_identity(
                 str(key), requested, device=torch.device(device), dtype=dtype
             )
             found, value = self._prefetch.take(identity)
-            if found:
-                adopt = getattr(self, "_adopt_prefetched_result", None)
-                return adopt(value, device=device) if callable(adopt) else value
-        return self._get_slices_to_device_now(
-            str(key), requested, device=device, dtype=dtype
-        )
+        if not found:
+            value = self._get_slices_to_device_now(
+                str(key), requested, device=device, dtype=dtype
+            )
+        if isinstance(value, PackedCudaTransfer):
+            current = torch.cuda.current_stream(value.tensor.device)
+            current.wait_event(value.ready)
+            value.tensor.record_stream(current)
+            return value.tensor
+        return value
 
     def prefetch_slices_to_device(
         self,

@@ -12,7 +12,7 @@ from typing import Any
 from .packed_stream_layout import PackedTensorRegion
 from .packed_stream_layout import load_packed_regions
 from .packed_stream_layout import torch_dtype
-from .packed_stream_prefetch import PackedStreamPrefetchHost
+from .packed_stream_prefetch import PackedCudaTransfer, PackedStreamPrefetchHost
 from .packed_stream_prefetch import PackedStreamPrefetchRing
 from .packed_stream_cache import PackedStreamHostCache
 from .packed_stream_cache import packed_stream_cache_key
@@ -254,9 +254,6 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 )
             event = torch.cuda.Event()
             event.record(stream)
-        current = torch.cuda.current_stream(target)
-        current.wait_event(event)
-        stacked.record_stream(current)
         transferred = sum(
             int(tensor.numel()) * int(tensor.element_size())
             for tensor in host_tensors
@@ -264,7 +261,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         with self._stats_lock:
             self._h2d_ops += len(host_tensors)
             self._h2d_bytes += transferred
-        return stacked
+        return PackedCudaTransfer(stacked, event)
 
     def _host_expert_slice_batch(self, key, indices):
         cache_keys = {index: packed_stream_cache_key(key, (index,), access="slice") for index in indices}
@@ -315,15 +312,6 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         if self._prefetch is not None:
             snapshot.update(self._prefetch.snapshot())
         return snapshot
-
-    def _adopt_prefetched_result(self, value: Any, *, device: Any) -> Any:
-        target = torch.device(device)
-        if target.type != "cuda" or self._backend == "gds":
-            return value
-        current = torch.cuda.current_stream(target)
-        current.wait_stream(self._cuda_stream(target))
-        value.record_stream(current)
-        return value
 
     def evict_file_cache(self) -> bool:
         """Request cold-cache reads where the OS exposes POSIX fadvise."""

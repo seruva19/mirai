@@ -8,7 +8,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .packed_stream_prefetch import PackedStreamPrefetchHost
+from .packed_stream_prefetch import PackedCudaTransfer, PackedStreamPrefetchHost
 from .packed_stream_prefetch import PackedStreamPrefetchRing
 
 try:
@@ -315,14 +315,11 @@ class PrefetchedPreloadedPackedTensorMapping(
             except Exception:
                 self._host_ring.release(slot_index, copy_event=None)
                 raise
-        current = torch.cuda.current_stream(target)
-        current.wait_event(event)
-        result.record_stream(current)
         nbytes = int(source[0].numel()) * int(source.element_size()) * len(requested)
         with self._stats_lock:
             self._h2d_ops += h2d_ops
             self._h2d_bytes += nbytes
-        return result
+        return PackedCudaTransfer(result, event)
 
     @staticmethod
     def _is_fragmented_pinned(
@@ -353,15 +350,6 @@ class PrefetchedPreloadedPackedTensorMapping(
             self._h2d_ops += len(parts)
             self._h2d_bytes += nbytes
         return result
-
-    def _adopt_prefetched_result(self, value: Any, *, device: Any) -> Any:
-        target = torch.device(device)
-        if target.type != "cuda":
-            return value
-        current = torch.cuda.current_stream(target)
-        current.wait_stream(self._cuda_stream(target))
-        value.record_stream(current)
-        return value
 
     def snapshot(self) -> dict[str, int | float | str]:
         with self._stats_lock:
