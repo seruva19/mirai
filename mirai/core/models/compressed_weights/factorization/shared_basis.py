@@ -43,6 +43,49 @@ class SharedBasisFactors:
         return basis @ coefficients
 
 
+def factorize_shared_basis_blocks(load_block, *, shape, rank, factor_dtype, block_groups=8):
+    """Fit an equally weighted shared basis with bounded FP32 source blocks."""
+    experts, out_features, in_features = shape
+    if experts < 1 or not 0 < rank <= min(out_features, in_features) or block_groups < 1:
+        raise ValueError("Shared-basis block factorization has invalid shape, rank, or block size.")
+    right = in_features + experts * out_features <= out_features + experts * in_features
+    width = in_features if right else out_features
+    covariance = torch.zeros((width, width), dtype=torch.float32)
+
+    def blocks():
+        for start in range(0, experts, block_groups):
+            stop = min(start + block_groups, experts)
+            block = load_block(start, stop).detach().to(device="cpu", dtype=torch.float32)
+            if block.shape != (stop - start, out_features, in_features) or not torch.isfinite(block).all():
+                raise ValueError("Shared-basis source block has invalid shape or values.")
+            yield start, stop, block
+
+    for _, _, block in blocks():
+        rows = (block if right else block.transpose(-1, -2)).reshape(-1, width)
+        covariance.addmm_(rows.T, rows, alpha=1.0 / experts)
+    del block, rows
+    _, vectors = torch.linalg.eigh(covariance)
+    leading = vectors[:, -rank:].flip(1)
+    del covariance, vectors
+    dtype = _storage_dtype(factor_dtype)
+    basis = (leading.T if right else leading).to(dtype=dtype).contiguous()
+    coefficients = torch.empty(
+        (experts, out_features, rank) if right else (experts, rank, in_features), dtype=dtype,
+    )
+    basis_for_error = basis.float()
+    energies = torch.zeros(2, dtype=torch.float64)
+    for start, stop, block in blocks():
+        coefficients[start:stop].copy_(block @ leading if right else leading.T @ block)
+        stored = coefficients[start:stop].float()
+        reconstructed = stored @ basis_for_error if right else basis_for_error @ stored
+        energies[0] += (block - reconstructed).square().sum(dtype=torch.float64)
+        energies[1] += block.square().sum(dtype=torch.float64)
+    error = float((energies[0] / energies[1].clamp_min(torch.finfo(torch.float64).tiny)).sqrt())
+    if not math.isfinite(error):
+        raise RuntimeError("Shared-basis reconstruction error is non-finite.")
+    return SharedBasisFactors("right" if right else "left", basis, coefficients, shape, rank, error, error)
+
+
 def _storage_dtype(name: str) -> Any:
     if torch is None:  # pragma: no cover
         raise RuntimeError("Shared-basis factorization requires torch.")

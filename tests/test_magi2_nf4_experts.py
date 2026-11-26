@@ -857,6 +857,23 @@ def test_magi2_shared_basis_reconstructs_selected_native_groups(tmp_path) -> Non
         torch.testing.assert_close(actual, source[[3, 1, 3]], rtol=2e-5, atol=1e-5)
     assert store.is_fully_loaded()
     assert store.payload_bytes() < 3 * 4 * 8 * 16 * 4
+    blocks = []
+    long_source = source.repeat(5, 1, 1)
+
+    def read_block(start, stop):
+        blocks.append((start, stop))
+        return long_source[start:stop]
+
+    bounded = Magi2SharedBasisExpertStore(num_groups=20)
+    bounded.factorize_projection_blocks(
+        "W_down", read_block, shape=tuple(long_source.shape), source_dtype=torch.float32,
+        rank=2, factor_dtype="float32",
+    )
+    assert blocks == [(0, 8), (8, 16), (16, 20)] * 2
+    torch.testing.assert_close(
+        bounded.materialize_segment("W_down", 15, 18, dtype=torch.float32, device="cpu"),
+        long_source[15:18], rtol=2e-5, atol=1e-5,
+    )
     layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
     transformer = _container(layer)
     save_file(transformer.state_dict(), str(tmp_path / "model.safetensors"))

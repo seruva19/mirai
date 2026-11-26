@@ -829,7 +829,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   `model.params.family_params.expert_shared_basis_rank` to a positive rank
   to factorize dense routed projections during checkpoint loading. The default
   is zero. The grouped backend reconstructs requested expert groups from
-  BF16 factors. This mode uses the original checkpoint as its source.
+  BF16 factors. The loader fits the basis and computes coefficients in two
+  passes over blocks of up to eight experts from the original checkpoint.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group

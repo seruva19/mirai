@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from mirai.core.models.compressed_weights.factorization.shared_basis import factorize_dense_experts
+from mirai.core.models.compressed_weights.factorization.shared_basis import factorize_shared_basis_blocks
 
 from .quantized_experts import (
     MAGI2_NF4_STORE_ATTR, MAGI2_ROUTED_EXPERT_TENSOR_NAMES, Magi2Nf4ExpertStore, iter_magi2_moe_layers,
@@ -26,16 +26,29 @@ class Magi2SharedBasisExpertStore(Magi2Nf4ExpertStore):
     ) -> None:
         if key not in MAGI2_ROUTED_EXPERT_TENSOR_NAMES or source.ndim != 3 or source.shape[0] != self.num_groups:
             raise ValueError("MAGI-2 shared-basis projection has incompatible shape or key.")
+        self.factorize_projection_blocks(
+            key, lambda start, stop: source[start:stop],
+            shape=tuple(source.shape), source_dtype=source.dtype, rank=rank, factor_dtype=factor_dtype,
+        )
+
+    def factorize_projection_blocks(self, key, load_block, *, shape, source_dtype, rank, factor_dtype):
         # MAGI-2 multiplies row activations by [in, out] matrices.
-        factors = factorize_dense_experts(
-            source.transpose(-1, -2), rank=rank, factor_dtype=factor_dtype,
-            expert_weights=torch.ones(self.num_groups, device=source.device),
+        groups, inputs, outputs = shape
+
+        def load_transposed(start, stop):
+            value = load_block(start, stop)
+            if not value.is_floating_point():
+                raise ValueError(f"MAGI-2 shared-basis projection {key!r} requires floating-point weights.")
+            return value.to(dtype=source_dtype).transpose(-1, -2)
+
+        factors = factorize_shared_basis_blocks(
+            load_transposed, shape=(groups, outputs, inputs), rank=rank, factor_dtype=factor_dtype,
         )
         self._set_buffer(f"{key}_basis", factors.basis.detach())
         self._set_buffer(f"{key}_coefficients", factors.coefficients.detach())
         self._axes[key] = factors.axis
-        self._shapes[key] = tuple(source.shape)
-        self._dtypes[key] = source.dtype
+        self._shapes[key] = shape
+        self._dtypes[key] = source_dtype
 
     @torch.no_grad()
     def materialize_segment(self, key, group_start, group_stop, *, dtype, device, group_ids=None):
@@ -99,11 +112,13 @@ def stream_factorize_magi2_shared_basis_experts(
                 raise ValueError(f"MAGI-2 checkpoint is missing shared-basis projection {full_key!r}.")
             target = layer._parameters[key]
             with safe_open(weight_map[full_key], framework="pt", device="cpu") as shard:
-                source = shard.get_tensor(full_key)
-                if source.shape != target.shape or not source.is_floating_point():
+                source = shard.get_slice(full_key)
+                if tuple(source.get_shape()) != target.shape:
                     raise ValueError(f"MAGI-2 shared-basis projection {full_key!r} has incompatible shape or dtype.")
-                store.factorize_projection(key, source.to(dtype=target.dtype), rank=rank, factor_dtype=factor_dtype)
-                del source
+                store.factorize_projection_blocks(
+                    key, lambda start, stop, shard_slice=source: shard_slice[start:stop],
+                    shape=tuple(target.shape), source_dtype=target.dtype, rank=rank, factor_dtype=factor_dtype,
+                )
         stores[name] = store
     for name, layer in layers.items():
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
