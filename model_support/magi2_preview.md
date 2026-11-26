@@ -814,6 +814,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   Clustering and weight averaging operate within each head while routing
   retains the original expert IDs. Reference and grouped execution resolve
   those IDs against the compacted weights.
+  Unfused grouped execution reuses the expert output when multiple routes from the
+  same token and head resolve to the same physical expert.
   Set `memory.quantize_experts_on_load=true` with a supported format to
   pack each merged projection as it is read. To reuse a packed export, set
   `memory.frozen_weight_packed_state_path` with the same original checkpoint,

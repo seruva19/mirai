@@ -791,14 +791,31 @@ class Magi2GroupedMoEBackend:
                     "memory.moe_routed_gemm='triton' " + verdict.reason + "."
                 )
 
-        expert_output = self.branch_features(
-            module, x_heads, sorted_rows, offsets, forward_backend, dx_backend
+        expert_output = self._grouped_branch_features(
+            module, x_heads, sorted_rows, flat_experts, order, offsets, forward_backend, dx_backend,
         )
         weighted = expert_output * sorted_probs.to(expert_output.dtype)[:, None]
         output = torch.zeros(
             tokens * num_heads, d_head, device=device, dtype=x_heads.dtype
         ).index_add(0, sorted_rows, weighted.to(x_heads.dtype))
         return output.view(tokens, num_heads, d_head)
+
+
+    def _grouped_branch_features(
+        self, module, x_heads, sorted_rows, experts, order, offsets, forward_backend, dx_backend,
+    ):
+        if getattr(module, "_mirai_expert_alias_indices", None) is None:
+            return self.branch_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend)
+        # Stable grouping keeps token order inside each physical expert.
+        row_count = max(1, x_heads.shape[0] * x_heads.shape[1])
+        keys = experts[order] * row_count + sorted_rows
+        unique, inverse = torch.unique_consecutive(keys, return_inverse=True)
+        compact_rows = unique.remainder(row_count)
+        compact_experts = torch.div(unique, row_count, rounding_mode="floor")
+        compact_offsets = torch.bincount(compact_experts, minlength=offsets.numel()).cumsum(0).to(torch.int32)
+        return self.branch_features(
+            module, x_heads, compact_rows, compact_offsets, forward_backend, dx_backend,
+        ).index_select(0, inverse)
 
 
 @dataclass
@@ -848,10 +865,12 @@ class Magi2ExpertBranchPlan:
             experts = self.flat_experts.index_select(0, selected)
             rows = self.rows.index_select(0, selected)
         order = experts.argsort(stable=True)
-        computed = self.backend.branch_features(
+        computed = self.backend._grouped_branch_features(
             self.module,
             self.x_heads,
             rows.index_select(0, order),
+            experts,
+            order,
             self._grouped_offsets(experts),
             self.forward_backend,
             self.dx_backend,

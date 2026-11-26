@@ -921,6 +921,26 @@ def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(t
         branch_plan.combine_branch_features(branch_plan.compute_branch_features(None)),
         expected.detach(), rtol=2e-5, atol=1e-5,
     )
+    duplicate_ids = torch.tensor([[0, 1], [0, 2]])[:, None, :].expand(2, tokens.shape[0], 2)
+    coefficients = torch.rand(duplicate_ids.shape, requires_grad=True)
+    visited_rows = []
+    branch_features = backend.branch_features
+
+    def record_branches(module, inputs, rows, offsets, forward_backend, dx_backend):
+        visited_rows.append(rows.numel())
+        return branch_features(module, inputs, rows, offsets, forward_backend, dx_backend)
+
+    backend.branch_features = record_branches
+    compact = backend.execute(layer, x, coefficients, duplicate_ids)
+    expanded = backend.execute(reference, x, coefficients, duplicate_ids)
+    assert visited_rows == [tokens.shape[0] * 2, tokens.shape[0] * 4]
+    torch.testing.assert_close(compact, expanded, rtol=2e-5, atol=1e-5)
+    for actual, wanted in zip(
+        torch.autograd.grad(compact.sum(), (x, coefficients)),
+        torch.autograd.grad(expanded.sum(), (x, coefficients)),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, wanted, rtol=5e-5, atol=5e-5)
     from mirai.core.models.magi2_preview.quantized_experts import _new_expert_store
 
     packed = _container(_reduced_moe(
