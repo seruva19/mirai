@@ -999,13 +999,19 @@ def run_segmented_grouped_expert_mlp(
 
         if fused_gate_up:
             weight = materialize(MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop)
+            if prefetch is not None:
+                prefetch("W_down", segment.group_start, segment.group_stop)
             gate, up = _grouped_linear(rows, weight, local_offsets, backend).chunk(2, dim=-1)
             del weight
         else:
             weight = materialize("W_gate", segment.group_start, segment.group_stop)
+            if prefetch is not None:
+                prefetch("W_up", segment.group_start, segment.group_stop)
             gate = _grouped_linear(rows, weight, local_offsets, backend)
             del weight
             weight = materialize("W_up", segment.group_start, segment.group_stop)
+            if prefetch is not None:
+                prefetch("W_down", segment.group_start, segment.group_stop)
             up = _grouped_linear(rows, weight, local_offsets, backend)
             del weight
 
@@ -1213,6 +1219,8 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
                     MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop,
                     dtype=rows.dtype, device=rows.device,
                 )
+                if prefetch is not None:
+                    prefetch("W_down", segment.group_start, segment.group_stop)
                 gate, up = _grouped_linear(rows, w_gate_up, local_offsets, ctx.forward_backend).chunk(2, dim=-1)
             else:
                 w_gate = store.materialize_segment(
@@ -1222,6 +1230,8 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
                     dtype=rows.dtype,
                     device=rows.device,
                 )
+                if prefetch is not None:
+                    prefetch("W_up", segment.group_start, segment.group_stop)
                 gate = _grouped_linear(rows, w_gate, local_offsets, ctx.forward_backend)
                 w_up = store.materialize_segment(
                     "W_up",
@@ -1230,6 +1240,8 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
                     dtype=rows.dtype,
                     device=rows.device,
                 )
+                if prefetch is not None:
+                    prefetch("W_down", segment.group_start, segment.group_stop)
                 up = _grouped_linear(rows, w_up, local_offsets, ctx.forward_backend)
             w_down = store.materialize_segment(
                 "W_down",
@@ -1328,6 +1340,8 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                     MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop,
                     dtype=x_rows.dtype, device=x_rows.device,
                 )
+                if prefetch is not None:
+                    prefetch("W_down", segment.group_start, segment.group_stop)
                 gate, up = _segment_routed_projection(
                     x_rows, w_gate_up, local_offsets, gather_rows=local_rows,
                     max_group_rows=max_group_rows,
@@ -1338,6 +1352,8 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                     "W_gate", segment.group_start, segment.group_stop,
                     dtype=x_rows.dtype, device=x_rows.device,
                 )
+                if prefetch is not None:
+                    prefetch("W_up", segment.group_start, segment.group_stop)
                 gate = _segment_routed_projection(
                     x_rows, w_gate, local_offsets, gather_rows=local_rows,
                     max_group_rows=max_group_rows,
@@ -1347,6 +1363,8 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                     "W_up", segment.group_start, segment.group_stop,
                     dtype=x_rows.dtype, device=x_rows.device,
                 )
+                if prefetch is not None:
+                    prefetch("W_down", segment.group_start, segment.group_stop)
                 up = _segment_routed_projection(
                     x_rows, w_up, local_offsets, gather_rows=local_rows,
                     max_group_rows=max_group_rows,
@@ -1395,6 +1413,8 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                     MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop,
                     dtype=x_rows.dtype, device=x_rows.device,
                 )
+                if prefetch is not None:
+                    prefetch("W_down", segment.group_start, segment.group_stop)
                 gate, up = _segment_routed_projection(
                     x_rows, w_gate_up, local_offsets, gather_rows=local_rows,
                     max_group_rows=max_group_rows,
@@ -1404,6 +1424,8 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                     "W_gate", segment.group_start, segment.group_stop,
                     dtype=x_rows.dtype, device=x_rows.device,
                 )
+                if prefetch is not None:
+                    prefetch("W_up", segment.group_start, segment.group_stop)
                 gate = _segment_routed_projection(
                     x_rows, w_gate, local_offsets, gather_rows=local_rows,
                     max_group_rows=max_group_rows,
@@ -1412,6 +1434,8 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                     "W_up", segment.group_start, segment.group_stop,
                     dtype=x_rows.dtype, device=x_rows.device,
                 )
+                if prefetch is not None:
+                    prefetch("W_down", segment.group_start, segment.group_stop)
                 up = _segment_routed_projection(
                     x_rows, w_up, local_offsets, gather_rows=local_rows,
                     max_group_rows=max_group_rows,
@@ -1578,6 +1602,8 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                     MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop,
                     dtype=x_rows.dtype, device=device,
                 )
+                if prefetch is not None:
+                    prefetch("W_down", segment.group_start, segment.group_stop)
                 gate, up = _segment_routed_projection(
                     x_rows, w_gate_up, local_offsets, gather_rows=local_rows,
                     max_group_rows=max_group_rows,
@@ -1588,6 +1614,8 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                     "W_gate", segment.group_start, segment.group_stop,
                     dtype=x_rows.dtype, device=device,
                 )
+                if prefetch is not None:
+                    prefetch("W_up", segment.group_start, segment.group_stop)
                 gate = _segment_routed_projection(
                     x_rows, w_gate, local_offsets, gather_rows=local_rows,
                     max_group_rows=max_group_rows,
@@ -1597,6 +1625,8 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                     "W_up", segment.group_start, segment.group_stop,
                     dtype=x_rows.dtype, device=device,
                 )
+                if prefetch is not None:
+                    prefetch("W_down", segment.group_start, segment.group_stop)
                 up = _segment_routed_projection(
                     x_rows, w_up, local_offsets, gather_rows=local_rows,
                     max_group_rows=max_group_rows,

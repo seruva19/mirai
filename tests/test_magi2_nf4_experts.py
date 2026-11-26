@@ -1898,8 +1898,10 @@ def test_magi2_staged_layers_share_one_packed_reader(tmp_path, monkeypatch) -> N
     torch.testing.assert_close(
         torch.autograd.grad(actual.sum(), x)[0], torch.autograd.grad(expected.sum(), x)[0], rtol=0, atol=0,
     )
-    assert active._packed_range_reader.reader.snapshot()["prefetch_consumed"] > before
-    before = active._packed_range_reader.reader.snapshot()["prefetch_consumed"]
+    snapshot = active._packed_range_reader.reader.snapshot()
+    assert snapshot["prefetch_consumed"] - before > 8
+    assert snapshot["prefetch_queued"] == 0
+    before = snapshot["prefetch_consumed"]
 
     def routed_reference(rows, weights, boundaries, *, gather_rows=None, max_group_rows=None):
         if gather_rows is not None:
@@ -1914,7 +1916,9 @@ def test_magi2_staged_layers_share_one_packed_reader(tmp_path, monkeypatch) -> N
     torch.testing.assert_close(
         torch.autograd.grad(actual.sum(), x)[0], torch.autograd.grad(expected.sum(), x)[0], rtol=0, atol=0,
     )
-    assert active._packed_range_reader.reader.snapshot()["prefetch_consumed"] > before
+    snapshot = active._packed_range_reader.reader.snapshot()
+    assert snapshot["prefetch_consumed"] - before > 8
+    assert snapshot["prefetch_queued"] == 0
     from mirai.core.training.residency import tensor_residency
 
     events = []

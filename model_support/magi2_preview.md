@@ -248,8 +248,9 @@ packed expert slices, so overlapping route sets can reuse cached experts.
 Staged CUDA uploads reuse a pinned host ring sized by the host pin budget
 and the reader's maximum transfer size.
 For segmented grouped linear and expert MLP execution,
-`memory.packed_stream_prefetch_depth` enables reads of the next segment
-during the current matmul, including input-gradient recomputation.
+`memory.packed_stream_prefetch_depth` enables reads for the next projection
+within the active segment and the first projection of the next active segment,
+including during input-gradient recomputation.
 The
 provider-owned schema stores a versioned manifest and one NF4 safetensors shard
 per routed-expert layer. Restore checks model variant, denoiser subfolder,
