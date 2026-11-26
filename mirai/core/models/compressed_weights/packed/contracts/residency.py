@@ -373,6 +373,29 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
                 stream_backend="gds",
             )
 
+    def test_gds_rejects_a_handle_without_async_reads(self) -> None:
+        import sys
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from mirai.core.models.compressed_weights.packed import packed_stream_gds
+
+        driver = mock.Mock()
+        driver.get.side_effect = {"is_gds_available": True, "allow_compat_mode": False}.__getitem__
+        defaults = mock.Mock()
+        context = mock.MagicMock()
+        defaults.set.return_value = context
+        handle = mock.Mock(spec=["close", "raw_read", "is_direct_io_supported"])
+        kvikio = SimpleNamespace(cufile_driver=driver, defaults=defaults, CuFile=mock.Mock(return_value=handle))
+        with mock.patch.dict(sys.modules, {
+            "kvikio": kvikio, "kvikio.cufile_driver": driver, "kvikio.defaults": defaults,
+        }), mock.patch.object(packed_stream_gds, "read_safetensors_storage_alignment"):
+            with self.assertRaisesRegex(packed_stream_gds.GdsUnavailableError, "raw_read_async"):
+                packed_stream_gds.KvikioGdsReader({"experts": Path("experts.safetensors")}, slots=1, slot_bytes=4096)
+        handle.close.assert_called_once_with()
+        handle.raw_read.assert_not_called()
+        context.__exit__.assert_called_once()
+
     def test_gds_async_read_awaits_its_stream_and_trims_aligned_bytes(self) -> None:
         import contextlib
         import threading
