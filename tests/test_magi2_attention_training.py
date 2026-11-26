@@ -36,6 +36,21 @@ from mirai.vendors.magi2_preview.model.magi2_preview import (
 CU_SEQLENS = torch.tensor([0, 5, 12], dtype=torch.int32)
 
 
+@pytest.fixture(scope="module")
+def flex_grad_device() -> torch.device:
+    cpu = torch.device("cpu")
+    sample = torch.ones(1, 1, 2, 16, device=cpu, requires_grad=True)
+    try:
+        flex_module.flex_attention_function(compiled=False)(sample, sample, sample).sum().backward()
+    except NotImplementedError as exc:
+        if "does not support backward on CPU" not in str(exc):
+            raise
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        pytest.skip(str(exc))
+    return cpu
+
+
 def _packed_inputs(
     *,
     heads_q: int = 4,
@@ -45,13 +60,14 @@ def _packed_inputs(
     sink_tokens: int = 1,
     dtype: torch.dtype = torch.float32,
     seed: int = 17,
+    device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     heads_kv = heads_q if heads_kv is None else heads_kv
-    query = torch.randn(1, tokens, heads_q, head_dim, dtype=dtype, requires_grad=True)
-    key = torch.randn(1, tokens, heads_kv, head_dim, dtype=dtype, requires_grad=True)
-    value = torch.randn(1, tokens, heads_kv, head_dim, dtype=dtype, requires_grad=True)
-    sink = torch.randn(sink_tokens, heads_q, dtype=torch.float32, requires_grad=True)
+    query = torch.randn(1, tokens, heads_q, head_dim, device=device, dtype=dtype, requires_grad=True)
+    key = torch.randn(1, tokens, heads_kv, head_dim, device=device, dtype=dtype, requires_grad=True)
+    value = torch.randn(1, tokens, heads_kv, head_dim, device=device, dtype=dtype, requires_grad=True)
+    sink = torch.randn(sink_tokens, heads_q, device=device, dtype=torch.float32, requires_grad=True)
     return query, key, value, sink
 
 
@@ -221,9 +237,9 @@ def test_magi2_regional_mhc_matches_eager_with_attention_views(monkeypatch) -> N
 @pytest.mark.parametrize("softcap", (-1.0, 8.0))
 @pytest.mark.parametrize("offsets", (CU_SEQLENS, torch.tensor([0, 12])))
 def test_flex_matches_reference_outputs_and_every_gradient(
-    softcap: float, sink_tokens: int, offsets: torch.Tensor
+    softcap: float, sink_tokens: int, offsets: torch.Tensor, flex_grad_device: torch.device
 ) -> None:
-    inputs = _packed_inputs(sink_tokens=sink_tokens)
+    inputs = _packed_inputs(sink_tokens=sink_tokens, device=flex_grad_device)
     references = _cloned(inputs)
 
     observed = flex_varlen_attention_with_sink(
@@ -249,10 +265,10 @@ def test_flex_matches_reference_outputs_and_every_gradient(
         torch.testing.assert_close(value.grad, reference.grad, rtol=1e-5, atol=1e-5)
 
 
-def test_document_mask_cache_tracks_offsets_and_accepts_grad_after_inference() -> None:
+def test_document_mask_cache_tracks_offsets_and_accepts_grad_after_inference(flex_grad_device) -> None:
     cache = flex_module._document_block_mask
     cache.cache_clear()
-    inputs = _packed_inputs()
+    inputs = _packed_inputs(device=flex_grad_device)
     offsets = CU_SEQLENS.clone()
 
     def run(cu: torch.Tensor) -> torch.Tensor:
@@ -274,8 +290,8 @@ def test_document_mask_cache_tracks_offsets_and_accepts_grad_after_inference() -
         run(offsets)
 
 
-def test_flex_matches_reference_in_bfloat16() -> None:
-    inputs = _packed_inputs(dtype=torch.bfloat16, seed=41)
+def test_flex_matches_reference_in_bfloat16(flex_grad_device) -> None:
+    inputs = _packed_inputs(dtype=torch.bfloat16, seed=41, device=flex_grad_device)
     references = _cloned(inputs)
 
     observed = flex_varlen_attention_with_sink(
@@ -302,8 +318,8 @@ def test_flex_matches_reference_in_bfloat16() -> None:
         torch.testing.assert_close(value.grad, reference.grad, rtol=5e-2, atol=5e-2)
 
 
-def test_flex_matches_reference_for_grouped_query_attention() -> None:
-    inputs = _packed_inputs(heads_q=4, heads_kv=2, seed=53)
+def test_flex_matches_reference_for_grouped_query_attention(flex_grad_device) -> None:
+    inputs = _packed_inputs(heads_q=4, heads_kv=2, seed=53, device=flex_grad_device)
     references = _cloned(inputs)
 
     observed = flex_varlen_attention_with_sink(
@@ -369,19 +385,18 @@ def test_sink_enters_the_denominator_unscaled_with_zero_value_contribution() -> 
 
 
 def test_absent_sink_reduces_to_plain_varlen_attention() -> None:
-    inputs = _packed_inputs(seed=61)
-    references = _cloned(inputs)
+    inputs = tuple(tensor.detach() for tensor in _packed_inputs(seed=61)[:3])
     empty = torch.zeros(0, 4, dtype=torch.float32)
 
     observed = flex_varlen_attention_with_sink(
-        *inputs[:3],
+        *inputs,
         cu_seqlens_q=CU_SEQLENS,
         cu_seqlens_k=CU_SEQLENS,
         softcap=-1.0,
         sink=empty,
     )
     expected = _torch_varlen_attention_with_sink(
-        *references[:3],
+        *inputs,
         cu_seqlens_q=CU_SEQLENS,
         cu_seqlens_k=CU_SEQLENS,
         softcap=-1.0,
@@ -428,8 +443,8 @@ def test_document_ids_reject_inconsistent_cumulative_lengths() -> None:
         flex_document_ids(torch.tensor([0, 5, 12], dtype=torch.int32), total=13)
 
 
-def test_attached_backend_is_used_in_grad_mode_and_absence_is_the_reference() -> None:
-    inputs = _packed_inputs(seed=73)
+def test_attached_backend_is_used_in_grad_mode_and_absence_is_the_reference(flex_grad_device) -> None:
+    inputs = _packed_inputs(seed=73, device=flex_grad_device)
     references = _cloned(inputs)
     handler = VarlenHandler(
         cu_seqlens_q=CU_SEQLENS,
