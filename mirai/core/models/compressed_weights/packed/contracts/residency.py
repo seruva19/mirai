@@ -22,6 +22,30 @@ _GIB = 1024**3
 
 
 class PackedStateResidencyPolicyTests(unittest.TestCase):
+    def test_prefetched_slot_waits_for_consumer_and_legacy_read_owns_a_copy(self) -> None:
+        from mirai.core.models.compressed_weights.packed.packed_stream_prefetch import (
+            PackedCudaSlotTransfer,
+            PackedStreamPrefetchHost,
+        )
+
+        host = PackedStreamPrefetchHost()
+        host._normalize_indices = lambda _key, indices: tuple(indices)
+        host._prefetch = mock.Mock()
+        weight = torch.tensor([12, 5])
+        sequence = mock.Mock()
+        release = sequence.release
+        release.side_effect = lambda: weight.zero_()
+        host._prefetch.take.return_value = (True, PackedCudaSlotTransfer(weight, sequence.ready, sequence.producer, release))
+        with mock.patch("torch.cuda.current_stream", return_value=sequence.consumer), mock.patch(
+            "torch.cuda.Event", return_value=sequence.done,
+        ):
+            actual = host.get_slices_to_device("weight", (0,), device="cpu")
+        torch.testing.assert_close(actual, torch.tensor([12, 5]))
+        self.assertEqual(sequence.mock_calls, [
+            mock.call.consumer.wait_event(sequence.ready), mock.call.done.record(sequence.consumer),
+            mock.call.producer.wait_event(sequence.done), mock.call.release(),
+        ])
+
     def test_prefetch_claim_has_one_owner_and_close_discards_only_unclaimed_results(self) -> None:
         from concurrent.futures import ThreadPoolExecutor
         from threading import Event

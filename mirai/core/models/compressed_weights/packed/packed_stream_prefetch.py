@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Hashable
 
@@ -161,6 +161,33 @@ class PackedCudaTransfer:
     ready: Any
 
 
+@dataclass(frozen=True)
+class PackedCudaSlotTransfer:
+    tensor: Any
+    ready: Any
+    producer: Any
+    release: Callable[[], None]
+
+    @contextmanager
+    def borrow(self):
+        import torch
+
+        consumer = torch.cuda.current_stream(self.tensor.device)
+        try:
+            consumer.wait_event(self.ready)
+            yield self.tensor
+        finally:
+            try:
+                consumed = torch.cuda.Event()
+                consumed.record(consumer)
+                self.producer.wait_event(consumed)
+            except Exception:
+                consumer.synchronize()
+                self.release()
+                raise
+            self.release()
+
+
 class PackedStreamPrefetchHost:
     """Request-consumption contract mixed into the packed stream mapping."""
 
@@ -174,6 +201,11 @@ class PackedStreamPrefetchHost:
         device: Any,
         dtype: Any | None = None,
     ) -> Any:
+        with self._borrow_slices_to_device(key, indices, device=device, dtype=dtype) as (tensor, borrowed):
+            return tensor.clone() if borrowed else tensor
+
+    @contextmanager
+    def _borrow_slices_to_device(self, key, indices, *, device, dtype=None):
         import torch
 
         requested = self._normalize_indices(str(key), indices)
@@ -183,7 +215,7 @@ class PackedStreamPrefetchHost:
                 str(key), requested, device=torch.device(device), dtype=dtype
             )
             found, value = self._prefetch.take(identity)
-        if not found:
+        if not found or value is None:
             value = self._get_slices_to_device_now(
                 str(key), requested, device=device, dtype=dtype
             )
@@ -191,8 +223,12 @@ class PackedStreamPrefetchHost:
             current = torch.cuda.current_stream(value.tensor.device)
             current.wait_event(value.ready)
             value.tensor.record_stream(current)
-            return value.tensor
-        return value
+            yield value.tensor, False
+        elif isinstance(value, PackedCudaSlotTransfer):
+            with value.borrow() as tensor:
+                yield tensor, True
+        else:
+            yield value, False
 
     def prefetch_slices_to_device(
         self,

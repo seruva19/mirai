@@ -48,16 +48,20 @@ class FixedCudaArena:
         return self._storage[start:start + self._slot_bytes]
 
     @contextmanager
-    def lease(self, stream):
+    def lease(self, stream, *, wait: bool = True):
         """Borrow a slot for reads and writes enqueued on the given stream."""
         import torch
 
         with self._leases:
-            self._leases.wait_for(lambda: self._failed or bool(self._available))
+            if wait:
+                self._leases.wait_for(lambda: self._failed or bool(self._available))
             if self._failed:
                 raise RuntimeError("CUDA arena slot completion could not be verified.")
-            index = self._available.pop(0)
+            index = self._available.pop(0) if self._available else None
             previous = self._release_events.get(index)
+        if index is None:
+            yield None
+            return
         try:
             if previous is not None:
                 stream.wait_event(previous)

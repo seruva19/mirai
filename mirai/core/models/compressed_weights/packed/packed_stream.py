@@ -7,15 +7,16 @@ import time
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
 from .packed_stream_layout import PackedTensorRegion
 from .packed_stream_layout import load_packed_regions
 from .packed_stream_layout import torch_dtype
-from .packed_stream_prefetch import PackedCudaTransfer, PackedStreamPrefetchHost
+from .packed_stream_prefetch import PackedCudaSlotTransfer, PackedCudaTransfer, PackedStreamPrefetchHost
 from .packed_stream_prefetch import PackedStreamPrefetchRing
+from .packed_stream_prefetch import packed_prefetch_identity
 from .packed_stream_cache import PackedStreamHostCache
 from .packed_stream_cache import packed_stream_cache_key
 from .packed_stream_io import contiguous_runs as _contiguous_runs
@@ -130,6 +131,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._prefetch_dense_lock = threading.RLock()
         self._prefetch_dense_arena = None
         self._prefetch_dense_device = None
+        self._prefetch_packed_lock = threading.Lock()
+        self._prefetch_packed_arena = None
+        self._prefetch_packed_device = None
         self._staging_unavailable = False
         self._pinned_in_flight = 0
         self._pinned_peak = 0
@@ -321,6 +325,15 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
     def borrow_packed_fields(self, keys, indices, *, device):
         """Supply short-lived packed fields on the current CUDA stream."""
         target = torch.device(device)
+        if self._raw_staging and target.type == "cuda" and self.prefetch_enabled:
+            with self._prefetch_dense_lock, ExitStack() as leases:
+                if self._closed:
+                    raise RuntimeError("Packed stream mapping is closed.")
+                yield [
+                    leases.enter_context(self._borrow_slices_to_device(key, indices, device=target))[0]
+                    for key in keys
+                ]
+            return
         if self._raw_staging and target.type == "cuda" and not self.prefetch_enabled:
             indices = tuple(indices)
             regions = [self._region(key) for key in keys]
@@ -358,6 +371,61 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                         yield fields
                 return
         yield [self.get_slices_to_device(key, indices, device=target) for key in keys]
+
+    def get_slices_to_device(self, key, indices, *, device, dtype=None):
+        if self._raw_staging and self.prefetch_enabled:
+            with self._prefetch_dense_lock:
+                if self._closed:
+                    raise RuntimeError("Packed stream mapping is closed.")
+                return super().get_slices_to_device(key, indices, device=device, dtype=dtype)
+        return super().get_slices_to_device(key, indices, device=device, dtype=dtype)
+
+    def prefetch_slices_to_device(self, key, indices, *, device, dtype=None):
+        target = torch.device(device)
+        if not self._raw_staging or self._prefetch is None or target.type != "cuda" or dtype is not None:
+            return super().prefetch_slices_to_device(key, indices, device=device, dtype=dtype)
+        requested = self._normalize_indices(str(key), indices)
+        if not requested:
+            raise ValueError("Packed stream prefetch requires at least one expert.")
+        region = self._region(str(key))
+        nbytes = region.nbytes // region.shape[0] * len(requested)
+        if nbytes > _MAX_RANGE_BYTES:
+            return super().prefetch_slices_to_device(key, indices, device=device, dtype=dtype)
+        return self._prefetch.submit(
+            packed_prefetch_identity(str(key), requested, device=target, dtype=None),
+            lambda: self._load_prefetched_slot(str(key), region, requested, target, nbytes),
+            discard=lambda transfer: transfer.release() if transfer is not None else None,
+        )
+
+    def _load_prefetched_slot(self, key, region, indices, target, nbytes):
+        from .fixed_cuda_arena import FixedCudaArena
+
+        producer = self._cuda_stream(target)
+        with self._prefetch_packed_lock:
+            if self._prefetch_packed_arena is None:
+                self._prefetch_packed_arena = FixedCudaArena(
+                    device=target, slots=_CUDA_STAGING_SLOTS, slot_bytes=_MAX_RANGE_BYTES, alignment=4096,
+                )
+                self._prefetch_packed_device = producer.device
+            elif self._prefetch_packed_device != producer.device:
+                raise ValueError("Packed CUDA prefetch slots are bound to one device.")
+            arena = self._prefetch_packed_arena
+        with torch.cuda.stream(producer), ExitStack() as ownership:
+            slot = ownership.enter_context(arena.lease(producer, wait=False))
+            if slot is None:
+                return None
+            if self._gds is not None:
+                tensor = self._read_borrowed_gds_field(key, region, indices, slot, target)
+            else:
+                source = self._get_slices_to_device_now(key, indices, device="cpu")
+                tensor = slot[:nbytes].view(source.dtype).view(source.shape)
+                tensor.copy_(source)
+                with self._stats_lock:
+                    self._h2d_ops += 1
+                    self._h2d_bytes += nbytes
+            ready = torch.cuda.Event()
+            ready.record(producer)
+            return PackedCudaSlotTransfer(tensor, ready, producer, ownership.pop_all().close)
 
     def _read_borrowed_gds_field(self, key, region, indices, slot, device):
         requested = self._normalize_indices(key, indices)
@@ -471,6 +539,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 snapshot["cuda_prefetch_dense_arena_bytes"] = (
                     _CUDA_PREFETCH_DENSE_SLOTS * _MAX_RANGE_BYTES if self._prefetch_dense_arena is not None else 0
                 )
+                snapshot["cuda_prefetch_packed_arena_bytes"] = (
+                    _CUDA_STAGING_SLOTS * _MAX_RANGE_BYTES if self._prefetch_packed_arena is not None else 0
+                )
         snapshot.update(self._cache.snapshot())
         if self._gds is not None:
             snapshot.update(self._gds.snapshot())
@@ -505,6 +576,10 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 self._prefetch_dense_arena = None
         if self._prefetch is not None:
             self._prefetch.close()
+        with self._prefetch_packed_lock:
+            if self._prefetch_packed_arena is not None:
+                self._prefetch_packed_arena.synchronize()
+                self._prefetch_packed_arena = None
         self._executor.shutdown(wait=True, cancel_futures=False)
         with self._staging_lock:
             if self._staging_arena is not None:

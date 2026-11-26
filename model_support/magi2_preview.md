@@ -259,7 +259,10 @@ Grouped CUDA execution caps segment size to fit the dense slots, including
 scratch for fused gate/up. An individual projection larger than the slot
 uses an owning CUDA tensor. With prefetch enabled, three separate 32 MiB
 dense slots keep grouped execution independent of the prefetch worker.
-Prefetched packed fields use owning CUDA tensors. Eligible segmented
+Four separate packed slots hold completed prefetch results until the
+consumer finishes or the queue closes. If all slots are occupied, a demand
+read serves the request. Callers that retain a prefetched tensor receive
+an owning copy. Eligible segmented
 grouped projections can also write the dense weights into a second slot
 and hold it until the grouped matrix multiplication finishes. FP8 decodes
 one tile at a time into the slot. FP4 and GGUF use per-expert decode scratch.
