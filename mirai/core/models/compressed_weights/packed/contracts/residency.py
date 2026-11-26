@@ -49,6 +49,20 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         self.assertIs(arena.slot(0).untyped_storage(), arena.slot(1).untyped_storage())
         with self.assertRaises(IndexError):
             arena.slot(2)
+        producer, consumer = mock.Mock(), mock.Mock()
+        first_done, second_done, third_done = mock.Mock(), mock.Mock(), mock.Mock()
+        with mock.patch("torch.cuda.Event", side_effect=[first_done, second_done, third_done]):
+            with self.assertRaisesRegex(ValueError, "consumer failed"):
+                with arena.lease(producer) as first:
+                    with arena.lease(producer) as second:
+                        self.assertNotEqual(first.data_ptr(), second.data_ptr())
+                    raise ValueError("consumer failed")
+            with arena.lease(consumer) as reused:
+                self.assertEqual(reused.data_ptr(), second.data_ptr())
+                consumer.wait_event.assert_called_once_with(first_done)
+        first_done.record.assert_called_once_with(producer)
+        second_done.record.assert_called_once_with(producer)
+        third_done.record.assert_called_once_with(consumer)
 
     def test_raw_staged_upload_reuses_slots_without_aliasing_results(self) -> None:
         from types import SimpleNamespace
