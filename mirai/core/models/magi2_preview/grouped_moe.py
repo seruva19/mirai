@@ -1835,7 +1835,9 @@ _POLICY_FIELD_NOTES: dict[str, str] = {
 }
 
 
-def _reject_unconsumed_policy_fields(policy: Any, *, quantized_experts: bool = False) -> None:
+def _reject_unconsumed_policy_fields(
+    policy: Any, *, quantized_experts: bool = False, packed_stream_bound: bool = False,
+) -> None:
     """Raise for any policy field MAGI-2 neither consumes nor leaves at default.
 
     The consumed set is a function of the storage format: three fields acquire a
@@ -1843,6 +1845,13 @@ def _reject_unconsumed_policy_fields(policy: Any, *, quantized_experts: bool = F
     the family runs native BF16 experts.
     """
     consumed = _QUANTIZED_CONSUMED_POLICY_FIELDS if quantized_experts else _CONSUMED_POLICY_FIELDS
+    if quantized_experts and packed_stream_bound:
+        consumed = consumed | {
+            "packed_state_preload",
+            "packed_stream_cache_gib",
+            "packed_stream_backend",
+            "packed_stream_prefetch_depth",
+        }
     defaults = MoEOptimizationPolicy()
     for field in fields(MoEOptimizationPolicy):
         if field.name in consumed:
@@ -1863,7 +1872,7 @@ def _reject_unconsumed_policy_fields(policy: Any, *, quantized_experts: bool = F
 
 
 def resolve_magi2_moe_execution(
-    policy: Any, *, quantized_experts: bool = False
+    policy: Any, *, quantized_experts: bool = False, packed_stream_bound: bool = False,
 ) -> Magi2GroupedMoEPlan | None:
     """Validate a MoE optimization policy and return the grouped plan, if any.
 
@@ -1881,7 +1890,9 @@ def resolve_magi2_moe_execution(
             "MAGI-2 Preview supports memory.moe_kernel_backend='auto', 'torch', "
             f"or 'grouped'; got '{kernel_backend}'."
         )
-    _reject_unconsumed_policy_fields(policy, quantized_experts=quantized_experts)
+    _reject_unconsumed_policy_fields(
+        policy, quantized_experts=quantized_experts, packed_stream_bound=packed_stream_bound,
+    )
     if quantized_experts and kernel_backend == "torch":
         raise Magi2GroupedMoEPolicyError(
             "memory.moe_kernel_backend='torch' selects the vendored per-expert "

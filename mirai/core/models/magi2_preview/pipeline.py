@@ -302,6 +302,27 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        from mirai.core.models.magi2_preview.working_set import Magi2ExpertWorkingSet
+
+        self._expert_working_set = Magi2ExpertWorkingSet(
+            fraction=family.get("expert_working_set_fraction", 1.0),
+            hold_steps=family.get("expert_working_set_hold_steps", 4),
+            anneal_steps=family.get("expert_working_set_anneal_steps", 0),
+        )
+        if self._expert_working_set.fraction < 1 and (
+            not self._stream_expert_artifact
+            or self._packed_stream_cache_bytes <= 0
+            or not self._packed_expert_state_path
+            or self._packed_stream_backend not in {"staged", "direct_io", "io_uring"}
+            or getattr(memory_config, "packed_state_preload", "") != "off"
+            or getattr(memory_config, "expert_weight_access", "") != "active_group_dequant"
+        ):
+            raise ValueError(
+                "MAGI-2 expert working sets require stream_disk, a packed expert artifact, "
+                "a host-backed packed stream backend, packed_state_preload='off', a positive packed stream cache, "
+                "and expert_weight_access='active_group_dequant'."
+            )
+        self._expert_working_set_window: tuple[int, int] | None = None
         from mirai.core.models.magi2_preview.mixed_experts import MAGI2_EXPERT_ROTATION_SIZES
 
         self._expert_rotation_group_size = family.get("expert_rotation_group_size", 0)
@@ -1068,7 +1089,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         token_chunk_size = int(
             getattr(getattr(self, "_moe_token_chunk_policy", None), "token_chunk_size", 0)
         )
-        plan = resolve_magi2_moe_execution(policy, quantized_experts=quantized)
+        plan = resolve_magi2_moe_execution(
+            policy,
+            quantized_experts=quantized,
+            packed_stream_bound=quantized and all(
+                getattr(store, "_packed_range_reader", None) is not None
+                for store in self._expert_stores.values()
+            ),
+        )
         if plan is not None:
             validate_grouped_moe_backend_support(
                 plan, device=self._transformer_device()
@@ -1449,6 +1477,30 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
         self._gradient_checkpointing = mode
         self.transformer.block.gradient_checkpointing = active
+
+    def supports_router_subset_progress(self) -> bool:
+        return self._expert_working_set.fraction < 1
+
+    def set_router_subset_progress(self, *, step: int, seed: int) -> None:
+        policy = self._expert_working_set
+        if policy.fraction == 1:
+            return
+        window = (step // policy.hold_steps, seed)
+        if self._expert_working_set_window == window:
+            return
+        for index, layer in self.get_block_swap_units():
+            experts = getattr(layer.mlp, "moe_mlp", None)
+            if experts is None:
+                continue
+            heads = experts.router.expert_bias.numel() // experts.num_experts
+            candidates = policy.candidates(
+                step=step, seed=seed, layer=index, heads=heads,
+                experts=experts.num_experts, top_k=experts.topk,
+            )
+            experts._mirai_router_candidates = (
+                candidates.to(experts.router.expert_bias.device) if candidates is not None else None
+            )
+        self._expert_working_set_window = window
 
     def get_block_swap_units(self) -> list[tuple[int, Any]]:
         return list(enumerate(self.transformer.block.layers))
@@ -2259,6 +2311,9 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "expert_mixture_basis_down_format",
         "expert_pruning_adapter_source_plan_path",
         "expert_rotation_group_size",
+        "expert_working_set_fraction",
+        "expert_working_set_hold_steps",
+        "expert_working_set_anneal_steps",
         "companion_weight_quantization",
         "norm_weight_quantization",
         "config_path",
@@ -2341,6 +2396,16 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
 
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        from mirai.core.models.magi2_preview.working_set import Magi2ExpertWorkingSet
+
+        try:
+            Magi2ExpertWorkingSet(
+                fraction=params.get("expert_working_set_fraction", 1.0),
+                hold_steps=params.get("expert_working_set_hold_steps", 4),
+                anneal_steps=params.get("expert_working_set_anneal_steps", 0),
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
         basis_rank = params.get("expert_shared_basis_rank", 0)
         if type(basis_rank) is not int or basis_rank < 0:
             errors.append("MAGI-2 expert_shared_basis_rank must be a non-negative integer.")

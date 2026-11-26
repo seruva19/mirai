@@ -397,6 +397,17 @@ def test_quantized_policy_rejects_every_unconsumed_field(field_name: str) -> Non
         resolve_magi2_moe_execution(policy, quantized_experts=True)
 
 
+def test_magi2_grouped_plan_accepts_policy_for_a_bound_packed_stream() -> None:
+    policy = MoEOptimizationPolicy(
+        expert_weight_access="active_group_dequant", packed_state_preload="off",
+        packed_stream_backend="io_uring", packed_stream_cache_gib=1.0,
+        packed_stream_prefetch_depth=2,
+    )
+    assert resolve_magi2_moe_execution(policy, quantized_experts=True, packed_stream_bound=True)
+    with pytest.raises(Magi2GroupedMoEPolicyError, match="packed_state_preload"):
+        resolve_magi2_moe_execution(policy, quantized_experts=True)
+
+
 def test_expert_access_keys_are_consumed_only_for_packed_experts() -> None:
     policy = MoEOptimizationPolicy(
         kernel_backend="grouped",
@@ -625,6 +636,70 @@ def _container(module: torch.nn.Module) -> torch.nn.Module:
     container = torch.nn.Module()
     container.mlp = holder
     return container
+
+
+def test_magi2_working_set_replays_optimizer_windows_and_preserves_eval_routes(tmp_path) -> None:
+    from mirai.core.models.magi2_preview.working_set import Magi2ExpertWorkingSet
+
+    experts = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32, num_experts=8)
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.block = torch.nn.Module()
+    pipeline.transformer.block.layers = torch.nn.ModuleList([_container(experts)])
+    policy = Magi2ExpertWorkingSet(fraction=0.25, hold_steps=4, anneal_steps=8)
+    pipeline._expert_working_set = policy
+    pipeline._expert_working_set_window = None
+    rows = torch.randn(5, 2, experts.d_head, requires_grad=True)
+    baseline = experts._route(rows)
+
+    assert pipeline.supports_router_subset_progress()
+    pipeline.set_router_subset_progress(step=0, seed=13)
+    first = experts._mirai_router_candidates
+    assert first.shape == (2, 2)
+    pipeline.set_router_subset_progress(step=3, seed=13)
+    assert experts._mirai_router_candidates is first
+    weights, routes = experts._route(rows)
+    assert (routes[..., None] == first[:, None, None, :]).any(dim=-1).all()
+    torch.testing.assert_close(weights.sum(dim=-1), torch.full((2, 5), experts.config.route_scale))
+    assert torch.isfinite(torch.autograd.grad(weights.square().sum(), rows)[0]).all()
+
+    source = _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32, num_experts=8))
+    quantize_magi2_experts_in_place(source, quant_format="fp8")
+    artifact = save_magi2_nf4_packed_state(tmp_path / "packed", source)
+    target = _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32, num_experts=8))
+    store = load_magi2_nf4_packed_state(
+        artifact, target, blocksize=64, quant_format="fp8",
+        range_read_backend="staged", stream_cache_bytes=1 << 20,
+    )["mlp.moe_mlp"]
+    reader = store._packed_range_reader.reader
+    try:
+        head_base = torch.arange(2)[:, None, None] * experts.num_experts
+        groups = (routes + head_base).unique()
+        options = dict(device="cpu", dtype=torch.float32)
+        store.materialize_segment("W_gate", 0, len(groups), group_ids=groups, **options)
+        first_read = reader.snapshot()["read_bytes"]
+        assert first_read > 0
+        _, next_routes = experts._route(-rows)
+        groups = (next_routes + head_base).unique()
+        store.materialize_segment("W_gate", 0, len(groups), group_ids=groups, **options)
+        assert reader.snapshot()["read_bytes"] == first_read
+    finally:
+        reader.close()
+
+    experts.eval()
+    for actual, expected in zip(experts._route(rows), baseline):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    experts.train()
+    pipeline.set_router_subset_progress(step=4, seed=13)
+    second = experts._mirai_router_candidates
+    assert second.shape == (2, 5)
+    pipeline._expert_working_set_window = None
+    pipeline.set_router_subset_progress(step=7, seed=13)
+    torch.testing.assert_close(experts._mirai_router_candidates, second)
+    assert not any("candidates" in name for name in experts.state_dict())
+    pipeline.set_router_subset_progress(step=8, seed=13)
+    assert experts._mirai_router_candidates is None
 
 
 def test_installing_stores_removes_the_dense_expert_state() -> None:

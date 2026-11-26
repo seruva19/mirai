@@ -952,6 +952,8 @@ def test_magi2_moe_policy_rejects_unsupported_fields() -> None:
 # One non-default value per policy field MAGI-2 does not consume. Fields with a
 # cross-field constraint carry the co-required keys so the policy itself builds.
 _NON_DEFAULT_POLICY_VALUES: dict[str, dict[str, object]] = {
+    "expert_device_cache_policy": {"expert_device_cache_policy": "routing_frequency"},
+    "expert_transfer_profile_path": {"expert_transfer_profile_path": "transfer_profile.json"},
     "expert_weight_access": {"expert_weight_access": "full_dequant"},
     "expert_dequant_chunk_size": {"expert_dequant_chunk_size": 8},
     "expert_device_cache_gib": {"expert_device_cache_gib": 1.0},

@@ -3453,6 +3453,41 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_packed_expert_working_set",
+      "kind": "routing_topology",
+      "owner": "mirai/core/models/magi2_preview/working_set.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "held_out_evidence",
+        "documentation"
+      ],
+      "symbols": [
+        "Magi2ExpertWorkingSet"
+      ],
+      "config_keys": [
+        "model.params.family_params"
+      ],
+      "disabled_config": {
+        "model.params.family_params": {}
+      },
+      "contract_paths": [
+        "tests/test_magi2_nf4_experts.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Head-local expert working sets for packed streaming",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_preview",
       "kind": "model_family",
       "owner": "mirai/core/models/magi2_preview/pipeline.py",

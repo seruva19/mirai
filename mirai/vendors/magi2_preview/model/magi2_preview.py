@@ -2645,6 +2645,7 @@ class CoreMultiHeadMoE(nn.Module):
         # None keeps the reference torch/flash paths below.
         self._mirai_moe_kernel_backend = None
         self._mirai_router_lora_executor = None
+        self._mirai_router_candidates: torch.Tensor | None = None
         self.config = config
         self.num_heads = config.num_heads
         self.num_experts = config.num_experts
@@ -2745,6 +2746,12 @@ class CoreMultiHeadMoE(nn.Module):
             gate = self.gate.view(num_heads, self.num_experts, self.d_head).float()
             router_logits = torch.einsum("shd,hed->hse", x_heads.float(), gate)
         expert_bias = self.router.expert_bias.view(num_heads, self.num_experts)
+        candidates = self._mirai_router_candidates if self.training else None
+        if candidates is not None:
+            candidates = candidates.to(router_logits.device)
+            expert_bias = expert_bias.gather(1, candidates)
+            candidates = candidates[:, None, :].expand(-1, router_logits.size(1), -1)
+            router_logits = router_logits.gather(2, candidates)
         topk_probs, topk_indices = _mh_moe_compute_topk(
             router_logits=router_logits,
             top_k=self.topk,
@@ -2752,6 +2759,8 @@ class CoreMultiHeadMoE(nn.Module):
             expert_bias=expert_bias,
             route_norm=self.config.route_norm,
         )
+        if candidates is not None:
+            topk_indices = candidates.gather(2, topk_indices)
         topk_probs = topk_probs * self.config.route_scale
         return topk_probs, topk_indices
 

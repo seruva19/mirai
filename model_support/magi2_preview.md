@@ -251,6 +251,17 @@ For segmented grouped linear and expert MLP execution,
 `memory.packed_stream_prefetch_depth` enables reads for the next projection
 within the active segment and the first projection of the next active segment,
 including during input-gradient recomputation.
+
+For experimental LoRA training with a host-backed packed stream, a positive
+host cache, and `memory.expert_weight_access="active_group_dequant"`, set
+`model.params.family_params.expert_working_set_fraction` below
+`1.0` to restrict each head to a seeded subset of its experts. The candidates
+remain fixed for `expert_working_set_hold_steps` optimizer steps (default
+`4`). `expert_working_set_anneal_steps` (default `0`) grows the fraction toward
+`1.0` at window boundaries when positive. Evaluation uses the full router.
+Compare held-out loss and packed read bytes against a full-router run using
+the same seed, artifact, data split, and host-cache budget.
+
 The
 provider-owned schema stores a versioned manifest and one NF4 safetensors shard
 per routed-expert layer. Restore checks model variant, denoiser subfolder,
@@ -855,6 +866,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   `memory.frozen_weight_packed_state_path`. Keep the original checkpoint
   available for the router and remaining weights. Restore checks the
   original checkpoint shard contents against the export fingerprint.
+- **Head-local expert working sets for packed streaming** — Restrict training
+  router candidates to a deterministic set per head for several optimizer steps.
 - **MAGI-2 mixture-basis expert storage** — Set the family parameter
   `expert_mixture_basis_rank` to a positive rank to fit gate and up projections
   as the original checkpoint loads. Set `expert_mixture_basis_count` and
