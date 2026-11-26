@@ -836,10 +836,13 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
 
 
 def test_magi2_shared_basis_reconstructs_selected_native_groups(tmp_path) -> None:
+    from types import SimpleNamespace
+
     from safetensors.torch import save_file
 
     from mirai.core.models.magi2_preview.basis_experts import (
         Magi2SharedBasisExpertStore, factorize_magi2_shared_basis_experts,
+        fingerprint_magi2_basis_checkpoint,
         stream_factorize_magi2_shared_basis_experts,
     )
 
@@ -902,6 +905,31 @@ def test_magi2_shared_basis_reconstructs_selected_native_groups(tmp_path) -> Non
     )["mlp.moe_mlp"]
     for key, value in installed.named_buffers():
         torch.testing.assert_close(dict(loaded.named_buffers())[key], value, rtol=0, atol=0)
+    pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = transformer
+    pipeline.model_config = SimpleNamespace(params=SimpleNamespace(variant="test"))
+    pipeline._expert_shared_basis_rank = 2
+    pipeline._expert_pruning_plan_path = ""
+    pipeline._nf4_blocksize = 64
+    pipeline._expert_rotation_group_size = 0
+    pipeline._expert_basis_source_sha256 = fingerprint_magi2_basis_checkpoint(str(tmp_path))
+    packed = pipeline.save_packed_frozen_weight_state(
+        tmp_path / "bound-basis", metadata={"model_variant": "test", "denoiser_subfolder": "transformer"},
+    )
+    pipeline._packed_expert_state_path = str(packed)
+    pipeline._restore_packed_experts(target, shared_basis_rank=2)
+    from safetensors.torch import load_file
+
+    checkpoint = tmp_path / "model.safetensors"
+    weights = load_file(str(checkpoint))
+    weights["mlp.moe_mlp.W_gate"] = weights["mlp.moe_mlp.W_gate"] + 1
+    changed = tmp_path / "changed"
+    changed.mkdir()
+    save_file(weights, str(changed / "model.safetensors"))
+    pipeline._expert_basis_source_sha256 = fingerprint_magi2_basis_checkpoint(str(changed))
+    with pytest.raises(ValueError, match="magi2_basis_source_sha256"):
+        pipeline._restore_packed_experts(target, shared_basis_rank=2)
     tokens = torch.rand(2, layer.num_heads, layer.d_head, requires_grad=True)
     backend = Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
     output = backend.execute(layer, tokens, *layer._route(tokens))

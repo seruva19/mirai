@@ -833,7 +833,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   passes over blocks of up to eight experts from the original checkpoint.
   To reload an exported factor artifact, keep the same rank and set
   `memory.frozen_weight_packed_state_path`. Keep the original checkpoint
-  available for the router and remaining weights.
+  available for the router and remaining weights. Restore checks the
+  original checkpoint shard contents against the export fingerprint.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import torch
 
 from mirai.core.models.compressed_weights.factorization.shared_basis import factorize_shared_basis_blocks
@@ -9,6 +12,21 @@ from mirai.core.models.compressed_weights.factorization.shared_basis import fact
 from .quantized_experts import (
     MAGI2_NF4_STORE_ATTR, MAGI2_ROUTED_EXPERT_TENSOR_NAMES, Magi2Nf4ExpertStore, iter_magi2_moe_layers,
 )
+
+MAGI2_BASIS_SOURCE_METADATA = "magi2_basis_source_sha256"
+
+
+def fingerprint_magi2_basis_checkpoint(checkpoint_dir: str) -> str:
+    """Identify the complete name-to-shard content mapping independently of its path."""
+    from mirai.core.lineage import sha256_file
+    from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import read_safetensors_weight_map
+
+    weight_map = read_safetensors_weight_map(checkpoint_dir)
+    if not weight_map:
+        raise ValueError("MAGI-2 basis checkpoint has no source tensors.")
+    shard_digests = {path: sha256_file(path) for path in sorted(set(weight_map.values()))}
+    inventory = [(key, shard_digests[path]) for key, path in sorted(weight_map.items())]
+    return hashlib.sha256(json.dumps(inventory, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 class Magi2SharedBasisExpertStore(Magi2Nf4ExpertStore):

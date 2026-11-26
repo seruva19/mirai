@@ -470,6 +470,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
             pruning_plan = Magi2ExpertPruningPlan.load(pruning_plan_path)
         if shared_basis_rank:
+            from mirai.core.models.magi2_preview.basis_experts import fingerprint_magi2_basis_checkpoint
+
+            self._expert_basis_source_sha256 = fingerprint_magi2_basis_checkpoint(str(checkpoint_dir))
             if self._packed_expert_state_path:
                 self._restore_packed_experts(transformer, shared_basis_rank=shared_basis_rank)
             else:
@@ -849,15 +852,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
     ) -> None:
         from mirai.core.models.magi2_preview.packed_experts import load_magi2_nf4_packed_state
 
+        expected_metadata = {
+            "model_variant": str(self.model_config.params.variant),
+            "denoiser_subfolder": str(getattr(self.model_config.params, "denoiser_subfolder", "transformer") or "transformer"),
+        }
+        if shared_basis_rank is not None:
+            from mirai.core.models.magi2_preview.basis_experts import MAGI2_BASIS_SOURCE_METADATA
+
+            expected_metadata[MAGI2_BASIS_SOURCE_METADATA] = self._expert_basis_source_sha256
         self._expert_stores = load_magi2_nf4_packed_state(
             self._packed_expert_state_path, transformer, blocksize=self._nf4_blocksize,
             quant_format="shared_basis" if shared_basis_rank is not None else self._frozen_weight_quantization,
             expected_shared_basis_rank=shared_basis_rank,
             expected_pruning_digest=pruning_digest, expected_consolidation_digest=consolidation_digest,
-            expected_metadata={
-                "model_variant": str(self.model_config.params.variant),
-                "denoiser_subfolder": str(getattr(self.model_config.params, "denoiser_subfolder", "transformer") or "transformer"),
-            },
+            expected_metadata=expected_metadata,
         )
         if self._expert_rotation_group_size and any(
             getattr(store, "rotation_group_size", 0) != self._expert_rotation_group_size
@@ -875,6 +883,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             save_magi2_nf4_packed_state,
         )
 
+        if getattr(self, "_expert_shared_basis_rank", 0):
+            from mirai.core.models.magi2_preview.basis_experts import MAGI2_BASIS_SOURCE_METADATA
+
+            metadata = {**(metadata or {}), MAGI2_BASIS_SOURCE_METADATA: self._expert_basis_source_sha256}
         return save_magi2_nf4_packed_state(
             path, self.transformer, metadata=metadata,
             pruning_digest=self._expert_pruning_digest if self._expert_pruning_plan_path else None,
