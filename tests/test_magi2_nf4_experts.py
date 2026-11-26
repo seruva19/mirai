@@ -2034,6 +2034,9 @@ def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, 
         direct.materialize_segment("W_gate", 1, 3, dtype=torch.float32, device="cpu"), expected, rtol=0, atol=0,
     )
     assert calls
+    stats = direct._packed_range_reader.reader.snapshot()
+    assert stats["direct_io_read_bytes"] == sum(length for _, length in calls)
+    assert stats["direct_io_overread_bytes"] == stats["direct_io_read_bytes"] - stats["read_bytes"] > 0
     unaligned = save_magi2_nf4_packed_state(tmp_path / "unaligned", source)
     with pytest.raises(ValueError, match="4096-byte-aligned"):
         load_magi2_nf4_packed_state(

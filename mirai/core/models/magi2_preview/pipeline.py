@@ -2196,7 +2196,13 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return self.transformer
 
     def get_training_diagnostics(self) -> dict[str, Any]:
-        return dict(getattr(self, "_last_diagnostics", {}))
+        diagnostics = dict(getattr(self, "_last_diagnostics", {}))
+        for store in self._expert_stores.values():
+            reader = getattr(store, "_packed_range_reader", None)
+            if reader is not None:
+                diagnostics["packed_expert_stream"] = reader.snapshot()
+                break
+        return diagnostics
 
     def train(self, mode: bool = True):
         self.transformer.train(mode)

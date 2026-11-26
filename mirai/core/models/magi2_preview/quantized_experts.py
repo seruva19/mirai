@@ -110,6 +110,9 @@ class PackedExpertRangeView:
     def tensor_nbytes(self, key):
         return self.reader.tensor_nbytes(self.prefix + key)
 
+    def snapshot(self):
+        return self.reader.snapshot()
+
 
 class Magi2Nf4ExpertStore(nn.Module):
     """NF4 payload for the three routed expert tensors of one MoE layer.

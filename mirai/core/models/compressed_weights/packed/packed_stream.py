@@ -100,6 +100,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._pinned_peak = 0
         self._read_ops = 0
         self._read_bytes = 0
+        self._direct_io_read_bytes = 0
         self._read_seconds = 0.0
         self._h2d_ops = 0
         self._h2d_bytes = 0
@@ -303,6 +304,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                     int(shard.random_advice) for shard in self._shards.values()
                 ),
             }
+            if self._backend == "direct_io":
+                snapshot["direct_io_read_bytes"] = self._direct_io_read_bytes
+                snapshot["direct_io_overread_bytes"] = self._direct_io_read_bytes - self._read_bytes
         snapshot.update(self._cache.snapshot())
         if self._gds is not None:
             snapshot.update(self._gds.snapshot())
@@ -374,11 +378,13 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
     ) -> Any:
         buffer = torch.empty(int(nbytes), dtype=torch.uint8)
         started = time.perf_counter()
-        self._shards[region.shard].readinto(memoryview(buffer.numpy()), int(offset))
+        physical_bytes = self._shards[region.shard].readinto(memoryview(buffer.numpy()), int(offset))
         elapsed = time.perf_counter() - started
         with self._stats_lock:
             self._read_ops += 1
             self._read_bytes += int(nbytes)
+            if self._backend == "direct_io":
+                self._direct_io_read_bytes += int(physical_bytes)
             self._read_seconds += float(elapsed)
         dtype = torch_dtype(region.dtype_name)
         return buffer.view(dtype).reshape(shape)

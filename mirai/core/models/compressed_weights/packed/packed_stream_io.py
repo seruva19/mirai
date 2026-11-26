@@ -71,12 +71,12 @@ class DirectPackedShardReader:
         self.alignment = read_safetensors_storage_alignment(path)
         self.fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
 
-    def readinto(self, buffer: memoryview, offset: int) -> None:
+    def readinto(self, buffer: memoryview, offset: int) -> int:
         from .packed_storage_alignment import plan_aligned_read
 
         target = buffer.cast("B")
         if not len(target):
-            return
+            return 0
         window = plan_aligned_read(
             offset=offset, nbytes=len(target), file_size=self.alignment.file_size,
             alignment_bytes=self.alignment.alignment_bytes,
@@ -87,6 +87,7 @@ class DirectPackedShardReader:
                 raise EOFError(f"Packed O_DIRECT read returned {count} of {window.read_bytes} bytes.")
             start = window.payload_offset
             target[:] = aligned[start:start + len(target)]
+        return window.read_bytes
 
     def close(self) -> None:
         os.close(self.fd)
