@@ -205,7 +205,7 @@ class PackedStreamPrefetchHost:
             return tensor.clone() if borrowed else tensor
 
     @contextmanager
-    def _borrow_slices_to_device(self, key, indices, *, device, dtype=None):
+    def _borrow_slices_to_device(self, key, indices, *, device, dtype=None, on_miss=None):
         import torch
 
         requested = self._normalize_indices(str(key), indices)
@@ -216,6 +216,9 @@ class PackedStreamPrefetchHost:
             )
             found, value = self._prefetch.take(identity)
         if not found or value is None:
+            if on_miss is not None:
+                yield on_miss(str(key), requested), True
+                return
             value = self._get_slices_to_device_now(
                 str(key), requested, device=device, dtype=dtype
             )

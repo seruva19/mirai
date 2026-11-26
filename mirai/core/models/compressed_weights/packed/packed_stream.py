@@ -325,52 +325,43 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
     def borrow_packed_fields(self, keys, indices, *, device):
         """Supply short-lived packed fields on the current CUDA stream."""
         target = torch.device(device)
-        if self._raw_staging and target.type == "cuda" and self.prefetch_enabled:
-            with self._prefetch_dense_lock, ExitStack() as leases:
-                if self._closed:
-                    raise RuntimeError("Packed stream mapping is closed.")
-                yield [
-                    leases.enter_context(self._borrow_slices_to_device(key, indices, device=target))[0]
-                    for key in keys
-                ]
+        if not self._raw_staging or target.type != "cuda":
+            yield [self.get_slices_to_device(key, indices, device=target) for key in keys]
             return
-        if self._raw_staging and target.type == "cuda" and not self.prefetch_enabled:
-            indices = tuple(indices)
-            regions = [self._region(key) for key in keys]
-            offsets = []
-            size = 0
-            for key, region in zip(keys, regions, strict=True):
-                if not region.shape:
-                    raise IndexError(f"Packed tensor {key!r} is scalar and cannot be sliced.")
-                size = (size + 15) // 16 * 16
-                offsets.append(size)
-                size += region.nbytes // max(region.shape[0], 1) * len(indices)
-            if size <= _MAX_RANGE_BYTES:
-                with self._staging_lock:
-                    if self._closed:
-                        raise RuntimeError("Packed stream mapping is closed.")
-                    stream = torch.cuda.current_stream(target)
-                    arena = self._cuda_staging_arena(target, stream)
-                    with arena.lease(stream) as slot:
-                        if self._gds is not None:
-                            yield [
-                                self._read_borrowed_gds_field(key, region, indices, slot[offset:], target)
-                                for key, region, offset in zip(keys, regions, offsets, strict=True)
-                            ]
-                            return
-                        sources = [self.get_slices_to_device(key, indices, device="cpu") for key in keys]
-                        fields = []
-                        for source, offset in zip(sources, offsets, strict=True):
-                            packed_bytes = source.numel() * source.element_size()
-                            field = slot[offset:offset + packed_bytes].view(source.dtype).view(source.shape)
-                            field.copy_(source)
-                            fields.append(field)
-                        with self._stats_lock:
-                            self._h2d_ops += len(sources)
-                            self._h2d_bytes += sum(source.numel() * source.element_size() for source in sources)
-                        yield fields
-                return
-        yield [self.get_slices_to_device(key, indices, device=target) for key in keys]
+
+        indices = tuple(indices)
+        layout = {}
+        size = 0
+        for key in keys:
+            region = self._region(key)
+            if not region.shape:
+                raise IndexError(f"Packed tensor {key!r} is scalar and cannot be sliced.")
+            size = (size + 15) // 16 * 16
+            nbytes = region.nbytes // max(region.shape[0], 1) * len(indices)
+            layout[key] = region, size, nbytes
+            size += nbytes
+        prefetched = self.prefetch_enabled
+        lock = self._prefetch_dense_lock if prefetched else self._staging_lock
+        with lock, ExitStack() as leases:
+            if self._closed:
+                raise RuntimeError("Packed stream mapping is closed.")
+            slot = None
+
+            def fill_on_miss(key, requested):
+                nonlocal slot
+                if slot is None:
+                    with self._staging_lock:
+                        stream = torch.cuda.current_stream(target)
+                        arena = self._cuda_staging_arena(target, stream)
+                        slot = leases.enter_context(arena.lease(stream))
+                region, offset, nbytes = layout[key]
+                return self._fill_packed_slot(key, region, requested, slot[offset:], target, nbytes)
+
+            fill = fill_on_miss if size <= _MAX_RANGE_BYTES else None
+            yield [
+                leases.enter_context(self._borrow_slices_to_device(key, indices, device=target, on_miss=fill))[0]
+                for key in keys
+            ]
 
     def get_slices_to_device(self, key, indices, *, device, dtype=None):
         if self._raw_staging and self.prefetch_enabled:
@@ -414,18 +405,21 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             slot = ownership.enter_context(arena.lease(producer, wait=False))
             if slot is None:
                 return None
-            if self._gds is not None:
-                tensor = self._read_borrowed_gds_field(key, region, indices, slot, target)
-            else:
-                source = self._get_slices_to_device_now(key, indices, device="cpu")
-                tensor = slot[:nbytes].view(source.dtype).view(source.shape)
-                tensor.copy_(source)
-                with self._stats_lock:
-                    self._h2d_ops += 1
-                    self._h2d_bytes += nbytes
+            tensor = self._fill_packed_slot(key, region, indices, slot, target, nbytes)
             ready = torch.cuda.Event()
             ready.record(producer)
             return PackedCudaSlotTransfer(tensor, ready, producer, ownership.pop_all().close)
+
+    def _fill_packed_slot(self, key, region, indices, slot, target, nbytes):
+        if self._gds is not None:
+            return self._read_borrowed_gds_field(key, region, indices, slot, target)
+        source = self._get_slices_to_device_now(key, indices, device="cpu")
+        tensor = slot[:nbytes].view(source.dtype).view(source.shape)
+        tensor.copy_(source)
+        with self._stats_lock:
+            self._h2d_ops += 1
+            self._h2d_bytes += nbytes
+        return tensor
 
     def _read_borrowed_gds_field(self, key, region, indices, slot, device):
         requested = self._normalize_indices(key, indices)

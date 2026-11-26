@@ -207,13 +207,15 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         reader._raw_staging = True
         reader._backend = "staged"
         reader._gds = None
-        reader._prefetch = None
+        reader._prefetch = mock.Mock()
+        reader._prefetch.take.side_effect = [(True, None), (False, None)]
+        reader._prefetch_dense_lock = mock.MagicMock()
         reader._staging_lock = reader._stats_lock = mock.MagicMock()
         reader._h2d_ops = reader._h2d_bytes = 0
         reader._region = mock.Mock(return_value=SimpleNamespace(shape=(2,), nbytes=8))
         first = torch.tensor([7, 5], dtype=torch.int32)
         second = torch.tensor([2.5, 1.5], dtype=torch.float32)
-        reader.get_slices_to_device = mock.Mock(side_effect=[first, second])
+        reader._get_slices_to_device_now = mock.Mock(side_effect=[first, second])
         slot = torch.empty(32, dtype=torch.uint8)
         released = mock.Mock()
 
@@ -234,7 +236,8 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
                 self.assertEqual(fields[1].data_ptr(), slot.data_ptr() + 16)
         released.assert_called_once()
         self.assertEqual(reader._h2d_bytes, 16)
-        self.assertEqual(reader.get_slices_to_device.call_args_list, [
+        self.assertEqual(reader._prefetch.take.call_count, 2)
+        self.assertEqual(reader._get_slices_to_device_now.call_args_list, [
             mock.call("weights", (1, 0), device="cpu"), mock.call("scales", (1, 0), device="cpu"),
         ])
         reader._closed = True

@@ -260,8 +260,8 @@ scratch for fused gate/up. An individual projection larger than the slot
 uses an owning CUDA tensor. With prefetch enabled, three separate 32 MiB
 dense slots keep grouped execution independent of the prefetch worker.
 Four separate packed slots hold completed prefetch results until the
-consumer finishes or the queue closes. If all slots are occupied, a demand
-read serves the request. Callers that retain a prefetched tensor receive
+consumer finishes or the queue closes. A request missed by prefetch reads
+into a demand slot if the fields fit. Callers that retain a prefetched tensor receive
 an owning copy. Eligible segmented
 grouped projections can also write the dense weights into a second slot
 and hold it until the grouped matrix multiplication finishes. FP8 decodes
