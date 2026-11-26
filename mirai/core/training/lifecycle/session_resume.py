@@ -35,8 +35,9 @@ def apply_resume_checkpoint(
     model_component_id: str = "",
     runtime_overrides: Any | None = None,
     optimizer_result: Any | None = None,
+    checkpoint_payload: dict[str, Any] | None = None,
 ) -> ResumeApplicationResult:
-    payload = load_checkpoint(resume_path)
+    payload = load_checkpoint(resume_path) if checkpoint_payload is None else checkpoint_payload
     validation = validate_resume_checkpoint_compatibility(
         payload=payload,
         config=config,

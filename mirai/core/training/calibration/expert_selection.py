@@ -45,6 +45,8 @@ def maybe_calibrate_expert_selection(session: Any) -> ExpertSelectionReport | No
     adapter = config.adapter
     if str(getattr(adapter, "expert_selection", "all")).strip().lower() != "routing_topk":
         return None
+    if (existing := getattr(session, "expert_selection_report", None)) is not None:
+        return existing
     if torch is None:  # pragma: no cover
         return None
     if bool(getattr(session, "resumed", False)):

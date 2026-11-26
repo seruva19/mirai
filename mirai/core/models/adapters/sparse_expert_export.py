@@ -35,12 +35,14 @@ class SparseExpertExportPolicy:
         ids = torch.nonzero(
             module.active_expert_mask > 0.0, as_tuple=False
         ).reshape(-1).to(torch.long)
-        state[f"{name}{SPARSE_A_SUFFIX}"] = module.lora_a.detach().index_select(
-            0, ids.to(module.lora_a.device)
-        )
-        state[f"{name}{SPARSE_B_SUFFIX}"] = module.lora_b.detach().index_select(
-            0, ids.to(module.lora_b.device)
-        )
+        compact_ids = getattr(module, "compact_expert_ids", lambda: None)()
+        if compact_ids is not None and tuple(ids.tolist()) != compact_ids:
+            raise ValueError(f"Compact expert adapter '{name}' has inconsistent selected rows.")
+        for suffix, factor in ((SPARSE_A_SUFFIX, module.lora_a), (SPARSE_B_SUFFIX, module.lora_b)):
+            state[f"{name}{suffix}"] = (
+                factor.detach() if compact_ids is not None else
+                factor.detach().index_select(0, ids.to(factor.device))
+            )
         state[f"{name}{SPARSE_IDS_SUFFIX}"] = ids.detach().cpu()
         state[f"{name}{MASK_SUFFIX}"] = module.active_expert_mask.detach()
         state[f"{name}.lora_alpha"] = module.lora_alpha.detach().reshape(1)
@@ -63,7 +65,7 @@ def load_compact_expert_adapter(
         like=module.active_expert_mask,
         name=f"{name}{MASK_SUFFIX}",
     ).reshape_as(module.active_expert_mask)
-    num_experts = int(module.lora_a.shape[0])
+    num_experts = int(module.active_expert_mask.numel())
     if int(mask.numel()) != num_experts:
         raise ValueError(
             f"Compact expert adapter '{name}' mask length {int(mask.numel())} "
@@ -76,17 +78,18 @@ def load_compact_expert_adapter(
             f"Compact expert adapter '{name}' selected-id count {int(ids.numel())} "
             "does not match stored slice count."
         )
-    src_ids = ids.to(device=module.lora_a.device)
-    module.lora_a.index_copy_(
-        0, src_ids, a_sel.to(device=module.lora_a.device, dtype=module.lora_a.dtype)
-    )
-    rebuilt_b = torch.zeros_like(module.lora_b)
-    rebuilt_b.index_copy_(
-        0,
-        src_ids.to(device=module.lora_b.device),
-        b_sel.to(device=module.lora_b.device, dtype=module.lora_b.dtype),
-    )
-    module.lora_b.copy_(rebuilt_b)
+    compact_ids = getattr(module, "compact_expert_ids", lambda: None)()
+    if compact_ids is not None:
+        if tuple(ids.tolist()) != compact_ids:
+            raise ValueError(f"Compact expert adapter '{name}' selection differs from its bound rows.")
+        module.lora_a.copy_(a_sel)
+        module.lora_b.copy_(b_sel)
+    else:
+        src_ids = ids.to(device=module.lora_a.device)
+        module.lora_a.index_copy_(0, src_ids, a_sel.to(module.lora_a))
+        rebuilt_b = torch.zeros_like(module.lora_b)
+        rebuilt_b.index_copy_(0, src_ids.to(module.lora_b.device), b_sel.to(module.lora_b))
+        module.lora_b.copy_(rebuilt_b)
     module.active_expert_mask.copy_(mask.to(device=module.active_expert_mask.device))
     alpha_key = f"{name}.lora_alpha"
     if alpha_key in state:

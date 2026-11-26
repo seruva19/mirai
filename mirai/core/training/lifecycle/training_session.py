@@ -100,6 +100,7 @@ class TrainingSession:
     resume_validation_warnings: list[str]
     gora_initialization_report: dict[str, Any] | None
     esft_calibration_report: dict[str, Any] | None
+    expert_selection_report: Any = None
 
     def close_callbacks(self) -> None:
         for cb in self.callbacks:
@@ -262,6 +263,34 @@ def create_training_session(
         )
 
     run_state = init_training_run_state(trainer=trainer, config=config)
+    checkpoint_payload = None
+    expert_selection_report = None
+    requires_selection = getattr(trainer.pipeline, "requires_pre_optimizer_expert_selection", None)
+    if callable(requires_selection) and requires_selection():
+        if resume_path:
+            from mirai.core.persistence.checkpoints import load_checkpoint
+
+            checkpoint_payload = load_checkpoint(resume_path)
+            saved_trainer = checkpoint_payload.get("trainer_state")
+            saved_pipeline = saved_trainer.get("pipeline") if isinstance(saved_trainer, dict) else None
+            if not isinstance(saved_pipeline, dict):
+                raise ValueError("Compact expert LoRA resume requires a saved pipeline state.")
+            trainer.pipeline.prepare_compact_expert_lora(saved_pipeline)
+        else:
+            from mirai.core.training.calibration.expert_selection import maybe_calibrate_expert_selection
+
+            expert_selection_report = maybe_calibrate_expert_selection(SimpleNamespace(
+                config=config, trainer=trainer, curriculum=curriculum,
+                train_records=prepared_data.train_records,
+                temporal_base_ids=prepared_data.temporal_base_ids,
+                temporal_groups=prepared_data.temporal_groups,
+                compute_device=compute_device, compute_dtype=compute_dtype,
+                grad_accum=max(1, int(config.training.gradient_accumulation)),
+                rng=rng, run_state=run_state,
+            ))
+            if expert_selection_report is None:
+                raise ValueError("Pre-optimizer expert selection did not produce a routing plan.")
+            trainer.pipeline.prepare_compact_expert_lora()
     try:
         components = build_training_runtime_components(
             trainer=trainer,
@@ -299,6 +328,7 @@ def create_training_session(
                 ),
                 runtime_overrides=runtime_overrides,
                 optimizer_result=components.optimizer_result,
+                checkpoint_payload=checkpoint_payload,
             )
         except ValueError as exc:
             raise SystemExit(str(exc))
@@ -387,4 +417,5 @@ def create_training_session(
         esft_calibration_report=(
             None if esft_report is None else esft_report.to_dict()
         ),
+        expert_selection_report=expert_selection_report,
     )

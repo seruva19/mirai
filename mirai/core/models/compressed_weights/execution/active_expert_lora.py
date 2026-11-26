@@ -320,8 +320,9 @@ class ActiveExpertLoRA(nn.Module):
             self._observe_single(x, expert_idx=int(expert_idx))
         if self.training and self._rank_dropout > 0.0:
             x = F.dropout(x, p=self._rank_dropout, training=True)
-        a = self.lora_a[int(expert_idx)].to(device=x.device, dtype=x.dtype)
-        b = self.lora_b[int(expert_idx)].to(device=x.device, dtype=x.dtype)
+        row = self._factor_row(int(expert_idx))
+        a = self.lora_a[row].to(device=x.device, dtype=x.dtype)
+        b = self.lora_b[row].to(device=x.device, dtype=x.dtype)
         a, b = apply_lora_parameter_dropout(
             a,
             b,
@@ -344,6 +345,9 @@ class ActiveExpertLoRA(nn.Module):
         if cond is not None:
             out = out + cond
         return out
+
+    def _factor_row(self, expert_idx: int) -> int:
+        return expert_idx
 
     def grouped_forward(self, x: torch.Tensor, *, offsets: torch.Tensor) -> torch.Tensor:
         if not hasattr(torch, "_grouped_mm") or x.device.type != "cuda":

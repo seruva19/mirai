@@ -2021,8 +2021,9 @@ def test_magi2_native_fp4_sm120_matches_decoded_operands(fmt) -> None:
     torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.025)
 
 
-@pytest.mark.parametrize("sparse_export", [False, True])
-def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute(sparse_export) -> None:
+@pytest.mark.parametrize("sparse_export,compact_runtime", [(False, False), (True, False), (True, True)])
+def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute(sparse_export, compact_runtime) -> None:
+    from copy import deepcopy
     from types import SimpleNamespace
 
     def pipeline_with_adapter():
@@ -2031,8 +2032,10 @@ def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute(sparse_ex
         torch.nn.Module.__init__(pipeline)
         pipeline.transformer = _container(module)
         pipeline._expert_stores = quantize_magi2_experts_in_place(pipeline.transformer, quant_format="fp8")
+        pipeline._compact_expert_lora = compact_runtime
         pipeline.set_adapter_config(SimpleNamespace(
             target_preset="attn_router_routed_experts", rank=2, alpha=2.0, sparse_expert_export=sparse_export,
+            expert_selection="routing_topk" if compact_runtime else "all",
         ))
         return pipeline, module
 
@@ -2042,6 +2045,8 @@ def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute(sparse_ex
         for adapter in adapters.values():
             adapter.lora_b.normal_(std=0.01)
             adapter.set_active_experts([1, 6])
+    if compact_runtime:
+        pipeline.prepare_compact_expert_lora()
     plan = Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm")
     reference = Magi2QuantizedGroupedMoEBackend(plan, expert_autograd="segmented_recompute")
     compressed = Magi2QuantizedGroupedMoEBackend(plan, expert_autograd="segmented_recompute", int8_expert_checkpoint=True)
@@ -2058,8 +2063,11 @@ def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute(sparse_ex
     for value, ref in zip(actual_grads, expected_grads, strict=True):
         assert (value - ref).norm() < 0.03 * ref.norm()
     for grad in actual_grads[1:]:
-        assert grad[[1, 6]].abs().sum() > 0
-        assert torch.count_nonzero(grad[[0, 2, 3, 4, 5, 7]]) == 0
+        if compact_runtime:
+            assert grad.shape[0] == 2 and grad.abs().sum() > 0
+        else:
+            assert grad[[1, 6]].abs().sum() > 0
+            assert torch.count_nonzero(grad[[0, 2, 3, 4, 5, 7]]) == 0
 
     restored, restored_module = pipeline_with_adapter()
     state = pipeline.state_dict()
@@ -2073,9 +2081,30 @@ def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute(sparse_ex
             restored.load_adapter_state(invalid)
     else:
         assert state[f"{prefix}.lora_a"].shape[0] == 8
+    if compact_runtime:
+        restored.prepare_compact_expert_lora(state)
+        assert restored_module._mirai_expert_lora["W_gate"].lora_a.shape[0] == 2
     restored.load_adapter_state(state)
     assert restored_module._mirai_expert_lora["W_gate"].active_expert_ids() == [1, 6]
     torch.testing.assert_close(reference.execute(restored_module, rows, scores, routes), expected)
+    if compact_runtime:
+        params = [adapter.lora_b for adapter in adapters.values()]
+        optimizer = torch.optim.AdamW(params)
+        for param, grad in zip(params, actual_grads[1:], strict=True):
+            param.grad = grad
+        optimizer.step()
+        state = pipeline.state_dict()
+        restored.load_state_dict(state)
+        restored_params = [adapter.lora_b for adapter in restored_module._mirai_expert_lora.values()]
+        resumed = torch.optim.AdamW(restored_params)
+        resumed.load_state_dict(deepcopy(optimizer.state_dict()))
+        for param, restored_param in zip(params, restored_params, strict=True):
+            assert resumed.state[restored_param]["exp_avg"].shape == param.shape
+            restored_param.grad = param.grad.clone()
+        optimizer.step()
+        resumed.step()
+        for param, restored_param in zip(params, restored_params, strict=True):
+            torch.testing.assert_close(param, restored_param, rtol=0, atol=0)
 
 
 def test_magi2_routing_topk_calibration_reaches_head_local_adapters(monkeypatch) -> None:

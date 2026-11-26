@@ -308,6 +308,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        self._compact_expert_lora = family.get("expert_compact_lora", False)
+        if type(self._compact_expert_lora) is not bool:
+            raise ValueError("MAGI-2 expert_compact_lora must be a boolean.")
         self._int8_expert_checkpoint = family.get("expert_int8_checkpoint", False)
         if type(self._int8_expert_checkpoint) is not bool:
             raise ValueError("MAGI-2 expert_int8_checkpoint must be a boolean.")
@@ -1394,6 +1397,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         if str(getattr(adapter_config, "expert_selection", "all")).strip().lower() == "routing_topk" and not expert_targets:
             raise ValueError("MAGI-2 routing_topk requires adapter.target_preset='attn_router_routed_experts'.")
         sparse_export = bool(getattr(adapter_config, "sparse_expert_export", False))
+        if self.requires_pre_optimizer_expert_selection() and (
+            not expert_targets or not sparse_export
+            or str(getattr(adapter_config, "expert_selection", "all")).strip().lower() != "routing_topk"
+        ):
+            raise ValueError("MAGI-2 expert_compact_lora requires routed expert LoRA, routing_topk, and sparse_expert_export.")
         if sparse_export and not expert_targets:
             raise ValueError("MAGI-2 sparse expert export requires routed expert LoRA.")
         for parameter in self.transformer.parameters():
@@ -1436,14 +1444,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 attach_magi2_lora_executor(module, tensor_name)
                 matched.append(full_name)
         if expert_targets:
-            from mirai.core.models.compressed_weights.execution.active_expert_lora import ActiveExpertLoRA
+            from mirai.core.models.magi2_preview.expert_lora import Magi2ExpertLoRA
 
             for name, module in iter_magi2_moe_layers(self.transformer):
                 store = self._expert_stores[name]
                 adapters = nn.ModuleDict()
                 for key, _role in MAGI2_ROUTED_EXPERT_TENSORS:
                     groups, inputs, outputs = store.expert_weight_shape(key)
-                    adapters[key] = ActiveExpertLoRA(
+                    adapters[key] = Magi2ExpertLoRA(
                         adapter_name=f"{name}.{key}", num_experts=groups, in_features=inputs,
                         out_features=outputs, rank=rank, alpha=alpha,
                     )
@@ -1462,6 +1470,29 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             for name, module in iter_magi2_moe_layers(self.transformer)
             if (adapters := getattr(module, "_mirai_expert_lora", None)) is not None
         )
+
+    def requires_pre_optimizer_expert_selection(self) -> bool:
+        return getattr(self, "_compact_expert_lora", False)
+
+    def prepare_compact_expert_lora(self, state=None) -> None:
+        from mirai.core.models.adapters.sparse_expert_export import SPARSE_IDS_SUFFIX
+
+        pending = []
+        for name, module in self.transformer.named_modules():
+            if "._mirai_expert_lora." not in name or not hasattr(module, "compact_selected_experts"):
+                continue
+            if state is None:
+                ids = module.active_expert_ids()
+            else:
+                stored = state.get(f"{name}{SPARSE_IDS_SUFFIX}")
+                if not isinstance(stored, torch.Tensor) or stored.dtype != torch.long or stored.ndim != 1:
+                    raise ValueError(f"MAGI-2 compact resume has no selected expert IDs for '{name}'.")
+                ids = stored.tolist()
+            pending.append((module, ids))
+        if not pending:
+            raise ValueError("MAGI-2 compact expert LoRA has no routed expert adapters to bind.")
+        for module, ids in pending:
+            module.compact_selected_experts(ids)
 
     @contextmanager
     def expert_selection_context(self, accumulator):
@@ -2424,6 +2455,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 or not isinstance(mask, torch.Tensor) or mask.shape != module.active_expert_mask.shape
                 or not bool(((mask == 0) | (mask == 1)).all())
                 or not torch.equal(ids.cpu(), mask.nonzero().flatten().cpu())
+                or (module.compact_expert_ids() is not None and tuple(ids.tolist()) != module.compact_expert_ids())
             ):
                 raise ValueError(f"Invalid selected expert IDs or mask for '{name}'.")
             for suffix, parameter in ((SPARSE_A_SUFFIX, module.lora_a), (SPARSE_B_SUFFIX, module.lora_b)):
@@ -2460,6 +2492,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
         "nf4_fuse_gate_up",
         "expert_cpu_max_tokens",
+        "expert_compact_lora",
         "expert_int8_checkpoint",
         "expert_nvfp4_native_layout",
         "expert_pruning_plan_path",
@@ -2556,6 +2589,8 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
 
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        if type(params.get("expert_compact_lora", False)) is not bool:
+            errors.append("MAGI-2 expert_compact_lora must be a boolean.")
         if type(params.get("expert_int8_checkpoint", False)) is not bool:
             errors.append("MAGI-2 expert_int8_checkpoint must be a boolean.")
         cpu_max = params.get("expert_cpu_max_tokens", 0)

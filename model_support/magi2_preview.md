@@ -931,6 +931,9 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   and train expert LoRA on the selected fraction of head-local experts.
   Set `adapter.sparse_expert_export=true` to save selected factor rows with
   their expert IDs and mask.
+  With both settings enabled, `model.params.family_params.expert_compact_lora=true`
+  compacts the factor rows before optimizer construction. Resume restores the
+  same row mapping from the checkpoint before it constructs the optimizer.
 - **MAGI-2 mixture-basis expert storage** — Set the family parameter
   `expert_mixture_basis_rank` to a positive rank to fit gate and up projections
   as the original checkpoint loads. Set `expert_mixture_basis_count` and
