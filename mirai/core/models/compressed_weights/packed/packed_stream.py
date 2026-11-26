@@ -72,16 +72,24 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 shard.close()
             raise
         self._gds: Any | None = None
+        workers = max(1, min(int(read_workers), _DEFAULT_READ_WORKERS))
         if self._backend == "gds":
             from .packed_stream_gds import KvikioGdsReader
+            from .packed_storage_alignment import GDS_STORAGE_ALIGNMENT_BYTES
 
+            cap = max(
+                (max(min(region.nbytes, _MAX_RANGE_BYTES), region.nbytes // region.shape[0])
+                 for region in self._regions.values() if region.shape and region.shape[0]),
+                default=0,
+            )
+            alignment = GDS_STORAGE_ALIGNMENT_BYTES
+            slot_bytes = ((cap + 2 * alignment - 2) // alignment) * alignment
             try:
-                self._gds = KvikioGdsReader(shard_paths)
+                self._gds = KvikioGdsReader(shard_paths, slots=workers, slot_bytes=slot_bytes)
             except Exception:
                 for shard in self._shards.values():
                     shard.close()
                 raise
-        workers = max(1, min(int(read_workers), _DEFAULT_READ_WORKERS))
         self._executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="mirai-packed-read"
         )
@@ -198,12 +206,13 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 self._executor.submit(self._read_slice_run_to_device, str(key), start, count, target)
                 for start, count in runs
             ]
-            device_tensors = [future.result() for future in futures]
+            transfers = [future.result() for future in futures]
             stream = self._cuda_stream(target)
             with torch.cuda.stream(stream):
-                for tensor in device_tensors:
-                    tensor.record_stream(stream)
-                stacked = _stack_tensors(device_tensors)
+                for transfer in transfers:
+                    stream.wait_event(transfer.ready)
+                    transfer.tensor.record_stream(stream)
+                stacked = _stack_tensors([transfer.tensor for transfer in transfers])
                 if dtype is not None:
                     stacked = stacked.to(dtype=dtype)
                 if reordered:
@@ -470,8 +479,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         with self._stats_lock:
             self._read_ops += 1
             self._read_bytes += int(nbytes)
-        return buffer.view(torch_dtype(region.dtype_name)).reshape(
-            count, *region.shape[1:]
+        return PackedCudaTransfer(
+            buffer.tensor.view(torch_dtype(region.dtype_name)).reshape(count, *region.shape[1:]),
+            buffer.ready,
         )
 
     def _bounded_runs(

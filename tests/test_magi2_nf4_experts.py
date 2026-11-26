@@ -2523,7 +2523,7 @@ def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, 
     gds_shards = []
 
     class FakeGdsReader:
-        def __init__(self, shard_paths):
+        def __init__(self, shard_paths, *, slots, slot_bytes):
             gds_shards.extend(shard_paths.values())
 
         def close(self):

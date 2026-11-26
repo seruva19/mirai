@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 import threading
 from collections.abc import Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +15,18 @@ from mirai.core.models.compressed_weights.packed.packed_storage_alignment import
     plan_aligned_read,
     read_safetensors_storage_alignment,
 )
+from mirai.core.models.compressed_weights.packed.packed_stream_prefetch import PackedCudaTransfer
 
 
 class GdsUnavailableError(RuntimeError):
     """Raised when explicit GDS mode cannot prove a direct storage path."""
+
+
+@dataclass
+class _GdsSlot:
+    stream: Any | None = None
+    buffer: Any | None = None
+    busy: bool = False
 
 
 class KvikioGdsReader:
@@ -27,7 +37,9 @@ class KvikioGdsReader:
     bounce-buffer fallback cannot be reported as GPUDirect Storage.
     """
 
-    def __init__(self, shard_paths: Mapping[str, Path]) -> None:
+    def __init__(self, shard_paths: Mapping[str, Path], *, slots: int, slot_bytes: int) -> None:
+        if slots < 1 or slot_bytes < GDS_STORAGE_ALIGNMENT_BYTES or slot_bytes % GDS_STORAGE_ALIGNMENT_BYTES:
+            raise ValueError("GPUDirect Storage requires a positive number of aligned destination slots.")
         try:
             import kvikio
             import kvikio.cufile_driver
@@ -46,7 +58,10 @@ class KvikioGdsReader:
         self._file_sizes: dict[str, int] = {}
         self._closed = False
         self._stats_lock = threading.Lock()
-        self._io_streams = threading.local()
+        self._slots = [_GdsSlot() for _ in range(slots)]
+        self._slot_bytes = slot_bytes
+        self._slot_device: int | None = None
+        self._slot_condition = threading.Condition()
         self._async_ops = 0
         self._read_ops = 0
         self._read_bytes = 0
@@ -125,42 +140,47 @@ class KvikioGdsReader:
         )
 
         started = time.perf_counter()
-        streams = getattr(self._io_streams, "by_device", None)
-        if streams is None:
-            streams = self._io_streams.by_device = {}
-        stream = streams.get(device_index)
-        if stream is None:
-            stream = streams[device_index] = torch.cuda.Stream(device=device_index)
-        with torch.cuda.stream(stream):
-            allocation = torch.empty(
-                window.read_bytes + GDS_STORAGE_ALIGNMENT_BYTES - 1,
-                dtype=torch.uint8, device=target,
-            )
-            pointer_padding = (
-                -allocation.data_ptr()
-            ) % GDS_STORAGE_ALIGNMENT_BYTES
-            buffer = allocation[
-                pointer_padding:pointer_padding + window.read_bytes
-            ]
-            read_async = getattr(handle, "raw_read_async", None)
-            if callable(read_async):
-                # The returned future owns the cuFile request arguments until
-                # its associated non-default stream has completed the read.
-                pending = read_async(
-                    buffer, raw_stream=int(stream.cuda_stream),
-                    size=window.read_bytes, file_offset=window.file_offset,
-                )
-                count = int(pending.check_bytes_done())
-            else:
-                stream.synchronize()
-                read_sync = getattr(handle, "raw_read", handle.read)
-                count = int(read_sync(buffer, size=window.read_bytes, file_offset=window.file_offset))
+        if window.read_bytes > self._slot_bytes:
+            raise ValueError("GPUDirect Storage range exceeds its aligned slot capacity.")
+        read_async = getattr(handle, "raw_read_async", None)
+        with self._acquire_slot(device_index) as slot:
+            if slot.stream is None:
+                slot.stream = torch.cuda.Stream(device=device_index)
+            stream = slot.stream
+            with torch.cuda.stream(stream):
+                if slot.buffer is None:
+                    allocation = torch.empty(
+                        self._slot_bytes + GDS_STORAGE_ALIGNMENT_BYTES - 1,
+                        dtype=torch.uint8, device=target,
+                    )
+                    padding = -allocation.data_ptr() % GDS_STORAGE_ALIGNMENT_BYTES
+                    slot.buffer = allocation[padding:padding + self._slot_bytes]
+                buffer = slot.buffer[:window.read_bytes]
+                try:
+                    if callable(read_async):
+                        # Keep the request arguments alive through local stream completion.
+                        pending = read_async(
+                            buffer, raw_stream=int(stream.cuda_stream),
+                            size=window.read_bytes, file_offset=window.file_offset,
+                        )
+                        count = int(pending.check_bytes_done())
+                    else:
+                        stream.synchronize()
+                        read_sync = getattr(handle, "raw_read", handle.read)
+                        count = int(read_sync(buffer, size=window.read_bytes, file_offset=window.file_offset))
+                except BaseException:
+                    stream.synchronize()
+                    raise
+                if count != window.read_bytes:
+                    raise EOFError(
+                        f"GPUDirect Storage read returned {count} of {window.read_bytes} aligned bytes."
+                    )
+                # The next I/O uses this same stream. Its write follows this
+                # copy, while the owning result can outlive the staging slot.
+                payload = buffer[window.payload_offset:window.payload_offset + window.payload_bytes].clone()
+                ready = torch.cuda.Event()
+                ready.record(stream)
         elapsed = time.perf_counter() - started
-        if count != window.read_bytes:
-            raise EOFError(
-                f"GPUDirect Storage read returned {count} of "
-                f"{window.read_bytes} aligned bytes."
-            )
         with self._stats_lock:
             self._read_ops += 1
             self._async_ops += int(callable(read_async))
@@ -169,9 +189,25 @@ class KvikioGdsReader:
             self._overread_bytes += window.overread_bytes
             self._read_seconds += float(elapsed)
             self._trimmed_ops += int(window.overread_bytes > 0)
-        return buffer[
-            window.payload_offset:window.payload_offset + window.payload_bytes
-        ]
+        return PackedCudaTransfer(payload, ready)
+
+    @contextmanager
+    def _acquire_slot(self, device_index: int):
+        with self._slot_condition:
+            if self._slot_device is not None and self._slot_device != device_index:
+                raise ValueError("GPUDirect Storage slots are bound to one CUDA device.")
+            self._slot_condition.wait_for(lambda: self._closed or any(not slot.busy for slot in self._slots))
+            if self._closed:
+                raise RuntimeError("GPUDirect Storage reader is closed.")
+            self._slot_device = device_index
+            slot = next(slot for slot in self._slots if not slot.busy)
+            slot.busy = True
+        try:
+            yield slot
+        finally:
+            with self._slot_condition:
+                slot.busy = False
+                self._slot_condition.notify_all()
 
     def snapshot(self) -> dict[str, int | float | str]:
         version = self._kvikio.cufile_driver.libcufile_version()
@@ -190,22 +226,33 @@ class KvikioGdsReader:
                 "read_seconds": float(self._read_seconds),
                 "gds_alignment_bytes": GDS_STORAGE_ALIGNMENT_BYTES,
                 "gds_trimmed_ops": int(self._trimmed_ops),
+                "gds_ring_slots": len(self._slots),
+                "gds_ring_slot_bytes": self._slot_bytes,
             }
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        for handle in self._files.values():
-            try:
-                handle.close()
-            except Exception:
-                pass
-        self._files.clear()
-        self._file_sizes.clear()
-        if self._compat_context is not None:
-            try:
-                self._compat_context.__exit__(None, None, None)
-            except Exception:
-                pass
-            self._compat_context = None
+        with self._slot_condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._slot_condition.notify_all()
+            self._slot_condition.wait_for(lambda: not any(slot.busy for slot in self._slots))
+        try:
+            for slot in self._slots:
+                if slot.stream is not None:
+                    slot.stream.synchronize()
+        finally:
+            self._slots.clear()
+            for handle in self._files.values():
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            self._files.clear()
+            self._file_sizes.clear()
+            if self._compat_context is not None:
+                try:
+                    self._compat_context.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._compat_context = None

@@ -71,11 +71,15 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         import contextlib
         import threading
 
-        from mirai.core.models.compressed_weights.packed.packed_stream_gds import KvikioGdsReader
+        from mirai.core.models.compressed_weights.packed.packed_stream_gds import KvikioGdsReader, _GdsSlot
 
         reader = KvikioGdsReader.__new__(KvikioGdsReader)
         reader._closed = False
-        reader._io_streams = threading.local()
+        reader._slots = [_GdsSlot()]
+        reader._slot_bytes = 8192
+        reader._slot_device = None
+        reader._slot_condition = threading.Condition()
+        reader._compat_context = None
         reader._stats_lock = threading.Lock()
         for counter in ("_read_ops", "_read_bytes", "_requested_bytes", "_overread_bytes",
                         "_read_seconds", "_trimmed_ops", "_async_ops"):
@@ -86,28 +90,43 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         stream = mock.Mock(cuda_stream=9)
         empty = torch.empty
         pending = mock.Mock()
+        fills = []
+        pointers = []
 
         def submit(buffer, *, raw_stream, size, file_offset):
             self.assertEqual((raw_stream, size, file_offset), (9, 8192, 0))
             self.assertEqual(buffer.data_ptr() % 4096, 0)
+            pointers.append(buffer.data_ptr())
+            fills.append(len(fills) * 7)
 
             def complete():
-                buffer.copy_(torch.arange(size, dtype=torch.int64).to(torch.uint8))
+                buffer.copy_((torch.arange(size, dtype=torch.int64) + fills[-1]).to(torch.uint8))
                 return size
 
             pending.check_bytes_done.side_effect = complete
             return pending
 
         handle.raw_read_async.side_effect = submit
+        ready = mock.Mock()
         with mock.patch("torch.cuda.Stream", return_value=stream), mock.patch(
             "torch.cuda.stream", side_effect=lambda _: contextlib.nullcontext()
-        ), mock.patch("torch.empty", side_effect=lambda size, **_: empty(size, dtype=torch.uint8)):
+        ), mock.patch("torch.empty", side_effect=lambda size, **_: empty(size, dtype=torch.uint8)) as allocate, mock.patch(
+            "torch.cuda.Event", return_value=ready,
+        ):
             result = reader.read_device("shard", offset=4093, nbytes=12, device="cuda:0")
-        torch.testing.assert_close(result, torch.arange(4093, 4105).to(torch.uint8))
-        pending.check_bytes_done.assert_called_once_with()
+            second = reader.read_device("shard", offset=4093, nbytes=12, device="cuda:0")
+            allocate.assert_called_once()
+        torch.testing.assert_close(result.tensor, torch.arange(4093, 4105).to(torch.uint8))
+        torch.testing.assert_close(second.tensor, torch.arange(4100, 4112).to(torch.uint8))
+        self.assertEqual(pointers[0], pointers[1])
+        self.assertEqual(pending.check_bytes_done.call_count, 2)
+        self.assertEqual(ready.record.call_args_list, [mock.call(stream), mock.call(stream)])
         stream.synchronize.assert_not_called()
         handle.read.assert_not_called()
-        self.assertEqual(reader._async_ops, 1)
+        self.assertEqual(reader._async_ops, 2)
+        reader.close()
+        stream.synchronize.assert_called_once_with()
+        handle.close.assert_called_once_with()
 
     def test_prefetch_ring_supports_disk_and_preloaded_ram(self) -> None:
         with self.assertRaisesRegex(ValueError, "between 0 and 16"):
