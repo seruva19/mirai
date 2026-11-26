@@ -44,11 +44,12 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         cache_capacity_bytes: int = 0,
         backend: str = "staged",
         prefetch_depth: int = 0,
+        tensor_aliases: Mapping[str, tuple[str, str]] | None = None,
     ):
         if torch is None:  # pragma: no cover
             raise RuntimeError("torch is required for packed tensor streaming.")
         self._path = Path(path)
-        self._regions, shard_paths = load_packed_regions(self._path)
+        self._regions, shard_paths = load_packed_regions(self._path, tensor_aliases=tensor_aliases)
         self._backend = _normalize_backend(backend)
         depth = int(prefetch_depth)
         if depth < 0 or depth > 16:

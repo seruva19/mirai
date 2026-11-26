@@ -6,7 +6,7 @@ import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 try:
     import torch
@@ -28,10 +28,15 @@ class PackedTensorRegion:
 
 def load_packed_regions(
     path: Path,
+    *, tensor_aliases: Mapping[str, tuple[str, str]] | None = None,
 ) -> tuple[dict[str, PackedTensorRegion], dict[str, Path]]:
     if not path.is_file():
         raise FileNotFoundError(f"Packed-state artifact {str(path)!r} was not found.")
-    if path.name.endswith(".index.json"):
+    if tensor_aliases is not None:
+        if not tensor_aliases:
+            raise ValueError("Packed tensor alias map cannot be empty.")
+        weight_map = {alias: shard for alias, (shard, _) in tensor_aliases.items()}
+    elif path.name.endswith(".index.json"):
         payload = json.loads(path.read_text(encoding="utf-8"))
         raw_map = payload.get("weight_map", {})
         if not isinstance(raw_map, dict) or not raw_map:
@@ -52,7 +57,8 @@ def load_packed_regions(
     regions: dict[str, PackedTensorRegion] = {}
     for key, shard_name in weight_map.items():
         try:
-            regions[key] = shard_regions[shard_name][key]
+            storage_key = key if tensor_aliases is None else tensor_aliases[key][1]
+            regions[key] = shard_regions[shard_name][storage_key]
         except KeyError as exc:
             raise ValueError(
                 f"Packed-state index maps {key!r} to {shard_name!r}, "

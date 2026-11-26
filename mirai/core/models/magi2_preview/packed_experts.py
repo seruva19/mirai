@@ -21,6 +21,7 @@ from mirai.core.models.magi2_preview.quantized_experts import (
     MAGI2_PACKED_EXPERT_FORMATS,
     Magi2Nf4ExpertStore,
     Magi2PackedExpertStore,
+    PackedExpertRangeView,
     _new_expert_store,
     iter_magi2_moe_layers,
     magi2_expert_store,
@@ -182,6 +183,8 @@ def load_magi2_nf4_packed_state(
     expected_mixture_basis: tuple[int, int, str] | None = None,
     retain_mapped_buffers: bool = False,
     staged_range_reads: bool = False,
+    stream_cache_bytes: int = 0,
+    stream_prefetch_depth: int = 0,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Restore NF4 stores directly and reject topology or schema mismatches."""
 
@@ -258,6 +261,7 @@ def load_magi2_nf4_packed_state(
         ):
             raise Magi2PackedExpertStateError("Mixed MAGI-2 artifact has inconsistent rotation metadata.")
     stores = {}
+    tensor_aliases = {}
     for module_name, layer in layers.items():
         spec = layer_specs[module_name]
         if "head_layout" in spec and spec["head_layout"] != _head_layout(layer):
@@ -348,8 +352,21 @@ def load_magi2_nf4_packed_state(
                 except (KeyError, TypeError, ValueError) as exc:
                     raise Magi2PackedExpertStateError(f"Invalid packed MAGI-2 layer '{module_name}': {exc}") from exc
         if staged_range_reads:
-            store.enable_packed_range_reads(shard_path)
+            tensor_aliases.update({f"{module_name}:{key}": (shard_name, key) for key in expected_buffers})
         stores[module_name] = store
+    if staged_range_reads:
+        from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
+
+        reader = StreamingPackedTensorMapping(
+            manifest_path, tensor_aliases=tensor_aliases, cache_capacity_bytes=stream_cache_bytes,
+            prefetch_depth=stream_prefetch_depth,
+        )
+        try:
+            for module_name, store in stores.items():
+                store.bind_packed_range_reader(PackedExpertRangeView(reader, f"{module_name}:"))
+        except Exception:
+            reader.close()
+            raise
     for module_name, layer in layers.items():
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             if key in layer._parameters:

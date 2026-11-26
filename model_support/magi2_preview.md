@@ -238,6 +238,8 @@ With `memory.weight_residency_strategy="stream_disk"` and
 stores and mixed-precision buckets read requested groups from the artifact
 during execution. Shared-basis and mixture-basis stores keep shared bases
 resident and fetch per-expert factors on demand.
+All expert layers share one range reader and one
+`memory.packed_stream_cache_gib` host-cache budget.
 The
 provider-owned schema stores a versioned manifest and one NF4 safetensors shard
 per routed-expert layer. Restore checks model variant, denoiser subfolder,

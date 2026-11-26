@@ -268,6 +268,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         super().__init__()
         self.model_config = model_config
         self._packed_stream_backend = getattr(memory_config, "packed_stream_backend", "auto")
+        self._packed_stream_cache_bytes = int(float(getattr(memory_config, "packed_stream_cache_gib", 0)) * 1024**3)
+        self._packed_stream_prefetch_depth = int(getattr(memory_config, "packed_stream_prefetch_depth", 0))
         self._retain_mapped_expert_buffers = (
             getattr(memory_config, "weight_residency_strategy", "disabled") == "stream_disk"
             and self._packed_stream_backend in {"auto", "staged"}
@@ -910,6 +912,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 getattr(self, "_retain_mapped_expert_buffers", False)
                 and getattr(self, "_packed_stream_backend", "auto") == "staged"
             ),
+            stream_cache_bytes=getattr(self, "_packed_stream_cache_bytes", 0),
+            stream_prefetch_depth=getattr(self, "_packed_stream_prefetch_depth", 0),
             expected_pruning_digest=pruning_digest, expected_consolidation_digest=consolidation_digest,
             expected_metadata=expected_metadata,
         )

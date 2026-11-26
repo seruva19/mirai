@@ -94,6 +94,9 @@ class PackedExpertRangeView:
     def __iter__(self):
         return (key.removeprefix(self.prefix) for key in self.reader if key.startswith(self.prefix))
 
+    def __getitem__(self, key):
+        return self.reader[self.prefix + key]
+
     def get_slices_to_device(self, key, indices, **kwargs):
         return self.reader.get_slices_to_device(self.prefix + key, indices, **kwargs)
 
@@ -381,11 +384,6 @@ class Magi2Nf4ExpertStore(nn.Module):
                 for buffer in self.buffers()
             )
         )
-
-    def enable_packed_range_reads(self, shard_path) -> None:
-        from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
-
-        self.bind_packed_range_reader(StreamingPackedTensorMapping(shard_path, backend="staged"))
 
     def bind_packed_range_reader(self, reader, *, retain=()) -> None:
         self._packed_range_reader = reader

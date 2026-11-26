@@ -1846,6 +1846,30 @@ def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -
         load_magi2_nf4_packed_state(artifact, model(), blocksize=64)
 
 
+def test_magi2_staged_layers_share_one_packed_reader(tmp_path) -> None:
+    def model():
+        root = _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32))
+        root.second = _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32))
+        return root
+
+    source = model()
+    with torch.no_grad():
+        source.second.mlp.moe_mlp.W_gate.mul_(2)
+    resident = quantize_magi2_experts_in_place(source, quant_format="fp8")
+    artifact = save_magi2_nf4_packed_state(tmp_path / "packed", source)
+    ranged = load_magi2_nf4_packed_state(
+        artifact, model(), blocksize=64, quant_format="fp8", staged_range_reads=True,
+        stream_cache_bytes=1024, stream_prefetch_depth=2,
+    )
+    assert len({id(store._packed_range_reader.reader) for store in ranged.values()}) == 1
+    for name, store in ranged.items():
+        options = dict(dtype=torch.float32, device="cpu")
+        torch.testing.assert_close(
+            store.materialize_segment("W_gate", 0, 1, **options),
+            resident[name].materialize_segment("W_gate", 0, 1, **options), rtol=0, atol=0,
+        )
+
+
 def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, monkeypatch) -> None:
     import json
     from contextlib import contextmanager
