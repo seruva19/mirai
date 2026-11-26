@@ -1784,6 +1784,10 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         topk_probs: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
+        if getattr(module, "_mirai_expert_lora", None) is not None and (
+            self.plan.routed_gemm != "disabled" or self.cpu_expert_max_tokens
+        ):
+            raise Magi2GroupedMoEPolicyError("MAGI-2 expert LoRA requires the grouped device execution path.")
         if self.plan.routed_gemm != "disabled" and not torch.is_grad_enabled():
             supported = (
                 x_heads.device.type == "cuda"
@@ -1812,6 +1816,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         forward_backend: str,
         dx_backend: str,
     ) -> torch.Tensor:
+        adapters = getattr(module, "_mirai_expert_lora", None)
+        if adapters is not None:
+            return self._expert_lora_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend, adapters)
         if forward_backend == "scaled_mm_fp4":
             return super().branch_features(module, x_heads, sorted_rows, offsets, forward_backend, dx_backend)
         if self.plan.routed_gemm != "disabled":
@@ -1889,6 +1896,49 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             with int8_saved_rows_context():
                 return operation.apply(*args)
         return operation.apply(*args)
+
+    def _expert_lora_features(self, module, x_heads, sorted_rows, offsets, forward_backend, dx_backend, adapters):
+        from contextlib import nullcontext
+        from torch.utils.checkpoint import checkpoint
+
+        from mirai.core.training.residency.activation_compression import int8_saved_rows_context
+
+        if self.plan.routed_gemm != "disabled" or self.cpu_expert_max_tokens:
+            raise Magi2GroupedMoEPolicyError("MAGI-2 expert LoRA requires the grouped device execution path.")
+        store = self._store(module)
+        selected = {key: set(adapter.active_expert_ids()) for key, adapter in adapters.items()}
+        rows = x_heads.flatten(0, 1).index_select(0, sorted_rows)
+        boundaries = [0, *_grouped_boundaries(offsets)]
+        outputs = []
+        for group, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True)):
+            if start == stop:
+                continue
+            subset = _ActiveExpertGroups(store, torch.tensor([group]))
+            local_offsets = offsets.new_tensor([stop - start])
+
+            def execute(value, expert=group, active_store=subset, bounds=local_offsets):
+                def project(key, x):
+                    result = _QuantizedGroupedExpertLinear.apply(
+                        x, bounds, active_store, key, forward_backend, dx_backend,
+                    )
+                    if expert in selected[key]:
+                        result = result + adapters[key](x, expert_idx=expert)
+                    return result
+
+                gate, up = project("W_gate", value), project("W_up", value)
+                hidden = _ConfiguredSwiGlu7.apply(
+                    gate, up, store.expert_weight_dtype("W_down"), self.activation_backend,
+                )
+                return project("W_down", hidden)
+
+            group_rows = rows[start:stop]
+            if torch.is_grad_enabled() and self.expert_autograd == "segmented_recompute":
+                context = int8_saved_rows_context() if self.int8_expert_checkpoint else nullcontext()
+                with context:
+                    outputs.append(checkpoint(execute, group_rows, use_reentrant=False))
+            else:
+                outputs.append(execute(group_rows))
+        return torch.cat(outputs, dim=0) if outputs else rows.new_empty((0, rows.shape[-1]))
 
 
 # The only MoEOptimizationPolicy fields MAGI-2 grouped execution reads. Every

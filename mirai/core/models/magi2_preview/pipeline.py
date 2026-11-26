@@ -179,6 +179,11 @@ MAGI2_TARGET_PRESETS: dict[str, tuple[str, ...]] = {
         ".attention.linear_proj",
         ".mlp.moe_mlp.gate",
     ),
+    "attn_router_routed_experts": (
+        ".attention.linear_qkv",
+        ".attention.linear_proj",
+        ".mlp.moe_mlp.gate",
+    ),
 }
 
 
@@ -1380,6 +1385,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         alpha = float(getattr(adapter_config, "alpha", rank))
         if rank <= 0:
             raise ValueError("adapter.rank must be > 0 for MAGI-2.")
+        expert_targets = preset == "attn_router_routed_experts"
+        if expert_targets and (
+            not self._expert_stores or getattr(self, "_expert_consolidation_plan_path", "")
+        ):
+            raise ValueError("MAGI-2 routed expert LoRA requires fully packed, unconsolidated experts.")
+        if str(getattr(adapter_config, "expert_selection", "all")).strip().lower() == "routing_topk":
+            raise ValueError("MAGI-2 expert LoRA does not yet support routing_topk calibration.")
+        if expert_targets and getattr(adapter_config, "sparse_expert_export", False):
+            raise ValueError("MAGI-2 expert LoRA requires full adapter checkpoint tensors.")
         for parameter in self.transformer.parameters():
             parameter.requires_grad_(False)
         targets = MAGI2_TARGET_PRESETS[preset]
@@ -1419,6 +1433,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
                 attach_magi2_lora_executor(module, tensor_name)
                 matched.append(full_name)
+        if expert_targets:
+            from mirai.core.models.compressed_weights.execution.active_expert_lora import ActiveExpertLoRA
+
+            for name, module in iter_magi2_moe_layers(self.transformer):
+                store = self._expert_stores[name]
+                adapters = nn.ModuleDict()
+                for key, _role in MAGI2_ROUTED_EXPERT_TENSORS:
+                    groups, inputs, outputs = store.expert_weight_shape(key)
+                    adapters[key] = ActiveExpertLoRA(
+                        adapter_name=f"{name}.{key}", num_experts=groups, in_features=inputs,
+                        out_features=outputs, rank=rank, alpha=alpha,
+                    )
+                module._mirai_expert_lora = adapters
+                matched.append(name)
         if not matched:
             raise ValueError(f"MAGI-2 LoRA preset '{preset}' matched no parameters.")
         self._adapter_configured = True
@@ -1438,6 +1466,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         value = float(scale)
         self._lora_scale = value
         for module in self.transformer.modules():
+            experts = getattr(module, "_mirai_expert_lora", None)
+            if experts is not None:
+                for adapter in experts.values():
+                    adapter.set_lora_scale(value)
             for parametrizations in module.parametrizations.values() if parametrize.is_parametrized(module) else ():
                 for item in parametrizations:
                     if isinstance(item, LowRankWeight):
@@ -1456,7 +1488,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         expected = set(self.state_dict())
         portable_alphas = {
             key for key in state
-            if key.endswith(".lora_alpha") and key.removesuffix(".lora_alpha") + ".lora_a" in expected
+            if key.endswith(".lora_alpha") and key not in expected
+            and key.removesuffix(".lora_alpha") + ".lora_a" in expected
         }
         for key in portable_alphas:
             alpha = state[key]
@@ -2309,7 +2342,13 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 
     def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         full = self.transformer.state_dict(*args, **kwargs)
-        adapter = {key: value for key, value in full.items() if "parametrizations." in key and (key.endswith("lora_a") or key.endswith("lora_b"))}
+        adapter = {
+            key: value for key, value in full.items()
+            if ("parametrizations." in key and key.endswith(("lora_a", "lora_b")))
+            or ("._mirai_expert_lora." in key and key.endswith(
+                (".lora_a", ".lora_b", ".lora_alpha", ".active_expert_mask")
+            ))
+        }
         digest = getattr(self, "_expert_pruning_digest", None)
         if digest is not None:
             adapter["__mirai_magi2_pruning_digest__"] = torch.tensor(list(digest), dtype=torch.uint8)

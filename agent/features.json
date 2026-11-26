@@ -3518,6 +3518,40 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_packed_expert_lora",
+      "kind": "adapter",
+      "owner": "mirai/core/models/magi2_preview/grouped_moe.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "persistence",
+        "documentation"
+      ],
+      "symbols": [
+        "_expert_lora_features"
+      ],
+      "config_keys": [
+        "adapter.target_preset"
+      ],
+      "disabled_config": {
+        "adapter.target_preset": "attn_only"
+      },
+      "contract_paths": [
+        "tests/test_magi2_nf4_experts.py"
+      ],
+      "default_off": true,
+      "stateful": true,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Packed routed expert LoRA",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_packed_expert_working_set",
       "kind": "routing_topology",
       "owner": "mirai/core/models/magi2_preview/working_set.py",

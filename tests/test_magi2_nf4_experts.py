@@ -2021,6 +2021,49 @@ def test_magi2_native_fp4_sm120_matches_decoded_operands(fmt) -> None:
     torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.025)
 
 
+def test_magi2_packed_expert_lora_composes_with_int8_segment_recompute() -> None:
+    from types import SimpleNamespace
+
+    def pipeline_with_adapter():
+        module = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
+        pipeline = Magi2PreviewPipeline.__new__(Magi2PreviewPipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.transformer = _container(module)
+        pipeline._expert_stores = quantize_magi2_experts_in_place(pipeline.transformer, quant_format="fp8")
+        pipeline.set_adapter_config(SimpleNamespace(target_preset="attn_router_routed_experts", rank=2, alpha=2.0))
+        return pipeline, module
+
+    pipeline, module = pipeline_with_adapter()
+    adapters = module._mirai_expert_lora
+    with torch.no_grad():
+        for adapter in adapters.values():
+            adapter.lora_b.normal_(std=0.01)
+            adapter.set_active_experts([1, 6])
+    plan = Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm")
+    reference = Magi2QuantizedGroupedMoEBackend(plan, expert_autograd="segmented_recompute")
+    compressed = Magi2QuantizedGroupedMoEBackend(plan, expert_autograd="segmented_recompute", int8_expert_checkpoint=True)
+    rows = torch.randn(5, 2, module.d_head, requires_grad=True)
+    scores = torch.ones(2, 5, 2) / 2
+    routes = torch.tensor([[[1, 0]] * 5, [[2, 0]] * 5])
+
+    expected = reference.execute(module, rows, scores, routes)
+    actual = compressed.execute(module, rows, scores, routes)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    inputs = (rows, *(adapter.lora_b for adapter in adapters.values()))
+    expected_grads = torch.autograd.grad(expected.square().sum(), inputs)
+    actual_grads = torch.autograd.grad(actual.square().sum(), inputs)
+    for value, ref in zip(actual_grads, expected_grads, strict=True):
+        assert (value - ref).norm() < 0.03 * ref.norm()
+    for grad in actual_grads[1:]:
+        assert grad[[1, 6]].abs().sum() > 0
+        assert torch.count_nonzero(grad[[0, 2, 3, 4, 5, 7]]) == 0
+
+    restored, restored_module = pipeline_with_adapter()
+    restored.load_adapter_state(pipeline.state_dict())
+    assert restored_module._mirai_expert_lora["W_gate"].active_expert_ids() == [1, 6]
+    torch.testing.assert_close(reference.execute(restored_module, rows, scores, routes), expected)
+
+
 @pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
 def test_magi2_native_fp4_dispatches_active_groups_and_preserves_input_gradient(monkeypatch, tmp_path, fmt) -> None:
     from mirai.core.models.compressed_weights.quantization import native_fp4
