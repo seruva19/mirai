@@ -640,12 +640,22 @@ class Magi2Nf4ExpertStore(nn.Module):
 class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
     """Addressable expert groups backed by a shared non-NF4 codec."""
 
-    def __init__(self, *, num_groups: int, quant_format: str, blocksize: int = NF4_BLOCKSIZE) -> None:
+    def __init__(
+        self, *, num_groups: int, quant_format: str, blocksize: int = NF4_BLOCKSIZE,
+        native_nvfp4_layout: bool = False,
+    ) -> None:
         super().__init__(num_groups=num_groups, blocksize=blocksize)
         if quant_format not in MAGI2_PACKED_EXPERT_FORMATS[1:]:
             raise Magi2QuantizedExpertError(f"Unsupported MAGI-2 packed format '{quant_format}'.")
         self.quant_format = quant_format
+        if native_nvfp4_layout and quant_format != "nvfp4":
+            raise Magi2QuantizedExpertError("The native NVFP4 layout requires NVFP4 expert weights.")
+        self.native_nvfp4_layout = native_nvfp4_layout
         self.expected_shapes: dict[str, tuple[int, ...]] = {}
+
+    @property
+    def has_native_fp4_layout(self) -> bool:
+        return self.quant_format == "mxfp4" or self.native_nvfp4_layout
 
     def _buffer_names(self, key: str) -> tuple[str, ...]:
         suffixes = ("codes",)
@@ -659,12 +669,10 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
         return {name for key in keys for name in self._buffer_names(key)}
 
     def _fp4_meta(self, shape):
-        if self.quant_format == "mxfp4":
+        if self.has_native_fp4_layout:
             # Native GEMM contracts along contiguous input columns.
             shape = shape[::-1]
-            block_size = 32
-        else:
-            block_size = 16
+        block_size = 32 if self.quant_format == "mxfp4" else 16
         return MicroscalingMeta(self.quant_format, block_size, shape, (-prod(shape)) % block_size)
 
     @torch.no_grad()
@@ -682,10 +690,8 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
                 group = transform(group)
             if self.quant_format == "fp8":
                 values = quantize_blockwise_fp8_weight(group)[:2]
-            elif self.quant_format == "nvfp4":
-                values = quantize_microscaling(self.quant_format, group)[:3]
-            elif self.quant_format == "mxfp4":
-                values = quantize_microscaling(self.quant_format, group.t())[:3]
+            elif self.quant_format in {"nvfp4", "mxfp4"}:
+                values = quantize_microscaling(self.quant_format, group.t() if self.has_native_fp4_layout else group)[:3]
             else:
                 values = (quantize_gguf(self.quant_format, group),)
             if payload is None:
@@ -764,7 +770,7 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
                 dequantize_microscaling(*group, meta, dtype=dtype, device=device)
                 for group in zip(*fields, strict=True)
             ])
-            return weights.transpose(-2, -1).contiguous() if self.quant_format == "mxfp4" else weights
+            return weights.transpose(-2, -1).contiguous() if self.has_native_fp4_layout else weights
         return torch.stack([
             dequantize_gguf(self.quant_format, group, shape=shape, dtype=dtype, device=device)
             for group in fields[0]
@@ -773,8 +779,8 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
     def native_fp4_projection(self, key, group, x):
         from mirai.core.models.compressed_weights.quantization.native_fp4 import native_fp4_linear
 
-        if self.quant_format != "mxfp4":
-            raise Magi2QuantizedExpertError("Native MAGI-2 FP4 GEMM requires contraction-major MXFP4 weights.")
+        if not self.has_native_fp4_layout:
+            raise Magi2QuantizedExpertError("Native MAGI-2 FP4 GEMM requires contraction-major FP4 weights.")
         fields = self._packed_segment(key, group, group + 1, device=x.device)
         return native_fp4_linear(x, *(field[0] for field in fields), self._fp4_meta(self._shapes[key][1:]))
 
@@ -809,10 +815,16 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
 
 
 
-def _new_expert_store(*, num_groups: int, blocksize: int, quant_format: str) -> Magi2Nf4ExpertStore:
+def _new_expert_store(
+    *, num_groups: int, blocksize: int, quant_format: str, native_nvfp4_layout: bool = False,
+) -> Magi2Nf4ExpertStore:
     if quant_format == "nf4":
+        if native_nvfp4_layout:
+            raise Magi2QuantizedExpertError("The native NVFP4 layout requires NVFP4 expert weights.")
         return Magi2Nf4ExpertStore(num_groups=num_groups, blocksize=blocksize)
-    return Magi2PackedExpertStore(num_groups=num_groups, blocksize=blocksize, quant_format=quant_format)
+    return Magi2PackedExpertStore(
+        num_groups=num_groups, blocksize=blocksize, quant_format=quant_format, native_nvfp4_layout=native_nvfp4_layout,
+    )
 
 
 def iter_magi2_moe_layers(transformer: nn.Module) -> Iterator[tuple[str, nn.Module]]:
@@ -835,6 +847,7 @@ def install_magi2_nf4_expert_stores(
     *,
     blocksize: int = NF4_BLOCKSIZE,
     quant_format: str = "nf4",
+    native_nvfp4_layout: bool = False,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Replace every MoE layer's dense expert parameters with an NF4 store.
 
@@ -846,12 +859,15 @@ def install_magi2_nf4_expert_stores(
     for name, module in list(iter_magi2_moe_layers(transformer)):
         existing = magi2_expert_store(module)
         if existing is not None:
-            if existing.quant_format != quant_format:
+            if existing.quant_format != quant_format or (
+                bool(getattr(existing, "native_nvfp4_layout", False)) != native_nvfp4_layout
+            ):
                 raise Magi2QuantizedExpertError("MAGI-2 layer already carries a different packed format.")
             stores[name] = existing
             continue
         store = _new_expert_store(
-            num_groups=int(module.local_flatten_num_experts), blocksize=blocksize, quant_format=quant_format
+            num_groups=int(module.local_flatten_num_experts), blocksize=blocksize, quant_format=quant_format,
+            native_nvfp4_layout=native_nvfp4_layout,
         )
         if isinstance(store, Magi2PackedExpertStore):
             store.expected_shapes = {
@@ -875,6 +891,7 @@ def quantize_magi2_experts_in_place(
     *,
     blocksize: int = NF4_BLOCKSIZE,
     quant_format: str = "nf4",
+    native_nvfp4_layout: bool = False,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Quantize already-materialized dense expert parameters, layer by layer.
 
@@ -892,7 +909,8 @@ def quantize_magi2_experts_in_place(
         if magi2_expert_store(module) is not None:
             continue
         store = _new_expert_store(
-            num_groups=int(module.local_flatten_num_experts), blocksize=blocksize, quant_format=quant_format
+            num_groups=int(module.local_flatten_num_experts), blocksize=blocksize, quant_format=quant_format,
+            native_nvfp4_layout=native_nvfp4_layout,
         )
         for tensor_name in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             parameter = module._parameters.get(tensor_name)
@@ -922,6 +940,7 @@ def stream_quantize_magi2_experts(
     checkpoint_dir: str,
     blocksize: int = NF4_BLOCKSIZE,
     quant_format: str = "nf4",
+    native_nvfp4_layout: bool = False,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Read the released expert shards one tensor at a time and pack them.
 
@@ -938,7 +957,9 @@ def stream_quantize_magi2_experts(
     )
 
     weight_map = read_safetensors_weight_map(str(checkpoint_dir))
-    stores = install_magi2_nf4_expert_stores(transformer, blocksize=blocksize, quant_format=quant_format)
+    stores = install_magi2_nf4_expert_stores(
+        transformer, blocksize=blocksize, quant_format=quant_format, native_nvfp4_layout=native_nvfp4_layout,
+    )
     pending = []
     for module_name, store in stores.items():
         for tensor_name in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:

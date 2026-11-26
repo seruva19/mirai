@@ -35,6 +35,7 @@ _MIXED_SCHEMA_VERSION = 5
 _ROTATED_MIXED_SCHEMA_VERSION = 6
 _SHARED_BASIS_SCHEMA_VERSION = 7
 _MIXTURE_BASIS_SCHEMA_VERSION = 8
+_NATIVE_NVFP4_SCHEMA_VERSION = 9
 _MANIFEST_FILE = "manifest.json"
 _PRUNING_DIGEST_KEY = "head_expert_pruning_digest"
 _CONSOLIDATION_DIGEST_KEY = "head_expert_consolidation_digest"
@@ -95,6 +96,7 @@ def save_magi2_nf4_packed_state(
     quant_format = None
     mixed = None
     mixed_lineage = None
+    native_nvfp4_layout = False
     rotation_group_size = 0
     for layer_index, (module_name, module) in enumerate(
         iter_magi2_moe_layers(transformer)
@@ -108,9 +110,11 @@ def save_magi2_nf4_packed_state(
             quant_format = store.quant_format
             mixed = isinstance(store, Magi2MixedExpertStore)
             mixed_lineage = store.lineage if mixed else None
+            native_nvfp4_layout = bool(getattr(store, "native_nvfp4_layout", False))
             rotation_group_size = store.rotation_group_size if mixed else 0
         if (
             quant_format != store.quant_format or mixed != isinstance(store, Magi2MixedExpertStore)
+            or native_nvfp4_layout != bool(getattr(store, "native_nvfp4_layout", False))
             or (fuse_gate_up and (mixed or quant_format != "nf4"))
         ):
             raise Magi2PackedExpertStateError("Incompatible gate/up or packed format across expert layers.")
@@ -147,6 +151,7 @@ def save_magi2_nf4_packed_state(
     manifest = {
         "schema": MAGI2_PACKED_EXPERT_SCHEMA,
         "schema_version": (
+            _NATIVE_NVFP4_SCHEMA_VERSION if native_nvfp4_layout else
             _SHARED_BASIS_SCHEMA_VERSION if quant_format == "shared_basis" else
             _MIXTURE_BASIS_SCHEMA_VERSION if quant_format == "mixture_basis" else
             _ROTATED_MIXED_SCHEMA_VERSION if rotation_group_size else
@@ -185,6 +190,7 @@ def load_magi2_nf4_packed_state(
     range_read_backend: str | None = None,
     stream_cache_bytes: int = 0,
     stream_prefetch_depth: int = 0,
+    require_native_nvfp4_layout: bool = False,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Restore NF4 stores directly and reject topology or schema mismatches."""
 
@@ -208,7 +214,7 @@ def load_magi2_nf4_packed_state(
     if (
         manifest.get("schema") != MAGI2_PACKED_EXPERT_SCHEMA
         or type(version) is not int
-        or version not in (2, MAGI2_PACKED_EXPERT_SCHEMA_VERSION, _MULTIFORMAT_SCHEMA_VERSION, _MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION, _SHARED_BASIS_SCHEMA_VERSION, _MIXTURE_BASIS_SCHEMA_VERSION)
+        or version not in (2, MAGI2_PACKED_EXPERT_SCHEMA_VERSION, _MULTIFORMAT_SCHEMA_VERSION, _MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION, _SHARED_BASIS_SCHEMA_VERSION, _MIXTURE_BASIS_SCHEMA_VERSION, _NATIVE_NVFP4_SCHEMA_VERSION)
     ):
         raise Magi2PackedExpertStateError(
             "Packed MAGI-2 expert state has an unsupported schema or version."
@@ -222,11 +228,15 @@ def load_magi2_nf4_packed_state(
         raise Magi2PackedExpertStateError("Packed MAGI-2 expert state has incompatible consolidation lineage.")
     shared_basis = version == _SHARED_BASIS_SCHEMA_VERSION
     mixture_basis = version == _MIXTURE_BASIS_SCHEMA_VERSION
+    native_nvfp4_layout = version == _NATIVE_NVFP4_SCHEMA_VERSION
+    if require_native_nvfp4_layout and not native_nvfp4_layout:
+        raise Magi2PackedExpertStateError("Packed MAGI-2 expert state does not carry the native NVFP4 layout.")
     if (
         manifest.get("quant_format") != quant_format
+        or (native_nvfp4_layout and quant_format != "nvfp4")
         or shared_basis != (quant_format == "shared_basis") or mixture_basis != (quant_format == "mixture_basis")
     ) or (
-        version not in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION, _SHARED_BASIS_SCHEMA_VERSION, _MIXTURE_BASIS_SCHEMA_VERSION}
+        version not in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION, _SHARED_BASIS_SCHEMA_VERSION, _MIXTURE_BASIS_SCHEMA_VERSION, _NATIVE_NVFP4_SCHEMA_VERSION}
         and (version == _MULTIFORMAT_SCHEMA_VERSION) != (quant_format != "nf4")
     ):
         raise Magi2PackedExpertStateError(
@@ -287,7 +297,10 @@ def load_magi2_nf4_packed_state(
         elif shared_basis:
             store = Magi2SharedBasisExpertStore(num_groups=groups)
         else:
-            store = _new_expert_store(num_groups=groups, blocksize=blocksize, quant_format=quant_format)
+            store = _new_expert_store(
+                num_groups=groups, blocksize=blocksize, quant_format=quant_format,
+                native_nvfp4_layout=native_nvfp4_layout,
+            )
         fused = spec.get("fused_gate_up", False)
         if not isinstance(fused, bool) or (version != MAGI2_PACKED_EXPERT_SCHEMA_VERSION and fused):
             raise Magi2PackedExpertStateError("Packed MAGI-2 layer has an invalid gate/up layout.")

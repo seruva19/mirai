@@ -1164,8 +1164,8 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
 
 def _native_fp4_grouped_projection(x_sorted, offsets, store, key, columns):
     physical_store = store.store if isinstance(store, _ActiveExpertGroups) else store
-    if not isinstance(physical_store, Magi2PackedExpertStore) or physical_store.quant_format != "mxfp4":
-        raise Magi2GroupedMoEPolicyError("Native MAGI-2 FP4 GEMM requires a uniform MXFP4 expert store.")
+    if not isinstance(physical_store, Magi2PackedExpertStore) or not physical_store.has_native_fp4_layout:
+        raise Magi2GroupedMoEPolicyError("Native MAGI-2 FP4 GEMM requires uniform contraction-major FP4 weights.")
     group_ids = store.group_ids.tolist() if isinstance(store, _ActiveExpertGroups) else range(offsets.numel())
     boundaries = [0, *_grouped_boundaries(offsets)]
     outputs = [
@@ -1551,10 +1551,11 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             return self.alignment_violations
         store = self._store(module)
         if self.plan.forward_backend == "scaled_mm_fp4":
-            if not isinstance(store, Magi2PackedExpertStore) or store.quant_format != "mxfp4":
-                raise Magi2GroupedMoEPolicyError("Native MAGI-2 FP4 GEMM requires a uniform MXFP4 expert store.")
-            if any(store.expert_weight_shape(key)[1] % 32 for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES):
-                raise Magi2GroupedMoEPolicyError("Native MAGI-2 MXFP4 GEMM requires input widths divisible by 32.")
+            if not isinstance(store, Magi2PackedExpertStore) or not store.has_native_fp4_layout:
+                raise Magi2GroupedMoEPolicyError("Native MAGI-2 FP4 GEMM requires uniform contraction-major FP4 weights.")
+            block_size = 32 if store.quant_format == "mxfp4" else 16
+            if any(store.expert_weight_shape(key)[1] % block_size for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES):
+                raise Magi2GroupedMoEPolicyError(f"Native MAGI-2 FP4 GEMM requires input widths divisible by {block_size}.")
         violations = magi2_grouped_mm_alignment_violations(
             w_gate=store.layout_probe("W_gate"),
             w_up=store.layout_probe("W_up"),

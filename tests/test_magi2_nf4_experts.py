@@ -1895,15 +1895,18 @@ def test_magi2_mixed_plan_preserves_group_order_and_checks_source_fingerprint(tm
         load_magi2_nf4_packed_state(artifact, restored_model, blocksize=64, quant_format="fp8")
 
 
-def test_magi2_mxfp4_packs_contiguous_contraction_blocks() -> None:
+@pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
+def test_magi2_fp4_packs_contiguous_contraction_blocks(fmt) -> None:
     from mirai.core.models.compressed_weights.quantization.microscaling_quant import (
         dequantize_microscaling, quantize_microscaling,
     )
 
     weights = torch.randn(2, 32, 64)
-    store = quantized_experts.Magi2PackedExpertStore(num_groups=2, quant_format="mxfp4")
+    store = quantized_experts.Magi2PackedExpertStore(
+        num_groups=2, quant_format=fmt, native_nvfp4_layout=fmt == "nvfp4",
+    )
     store.quantize_dense("W_gate", weights)
-    payload = quantize_microscaling("mxfp4", weights[1].t().contiguous())
+    payload = quantize_microscaling(fmt, weights[1].t().contiguous())
     for actual, expected in zip((store.W_gate_codes[1], store.W_gate_scales[1],
                                 store.W_gate_global_scale[1]), payload[:3], strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -1914,11 +1917,36 @@ def test_magi2_mxfp4_packs_contiguous_contraction_blocks() -> None:
     )
 
 
-def test_magi2_native_fp4_dispatches_active_groups_and_preserves_input_gradient(monkeypatch) -> None:
+@pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
+def test_magi2_native_fp4_dispatches_active_groups_and_preserves_input_gradient(monkeypatch, tmp_path, fmt) -> None:
     from mirai.core.models.compressed_weights.quantization import native_fp4
 
-    module = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
-    store = quantize_magi2_experts_in_place(_container(module), quant_format="mxfp4")["mlp.moe_mlp"]
+    def model():
+        return _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32))
+
+    source = model()
+    if fmt == "nvfp4":
+        legacy = model()
+        quantize_magi2_experts_in_place(legacy, quant_format=fmt)
+        legacy_artifact = save_magi2_nf4_packed_state(tmp_path / "legacy", legacy)
+        with pytest.raises(ValueError, match="native NVFP4 layout"):
+            load_magi2_nf4_packed_state(
+                legacy_artifact, model(), blocksize=64, quant_format=fmt, require_native_nvfp4_layout=True,
+            )
+        _write_expert_shard(tmp_path, source.mlp.moe_mlp)
+        quantized_experts.install_magi2_nf4_expert_stores(source, quant_format=fmt, native_nvfp4_layout=True)
+        quantized_experts.stream_quantize_magi2_experts(
+            source, checkpoint_dir=str(tmp_path), quant_format=fmt, native_nvfp4_layout=True,
+        )
+    else:
+        quantize_magi2_experts_in_place(source, quant_format=fmt)
+    artifact = save_magi2_nf4_packed_state(tmp_path / "native", source)
+    target = model()
+    store = load_magi2_nf4_packed_state(
+        artifact, target, blocksize=64, quant_format=fmt, range_read_backend="staged",
+        require_native_nvfp4_layout=fmt == "nvfp4",
+    )["mlp.moe_mlp"]
+    module = target.mlp.moe_mlp
     store.set_expert_weight_access_policy(expert_weight_access="active_group_dequant", expert_dequant_chunk_size=1)
     native = Magi2QuantizedGroupedMoEBackend(
         Magi2GroupedMoEPlan(forward_backend="scaled_mm_fp4", dx_backend="bmm"),

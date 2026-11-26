@@ -302,6 +302,19 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        self._native_nvfp4_layout = family.get("expert_nvfp4_native_layout", False)
+        if type(self._native_nvfp4_layout) is not bool:
+            raise ValueError("MAGI-2 expert_nvfp4_native_layout must be a boolean.")
+        if self._native_nvfp4_layout and (
+            self._frozen_weight_quantization != "nvfp4"
+            or self._expert_precision_plan_path
+            or str(getattr(model_config.params, "expert_precision_calibration", "off")) != "off"
+            or any(family.get(key) for key in (
+                "expert_pruning_plan_path", "expert_consolidation_plan_path",
+                "expert_shared_basis_rank", "expert_mixture_basis_rank",
+            ))
+        ):
+            raise ValueError("MAGI-2 expert_nvfp4_native_layout requires uniform NVFP4 expert packing.")
         from mirai.core.models.magi2_preview.working_set import Magi2ExpertWorkingSet
 
         self._expert_working_set = Magi2ExpertWorkingSet(
@@ -595,6 +608,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             install_magi2_nf4_expert_stores(
                 transformer, blocksize=self._nf4_blocksize,
                 quant_format=self._frozen_weight_quantization,
+                native_nvfp4_layout=self._native_nvfp4_layout,
             )
         if pruning_plan is not None:
             self._expert_pruning_digest = pruning_plan.topology_digest()
@@ -630,6 +644,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                     checkpoint_dir=str(checkpoint_dir),
                     blocksize=self._nf4_blocksize,
                     quant_format=self._frozen_weight_quantization,
+                    native_nvfp4_layout=self._native_nvfp4_layout,
                 )
         elif getattr(self, "_expert_pruning_adapter_source_plan_path", ""):
             from mirai.core.models.magi2_preview.expert_pruning import (
@@ -937,6 +952,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             ),
             stream_cache_bytes=getattr(self, "_packed_stream_cache_bytes", 0),
             stream_prefetch_depth=getattr(self, "_packed_stream_prefetch_depth", 0),
+            require_native_nvfp4_layout=getattr(self, "_native_nvfp4_layout", False),
             expected_pruning_digest=pruning_digest, expected_consolidation_digest=consolidation_digest,
             expected_metadata=expected_metadata,
         )
@@ -1247,7 +1263,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
 
             self._expert_stores = quantize_magi2_experts_in_place(
-                self.transformer, blocksize=block_size, quant_format=scheme
+                self.transformer, blocksize=block_size, quant_format=scheme,
+                native_nvfp4_layout=getattr(self, "_native_nvfp4_layout", False),
             )
         self._attach_moe_execution()
 
@@ -2302,6 +2319,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
         "nf4_fuse_gate_up",
+        "expert_nvfp4_native_layout",
         "expert_pruning_plan_path",
         "expert_consolidation_plan_path",
         "expert_shared_basis_rank",
@@ -2396,6 +2414,8 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
 
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        if type(params.get("expert_nvfp4_native_layout", False)) is not bool:
+            errors.append("MAGI-2 expert_nvfp4_native_layout must be a boolean.")
         from mirai.core.models.magi2_preview.working_set import Magi2ExpertWorkingSet
 
         try:
