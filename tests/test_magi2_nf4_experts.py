@@ -835,9 +835,12 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
         verify_magi2_pruning_source(transformer, plan)
 
 
-def test_magi2_shared_basis_reconstructs_selected_native_groups() -> None:
+def test_magi2_shared_basis_reconstructs_selected_native_groups(tmp_path) -> None:
+    from safetensors.torch import save_file
+
     from mirai.core.models.magi2_preview.basis_experts import (
         Magi2SharedBasisExpertStore, factorize_magi2_shared_basis_experts,
+        stream_factorize_magi2_shared_basis_experts,
     )
 
     generator = torch.Generator().manual_seed(7)
@@ -855,8 +858,19 @@ def test_magi2_shared_basis_reconstructs_selected_native_groups() -> None:
     assert store.is_fully_loaded()
     assert store.payload_bytes() < 3 * 4 * 8 * 16 * 4
     layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
-    installed = factorize_magi2_shared_basis_experts(_container(layer), rank=2)["mlp.moe_mlp"]
+    transformer = _container(layer)
+    save_file(transformer.state_dict(), str(tmp_path / "model.safetensors"))
+    skeleton = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, routed_weight_device="meta",
+    ))
+    streamed = stream_factorize_magi2_shared_basis_experts(
+        skeleton, checkpoint_dir=str(tmp_path), rank=2,
+    )["mlp.moe_mlp"]
+    installed = factorize_magi2_shared_basis_experts(transformer, rank=2)["mlp.moe_mlp"]
     assert installed.is_fully_loaded()
+    assert not hasattr(skeleton.mlp.moe_mlp, "W_gate")
+    for key, value in installed.named_buffers():
+        torch.testing.assert_close(dict(streamed.named_buffers())[key], value, rtol=0, atol=0)
     tokens = torch.rand(2, layer.num_heads, layer.d_head, requires_grad=True)
     backend = Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
     output = backend.execute(layer, tokens, *layer._route(tokens))

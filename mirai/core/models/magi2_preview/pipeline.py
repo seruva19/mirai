@@ -315,6 +315,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("MAGI-2 expert rotation requires precision calibration, a mixed plan, or a rotated artifact.")
         self._expert_pruning_plan_path = str(family.get("expert_pruning_plan_path", "")).strip()
         self._expert_consolidation_plan_path = str(family.get("expert_consolidation_plan_path", "")).strip()
+        self._expert_shared_basis_rank = family.get("expert_shared_basis_rank", 0)
+        if type(self._expert_shared_basis_rank) is not int or self._expert_shared_basis_rank < 0:
+            raise ValueError("MAGI-2 expert_shared_basis_rank must be a non-negative integer.")
         self._expert_pruning_adapter_source_plan_path = str(
             family.get("expert_pruning_adapter_source_plan_path", "") or ""
         ).strip()
@@ -335,6 +338,13 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
         ):
             raise ValueError("MAGI-2 hierarchical consolidation requires a dense source and no pruning plan.")
+        if self._expert_shared_basis_rank and (
+            self._expert_pruning_plan_path or self._expert_pruning_adapter_source_plan_path
+            or self._expert_consolidation_plan_path or self._expert_precision_plan_path
+            or self._packed_expert_state_path or self._quantize_experts_on_load
+            or self._frozen_weight_quantization not in {"", "none", "off", "disabled"}
+        ):
+            raise ValueError("MAGI-2 shared-basis rank requires an original dense checkpoint and no other expert storage policy.")
         default_config = (
             Path(__file__).resolve().parents[3]
             / "vendors"
@@ -446,9 +456,11 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         packed_experts = self._quantizes_experts_on_load() or bool(self._packed_expert_state_path)
         pruning_plan_path = self._expert_pruning_plan_path
         consolidation_plan_path = getattr(self, "_expert_consolidation_plan_path", "")
+        shared_basis_rank = getattr(self, "_expert_shared_basis_rank", 0)
         transformer = (
             Transformer(config.arch_config, ep_size=1, routed_weight_device="meta")
-            if packed_experts or pruning_plan_path or consolidation_plan_path else Transformer(config.arch_config, ep_size=1)
+            if packed_experts or pruning_plan_path or consolidation_plan_path or shared_basis_rank
+            else Transformer(config.arch_config, ep_size=1)
         )
         mixed_stream = self._quantizes_experts_on_load() and self._expert_precision_plan_path
         preloaded_keys = set()
@@ -457,7 +469,13 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             from mirai.core.models.magi2_preview.expert_pruning import Magi2ExpertPruningPlan
 
             pruning_plan = Magi2ExpertPruningPlan.load(pruning_plan_path)
-        if consolidation_plan_path:
+        if shared_basis_rank:
+            from mirai.core.models.magi2_preview.basis_experts import stream_factorize_magi2_shared_basis_experts
+
+            self._expert_stores = stream_factorize_magi2_shared_basis_experts(
+                transformer, checkpoint_dir=str(checkpoint_dir), rank=shared_basis_rank,
+            )
+        elif consolidation_plan_path:
             from mirai.core.models.magi2_preview.expert_pruning import (
                 Magi2ExpertConsolidationPlan,
                 stream_merge_magi2_experts,
@@ -847,6 +865,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         *,
         metadata: dict[str, str] | None = None,
     ) -> Any:
+        if getattr(self, "_expert_shared_basis_rank", 0):
+            raise ValueError("MAGI-2 shared-basis factors currently load from the source checkpoint.")
         from mirai.core.models.magi2_preview.packed_experts import (
             save_magi2_nf4_packed_state,
         )
@@ -2154,6 +2174,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "nf4_fuse_gate_up",
         "expert_pruning_plan_path",
         "expert_consolidation_plan_path",
+        "expert_shared_basis_rank",
         "expert_pruning_adapter_source_plan_path",
         "expert_rotation_group_size",
         "companion_weight_quantization",
@@ -2238,6 +2259,9 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
 
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        basis_rank = params.get("expert_shared_basis_rank", 0)
+        if type(basis_rank) is not int or basis_rank < 0:
+            errors.append("MAGI-2 expert_shared_basis_rank must be a non-negative integer.")
         if params.get("companion_weight_quantization", "none") not in MAGI2_COMPANION_FORMATS:
             errors.append("MAGI-2 companion_weight_quantization must be 'none', 'fp8', or 'nf4'.")
         if params.get("norm_weight_quantization", "none") not in MAGI2_NORM_FORMATS:

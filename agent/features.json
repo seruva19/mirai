@@ -3566,6 +3566,40 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_shared_basis_expert_storage",
+      "kind": "compressed_weight",
+      "owner": "mirai/core/models/magi2_preview/basis_experts.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "resource_bound",
+        "documentation"
+      ],
+      "symbols": [
+        "stream_factorize_magi2_shared_basis_experts"
+      ],
+      "config_keys": [
+        "model.params.family_params"
+      ],
+      "disabled_config": {
+        "model.params.family_params": {}
+      },
+      "contract_paths": [
+        "tests/test_magi2_nf4_experts.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "MAGI-2 shared-basis expert storage",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_spatial_turbovae",
       "kind": "inference",
       "owner": "mirai/core/models/magi2_preview/vae_tiling.py",

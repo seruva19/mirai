@@ -825,6 +825,11 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   `memory.frozen_weight_packed_state_path` with the same original checkpoint,
   merge plan, and expert format. Restore verifies the source fingerprint,
   plan digest, and the logical-to-physical aliases.
+- **MAGI-2 shared-basis expert storage** — Set
+  `model.params.family_params.expert_shared_basis_rank` to a positive rank
+  to factorize dense routed projections during checkpoint loading. The default
+  is zero. The grouped backend reconstructs requested expert groups from
+  BF16 factors. This mode uses the original checkpoint as its source.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group

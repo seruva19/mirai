@@ -76,3 +76,37 @@ def factorize_magi2_shared_basis_experts(
             del layer._parameters[key]
         layer.add_module(MAGI2_NF4_STORE_ATTR, stores[name])
     return stores
+
+
+def stream_factorize_magi2_shared_basis_experts(
+    transformer: torch.nn.Module, *, checkpoint_dir: str, rank: int, factor_dtype: str = "bfloat16",
+) -> dict[str, Magi2SharedBasisExpertStore]:
+    """Build all stores from source shards before replacing any expert parameters."""
+    from safetensors import safe_open
+
+    from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import read_safetensors_weight_map
+
+    layers = dict(iter_magi2_moe_layers(transformer))
+    if not layers:
+        raise ValueError("MAGI-2 shared-basis factorization matched no expert layers.")
+    weight_map = read_safetensors_weight_map(checkpoint_dir)
+    stores = {}
+    for name, layer in layers.items():
+        store = Magi2SharedBasisExpertStore(num_groups=layer.local_flatten_num_experts)
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            full_key = f"{name}.{key}"
+            if full_key not in weight_map:
+                raise ValueError(f"MAGI-2 checkpoint is missing shared-basis projection {full_key!r}.")
+            target = layer._parameters[key]
+            with safe_open(weight_map[full_key], framework="pt", device="cpu") as shard:
+                source = shard.get_tensor(full_key)
+                if source.shape != target.shape or not source.is_floating_point():
+                    raise ValueError(f"MAGI-2 shared-basis projection {full_key!r} has incompatible shape or dtype.")
+                store.factorize_projection(key, source.to(dtype=target.dtype), rank=rank, factor_dtype=factor_dtype)
+                del source
+        stores[name] = store
+    for name, layer in layers.items():
+        for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+            del layer._parameters[key]
+        layer.add_module(MAGI2_NF4_STORE_ATTR, stores[name])
+    return stores
