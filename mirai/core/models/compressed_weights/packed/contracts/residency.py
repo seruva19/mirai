@@ -22,6 +22,38 @@ _GIB = 1024**3
 
 
 class PackedStateResidencyPolicyTests(unittest.TestCase):
+    def test_nf4_stack_writes_into_supplied_dense_slot_view(self) -> None:
+        import sys
+        from types import SimpleNamespace
+
+        from mirai.core.models.compressed_weights.quantization import quant
+
+        slot = torch.empty(64, dtype=torch.uint8)
+        out = slot[:16].view(torch.float32).view(2, 1, 2)
+
+        def dequantize(_packed, state, *, out, **_kwargs):
+            self.assertEqual(out.data_ptr(), slot.data_ptr())
+            self.assertEqual(out.shape, state.shape)
+            out.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+            return out
+
+        bnb = SimpleNamespace(
+            QuantState=SimpleNamespace,
+            dequantize_blockwise=mock.Mock(return_value=torch.ones(2)),
+            dequantize_4bit=dequantize,
+        )
+        with mock.patch.dict(sys.modules, {"bitsandbytes.functional": bnb}), mock.patch.object(
+            quant, "_import_bnb_functional", return_value=bnb,
+        ):
+            result = quant.nf4_dequantize_stack(
+                packed=torch.zeros(2, dtype=torch.uint8), absmax_q=torch.zeros(2), nested_absmax=torch.ones(2),
+                offsets=torch.zeros(2), code=torch.empty(0), nested_code=torch.empty(0),
+                num_selected=2, out_features=1, in_features=2, dtype=torch.float32,
+                meta=quant._Nf4Meta(64, 256, torch.float32, torch.float32), out=out,
+            )
+        self.assertEqual(result.data_ptr(), out.data_ptr())
+        torch.testing.assert_close(result, torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]))
+
     def test_raw_cuda_arena_subdivides_one_allocation_into_aligned_slots(self) -> None:
         from contextlib import nullcontext
         import sys

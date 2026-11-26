@@ -34,8 +34,9 @@ rejected rather than reinterpreted.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable
+from typing import Any, Callable, ContextManager
 
 import torch
 
@@ -915,6 +916,7 @@ def run_segmented_grouped_linear(
     transposed: bool = False,
     segments: tuple[GroupedMMSegment, ...] | None = None,
     prefetch: Callable[[int, int], None] | None = None,
+    borrow: Callable[[int, int], ContextManager[torch.Tensor]] | None = None,
 ) -> torch.Tensor:
     """Run the sorted-layout grouped matmul one contiguous group range at a time.
 
@@ -942,20 +944,20 @@ def run_segmented_grouped_linear(
     for index, segment in enumerate(segments):
         if segment.row_count == 0:
             continue
-        weight = materialize(segment.group_start, segment.group_stop)
-        if prefetch is not None and index + 1 < len(segments):
-            next_segment = segments[index + 1]
-            prefetch(next_segment.group_start, next_segment.group_stop)
-        local_offsets = (
-            offsets[segment.group_start : segment.group_stop] - segment.row_start
-        ).contiguous()
-        rows = x_sorted[segment.row_start : segment.row_stop]
-        outputs.append(
-            _grouped_linear_dx(rows, weight, local_offsets, backend)
-            if transposed
-            else _grouped_linear(rows, weight, local_offsets, backend)
-        )
-        del weight
+        start, stop = segment.group_start, segment.group_stop
+        lease = nullcontext(materialize(start, stop)) if borrow is None else borrow(start, stop)
+        with lease as weight:
+            if prefetch is not None and index + 1 < len(segments):
+                next_segment = segments[index + 1]
+                prefetch(next_segment.group_start, next_segment.group_stop)
+            local_offsets = (offsets[start:stop] - segment.row_start).contiguous()
+            rows = x_sorted[segment.row_start : segment.row_stop]
+            outputs.append(
+                _grouped_linear_dx(rows, weight, local_offsets, backend)
+                if transposed
+                else _grouped_linear(rows, weight, local_offsets, backend)
+            )
+        del weight, lease
     if not outputs:
         return x_sorted.new_empty((0, int(columns)))
     if len(outputs) == 1:
@@ -1069,6 +1071,12 @@ class _ActiveExpertGroups:
 
     def prefetch_segment(self, key, start, stop, *, device, dtype) -> None:
         self.store.prefetch_segment(key, start, stop, device=device, dtype=dtype, group_ids=self.group_ids)
+
+    def borrow_segment(self, key, start, stop, *, device, dtype):
+        borrow = getattr(self.store, "borrow_segment", None)
+        if borrow is None:
+            return nullcontext(self.materialize_segment(key, start, stop, device=device, dtype=dtype))
+        return borrow(key, start, stop, device=device, dtype=dtype, group_ids=self.group_ids)
 
     @property
     def packed_prefetch_enabled(self) -> bool:
@@ -1190,6 +1198,10 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
                 materialize=lambda start, stop: store.materialize_segment(
                     key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
                 ),
+                borrow=(
+                    (lambda start, stop: store.borrow_segment(key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device))
+                    if hasattr(store, "borrow_segment") else None
+                ),
                 prefetch=(
                     (lambda start, stop: store.prefetch_segment(key, start, stop, device=x_sorted.device, dtype=x_sorted.dtype))
                     if getattr(store, "packed_prefetch_enabled", False) else None
@@ -1220,6 +1232,10 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
                 segments=ctx.segments,
                 materialize=lambda start, stop: store.materialize_segment(
                     key, start, stop, dtype=grad_output.dtype, device=grad_output.device
+                ),
+                borrow=(
+                    (lambda start, stop: store.borrow_segment(key, start, stop, dtype=grad_output.dtype, device=grad_output.device))
+                    if hasattr(store, "borrow_segment") else None
                 ),
                 prefetch=(
                     (lambda start, stop: store.prefetch_segment(key, start, stop, device=grad_output.device, dtype=grad_output.dtype))

@@ -120,7 +120,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             self._prefetch = PackedStreamPrefetchRing(depth)
         self._uring_fixed_bytes = 0 if fixed_reader is None else fixed_reader.fixed_buffer_bytes
         self._pin_cap_bytes = max(0, _pin_budget_bytes() - self._uring_fixed_bytes)
-        self._staging_lock = threading.Lock()
+        self._staging_lock = threading.RLock()
         self._staging_pool = None
         self._raw_staging = self._backend != "gds" and os.environ.get("MIRAI_PACKED_CUDA_ARENA", "") == "raw"
         self._staging_arena = None
@@ -284,6 +284,23 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             self._h2d_ops += len(host_tensors)
             self._h2d_bytes += transferred
         return PackedCudaTransfer(stacked, event)
+
+    @contextmanager
+    def borrow_cuda_weight(self, shape, *, dtype, device):
+        target = torch.device(device)
+        if not self._raw_staging or target.type != "cuda" or self._backend == "gds" or self.prefetch_enabled:
+            yield None
+            return
+        size = torch.Size(shape).numel() * torch.empty((), device="meta", dtype=dtype).element_size()
+        if size > _MAX_RANGE_BYTES:
+            yield None
+            return
+        with self._staging_lock:
+            if self._closed:
+                raise RuntimeError("Packed stream mapping is closed.")
+            stream = torch.cuda.current_stream(target)
+            with self._cuda_staging_arena(target, stream).lease(stream) as slot:
+                yield slot[:size].view(dtype).view(shape)
 
     @contextmanager
     def borrow_packed_fields(self, keys, indices, *, device):

@@ -253,7 +253,9 @@ allocation outside the PyTorch caching allocator. Host-backed streams use
 the same option for two fixed 32 MiB upload slots. With prefetch disabled,
 dequantization reads borrowed packed fields directly from a slot when the
 batch fits. A CUDA event orders reuse after the consumer finishes. Larger
-batches and prefetched reads use owning CUDA tensors. This experimental
+batches and prefetched reads use owning CUDA tensors. Eligible segmented
+NF4 grouped projections can also write the dense weights into a second
+slot and hold it until the grouped matrix multiplication finishes. This experimental
 mode requires CuPy for the active CUDA version. Compare with
 the variable unset using the same synthetic shard, reader depth, and device.
 With `memory.weight_residency_strategy="stream_disk"` and

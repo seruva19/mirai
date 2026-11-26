@@ -394,6 +394,7 @@ def nf4_dequantize_stack(
     in_features: int,
     dtype: torch.dtype,
     meta: _Nf4Meta,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Dequantize ``num_selected`` equally-shaped NF4 slices in one call pair.
 
@@ -402,6 +403,12 @@ def nf4_dequantize_stack(
     Returns ``None`` when the installed bitsandbytes surface does not match, so
     callers keep a per-slice reference path.
     """
+    shape = (num_selected, int(out_features), int(in_features))
+    if out is not None and (
+        out.shape != shape or out.device != packed.device or out.dtype != dtype
+        or dtype != meta.weight_dtype or not out.is_contiguous()
+    ):
+        raise ValueError("NF4 output must be contiguous and match the target shape, device, and dtype.")
     try:
         bnb = _import_bnb_functional()
         from bitsandbytes.functional import QuantState
@@ -425,17 +432,18 @@ def nf4_dequantize_stack(
             code=code,
             blocksize=int(meta.blocksize),
             quant_type="nf4",
-            dtype=meta.weight_dtype,
+            dtype=meta.weight_dtype if out is None else dtype,
         )
         weight = bnb.dequantize_4bit(
             packed.reshape(-1, 1),
             quant_state,
             blocksize=int(meta.blocksize),
             quant_type="nf4",
+            **({} if out is None else {"out": out.view(quant_state.shape)}),
         )
     except (TypeError, RuntimeError, AttributeError):
         return None
-    return weight.reshape(num_selected, int(out_features), int(in_features)).to(dtype=dtype)
+    return weight.reshape(shape).to(dtype=dtype)
 
 
 def _nf4_dequantize(

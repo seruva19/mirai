@@ -22,7 +22,7 @@ rather than retaining a dense copy.
 
 from __future__ import annotations
 
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from math import prod
 from typing import Callable, Iterator, Sequence
 
@@ -106,6 +106,10 @@ class PackedExpertRangeView:
         if borrow is None:
             return nullcontext([self.get_slices_to_device(key, indices, device=device) for key in keys])
         return borrow(tuple(self.prefix + key for key in keys), indices, device=device)
+
+    def borrow_cuda_weight(self, shape, *, dtype, device):
+        borrow = getattr(self.reader, "borrow_cuda_weight", None)
+        return nullcontext() if borrow is None else borrow(shape, dtype=dtype, device=device)
 
     def prefetch_slices_to_device(self, key, indices, **kwargs):
         return self.reader.prefetch_slices_to_device(self.prefix + key, indices, **kwargs)
@@ -513,6 +517,21 @@ class Magi2Nf4ExpertStore(nn.Module):
         self._dtypes[key] = self._meta.weight_dtype if self._meta is not None else source.dtype
 
     # -- execution ---------------------------------------------------------
+    @contextmanager
+    def borrow_segment(self, key, start, stop, *, dtype, device, group_ids=None):
+        reader = getattr(self, "_packed_range_reader", None)
+        if (
+            self.quant_format == "nf4" and reader is not None and not torch.is_grad_enabled()
+            and torch.device(device).type == "cuda" and self._meta is not None
+            and dtype == self._meta.weight_dtype and key != MAGI2_FUSED_GATE_UP
+        ):
+            _, rows, cols = self.expert_weight_shape(key)
+            if stop - start > 1 and nf4_stack_dequant_supported(elements=rows * cols, meta=self._meta):
+                with reader.borrow_cuda_weight((stop - start, rows, cols), dtype=dtype, device=device) as out:
+                    yield self.materialize_segment(key, start, stop, dtype=dtype, device=device, group_ids=group_ids, out=out)
+                return
+        yield self.materialize_segment(key, start, stop, dtype=dtype, device=device, group_ids=group_ids)
+
     def materialize_segment(
         self,
         key: str,
@@ -522,6 +541,7 @@ class Magi2Nf4ExpertStore(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
         group_ids: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dequantize a range in the native or selected group order.
 
@@ -618,6 +638,7 @@ class Magi2Nf4ExpertStore(nn.Module):
                     in_features=int(in_features),
                     dtype=dtype,
                     meta=meta,
+                    out=out,
                 )
                 if stacked is not None:
                     return projection_layout(stacked)
