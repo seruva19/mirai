@@ -460,7 +460,8 @@ def flex_range_attention(
     mask = range_mask
     if mask is None:
         mask = build_range_union_mask(
-            q_ranges, k_ranges, query_tokens=query_tokens, key_tokens=key_tokens
+            q_ranges.to(device=query.device), k_ranges.to(device=query.device),
+            query_tokens=query_tokens, key_tokens=key_tokens,
         )
     elif int(mask.segment_of.numel()) != query_tokens or int(mask.key_tokens) != key_tokens:
         raise Magi2RefinerAttentionUnsupported(
