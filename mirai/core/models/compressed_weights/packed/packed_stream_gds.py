@@ -19,6 +19,9 @@ from mirai.core.models.compressed_weights.packed.packed_storage_alignment import
 from mirai.core.models.compressed_weights.packed.packed_stream_prefetch import PackedCudaTransfer
 
 
+_GDS_OPEN_LOCK = threading.Lock()
+
+
 class GdsUnavailableError(RuntimeError):
     """Raised when explicit GDS mode cannot prove a direct storage path."""
 
@@ -54,7 +57,6 @@ class KvikioGdsReader:
         self._kvikio = kvikio
         self._driver = kvikio.cufile_driver
         self._defaults = kvikio.defaults
-        self._compat_context: Any | None = None
         self._files: dict[str, Any] = {}
         self._file_sizes: dict[str, int] = {}
         self._closed = False
@@ -75,44 +77,45 @@ class KvikioGdsReader:
         self._trimmed_ops = 0
 
         try:
-            self._compat_context = self._defaults.set("compat_mode", False)
-            self._compat_context.__enter__()
-            try:
-                self._driver.initialize()
-            except (OSError, RuntimeError) as exc:
-                raise GdsUnavailableError("Could not initialize the cuFile driver.") from exc
-            if not bool(self._driver.get("is_gds_available")):
-                raise GdsUnavailableError(
-                    "cuFile reports that GPUDirect Storage is unavailable. "
-                    "Install/configure the GDS driver or CUDA P2P path for this "
-                    "GPU, filesystem, and mount."
-                )
-            if bool(self._driver.get("allow_compat_mode")):
-                raise GdsUnavailableError(
-                    "cuFile compatibility mode is enabled; Mirai refuses to "
-                    "label its CPU POSIX fallback as GPUDirect Storage. Disable "
-                    "allow_compat_mode in the active cufile configuration."
-                )
-            for name, path in shard_paths.items():
-                try:
-                    storage = read_safetensors_storage_alignment(path)
-                except (OSError, ValueError) as exc:
-                    raise GdsUnavailableError(str(exc)) from exc
-                handle = self._kvikio.CuFile(str(path), "r")
-                if not callable(getattr(handle, "raw_read_async", None)):
-                    handle.close()
-                    raise GdsUnavailableError("GPUDirect Storage requires KvikIO's raw_read_async API.")
-                if not bool(handle.is_direct_io_supported()):
-                    handle.close()
-                    raise GdsUnavailableError(
-                        f"Packed shard {path.name!r} does not support direct I/O "
-                        "on its current filesystem/mount."
-                    )
-                self._files[str(name)] = handle
-                self._file_sizes[str(name)] = storage.file_size
+            # KvikIO captures the process default when it constructs a file handle.
+            with _GDS_OPEN_LOCK, self._defaults.set("compat_mode", False):
+                self._open_shards(shard_paths)
         except Exception:
             self.close()
             raise
+
+    def _open_shards(self, shard_paths: Mapping[str, Path]) -> None:
+        try:
+            self._driver.initialize()
+        except (OSError, RuntimeError) as exc:
+            raise GdsUnavailableError("Could not initialize the cuFile driver.") from exc
+        if not bool(self._driver.get("is_gds_available")):
+            raise GdsUnavailableError(
+                "cuFile reports that GPUDirect Storage is unavailable. "
+                "Install/configure the GDS driver or CUDA P2P path for this "
+                "GPU, filesystem, and mount."
+            )
+        if bool(self._driver.get("allow_compat_mode")):
+            raise GdsUnavailableError(
+                "cuFile compatibility mode is enabled; Mirai refuses to "
+                "label its CPU POSIX fallback as GPUDirect Storage. Disable "
+                "allow_compat_mode in the active cufile configuration."
+            )
+        for name, path in shard_paths.items():
+            try:
+                storage = read_safetensors_storage_alignment(path)
+            except (OSError, ValueError) as exc:
+                raise GdsUnavailableError(str(exc)) from exc
+            handle = self._kvikio.CuFile(str(path), "r")
+            self._files[str(name)] = handle
+            if not callable(getattr(handle, "raw_read_async", None)):
+                raise GdsUnavailableError("GPUDirect Storage requires KvikIO's raw_read_async API.")
+            if not bool(handle.is_direct_io_supported()):
+                raise GdsUnavailableError(
+                    f"Packed shard {path.name!r} does not support direct I/O "
+                    "on its current filesystem/mount."
+                )
+            self._file_sizes[str(name)] = storage.file_size
 
     def read_device(
         self,
@@ -293,9 +296,3 @@ class KvikioGdsReader:
                     pass
             self._files.clear()
             self._file_sizes.clear()
-            if self._compat_context is not None:
-                try:
-                    self._compat_context.__exit__(None, None, None)
-                except Exception:
-                    pass
-                self._compat_context = None

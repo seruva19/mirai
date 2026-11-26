@@ -373,7 +373,7 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
                 stream_backend="gds",
             )
 
-    def test_gds_rejects_a_handle_without_async_reads(self) -> None:
+    def test_gds_restores_compatibility_after_opening_or_rejecting_a_handle(self) -> None:
         import sys
         from pathlib import Path
         from types import SimpleNamespace
@@ -385,16 +385,29 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
         defaults = mock.Mock()
         context = mock.MagicMock()
         defaults.set.return_value = context
-        handle = mock.Mock(spec=["close", "raw_read", "is_direct_io_supported"])
-        kvikio = SimpleNamespace(cufile_driver=driver, defaults=defaults, CuFile=mock.Mock(return_value=handle))
+        sync_handle = mock.Mock(spec=["close", "raw_read", "is_direct_io_supported"])
+        async_handle = mock.Mock()
+        kvikio = SimpleNamespace(
+            cufile_driver=driver, defaults=defaults,
+            CuFile=mock.Mock(side_effect=[sync_handle, async_handle]),
+        )
+        shards = {"experts": Path("experts.safetensors")}
         with mock.patch.dict(sys.modules, {
             "kvikio": kvikio, "kvikio.cufile_driver": driver, "kvikio.defaults": defaults,
         }), mock.patch.object(packed_stream_gds, "read_safetensors_storage_alignment"):
             with self.assertRaisesRegex(packed_stream_gds.GdsUnavailableError, "raw_read_async"):
-                packed_stream_gds.KvikioGdsReader({"experts": Path("experts.safetensors")}, slots=1, slot_bytes=4096)
-        handle.close.assert_called_once_with()
-        handle.raw_read.assert_not_called()
-        context.__exit__.assert_called_once()
+                packed_stream_gds.KvikioGdsReader(shards, slots=1, slot_bytes=4096)
+            context.__exit__.assert_called_once()
+            reader = packed_stream_gds.KvikioGdsReader(shards, slots=1, slot_bytes=4096)
+            try:
+                self.assertEqual(context.__exit__.call_count, 2)
+                async_handle.close.assert_not_called()
+            finally:
+                reader.close()
+        sync_handle.close.assert_called_once_with()
+        sync_handle.raw_read.assert_not_called()
+        async_handle.close.assert_called_once_with()
+        self.assertEqual(context.__exit__.call_count, 2)
 
     def test_gds_async_read_awaits_its_stream_and_trims_aligned_bytes(self) -> None:
         import contextlib
