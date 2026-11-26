@@ -815,8 +815,10 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   retains the original expert IDs. Reference and grouped execution resolve
   those IDs against the compacted weights.
   Set `memory.quantize_experts_on_load=true` with a supported format to
-  pack each merged projection as it is read. The compact pool is built from
-  the same checkpoint and merge plan on each load.
+  pack each merged projection as it is read. To reuse a packed export, set
+  `memory.frozen_weight_packed_state_path` with the same original checkpoint,
+  merge plan, and expert format. Restore verifies the source fingerprint,
+  plan digest, and the logical-to-physical aliases.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group

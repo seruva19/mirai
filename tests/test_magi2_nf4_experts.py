@@ -838,6 +838,7 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
 def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(tmp_path) -> None:
     from copy import deepcopy
     from dataclasses import replace
+    import json
 
     from safetensors.torch import save_file
 
@@ -941,6 +942,37 @@ def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(t
     packed_output = packed_backend.execute(packed_layer, tokens, *packed_layer._route(tokens))
     dense_output = backend.execute(reference, tokens, *reference._route(tokens))
     torch.testing.assert_close(packed_output, dense_output, rtol=2e-5, atol=1e-5)
+    artifact = save_magi2_nf4_packed_state(
+        tmp_path / "merged", packed, consolidation_digest=restored.topology_digest(),
+    )
+    target = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, routed_weight_device="meta",
+    ))
+    preloaded, unmaterialized = stream_merge_magi2_experts(
+        target, restored, tmp_path, prepare_packed_restore=True,
+    )
+    assert not unmaterialized
+    assert target.mlp.moe_mlp.W_down.is_meta
+    with pytest.raises(ValueError, match="consolidation lineage"):
+        load_magi2_nf4_packed_state(
+            artifact, target, blocksize=64, quant_format="fp8", expected_consolidation_digest=b"0" * 32,
+        )
+    restored_store = load_magi2_nf4_packed_state(
+        artifact, target, blocksize=64, quant_format="fp8",
+        expected_consolidation_digest=restored.topology_digest(),
+    )["mlp.moe_mlp"]
+    assert set(target.state_dict()) == preloaded
+    for key, value in store.named_buffers():
+        torch.testing.assert_close(dict(restored_store.named_buffers())[key], value, rtol=0, atol=0)
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["layers"]["mlp.moe_mlp"]["logical_to_physical"][0] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="incompatible expert aliases"):
+        load_magi2_nf4_packed_state(
+            artifact, target, blocksize=64, quant_format="fp8",
+            expected_consolidation_digest=restored.topology_digest(),
+        )
 
 
 def test_magi2_diet_head_replay_matches_native_expert_deletion() -> None:

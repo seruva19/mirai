@@ -328,9 +328,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             raise ValueError("MAGI-2 pruning with a mixed precision plan requires quantize_experts_on_load.")
         if self._expert_consolidation_plan_path and (
             self._expert_pruning_plan_path or self._expert_pruning_adapter_source_plan_path
-            or self._packed_expert_state_path or self._expert_precision_plan_path
+            or self._expert_precision_plan_path
             or (
-                not self._quantizes_experts_on_load()
+                not self._quantizes_experts_on_load() and not self._packed_expert_state_path
                 and self._frozen_weight_quantization not in {"", "none", "off", "disabled"}
             )
         ):
@@ -464,12 +464,19 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
 
             consolidation_plan = Magi2ExpertConsolidationPlan.load(consolidation_plan_path)
+            restoring_packed = bool(self._packed_expert_state_path)
             preloaded_keys, self._expert_stores = stream_merge_magi2_experts(
                 transformer, consolidation_plan, checkpoint_dir,
-                quant_format=self._frozen_weight_quantization if self._quantizes_experts_on_load() else None,
+                quant_format=(
+                    self._frozen_weight_quantization
+                    if not restoring_packed and self._quantizes_experts_on_load() else None
+                ),
                 blocksize=self._nf4_blocksize,
+                prepare_packed_restore=restoring_packed,
             )
             self._expert_pruning_digest = consolidation_plan.topology_digest()
+            if restoring_packed:
+                self._restore_packed_experts(transformer, consolidation_digest=self._expert_pruning_digest)
         elif mixed_stream:
             from mirai.core.models.magi2_preview.mixed_experts import stream_quantize_magi2_mixed_experts
 
@@ -530,33 +537,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             and (not pruning_plan_path or self._packed_expert_state_path)
         ):
             if self._packed_expert_state_path:
-                from mirai.core.models.magi2_preview.packed_experts import (
-                    load_magi2_nf4_packed_state,
+                self._restore_packed_experts(
+                    transformer, pruning_digest=self._expert_pruning_digest if pruning_plan_path else None,
                 )
-
-                self._expert_stores = load_magi2_nf4_packed_state(
-                    self._packed_expert_state_path,
-                    transformer,
-                    blocksize=self._nf4_blocksize,
-                    quant_format=self._frozen_weight_quantization,
-                    expected_pruning_digest=self._expert_pruning_digest if pruning_plan_path else None,
-                    expected_metadata={
-                        "model_variant": str(self.model_config.params.variant),
-                        "denoiser_subfolder": str(
-                            getattr(
-                                self.model_config.params,
-                                "denoiser_subfolder",
-                                "transformer",
-                            )
-                            or "transformer"
-                        ),
-                    },
-                )
-                if self._expert_rotation_group_size and any(
-                    getattr(store, "rotation_group_size", 0) != self._expert_rotation_group_size
-                    for store in self._expert_stores.values()
-                ):
-                    raise ValueError("MAGI-2 packed artifact does not match the requested expert rotation.")
             else:
                 from mirai.core.models.magi2_preview.quantized_experts import stream_quantize_magi2_experts
 
@@ -837,6 +820,27 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             moe_kernel_backend=True,
         )
 
+    def _restore_packed_experts(
+        self, transformer: nn.Module, *,
+        pruning_digest: bytes | None = None, consolidation_digest: bytes | None = None,
+    ) -> None:
+        from mirai.core.models.magi2_preview.packed_experts import load_magi2_nf4_packed_state
+
+        self._expert_stores = load_magi2_nf4_packed_state(
+            self._packed_expert_state_path, transformer, blocksize=self._nf4_blocksize,
+            quant_format=self._frozen_weight_quantization,
+            expected_pruning_digest=pruning_digest, expected_consolidation_digest=consolidation_digest,
+            expected_metadata={
+                "model_variant": str(self.model_config.params.variant),
+                "denoiser_subfolder": str(getattr(self.model_config.params, "denoiser_subfolder", "transformer") or "transformer"),
+            },
+        )
+        if self._expert_rotation_group_size and any(
+            getattr(store, "rotation_group_size", 0) != self._expert_rotation_group_size
+            for store in self._expert_stores.values()
+        ):
+            raise ValueError("MAGI-2 packed artifact does not match the requested expert rotation.")
+
     def save_packed_frozen_weight_state(
         self,
         path: Any,
@@ -850,6 +854,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         return save_magi2_nf4_packed_state(
             path, self.transformer, metadata=metadata,
             pruning_digest=self._expert_pruning_digest if self._expert_pruning_plan_path else None,
+            consolidation_digest=(
+                self._expert_pruning_digest if getattr(self, "_expert_consolidation_plan_path", "") else None
+            ),
             fuse_gate_up=(getattr(self.model_config.params, "family_params", None) or {}).get(
                 "nf4_fuse_gate_up", False
             ),

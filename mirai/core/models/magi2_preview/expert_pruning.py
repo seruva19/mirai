@@ -349,6 +349,7 @@ def _attach_merge_aliases(layer, aliases, physical_count):
 def stream_merge_magi2_experts(
     transformer: nn.Module, plan: Magi2ExpertConsolidationPlan, checkpoint_dir: str | Path,
     *, quant_format: str | None = None, blocksize: int = NF4_BLOCKSIZE,
+    prepare_packed_restore: bool = False,
 ) -> tuple[set[str], dict[str, Magi2Nf4ExpertStore]]:
     """Read and merge one original projection at a time before publishing the new pool."""
     from safetensors import safe_open
@@ -357,9 +358,13 @@ def stream_merge_magi2_experts(
 
     layers = _dense_pruning_layers(transformer)
     layouts = _merge_layouts(layers, plan)
+    if prepare_packed_restore and quant_format is not None:
+        raise ValueError("MAGI-2 packed consolidation restore cannot quantize the source.")
     weight_map = read_safetensors_weight_map(str(checkpoint_dir))
     sources = {}
     for name, layer in layers.items():
+        if prepare_packed_restore and name not in layouts:
+            continue
         for key in _PARAMETERS if name in layouts else MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             full_key = f"{name}.{key}"
             sources[full_key] = (name, layer, key, full_key)
@@ -387,6 +392,9 @@ def stream_merge_magi2_experts(
             if name in layouts:
                 update_router_tensor_fingerprints((digest,), full_key, value)
                 if key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
+                    if prepare_packed_restore:
+                        del value
+                        continue
                     value = _merge_projection(value, layouts[name][1])
             if name in stores and key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
                 stores[name].quantize_dense(key, value)

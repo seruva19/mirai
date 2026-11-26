@@ -29,6 +29,7 @@ _MIXED_SCHEMA_VERSION = 5
 _ROTATED_MIXED_SCHEMA_VERSION = 6
 _MANIFEST_FILE = "manifest.json"
 _PRUNING_DIGEST_KEY = "head_expert_pruning_digest"
+_CONSOLIDATION_DIGEST_KEY = "head_expert_consolidation_digest"
 
 
 class Magi2PackedExpertStateError(ValueError):
@@ -47,6 +48,17 @@ def _head_layout(layer: torch.nn.Module) -> dict[str, int]:
     return {"num_heads": layer.local_num_heads, "experts_per_head": layer.num_experts}
 
 
+def _consolidation_digest_hex(transformer: torch.nn.Module, digest: bytes | None) -> str | None:
+    aliased = any(
+        getattr(layer, "_mirai_expert_aliases", None) is not None for _, layer in iter_magi2_moe_layers(transformer)
+    )
+    if aliased != (digest is not None) or (
+        digest is not None and (not isinstance(digest, bytes) or len(digest) != 32)
+    ):
+        raise Magi2PackedExpertStateError("Packed MAGI-2 consolidation requires a matching plan digest.")
+    return None if digest is None else digest.hex()
+
+
 def save_magi2_nf4_packed_state(
     path: str | Path,
     transformer: torch.nn.Module,
@@ -54,13 +66,13 @@ def save_magi2_nf4_packed_state(
     metadata: dict[str, str] | None = None,
     fuse_gate_up: bool = False,
     pruning_digest: bytes | None = None,
+    consolidation_digest: bytes | None = None,
 ) -> Path:
     """Write the already-quantized expert stores without dense reconstruction."""
 
     from safetensors.torch import save_file
 
-    if any(getattr(layer, "_mirai_expert_aliases", None) is not None for _, layer in iter_magi2_moe_layers(transformer)):
-        raise Magi2PackedExpertStateError("Packed MAGI-2 consolidation must be rebuilt from its source plan.")
+    consolidation_hex = _consolidation_digest_hex(transformer, consolidation_digest)
     _validate_pruning_topology(transformer, pruning_digest)
     target = Path(path).expanduser()
     if target.exists() and any(target.iterdir()):
@@ -107,6 +119,9 @@ def save_magi2_nf4_packed_state(
         shard_name = f"layer_{layer_index:03d}.safetensors"
         save_file(tensors, str(target / shard_name))
         layers[module_name] = {"shard": shard_name, "head_layout": _head_layout(module), **descriptor}
+        aliases = getattr(module, "_mirai_expert_aliases", None)
+        if aliases is not None:
+            layers[module_name]["logical_to_physical"] = aliases
     if not layers:
         raise Magi2PackedExpertStateError(
             "MAGI-2 packed expert export matched no routed-expert layers."
@@ -125,6 +140,8 @@ def save_magi2_nf4_packed_state(
     }
     if pruning_digest is not None:
         manifest[_PRUNING_DIGEST_KEY] = pruning_digest.hex()
+    if consolidation_hex is not None:
+        manifest[_CONSOLIDATION_DIGEST_KEY] = consolidation_hex
     (target / _MANIFEST_FILE).write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -139,6 +156,7 @@ def load_magi2_nf4_packed_state(
     quant_format: str = "nf4",
     expected_metadata: dict[str, str] | None = None,
     expected_pruning_digest: bytes | None = None,
+    expected_consolidation_digest: bytes | None = None,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Restore NF4 stores directly and reject topology or schema mismatches."""
 
@@ -166,6 +184,9 @@ def load_magi2_nf4_packed_state(
     expected_hex = expected_pruning_digest.hex() if expected_pruning_digest is not None else None
     if manifest.get(_PRUNING_DIGEST_KEY) != expected_hex:
         raise Magi2PackedExpertStateError("Packed MAGI-2 expert state has incompatible pruning lineage.")
+    consolidation_hex = _consolidation_digest_hex(transformer, expected_consolidation_digest)
+    if manifest.get(_CONSOLIDATION_DIGEST_KEY) != consolidation_hex:
+        raise Magi2PackedExpertStateError("Packed MAGI-2 expert state has incompatible consolidation lineage.")
     if manifest.get("quant_format") != quant_format or (
         version not in {_MIXED_SCHEMA_VERSION, _ROTATED_MIXED_SCHEMA_VERSION}
         and (version == _MULTIFORMAT_SCHEMA_VERSION) != (quant_format != "nf4")
@@ -208,7 +229,10 @@ def load_magi2_nf4_packed_state(
         spec = layer_specs[module_name]
         if "head_layout" in spec and spec["head_layout"] != _head_layout(layer):
             raise Magi2PackedExpertStateError(f"Packed MAGI-2 layer '{module_name}' has incompatible head topology.")
-        groups = int(layer.local_flatten_num_experts)
+        aliases = getattr(layer, "_mirai_expert_aliases", None)
+        if spec.get("logical_to_physical") != (list(aliases) if aliases is not None else None):
+            raise Magi2PackedExpertStateError(f"Packed MAGI-2 layer '{module_name}' has incompatible expert aliases.")
+        groups = int(getattr(layer, "_mirai_physical_expert_count", layer.local_flatten_num_experts))
         gate = (groups, int(layer.d_head), int(layer.d_expert))
         down = (groups, int(layer.d_expert), int(layer.d_head))
         shapes = {"W_gate": gate, "W_up": gate, "W_down": down}

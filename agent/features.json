@@ -3194,12 +3194,14 @@
     },
     {
       "name": "magi2_head_local_hierarchical_merge",
-      "kind": "generic",
+      "kind": "artifact_transform",
       "owner": "mirai/core/models/magi2_preview/expert_pruning.py",
       "check": "model_family",
       "invariants": [
         "owner",
+        "config",
         "default_path",
+        "persistence",
         "resource_bound",
         "documentation"
       ],
@@ -3210,13 +3212,17 @@
         "Magi2ExpertConsolidationPlan",
         "stream_merge_magi2_experts"
       ],
-      "config_keys": [],
-      "disabled_config": {},
+      "config_keys": [
+        "model.params.family_params"
+      ],
+      "disabled_config": {
+        "model.params.family_params": {}
+      },
       "contract_paths": [
         "tests/test_magi2_nf4_experts.py"
       ],
       "default_off": true,
-      "stateful": false,
+      "stateful": true,
       "optimized": false,
       "reference_path": "",
       "readme_claim": "Head-local hierarchical expert merging",
