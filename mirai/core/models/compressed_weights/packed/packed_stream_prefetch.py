@@ -7,6 +7,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Hashable
 
@@ -14,6 +15,7 @@ from typing import Any, Hashable
 @dataclass
 class _PrefetchEntry:
     loader: Callable[[], Any]
+    discard: Callable[[Any], None] | None = None
     future: Future[Any] | None = None
 
 
@@ -39,6 +41,7 @@ class PackedStreamPrefetchRing:
         self._entries: dict[Hashable, _PrefetchEntry] = {}
         self._pending: deque[Hashable] = deque()
         self._active = 0
+        self._claimed = 0
         self._closed = False
         self._submitted = 0
         self._deduplicated = 0
@@ -48,45 +51,48 @@ class PackedStreamPrefetchRing:
         self._peak_entries = 0
         self._wait_seconds = 0.0
 
-    def submit(self, identity: Hashable, loader: Callable[[], Any]) -> bool:
+    def submit(
+        self, identity: Hashable, loader: Callable[[], Any], *, discard: Callable[[Any], None] | None = None,
+    ) -> bool:
         with self._lock:
             if self._closed:
                 raise RuntimeError("Packed stream prefetch ring is closed.")
             if identity in self._entries:
                 self._deduplicated += 1
                 return True
-            if len(self._entries) >= self._queue_limit:
+            if len(self._entries) + self._claimed >= self._queue_limit:
                 self._rejected += 1
                 return False
-            self._entries[identity] = _PrefetchEntry(loader=loader)
+            self._entries[identity] = _PrefetchEntry(loader=loader, discard=discard)
             self._pending.append(identity)
             self._submitted += 1
-            self._peak_entries = max(self._peak_entries, len(self._entries))
+            self._peak_entries = max(self._peak_entries, len(self._entries) + self._claimed)
             self._fill_slots_locked()
             return True
 
     def take(self, identity: Hashable) -> tuple[bool, Any | None]:
         with self._lock:
-            entry = self._entries.get(identity)
+            entry = self._entries.pop(identity, None)
             if entry is None:
                 self._misses += 1
                 return False, None
             if entry.future is None:
                 self._remove_pending_locked(identity)
-                self._entries.pop(identity, None)
                 self._misses += 1
                 return False, None
             future = entry.future
+            self._claimed += 1
         started = time.perf_counter()
         try:
             value = future.result()
         finally:
             elapsed = time.perf_counter() - started
             with self._lock:
-                if self._entries.pop(identity, None) is not None:
-                    self._active = max(0, self._active - 1)
-                    self._consumed += 1
-                    self._wait_seconds += float(elapsed)
+                self._active -= 1
+                self._claimed -= 1
+                self._consumed += 1
+                self._wait_seconds += float(elapsed)
+                if not self._closed:
                     self._fill_slots_locked()
         return True, value
 
@@ -101,7 +107,7 @@ class PackedStreamPrefetchRing:
                 "prefetch_misses": self._misses,
                 "prefetch_rejected": self._rejected,
                 "prefetch_active": self._active,
-                "prefetch_queued": len(self._entries),
+                "prefetch_queued": len(self._entries) + self._claimed,
                 "prefetch_peak_queued": self._peak_entries,
                 "prefetch_wait_seconds": self._wait_seconds,
             }
@@ -111,19 +117,20 @@ class PackedStreamPrefetchRing:
             if self._closed:
                 return
             self._closed = True
-            futures = tuple(
-                entry.future
-                for entry in self._entries.values()
-                if entry.future is not None
+            entries = tuple(
+                (future, entry.discard) for entry in self._entries.values() if (future := entry.future) is not None
             )
+            self._entries.clear()
+            self._active -= len(entries)
             self._pending.clear()
-        for future in futures:
+        for future, _ in entries:
             future.cancel()
         if self._executor is not None:
             self._executor.shutdown(wait=True, cancel_futures=True)
-        with self._lock:
-            self._entries.clear()
-            self._active = 0
+        with ExitStack() as cleanup:
+            for future, discard in entries:
+                if discard is not None and not future.cancelled() and future.exception() is None:
+                    cleanup.callback(discard, future.result())
 
     def _fill_slots_locked(self) -> None:
         while self._active < self._depth and self._pending:

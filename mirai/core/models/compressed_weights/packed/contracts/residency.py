@@ -22,6 +22,47 @@ _GIB = 1024**3
 
 
 class PackedStateResidencyPolicyTests(unittest.TestCase):
+    def test_prefetch_claim_has_one_owner_and_close_discards_only_unclaimed_results(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        from mirai.core.models.compressed_weights.packed.packed_stream_prefetch import PackedStreamPrefetchRing
+
+        ring = PackedStreamPrefetchRing(2)
+        release_loader, claimed = Event(), Event()
+        taken, abandoned = object(), object()
+        discard = mock.Mock()
+
+        def load():
+            if not release_loader.wait(timeout=3):
+                raise TimeoutError("Test did not release the loader.")
+            return taken
+
+        try:
+            ring.submit("taken", load, discard=discard)
+            ring.submit("abandoned", lambda: abandoned, discard=discard)
+            ring._entries["abandoned"].future.result(timeout=3)
+            future = ring._entries["taken"].future
+            original_result = future.result
+
+            def observe_claim():
+                claimed.set()
+                return original_result(timeout=3)
+
+            with ThreadPoolExecutor(max_workers=1) as worker, mock.patch.object(
+                future, "result", side_effect=observe_claim,
+            ):
+                result = worker.submit(ring.take, "taken")
+                self.assertTrue(claimed.wait(timeout=3))
+                self.assertEqual(ring.take("taken"), (False, None))
+                release_loader.set()
+                self.assertEqual(result.result(timeout=3), (True, taken))
+        finally:
+            release_loader.set()
+            ring.close()
+        discard.assert_called_once_with(abandoned)
+        self.assertEqual(ring.snapshot()["prefetch_active"], 0)
+
     def test_nf4_stack_writes_into_supplied_dense_slot_view(self) -> None:
         import sys
         from types import SimpleNamespace
