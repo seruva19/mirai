@@ -1846,7 +1846,7 @@ def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -
         load_magi2_nf4_packed_state(artifact, model(), blocksize=64)
 
 
-def test_magi2_staged_layers_share_one_packed_reader(tmp_path) -> None:
+def test_magi2_staged_layers_share_one_packed_reader(tmp_path, monkeypatch) -> None:
     def model():
         root = _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32))
         root.second = _container(_reduced_moe(device=torch.device("cpu"), dtype=torch.float32))
@@ -1892,6 +1892,32 @@ def test_magi2_staged_layers_share_one_packed_reader(tmp_path) -> None:
         torch.autograd.grad(actual.sum(), x)[0], torch.autograd.grad(expected.sum(), x)[0], rtol=0, atol=0,
     )
     assert active._packed_range_reader.reader.snapshot()["prefetch_consumed"] > before
+    from mirai.core.training.residency import tensor_residency
+
+    events = []
+
+    class DummyPool:
+        def __init__(self, budget):
+            events.append("allocate")
+            self.pinned_bytes = budget
+
+        def copy_to_device(self, host_tensors, *, device, stream):
+            events.append("copy")
+            return [tensor.clone().to(device) for tensor in host_tensors]
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(tensor_residency, "PinnedHostStagingPool", DummyPool)
+    reader = active._packed_range_reader.reader
+    reader._pin_cap_bytes = 1024
+    for _ in range(2):
+        output, = reader._copy_staged_to_device([torch.ones(2)], "cpu", torch.float64, None)
+        torch.testing.assert_close(output, torch.ones(2, dtype=torch.float64))
+    assert reader.snapshot()["pinned_peak_bytes"] == 1024
+    reader.close()
+    assert reader.snapshot()["pinned_in_flight_bytes"] == 0
+    assert events == ["allocate", "copy", "copy", "close"]
 
 
 def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, monkeypatch) -> None:

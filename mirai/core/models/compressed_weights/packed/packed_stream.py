@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -87,6 +86,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         if depth:
             self._prefetch = PackedStreamPrefetchRing(depth)
         self._pin_cap_bytes = _pin_budget_bytes()
+        self._staging_lock = threading.Lock()
+        self._staging_pool = None
+        self._staging_unavailable = False
         self._pinned_in_flight = 0
         self._pinned_peak = 0
         self._read_ops = 0
@@ -228,14 +230,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
 
         stream = self._cuda_stream(target)
         with torch.cuda.stream(stream):
-            device_tensors = [
-                tensor.to(
-                    device=target,
-                    dtype=dtype,
-                    non_blocking=bool(tensor.is_pinned()),
-                )
-                for tensor in host_tensors
-            ]
+            device_tensors = self._copy_staged_to_device(host_tensors, target, dtype, stream)
             stacked = _stack_tensors(device_tensors)
             if reordered:
                 stacked = stacked.index_select(
@@ -273,7 +268,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 "requested_slices": int(self._requested_slices),
                 "unique_slices": int(self._unique_slices),
                 "reordered_batches": int(self._reordered_batches),
-                "pinned_in_flight_bytes": int(self._pinned_in_flight),
+                "pinned_in_flight_bytes": self._pinned_in_flight,
                 "pinned_peak_bytes": int(self._pinned_peak),
                 "noatime_shards": sum(
                     int(shard.noatime) for shard in self._shards.values()
@@ -311,6 +306,12 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         if self._prefetch is not None:
             self._prefetch.close()
         self._executor.shutdown(wait=True, cancel_futures=False)
+        with self._staging_lock:
+            if self._staging_pool is not None:
+                self._staging_pool.close()
+                self._staging_pool = None
+                with self._stats_lock:
+                    self._pinned_in_flight = 0
         self._cache.clear()
         if self._gds is not None:
             self._gds.close()
@@ -345,19 +346,10 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         shape: tuple[int, ...],
         nbytes: int,
     ) -> Any:
-        buffer, pinned = self._allocate_bytes(int(nbytes))
+        buffer = torch.empty(int(nbytes), dtype=torch.uint8)
         started = time.perf_counter()
-        try:
-            self._shards[region.shard].readinto(
-                memoryview(buffer.numpy()), int(offset)
-            )
-        except Exception:
-            if pinned:
-                self._release_pinned(int(nbytes))
-            raise
+        self._shards[region.shard].readinto(memoryview(buffer.numpy()), int(offset))
         elapsed = time.perf_counter() - started
-        if pinned:
-            weakref.finalize(buffer, self._release_pinned, int(nbytes))
         with self._stats_lock:
             self._read_ops += 1
             self._read_bytes += int(nbytes)
@@ -437,29 +429,24 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             normalized.append(resolved)
         return tuple(normalized)
 
-    def _allocate_bytes(self, nbytes: int) -> tuple[Any, bool]:
-        want_pin = False
-        with self._stats_lock:
-            if (
-                torch.cuda.is_available()
-                and self._pin_cap_bytes > 0
-                and self._pinned_in_flight + int(nbytes) <= self._pin_cap_bytes
-            ):
-                self._pinned_in_flight += int(nbytes)
-                self._pinned_peak = max(self._pinned_peak, self._pinned_in_flight)
-                want_pin = True
-        if want_pin:
-            try:
-                return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), True
-            except (RuntimeError, MemoryError, OSError):
-                self._release_pinned(int(nbytes))
-        return torch.empty(nbytes, dtype=torch.uint8), False
+    def _copy_staged_to_device(self, host_tensors, target, dtype, stream):
+        from mirai.core.training.residency.tensor_residency import PinnedHostStagingPool
 
-    def _release_pinned(self, nbytes: int) -> None:
-        with self._stats_lock:
-            self._pinned_in_flight = max(
-                0, int(self._pinned_in_flight) - int(nbytes)
-            )
+        with self._staging_lock:
+            budget = min(self._pin_cap_bytes, 3 * _MAX_RANGE_BYTES)
+            if self._staging_pool is None and budget >= 3 and not self._staging_unavailable:
+                try:
+                    self._staging_pool = PinnedHostStagingPool(budget)
+                except (RuntimeError, MemoryError, OSError):
+                    self._staging_unavailable = True
+                else:
+                    with self._stats_lock:
+                        self._pinned_in_flight = self._staging_pool.pinned_bytes
+                        self._pinned_peak = self._pinned_in_flight
+            if self._staging_pool is not None:
+                copies = self._staging_pool.copy_to_device(list(host_tensors), device=target, stream=stream)
+                return copies if dtype is None else [tensor.to(dtype=dtype) for tensor in copies]
+        return [tensor.to(device=target, dtype=dtype) for tensor in host_tensors]
 
     def _cuda_stream(self, device: Any) -> Any:
         key = str(device)
