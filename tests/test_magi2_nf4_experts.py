@@ -130,7 +130,10 @@ def test_packed_segment_metadata_matches_full_host_layout(span: int) -> None:
     assert grouped_moe._packed_group_segments(offsets[:0], max_groups=span, routed=True) == ()
 
 
-def test_segmented_backward_releases_weights_after_their_last_use(monkeypatch) -> None:
+@pytest.mark.parametrize("use_lease", [False, True])
+def test_segmented_backward_releases_weights_after_their_last_use(monkeypatch, use_lease) -> None:
+    from contextlib import contextmanager
+
     weights = {
         "W_gate": torch.randn(1, 8, 16),
         "W_up": torch.randn(1, 8, 16),
@@ -148,6 +151,17 @@ def test_segmented_backward_releases_weights_after_their_last_use(monkeypatch) -
             weight = weights[key][start:stop].to(dtype=dtype, device=device).clone()
             materialized[key] = weakref.ref(weight)
             return weight
+
+    if use_lease:
+        @contextmanager
+        def borrow_segment(self, key, start, stop, *, dtype, device):
+            weight = self.materialize_segment(key, start, stop, dtype=dtype, device=device)
+            try:
+                yield weight
+            finally:
+                weight.fill_(float("nan"))
+
+        Store.borrow_segment = borrow_segment
 
     linear_dx = grouped_moe._grouped_linear_dx
 

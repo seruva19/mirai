@@ -32,7 +32,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 _DEFAULT_READ_WORKERS = 4
 _MAX_RANGE_BYTES = 32 * 1024 * 1024
-_CUDA_STAGING_SLOTS = 2
+# Backward holds three dense projections while decoding the last packed input.
+_CUDA_STAGING_SLOTS = 4
 
 
 class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):

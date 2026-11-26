@@ -34,7 +34,7 @@ rejected rather than reinterpreted.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, fields
 from typing import Any, Callable, ContextManager
 
@@ -1320,6 +1320,14 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         store = ctx.store
         prefetch = _expert_projection_prefetch(store, x_sorted)
         segments = tuple(segment for segment in ctx.segments if segment.row_count)
+        borrow = getattr(store, "borrow_segment", None)
+
+        def lease(key, start, stop):
+            kwargs = {"dtype": x_sorted.dtype, "device": x_sorted.device}
+            if borrow is None:
+                return nullcontext(store.materialize_segment(key, start, stop, **kwargs))
+            return borrow(key, start, stop, **kwargs)
+
         for index, segment in enumerate(segments):
             if segment.row_count == 0:
                 continue
@@ -1329,66 +1337,44 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
             rows = x_sorted[segment.row_start : segment.row_stop]
             grad_rows = grad_output[segment.row_start : segment.row_stop]
 
-            if store.has_fused_gate_up:
-                w_gate_up = store.materialize_segment(
-                    MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop,
-                    dtype=rows.dtype, device=rows.device,
-                )
-                if prefetch is not None:
-                    prefetch("W_down", segment.group_start, segment.group_stop)
-                gate, up = _grouped_linear(rows, w_gate_up, local_offsets, ctx.forward_backend).chunk(2, dim=-1)
-            else:
-                w_gate = store.materialize_segment(
-                    "W_gate",
-                    segment.group_start,
-                    segment.group_stop,
-                    dtype=rows.dtype,
-                    device=rows.device,
-                )
-                if prefetch is not None:
-                    prefetch("W_up", segment.group_start, segment.group_stop)
-                gate = _grouped_linear(rows, w_gate, local_offsets, ctx.forward_backend)
-                w_up = store.materialize_segment(
-                    "W_up",
-                    segment.group_start,
-                    segment.group_stop,
-                    dtype=rows.dtype,
-                    device=rows.device,
-                )
-                if prefetch is not None:
-                    prefetch("W_down", segment.group_start, segment.group_stop)
-                up = _grouped_linear(rows, w_up, local_offsets, ctx.forward_backend)
-            w_down = store.materialize_segment(
-                "W_down",
-                segment.group_start,
-                segment.group_stop,
-                dtype=rows.dtype,
-                device=rows.device,
-            )
-            if prefetch is not None and index + 1 < len(segments):
-                next_segment = segments[index + 1]
-                prefetch(
-                    MAGI2_FUSED_GATE_UP if store.has_fused_gate_up else "W_gate",
-                    next_segment.group_start, next_segment.group_stop,
-                )
-            grad_hidden = _grouped_linear_dx(grad_rows, w_down, local_offsets, ctx.dx_backend)
-            del w_down
-            grad_gate, grad_up = _swiglu7_backward(
-                gate,
-                up,
-                grad_hidden,
-                backend=ctx.activation_backend,
-            )
-            if store.has_fused_gate_up:
-                grad_x = _grouped_linear_dx(
-                    torch.cat((grad_gate, grad_up), dim=-1), w_gate_up, local_offsets, ctx.dx_backend
-                )
-                del w_gate_up
-            else:
-                grad_x = _grouped_linear_dx(grad_gate, w_gate, local_offsets, ctx.dx_backend)
-                del w_gate
-                grad_x.add_(_grouped_linear_dx(grad_up, w_up, local_offsets, ctx.dx_backend))
-                del w_up
+            start, stop = segment.group_start, segment.group_stop
+
+            with ExitStack() as gate_lease, ExitStack() as up_lease:
+                if store.has_fused_gate_up:
+                    w_gate_up = gate_lease.enter_context(lease(MAGI2_FUSED_GATE_UP, start, stop))
+                    if prefetch is not None:
+                        prefetch("W_down", start, stop)
+                    gate, up = _grouped_linear(rows, w_gate_up, local_offsets, ctx.forward_backend).chunk(2, dim=-1)
+                else:
+                    w_gate = gate_lease.enter_context(lease("W_gate", start, stop))
+                    if prefetch is not None:
+                        prefetch("W_up", start, stop)
+                    gate = _grouped_linear(rows, w_gate, local_offsets, ctx.forward_backend)
+                    w_up = up_lease.enter_context(lease("W_up", start, stop))
+                    if prefetch is not None:
+                        prefetch("W_down", start, stop)
+                    up = _grouped_linear(rows, w_up, local_offsets, ctx.forward_backend)
+                with lease("W_down", start, stop) as w_down:
+                    if prefetch is not None and index + 1 < len(segments):
+                        next_segment = segments[index + 1]
+                        prefetch(
+                            MAGI2_FUSED_GATE_UP if store.has_fused_gate_up else "W_gate",
+                            next_segment.group_start, next_segment.group_stop,
+                        )
+                    grad_hidden = _grouped_linear_dx(grad_rows, w_down, local_offsets, ctx.dx_backend)
+                del w_down
+                grad_gate, grad_up = _swiglu7_backward(gate, up, grad_hidden, backend=ctx.activation_backend)
+                if store.has_fused_gate_up:
+                    grad_x = _grouped_linear_dx(
+                        torch.cat((grad_gate, grad_up), dim=-1), w_gate_up, local_offsets, ctx.dx_backend
+                    )
+                    del w_gate_up
+                else:
+                    grad_x = _grouped_linear_dx(grad_gate, w_gate, local_offsets, ctx.dx_backend)
+                    del w_gate
+                    gate_lease.close()
+                    grad_x.add_(_grouped_linear_dx(grad_up, w_up, local_offsets, ctx.dx_backend))
+                    del w_up
             grad_segments.append(grad_x)
             del gate, up, grad_hidden, grad_gate, grad_up
         if not grad_segments:
