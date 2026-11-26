@@ -236,7 +236,9 @@ with `memory.packed_stream_backend="gds"`, `"direct_io"`, or `"io_uring"`
 align each shard file to 4096 bytes.
 `direct_io` uses Linux `O_DIRECT` reads into host memory.
 With `stream_disk`, the GDS backend requires an aligned export and a CUDA
-target. It routes packed expert reads through the shared KvikIO reader.
+target. It routes packed expert reads through the shared KvikIO reader. When
+KvikIO exposes stream-based cuFile reads, the reader waits on the issuing
+storage stream and reports `gds_async_read_ops`.
 With `memory.weight_residency_strategy="stream_disk"` and
 `memory.packed_stream_backend="staged"`, uniform NF4, FP8, NVFP4, MXFP4, and GGUF expert
 stores and mixed-precision buckets read requested groups from the artifact

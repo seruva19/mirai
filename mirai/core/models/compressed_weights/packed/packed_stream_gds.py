@@ -22,24 +22,22 @@ class GdsUnavailableError(RuntimeError):
 class KvikioGdsReader:
     """Read shard ranges directly into CUDA storage through KvikIO/cuFile.
 
-    KvikIO and CuPy are optional execution dependencies. Explicit GDS mode
+    KvikIO is an optional execution dependency. Explicit GDS mode
     rejects both KvikIO's POSIX backend and cuFile compatibility mode so a CPU
     bounce-buffer fallback cannot be reported as GPUDirect Storage.
     """
 
     def __init__(self, shard_paths: Mapping[str, Path]) -> None:
         try:
-            import cupy
             import kvikio
             import kvikio.cufile_driver
             import kvikio.defaults
         except (ImportError, OSError) as exc:
             raise GdsUnavailableError(
                 "memory.packed_stream_backend='gds' requires optional "
-                "'kvikio-cu12' (or the matching CUDA major) and CuPy."
+                "'kvikio-cu12' (or the matching CUDA major)."
             ) from exc
 
-        self._cupy = cupy
         self._kvikio = kvikio
         self._driver = kvikio.cufile_driver
         self._defaults = kvikio.defaults
@@ -48,6 +46,8 @@ class KvikioGdsReader:
         self._file_sizes: dict[str, int] = {}
         self._closed = False
         self._stats_lock = threading.Lock()
+        self._io_streams = threading.local()
+        self._async_ops = 0
         self._read_ops = 0
         self._read_bytes = 0
         self._requested_bytes = 0
@@ -97,7 +97,7 @@ class KvikioGdsReader:
         nbytes: int,
         device: Any,
     ) -> Any:
-        """Synchronously read one exact byte range into a CUDA uint8 tensor."""
+        """Read one byte range and wait only for its issuing storage stream."""
 
         if self._closed:
             raise RuntimeError("GPUDirect Storage reader is closed.")
@@ -125,25 +125,36 @@ class KvikioGdsReader:
         )
 
         started = time.perf_counter()
-        with self._cupy.cuda.Device(device_index):
-            allocation = self._cupy.empty(
+        streams = getattr(self._io_streams, "by_device", None)
+        if streams is None:
+            streams = self._io_streams.by_device = {}
+        stream = streams.get(device_index)
+        if stream is None:
+            stream = streams[device_index] = torch.cuda.Stream(device=device_index)
+        with torch.cuda.stream(stream):
+            allocation = torch.empty(
                 window.read_bytes + GDS_STORAGE_ALIGNMENT_BYTES - 1,
-                dtype=self._cupy.uint8,
+                dtype=torch.uint8, device=target,
             )
             pointer_padding = (
-                -int(allocation.data.ptr)
+                -allocation.data_ptr()
             ) % GDS_STORAGE_ALIGNMENT_BYTES
             buffer = allocation[
                 pointer_padding:pointer_padding + window.read_bytes
             ]
-            count = int(
-                handle.read(
-                    buffer,
-                    size=window.read_bytes,
-                    file_offset=window.file_offset,
+            read_async = getattr(handle, "raw_read_async", None)
+            if callable(read_async):
+                # The returned future owns the cuFile request arguments until
+                # its associated non-default stream has completed the read.
+                pending = read_async(
+                    buffer, raw_stream=int(stream.cuda_stream),
+                    size=window.read_bytes, file_offset=window.file_offset,
                 )
-            )
-            self._cupy.cuda.runtime.deviceSynchronize()
+                count = int(pending.check_bytes_done())
+            else:
+                stream.synchronize()
+                read_sync = getattr(handle, "raw_read", handle.read)
+                count = int(read_sync(buffer, size=window.read_bytes, file_offset=window.file_offset))
         elapsed = time.perf_counter() - started
         if count != window.read_bytes:
             raise EOFError(
@@ -152,15 +163,15 @@ class KvikioGdsReader:
             )
         with self._stats_lock:
             self._read_ops += 1
+            self._async_ops += int(callable(read_async))
             self._read_bytes += window.read_bytes
             self._requested_bytes += window.payload_bytes
             self._overread_bytes += window.overread_bytes
             self._read_seconds += float(elapsed)
             self._trimmed_ops += int(window.overread_bytes > 0)
-        payload = buffer[
+        return buffer[
             window.payload_offset:window.payload_offset + window.payload_bytes
         ]
-        return torch.from_dlpack(payload)
 
     def snapshot(self) -> dict[str, int | float | str]:
         version = self._kvikio.cufile_driver.libcufile_version()
@@ -171,6 +182,7 @@ class KvikioGdsReader:
                 "gds_compatibility_mode": 0,
                 "gds_direct_shards": len(self._files),
                 "gds_read_ops": int(self._read_ops),
+                "gds_async_read_ops": int(self._async_ops),
                 "gds_read_bytes": int(self._read_bytes),
                 "gds_requested_bytes": int(self._requested_bytes),
                 "gds_overread_bytes": int(self._overread_bytes),

@@ -67,6 +67,48 @@ class PackedStateResidencyPolicyTests(unittest.TestCase):
                 stream_backend="gds",
             )
 
+    def test_gds_async_read_awaits_its_stream_and_trims_aligned_bytes(self) -> None:
+        import contextlib
+        import threading
+
+        from mirai.core.models.compressed_weights.packed.packed_stream_gds import KvikioGdsReader
+
+        reader = KvikioGdsReader.__new__(KvikioGdsReader)
+        reader._closed = False
+        reader._io_streams = threading.local()
+        reader._stats_lock = threading.Lock()
+        for counter in ("_read_ops", "_read_bytes", "_requested_bytes", "_overread_bytes",
+                        "_read_seconds", "_trimmed_ops", "_async_ops"):
+            setattr(reader, counter, 0)
+        handle = mock.Mock()
+        reader._files = {"shard": handle}
+        reader._file_sizes = {"shard": 8192}
+        stream = mock.Mock(cuda_stream=9)
+        empty = torch.empty
+        pending = mock.Mock()
+
+        def submit(buffer, *, raw_stream, size, file_offset):
+            self.assertEqual((raw_stream, size, file_offset), (9, 8192, 0))
+            self.assertEqual(buffer.data_ptr() % 4096, 0)
+
+            def complete():
+                buffer.copy_(torch.arange(size, dtype=torch.int64).to(torch.uint8))
+                return size
+
+            pending.check_bytes_done.side_effect = complete
+            return pending
+
+        handle.raw_read_async.side_effect = submit
+        with mock.patch("torch.cuda.Stream", return_value=stream), mock.patch(
+            "torch.cuda.stream", side_effect=lambda _: contextlib.nullcontext()
+        ), mock.patch("torch.empty", side_effect=lambda size, **_: empty(size, dtype=torch.uint8)):
+            result = reader.read_device("shard", offset=4093, nbytes=12, device="cuda:0")
+        torch.testing.assert_close(result, torch.arange(4093, 4105).to(torch.uint8))
+        pending.check_bytes_done.assert_called_once_with()
+        stream.synchronize.assert_not_called()
+        handle.read.assert_not_called()
+        self.assertEqual(reader._async_ops, 1)
+
     def test_prefetch_ring_supports_disk_and_preloaded_ram(self) -> None:
         with self.assertRaisesRegex(ValueError, "between 0 and 16"):
             PackedStateResidencyPolicy("off", stream_prefetch_depth=17)

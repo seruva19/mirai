@@ -194,32 +194,25 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
                 raise ValueError(
                     "memory.packed_stream_backend='gds' requires a CUDA target."
                 )
-            device_tensors = [
-                future.result()
-                for future in (
-                    self._executor.submit(
-                        self._read_slice_run_to_device,
-                        str(key),
-                        start,
-                        count,
-                        target,
-                    )
-                    for start, count in runs
-                )
+            futures = [
+                self._executor.submit(self._read_slice_run_to_device, str(key), start, count, target)
+                for start, count in runs
             ]
-            stacked = _stack_tensors(device_tensors)
-            if dtype is not None:
-                stacked = stacked.to(dtype=dtype)
-            if reordered:
-                stacked = stacked.index_select(
-                    0,
-                    torch.as_tensor(
-                        restore_order,
-                        device=target,
-                        dtype=torch.long,
-                    ),
-                )
-            return stacked
+            device_tensors = [future.result() for future in futures]
+            stream = self._cuda_stream(target)
+            with torch.cuda.stream(stream):
+                for tensor in device_tensors:
+                    tensor.record_stream(stream)
+                stacked = _stack_tensors(device_tensors)
+                if dtype is not None:
+                    stacked = stacked.to(dtype=dtype)
+                if reordered:
+                    stacked = stacked.index_select(
+                        0, torch.as_tensor(restore_order, device=target, dtype=torch.long),
+                    )
+                event = torch.cuda.Event()
+                event.record(stream)
+            return PackedCudaTransfer(stacked, event)
 
         if self._cache_expert_slices and self._cache.enabled:
             host_tensors = (self._host_expert_slice_batch(str(key), unique_indices),)
