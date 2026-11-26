@@ -271,6 +271,12 @@ def benchmark_packed_expert_stream(
                 "stall_ratio": demand / compute if compute > 0 else None,
                 "reader_delta": {key: after[key] - before[key] for key in counters if key in after},
             }
+        storage_fields = (
+            "io_uring_mode", "io_uring_fixed_buffer_bytes",
+            "gds_provider", "gds_libcufile_version", "gds_compatibility_mode",
+            "gds_direct_shards", "gds_alignment_bytes",
+        )
+        storage_snapshot = reader.snapshot()
         return {
             "storage_label": storage_label,
             "backend": backend,
@@ -280,6 +286,9 @@ def benchmark_packed_expert_stream(
             "shape": {"groups": groups, "inputs": inputs, "hidden": hidden, "tokens": tokens},
             "clock": "cuda_consumer_stream" if cuda else "host_wall",
             "prefetch_depth": prefetch_depth,
+            "reader_configuration": {
+                key: storage_snapshot[key] for key in storage_fields if key in storage_snapshot
+            },
             "phases": phases,
         }
     finally:
