@@ -75,6 +75,23 @@ def _cloned(tensors: tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
     return [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
 
 
+@pytest.mark.parametrize("capability, expected", [((8, 6), "reference"), ((9, 0), "fa3"), ((10, 0), "reference"), ((12, 0), "reference")])
+@torch.inference_mode()
+def test_preview_automatic_fa3_dispatch_is_hopper_only(monkeypatch, capability, expected):
+    from types import SimpleNamespace
+
+    from mirai.vendors.magi2_preview.model import magi2_preview as model
+
+    query = SimpleNamespace(device=torch.device("cuda:0"))
+    offsets = torch.tensor([0, 2], dtype=torch.int32)
+    handler = VarlenHandler(offsets, offsets, 2, 2)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    monkeypatch.setattr(model, "_HAS_MAGI2_FAST_ATTENTION", True)
+    monkeypatch.setattr(model, "_torch_varlen_attention_with_sink", lambda *args, **kwargs: "reference")
+    monkeypatch.setattr(model, "magi2_fa3_with_sink_cp", lambda *args, **kwargs: "fa3")
+    assert flash_attn_with_sink(query, query, query, handler, offsets, -1.0, torch.zeros(1)) == expected
+
+
 def test_magi2_paired_cfg_matches_batched_and_visits_each_layer_once(monkeypatch) -> None:
     from types import SimpleNamespace
 

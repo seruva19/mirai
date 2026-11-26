@@ -2428,7 +2428,8 @@ def flash_attn_with_sink(
         torch.is_grad_enabled()
         or not _HAS_MAGI2_FAST_ATTENTION
         or q.device.type != "cuda"
-        or torch.cuda.get_device_capability(q.device)[0] < 9
+        # This bundled FA3 entry point targets Hopper (SM90a).
+        or torch.cuda.get_device_capability(q.device) != (9, 0)
     ):
         return _torch_varlen_attention_with_sink(
             q,
