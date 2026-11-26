@@ -540,8 +540,9 @@ def test_active_groups_decode_only_routed_weights_and_preserve_backward(
         torch.testing.assert_close(observed, reference)
 
     path = save_magi2_nf4_packed_state(tmp_path / "packed", model, fuse_gate_up=True)
-    store = load_magi2_nf4_packed_state(path, model, blocksize=64)["layer"]
+    store = load_magi2_nf4_packed_state(path, model, blocksize=64, staged_range_reads=True)["layer"]
     assert store.has_fused_gate_up
+    assert all(name.endswith(("_nf4_code", "_nf4_ncode")) for name, _ in store.named_buffers())
     assert not hasattr(store, "W_gate_nf4")
     materialize = store.materialize_segment
     requested = []

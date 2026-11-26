@@ -216,7 +216,9 @@ class Magi2Nf4ExpertStore(nn.Module):
 
     @property
     def has_fused_gate_up(self) -> bool:
-        return f"{MAGI2_FUSED_GATE_UP}_nf4" in self._buffers
+        key = f"{MAGI2_FUSED_GATE_UP}_nf4"
+        reader = getattr(self, "_packed_range_reader", None)
+        return key in self._buffers or (reader is not None and key in reader)
 
     def restore_packed_state(
         self,
@@ -356,12 +358,23 @@ class Magi2Nf4ExpertStore(nn.Module):
         )
 
     def payload_bytes(self) -> int:
+        reader = getattr(self, "_packed_range_reader", None)
+        if reader is not None:
+            return sum(reader.tensor_nbytes(key) for key in reader)
         return int(
             sum(
                 int(buffer.numel()) * int(buffer.element_size())
                 for buffer in self.buffers()
             )
         )
+
+    def enable_packed_range_reads(self, shard_path) -> None:
+        from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
+
+        self._packed_range_reader = StreamingPackedTensorMapping(shard_path, backend="staged")
+        for name in tuple(self._buffers):
+            if not name.endswith(("_nf4_code", "_nf4_ncode")):
+                delattr(self, name)
 
     def quantized_numel(self) -> int:
         return int(
@@ -496,9 +509,19 @@ class Magi2Nf4ExpertStore(nn.Module):
 
         with torch.no_grad():
             indices = None if group_ids is None else group_ids[start:stop]
+            reader = getattr(self, "_packed_range_reader", None)
+            ids = range(start, stop) if indices is None else (indices.tolist() if reader is not None else ())
 
             def select(suffix: str) -> torch.Tensor:
-                field = getattr(self, f"{storage_key}_nf4{suffix}")
+                name = f"{storage_key}_nf4{suffix}"
+                if reader is not None:
+                    field = reader.get_slices_to_device(name, ids, device=target)
+                    if lane is not None:
+                        field = field[:, lane]
+                    if both:
+                        field = field.flatten(0, 1)
+                    return field.contiguous()
+                field = getattr(self, name)
                 if lane is not None:
                     field = field[:, lane]
                 if indices is None:
@@ -703,18 +726,6 @@ class Magi2PackedExpertStore(Magi2Nf4ExpertStore):
             for group in fields[0]
         ])
 
-    def enable_packed_range_reads(self, shard_path) -> None:
-        from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
-
-        self._packed_range_reader = StreamingPackedTensorMapping(shard_path, backend="staged")
-        for name in self.expected_buffers():
-            delattr(self, name)
-
-    def payload_bytes(self) -> int:
-        reader = getattr(self, "_packed_range_reader", None)
-        if reader is None:
-            return super().payload_bytes()
-        return sum(reader.tensor_nbytes(key) for key in self.expected_buffers())
 
 
 def _new_expert_store(*, num_groups: int, blocksize: int, quant_format: str) -> Magi2Nf4ExpertStore:

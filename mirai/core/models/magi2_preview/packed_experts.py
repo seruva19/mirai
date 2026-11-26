@@ -118,8 +118,10 @@ def save_magi2_nf4_packed_state(
         descriptor = store.packed_state_descriptor()
         tensors: dict[str, torch.Tensor] = {}
         reader = getattr(store, "_packed_range_reader", None)
+        if reader is not None and fuse_gate_up and not store.has_fused_gate_up:
+            raise Magi2PackedExpertStateError("Fuse gate/up before enabling MAGI-2 packed range reads.")
         buffers = (
-            ((name, reader[name]) for name in sorted(store.expected_buffers()))
+            ((name, reader[name]) for name in sorted(reader))
             if reader is not None else
             store.fused_gate_up_buffers().items()
             if fuse_gate_up and not store.has_fused_gate_up
@@ -345,7 +347,7 @@ def load_magi2_nf4_packed_state(
                         store.restore_packed_state(descriptor=spec, buffers=restored_buffers)
                 except (KeyError, TypeError, ValueError) as exc:
                     raise Magi2PackedExpertStateError(f"Invalid packed MAGI-2 layer '{module_name}': {exc}") from exc
-        if staged_range_reads and isinstance(store, Magi2PackedExpertStore):
+        if staged_range_reads and not (mixed or shared_basis or mixture_basis):
             store.enable_packed_range_reads(shard_path)
         stores[module_name] = store
     for module_name, layer in layers.items():
