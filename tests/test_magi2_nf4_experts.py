@@ -352,6 +352,8 @@ def test_quantized_storage_adds_exactly_four_consumed_policy_fields() -> None:
 # dataclass, so a field added to the shared policy fails closed here.
 _QUANTIZED_NON_DEFAULT_POLICY_VALUES: dict[str, dict[str, object]] = {
     "expert_device_cache_gib": {"expert_device_cache_gib": 1.0},
+    "expert_device_cache_policy": {"expert_device_cache_policy": "routing_frequency"},
+    "expert_transfer_profile_path": {"expert_transfer_profile_path": "transfer_profile.json"},
     "device_residency_budget_gib": {"device_residency_budget_gib": 1.0},
     "router_quantization_calibration_path": {
         "router_quantization": "int8_per_channel",
