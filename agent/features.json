@@ -3233,6 +3233,39 @@
       "promotion_evidence": ""
     },
     {
+      "name": "magi2_hybrid_packed_experts",
+      "kind": "moe_policy",
+      "owner": "mirai/core/models/magi2_preview/grouped_moe.py",
+      "check": "model_family",
+      "invariants": [
+        "owner",
+        "config",
+        "default_path",
+        "gradients",
+        "documentation"
+      ],
+      "symbols": [
+        "_hybrid_expert_features"
+      ],
+      "config_keys": [
+        "model.params.family_params"
+      ],
+      "disabled_config": {
+        "model.params.family_params": {}
+      },
+      "contract_paths": [
+        "tests/test_magi2_nf4_experts.py"
+      ],
+      "default_off": true,
+      "stateful": false,
+      "optimized": false,
+      "reference_path": "",
+      "readme_claim": "Hybrid CPU/CUDA packed expert execution",
+      "readme_claims": [],
+      "provenance": "",
+      "promotion_evidence": ""
+    },
+    {
       "name": "magi2_int8_norm_weights",
       "kind": "compressed_weight",
       "owner": "mirai/core/models/magi2_preview/companion_weights.py",

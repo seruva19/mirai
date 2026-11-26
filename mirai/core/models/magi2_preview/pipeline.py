@@ -302,6 +302,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        self._cpu_expert_max_tokens = family.get("expert_cpu_max_tokens", 0)
+        if type(self._cpu_expert_max_tokens) is not int or not 0 <= self._cpu_expert_max_tokens <= 10:
+            raise ValueError("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")
+        if self._cpu_expert_max_tokens and (
+            not self._stream_expert_artifact or not self._packed_expert_state_path
+            or self._packed_stream_backend not in {"staged", "direct_io", "io_uring"}
+        ):
+            raise ValueError("Hybrid MAGI-2 experts require a host-backed packed stream.")
         self._native_nvfp4_layout = family.get("expert_nvfp4_native_layout", False)
         if type(self._native_nvfp4_layout) is not bool:
             raise ValueError("MAGI-2 expert_nvfp4_native_layout must be a boolean.")
@@ -1130,6 +1138,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 activation_backend=str(
                     getattr(policy, "moe_activation_backend", "torch")
                 ),
+                cpu_expert_max_tokens=getattr(self, "_cpu_expert_max_tokens", 0),
             )
         else:
             backend = Magi2GroupedMoEBackend(
@@ -2319,6 +2328,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
 class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
     _ALLOWED_FAMILY_PARAMS = {
         "nf4_fuse_gate_up",
+        "expert_cpu_max_tokens",
         "expert_nvfp4_native_layout",
         "expert_pruning_plan_path",
         "expert_consolidation_plan_path",
@@ -2414,6 +2424,9 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
 
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
+        cpu_max = params.get("expert_cpu_max_tokens", 0)
+        if type(cpu_max) is not int or not 0 <= cpu_max <= 10:
+            errors.append("MAGI-2 expert_cpu_max_tokens must be an integer in [0, 10].")
         if type(params.get("expert_nvfp4_native_layout", False)) is not bool:
             errors.append("MAGI-2 expert_nvfp4_native_layout must be a boolean.")
         from mirai.core.models.magi2_preview.working_set import Magi2ExpertWorkingSet

@@ -266,6 +266,15 @@ For segmented grouped linear and expert MLP execution,
 within the active segment and the first projection of the next active segment,
 including during input-gradient recomputation.
 
+For experimental hybrid CPU/CUDA execution, set
+`model.params.family_params.expert_cpu_max_tokens` from `1` to `10`.
+Packed experts with at most that many routed rows run on a CPU worker while
+larger expert groups run on CUDA. Use a host-backed packed stream with
+`memory.moe_expert_autograd="segmented_recompute"` and
+`memory.moe_routed_gemm="disabled"`. The default `0` leaves all experts on the
+compute device. Compare latency and packed-transfer bytes against threshold `0`
+using identical routes and the same artifact.
+
 For experimental LoRA training with a host-backed packed stream, a positive
 host cache, and `memory.expert_weight_access="active_group_dequant"`, set
 `model.params.family_params.expert_working_set_fraction` below
@@ -900,6 +909,8 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   original checkpoint shard contents against the export fingerprint.
 - **Head-local expert working sets for packed streaming** — Restrict training
   router candidates to a deterministic set per head for several optimizer steps.
+- **Hybrid CPU/CUDA packed expert execution** — Execute low-token expert
+  groups on a CPU worker and preserve the routed output order.
 - **MAGI-2 mixture-basis expert storage** — Set the family parameter
   `expert_mixture_basis_rank` to a positive rank to fit gate and up projections
   as the original checkpoint loads. Set `expert_mixture_basis_count` and

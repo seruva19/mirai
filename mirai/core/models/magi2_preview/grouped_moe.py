@@ -33,6 +33,7 @@ rejected rather than reinterpreted.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from typing import Any, Callable
 
@@ -1074,6 +1075,76 @@ class _ActiveExpertGroups:
         return self.store.packed_prefetch_enabled
 
 
+class _CpuExpertRecompute(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, rows, offsets, store, output):
+        ctx.save_for_backward(rows, offsets)
+        ctx.store = store
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        rows, offsets = ctx.saved_tensors
+        with torch.enable_grad():
+            rows = rows.detach().requires_grad_(True)
+            output = _SegmentedQuantizedExpertMlp.apply(rows, offsets, ctx.store, "bmm", "bmm", "torch")
+            (grad_rows,) = torch.autograd.grad(output, rows, grad_output)
+        return grad_rows, None, None, None
+
+
+def _hybrid_expert_features(
+    x_sorted, offsets, store, *, cpu_max_tokens, forward_backend, dx_backend, activation_backend,
+):
+    boundaries = [0, *_grouped_boundaries(offsets)]
+    cold, hot = [], []
+    for group, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True)):
+        if start < stop:
+            selected = cold if stop - start <= cpu_max_tokens else hot
+            selected.append((group, start, stop))
+    if not cold:
+        active_store, active_offsets = _packed_expert_layout(store, offsets)
+        return _SegmentedQuantizedExpertMlp.apply(
+            x_sorted, active_offsets, active_store, forward_backend, dx_backend, activation_backend,
+        )
+    def subset(groups):
+        group_ids = torch.tensor([group for group, _, _ in groups], dtype=torch.long)
+        packed = _ActiveExpertGroups(store, group_ids)
+        positions = torch.cat([torch.arange(start, stop) for _, start, stop in groups]).to(x_sorted.device)
+        counts = torch.tensor([stop - start for _, start, stop in groups], dtype=offsets.dtype)
+        return positions, counts.cumsum(0, dtype=offsets.dtype), packed
+
+    cold_positions, cold_offsets, cold_store = subset(cold)
+    cold_rows = x_sorted.index_select(0, cold_positions)
+    copy_ready = None
+    if cold_rows.device.type == "cuda":
+        host_rows = torch.empty_like(cold_rows, device="cpu", pin_memory=True)
+        host_rows.copy_(cold_rows, non_blocking=True)
+        copy_ready = torch.cuda.Event()
+        copy_ready.record(torch.cuda.current_stream(cold_rows.device))
+        cold_rows = host_rows
+
+    def execute_cold():
+        if copy_ready is not None:
+            copy_ready.synchronize()
+        with torch.no_grad():
+            return _SegmentedQuantizedExpertMlp.apply(cold_rows, cold_offsets, cold_store, "bmm", "bmm", "torch")
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mirai-magi2-cold") as executor:
+        pending = executor.submit(execute_cold)
+        output = torch.empty_like(x_sorted)
+        if hot:
+            positions, local_offsets, active_store = subset(hot)
+            hot_output = _SegmentedQuantizedExpertMlp.apply(
+                x_sorted.index_select(0, positions), local_offsets.to(offsets.device), active_store,
+                forward_backend, dx_backend, activation_backend,
+            )
+            output.index_copy_(0, positions, hot_output)
+        cold_output = pending.result()
+    if cold_rows.requires_grad:
+        cold_output = _CpuExpertRecompute.apply(cold_rows, cold_offsets, cold_store, cold_output)
+    return output.index_copy_(0, cold_positions, cold_output.to(device=output.device))
+
+
 def _packed_expert_layout(
     store: Magi2Nf4ExpertStore, offsets: torch.Tensor
 ) -> tuple[Magi2Nf4ExpertStore | _ActiveExpertGroups, torch.Tensor]:
@@ -1516,6 +1587,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         token_chunk_size: int = 0,
         expert_autograd: str = "standard",
         activation_backend: str = "torch",
+        cpu_expert_max_tokens: int = 0,
     ) -> None:
         super().__init__(
             plan,
@@ -1523,6 +1595,14 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             activation_backend=activation_backend,
         )
         self.expert_autograd = str(expert_autograd)
+        self.cpu_expert_max_tokens = cpu_expert_max_tokens
+        if cpu_expert_max_tokens and (
+            plan.routed_gemm != "disabled" or plan.forward_backend == "scaled_mm_fp4"
+            or self.expert_autograd != "segmented_recompute"
+        ):
+            raise Magi2GroupedMoEPolicyError(
+                "Hybrid MAGI-2 experts require dequantizing grouped GEMM and segmented_recompute."
+            )
         if plan.forward_backend == "scaled_mm_fp4" and (
             self.expert_autograd != "standard" or plan.routed_gemm != "disabled"
         ):
@@ -1765,6 +1845,11 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         d_head = int(x_heads.shape[2])
         x_rows = x_heads.reshape(tokens * num_heads, d_head)
         x_sorted = x_rows.index_select(0, sorted_rows)
+        if self.cpu_expert_max_tokens and x_heads.device.type == "cuda":
+            return _hybrid_expert_features(
+                x_sorted, offsets, self._store(module), cpu_max_tokens=self.cpu_expert_max_tokens,
+                forward_backend=forward_backend, dx_backend=dx_backend, activation_backend=self.activation_backend,
+            )
         store, offsets = _packed_expert_layout(self._store(module), offsets)
         if torch.is_grad_enabled():
             return _SegmentedQuantizedExpertMlp.apply(
