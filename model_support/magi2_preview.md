@@ -262,6 +262,24 @@ remain fixed for `expert_working_set_hold_steps` optimizer steps (default
 Compare held-out loss and packed read bytes against a full-router run using
 the same seed, artifact, data split, and host-cache budget.
 
+Use the synthetic packed-stream probe on Linux to compare two storage volumes
+with the same shape and backend. Pass a new output directory on each volume.
+The probe writes an FP8 fixture and requires no model checkpoint.
+
+```bash
+python -m scripts.agent.probe_moe_runtime \
+  --packed-stream-probe-dir ./packed-probe-gen5 \
+  --packed-stream-storage-label gen5-single \
+  --packed-stream-backend direct_io \
+  --packed-stream-prefetch-depth 2
+```
+
+The probe reports packed demand time and an estimated stall ratio for inference
+and forward plus segmented input-gradient recomputation. The denominator is
+consumer-stream elapsed time outside packed demand intervals and includes
+kernel launch gaps. Compare this with summed reader service time and physical
+read bytes. Use depth `0` for a demand-only comparison.
+
 The
 provider-owned schema stores a versioned manifest and one NF4 safetensors shard
 per routed-expert layer. Restore checks model variant, denoiser subfolder,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -144,6 +145,141 @@ def _summarize_latency(samples: list[float]) -> dict[str, float | int]:
         "min_ms": float(ordered[0]),
         "max_ms": float(ordered[-1]),
     }
+
+
+def benchmark_packed_expert_stream(
+    device: torch.device,
+    *,
+    directory: Path,
+    storage_label: str,
+    backend: str,
+    groups: int,
+    inputs: int,
+    hidden: int,
+    tokens: int,
+    warmup: int,
+    iterations: int,
+    prefetch_depth: int,
+) -> dict[str, object]:
+    """Time synthetic MAGI-2 expert execution on the caller's storage volume."""
+    from safetensors.torch import save_file
+
+    from mirai.core.models.compressed_weights.packed.packed_storage_alignment import (
+        GDS_STORAGE_ALIGNMENT_BYTES,
+        save_safetensors_with_storage_alignment,
+    )
+    from mirai.core.models.compressed_weights.packed.packed_stream import StreamingPackedTensorMapping
+    from mirai.core.models.magi2_preview.grouped_moe import _SegmentedQuantizedExpertMlp
+    from mirai.core.models.magi2_preview.quantized_experts import Magi2PackedExpertStore
+
+    if min(groups, inputs, hidden, iterations) < 1 or tokens < groups or warmup < 0:
+        raise ValueError("Packed benchmark requires positive dimensions, tokens >= groups, and positive iterations.")
+    if not 0 <= prefetch_depth <= 16:
+        raise ValueError("Packed benchmark prefetch depth must be in [0, 16].")
+    directory.mkdir()
+    shard = directory / "synthetic-experts.safetensors"
+    source = Magi2PackedExpertStore(num_groups=groups, blocksize=64, quant_format="fp8")
+    generator = torch.Generator().manual_seed(19)
+    for key, shape in (("W_gate", (inputs, hidden)), ("W_up", (inputs, hidden)), ("W_down", (hidden, inputs))):
+        weights = torch.randn((groups, *shape), generator=generator).mul_(0.02)
+        source.quantize_dense(key, weights)
+    del weights
+    save_safetensors_with_storage_alignment(
+        save_file, dict(source.named_buffers()), shard, metadata=None,
+        alignment_bytes=GDS_STORAGE_ALIGNMENT_BYTES if backend != "staged" else 0,
+    )
+    source.set_expert_weight_access_policy(expert_weight_access="chunked_dequant", expert_dequant_chunk_size=1)
+
+    cuda = device.type == "cuda"
+    stream = torch.cuda.current_stream(device) if cuda else None
+
+    def mark():
+        if stream is None:
+            return time.perf_counter()
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+        return event
+
+    def seconds(start, end):
+        return end - start if stream is None else start.elapsed_time(end) / 1000
+
+    class TimedReader(StreamingPackedTensorMapping):
+        def get_slices_to_device(self, key, indices, **kwargs):
+            if not recording:
+                return super().get_slices_to_device(key, indices, **kwargs)
+            started = mark()
+            tensor = super().get_slices_to_device(key, indices, **kwargs)
+            demand_intervals.append((started, mark()))
+            return tensor
+
+    reader = TimedReader(shard, backend=backend, prefetch_depth=prefetch_depth)
+    try:
+        source.bind_packed_range_reader(reader)
+        dtype = torch.bfloat16 if cuda else torch.float32
+        rows = torch.randn(tokens, inputs, generator=generator).to(device=device, dtype=dtype)
+        boundaries = ((torch.arange(1, groups + 1) * tokens) // groups).to(device=device, dtype=torch.int32)
+        training_rows = rows.detach().requires_grad_(True)
+        grad = torch.ones_like(rows)
+        demand_intervals = []
+        recording = False
+
+        def execute(active_rows):
+            return _SegmentedQuantizedExpertMlp.apply(active_rows, boundaries, source, "bmm", "bmm", "torch")
+
+        def inference():
+            with torch.no_grad():
+                return execute(rows)
+
+        def forward_backward():
+            return torch.autograd.grad(execute(training_rows), training_rows, grad)[0]
+
+        phases = {}
+        for name, operation in (("inference", inference), ("forward_backward", forward_backward)):
+            recording = False
+            for _ in range(warmup):
+                operation()
+            if stream is not None:
+                stream.synchronize()
+            before = reader.snapshot()
+            elapsed = []
+            demand = 0.0
+            recording = True
+            for _ in range(iterations):
+                demand_intervals.clear()
+                started = mark()
+                operation()
+                finished = mark()
+                if stream is not None:
+                    finished.synchronize()
+                elapsed.append(seconds(started, finished))
+                demand += sum(seconds(start, end) for start, end in demand_intervals)
+            after = reader.snapshot()
+            compute = max(0.0, sum(elapsed) - demand)
+            counters = (
+                "read_seconds", "read_ops", "read_bytes", "direct_io_read_bytes",
+                "direct_io_overread_bytes", "h2d_bytes", "prefetch_wait_seconds",
+                "prefetch_submitted", "prefetch_consumed", "prefetch_misses", "prefetch_rejected",
+            )
+            phases[name] = {
+                "latency": _summarize_latency([value * 1000 for value in elapsed]),
+                "packed_demand_seconds": demand,
+                "estimated_block_compute_seconds": compute,
+                "stall_ratio": demand / compute if compute > 0 else None,
+                "reader_delta": {key: after[key] - before[key] for key in counters if key in after},
+            }
+        return {
+            "storage_label": storage_label,
+            "backend": backend,
+            "device": torch.cuda.get_device_name(device) if cuda else str(device),
+            "torch_version": str(torch.__version__),
+            "shard_bytes": shard.stat().st_size,
+            "shape": {"groups": groups, "inputs": inputs, "hidden": hidden, "tokens": tokens},
+            "clock": "cuda_consumer_stream" if cuda else "host_wall",
+            "prefetch_depth": prefetch_depth,
+            "phases": phases,
+        }
+    finally:
+        reader.close()
 
 
 def _measure_operation(
@@ -467,6 +603,10 @@ def run_probe(device: torch.device) -> dict[str, float | int | bool]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--packed-stream-probe-dir", type=Path)
+    parser.add_argument("--packed-stream-storage-label", default="unspecified")
+    parser.add_argument("--packed-stream-backend", choices=("staged", "direct_io", "io_uring"), default="staged")
+    parser.add_argument("--packed-stream-prefetch-depth", type=int, default=2)
     parser.add_argument("--routed-gemm-warmup-cache", type=Path)
     parser.add_argument("--benchmark-routed-gemm", action="store_true")
     parser.add_argument("--benchmark-tokens", type=int, default=1024)
@@ -488,6 +628,25 @@ def main() -> int:
     )
     args = parser.parse_args()
     device = torch.device(args.device)
+    if args.packed_stream_probe_dir is not None:
+        def packed_probe():
+            return benchmark_packed_expert_stream(
+                device, directory=args.packed_stream_probe_dir,
+                storage_label=args.packed_stream_storage_label, backend=args.packed_stream_backend,
+                groups=args.benchmark_groups, inputs=args.benchmark_k, hidden=args.benchmark_n,
+                tokens=args.benchmark_tokens, warmup=args.benchmark_warmup,
+                iterations=args.benchmark_iterations, prefetch_depth=args.packed_stream_prefetch_depth,
+            )
+
+        if device.type == "cpu":
+            report = packed_probe()
+        elif device.type == "cuda" and torch.cuda.is_available():
+            with acquire_gpu_lease(lock_path=resolve_lease_lock_path(Path.cwd()), timeout_seconds=0.0):
+                report = packed_probe()
+        else:
+            parser.error("Packed stream probe requires CPU or an explicitly leased CUDA device.")
+        print(json.dumps({"packed_stream_benchmark": report}, indent=2, sort_keys=True))
+        return 0
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("This probe requires an explicitly leased CUDA device.")
     with acquire_gpu_lease(
