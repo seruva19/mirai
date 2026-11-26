@@ -1918,6 +1918,31 @@ def test_magi2_fp4_packs_contiguous_contraction_blocks(fmt) -> None:
 
 
 @pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
+def test_magi2_native_fp4_sm120_matches_decoded_operands(fmt) -> None:
+    from mirai.core.models.compressed_weights.quantization.microscaling_quant import (
+        dequantize_microscaling, quantize_microscaling,
+    )
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("requires an SM120 CUDA device")
+    device = torch.device("cuda")
+    generator = torch.Generator().manual_seed(13)
+    weights = torch.randn(2, 128, 64, generator=generator)
+    store = quantized_experts.Magi2PackedExpertStore(
+        num_groups=2, quant_format=fmt, native_nvfp4_layout=fmt == "nvfp4",
+    )
+    store.quantize_dense("W_gate", weights)
+    x = torch.randn(9, 128, generator=generator).to(device=device, dtype=torch.bfloat16)
+    actual = store.native_fp4_projection("W_gate", 1, x)
+    decoded_x = dequantize_microscaling(
+        *quantize_microscaling(fmt, x), dtype=torch.float32, device=device,
+    )
+    decoded_w = store.materialize_segment("W_gate", 1, 2, dtype=torch.float32, device=device)[0]
+    expected = (decoded_x @ decoded_w).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.025)
+
+
+@pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
 def test_magi2_native_fp4_dispatches_active_groups_and_preserves_input_gradient(monkeypatch, tmp_path, fmt) -> None:
     from mirai.core.models.compressed_weights.quantization import native_fp4
 
