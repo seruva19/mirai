@@ -267,6 +267,7 @@ class PublicationContractTests(unittest.TestCase):
                 "calibrate_moe_quantization.py",
                 "calibrate_router_quantization.py",
                 "calibrate_routing_agreement.py",
+                "calibrate_routing_batches.py",
                 "check_comfyui_lora_load.py",
                 "check_lora_host_compat.py",
                 "compress_adapter_para.py",
@@ -323,7 +324,9 @@ class PublicationContractTests(unittest.TestCase):
         # documentation; it resolves to the contract in agent/AGENTS.md.
         bootstrap = {"AGENTS.md"}
         root_markdown = {
-            path.name for path in ROOT.glob("*.md") if path.name not in bootstrap
+            relative for relative in _publication_relative_paths()
+            if "/" not in relative and relative.endswith(".md") and relative not in bootstrap
+            and (ROOT / relative).is_file()
         }
         self.assertEqual(root_markdown, {"README.md", "CONFIG_REFERENCE.md"})
         architecture = json.loads(
