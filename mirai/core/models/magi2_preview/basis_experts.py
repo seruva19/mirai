@@ -8,9 +8,12 @@ import json
 import torch
 
 from mirai.core.models.compressed_weights.factorization.shared_basis import factorize_shared_basis_blocks
+from mirai.core.models.compressed_weights.factorization.mixture_basis import (
+    _activate, factorize_mixture_basis_experts,
+)
 
 from .quantized_experts import (
-    MAGI2_NF4_STORE_ATTR, MAGI2_ROUTED_EXPERT_TENSOR_NAMES, Magi2Nf4ExpertStore, iter_magi2_moe_layers,
+    MAGI2_NF4_STORE_ATTR, MAGI2_ROUTED_EXPERT_TENSOR_NAMES, Magi2Nf4ExpertStore, _new_expert_store, iter_magi2_moe_layers,
 )
 
 MAGI2_BASIS_SOURCE_METADATA = "magi2_basis_source_sha256"
@@ -133,6 +136,57 @@ class Magi2SharedBasisExpertStore(Magi2Nf4ExpertStore):
         self._axes = dict(axes)
         self._shapes = {key: tuple(shape) for key, shape in shapes.items()}
         self._dtypes = {key: getattr(torch, dtypes[key]) for key in keys}
+
+
+class Magi2MixtureBasisExpertStore(Magi2Nf4ExpertStore):
+    """Factorize gate/up and retain the ordinary packed down projection."""
+
+    quant_format = "mixture_basis"
+
+    def __init__(self, *, num_groups: int, down_format: str, blocksize: int = 64) -> None:
+        super().__init__(num_groups=num_groups, blocksize=blocksize)
+        self.down = _new_expert_store(num_groups=num_groups, blocksize=blocksize, quant_format=down_format)
+        self._activations: dict[str, str] = {}
+
+    def factorize_projection(self, key: str, source: torch.Tensor, **factor_options) -> None:
+        if key not in MAGI2_ROUTED_EXPERT_TENSOR_NAMES or source.ndim != 3 or source.shape[0] != self.num_groups:
+            raise ValueError("MAGI-2 mixture-basis projection has incompatible shape or key.")
+        if key == "W_down":
+            self.down.quantize_dense(key, source)
+        else:
+            with torch.enable_grad():
+                factors = factorize_mixture_basis_experts(source.detach().transpose(-1, -2), **factor_options)
+            for name in ("transforms", "bases", "coefficients"):
+                self._set_buffer(f"{key}_{name}", getattr(factors, name).detach())
+            self._activations[key] = factors.activation
+        self._shapes[key] = tuple(source.shape)
+        self._dtypes[key] = self.down.expert_weight_dtype(key) if key == "W_down" else source.dtype
+
+    @torch.no_grad()
+    def materialize_segment(self, key, group_start, group_stop, *, dtype, device, group_ids=None):
+        self._require_loaded(key)
+        if key == "W_down":
+            return self.down.materialize_segment(
+                key, group_start, group_stop, dtype=dtype, device=device, group_ids=group_ids,
+            )
+        count = self.num_groups if group_ids is None else group_ids.numel()
+        if not 0 <= group_start < group_stop <= count:
+            raise ValueError("MAGI-2 mixture-basis segment is out of bounds.")
+        transforms = getattr(self, f"{key}_transforms")
+        coefficients = getattr(self, f"{key}_coefficients")
+        if group_ids is None:
+            transforms = transforms[group_start:group_stop]
+            coefficients = coefficients[group_start:group_stop]
+        else:
+            ids = group_ids[group_start:group_stop].to(transforms.device, dtype=torch.long)
+            transforms = transforms.index_select(0, ids)
+            coefficients = coefficients.index_select(0, ids.to(coefficients.device))
+        coefficients = coefficients.to(device=device, dtype=torch.float32)
+        coefficients = coefficients / coefficients.sum(dim=1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+        bases = getattr(self, f"{key}_bases").to(device=device, dtype=dtype)
+        mixed = torch.einsum("gk,kri->gri", coefficients.to(dtype), bases)
+        dense = transforms.to(device=device, dtype=dtype) @ _activate(mixed, self._activations[key])
+        return dense.transpose(-1, -2).contiguous()
 
 
 def factorize_magi2_shared_basis_experts(

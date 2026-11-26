@@ -835,6 +835,36 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
         verify_magi2_pruning_source(transformer, plan)
 
 
+def test_magi2_mixture_basis_preserves_packed_down_and_selected_group_order() -> None:
+    from mirai.core.models.magi2_preview.basis_experts import Magi2MixtureBasisExpertStore
+    from mirai.core.models.magi2_preview.quantized_experts import MAGI2_NF4_STORE_ATTR
+
+    layer = _reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
+        expert_intermediate_size=16, num_heads=1, num_experts=2, top_k=1,
+    )
+    store = Magi2MixtureBasisExpertStore(num_groups=2, down_format="fp8")
+    for key in ("W_gate", "W_up", "W_down"):
+        store.factorize_projection(
+            key, getattr(layer, key), rank=2, basis_count=2, optimization_steps=1,
+            checkpoint_interval=1, factor_dtype="float32",
+        )
+        del layer._parameters[key]
+        kwargs = dict(device="cpu", dtype=torch.float32)
+        whole = store.materialize_segment(key, 0, 2, **kwargs)
+        selected = store.materialize_segment(key, 0, 3, group_ids=torch.tensor([1, 0, 1]), **kwargs)
+        torch.testing.assert_close(selected, whole[[1, 0, 1]])
+        if key == "W_down":
+            torch.testing.assert_close(whole, store.down.materialize_segment(key, 0, 2, **kwargs), rtol=0, atol=0)
+    assert store.is_fully_loaded()
+    layer.add_module(MAGI2_NF4_STORE_ATTR, store)
+    x = torch.randn(3, 1, 16, requires_grad=True)
+    backend = Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEPlan(forward_backend="bmm", dx_backend="bmm"))
+    output = backend.execute(layer, x, *layer._route(x))
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(torch.autograd.grad(output.sum(), x)[0]).all()
+
+
 def test_magi2_shared_basis_reconstructs_selected_native_groups(tmp_path) -> None:
     from types import SimpleNamespace
 
