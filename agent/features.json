@@ -3210,7 +3210,9 @@
         "apply_magi2_hierarchical_merge",
         "observe_magi2_hierarchical_merge_head",
         "Magi2ExpertConsolidationPlan",
-        "stream_merge_magi2_experts"
+        "stream_merge_magi2_experts",
+        "build_magi2_hierarchical_calibration_targets",
+        "build_magi2_hierarchical_merge_plan_from_evidence"
       ],
       "config_keys": [
         "model.params.family_params"

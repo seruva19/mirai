@@ -453,7 +453,8 @@ def save_prototype_calibration_evidence(
     dataset_snapshot_id: str,
     model_snapshot_id: str,
     config_snapshot_id: str,
-    packed_artifact_fingerprint: str,
+    packed_artifact_fingerprint: str = "",
+    dense_source_fingerprint: str = "",
 ) -> None:
     """Write versioned, tensor-native evidence with mandatory lineage."""
     from safetensors.torch import save_file
@@ -462,10 +463,13 @@ def save_prototype_calibration_evidence(
         "dataset_snapshot_id": str(dataset_snapshot_id).strip(),
         "model_snapshot_id": str(model_snapshot_id).strip(),
         "config_snapshot_id": str(config_snapshot_id).strip(),
-        "packed_artifact_fingerprint": str(packed_artifact_fingerprint).strip(),
     }
-    if not all(lineage.values()):
+    if not all(lineage.values()) or bool(packed_artifact_fingerprint.strip()) == bool(dense_source_fingerprint.strip()):
         raise ValueError("Prototype calibration requires complete snapshot lineage.")
+    if dense_source_fingerprint.strip():
+        lineage["dense_source_fingerprint"] = dense_source_fingerprint.strip()
+    else:
+        lineage["packed_artifact_fingerprint"] = packed_artifact_fingerprint.strip()
     if not evidence_by_module:
         raise ValueError("At least one module's calibration evidence is required.")
     tensors: dict[str, Any] = {}
@@ -521,6 +525,7 @@ def load_prototype_calibration_evidence(
     expected_model_snapshot_id: str | None = None,
     expected_config_snapshot_id: str | None = None,
     expected_packed_artifact_fingerprint: str | None = None,
+    expected_dense_source_fingerprint: str | None = None,
 ) -> tuple[dict[str, PrototypeCalibrationEvidence], dict[str, str]]:
     """Load evidence and reject requested lineage mismatches."""
     from safetensors import safe_open
@@ -545,22 +550,28 @@ def load_prototype_calibration_evidence(
             "dataset_snapshot_id",
             "model_snapshot_id",
             "config_snapshot_id",
-            "packed_artifact_fingerprint",
         )
     }
-    if not all(lineage.values()):
+    sources = {
+        key: str(manifest.get(key, "")).strip()
+        for key in ("packed_artifact_fingerprint", "dense_source_fingerprint")
+        if str(manifest.get(key, "")).strip()
+    }
+    if not all(lineage.values()) or len(sources) != 1:
         raise ValueError("Prototype calibration artifact has incomplete lineage.")
+    lineage.update(sources)
     expected = {
         "dataset_snapshot_id": expected_dataset_snapshot_id,
         "model_snapshot_id": expected_model_snapshot_id,
         "config_snapshot_id": expected_config_snapshot_id,
         "packed_artifact_fingerprint": expected_packed_artifact_fingerprint,
+        "dense_source_fingerprint": expected_dense_source_fingerprint,
     }
     for key, value in expected.items():
-        if value is not None and str(value) != lineage[key]:
+        if value is not None and str(value) != lineage.get(key):
             raise ValueError(
                 f"Prototype calibration {key} mismatch: expected {value!r}, "
-                f"found {lineage[key]!r}."
+                f"found {lineage.get(key)!r}."
             )
     modules = manifest.get("modules")
     if not isinstance(modules, list) or not modules:

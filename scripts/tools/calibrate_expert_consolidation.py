@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from mirai.config.schema import TrainingConfig
 from mirai.core.builtins import register_builtin_components
 from mirai.core.dataset.registration import enforce_dataset_compliance
+from mirai.core.models.providers import get_model_family_provider
 from mirai.core.moe.runtime.specs import normalize_expert_weight_access_policy
 from mirai.core.training.runtime.cli import load_runtime_config
 from mirai.core.training.runtime.gpu_lease import acquire_gpu_lease
@@ -40,6 +41,15 @@ def _validate_calibration_config(config: TrainingConfig) -> None:
             "Expert consolidation calibration requires model.params."
             "expert_consolidation='prototype' or 'hierarchical_output'."
         )
+    provider = get_model_family_provider(str(config.model.type))
+    if provider is not None and provider.prototype_calibration_dense_source:
+        if (
+            not provider.supports_prototype_calibration(config)
+            or config.memory.quantize_experts_on_load
+            or str(config.memory.frozen_weight_packed_state_path).strip()
+        ):
+            raise ValueError("This consolidation provider requires hierarchical_output and a dense checkpoint.")
+        return
     access = normalize_expert_weight_access_policy(config.memory.expert_weight_access)
     if access != "active_dequant" or int(config.memory.expert_dequant_chunk_size) > 1:
         raise ValueError(

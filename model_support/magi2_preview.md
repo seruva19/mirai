@@ -807,6 +807,10 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   `observe_magi2_hierarchical_merge_head` records sampled activations into
   the shared mean-output accumulator. Save or load the resulting plan
   with `Magi2ExpertConsolidationPlan`.
+  For dataset calibration, set `model.params.expert_consolidation="hierarchical_output"`
+  and run `scripts/tools/calibrate_expert_consolidation.py` with the original
+  dense checkpoint. Convert the resulting evidence with
+  `build_magi2_hierarchical_merge_plan_from_evidence` against the same source.
   Set `model.params.family_params.expert_consolidation_plan_path` to load
   a saved plan from the original checkpoint, merging one source projection
   at a time. Use dense expert execution and the `attn_only` adapter

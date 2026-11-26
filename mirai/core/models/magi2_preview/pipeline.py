@@ -2181,6 +2181,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
             paired_cfg_inference=True,
             expert_pruning_calibration=True,
             diet_calibration_dense_source=True,
+            prototype_calibration_dense_source=True,
             diet_calibration_cfg_mode="paired",
             expert_precision_calibration=True,
             # Raw media is encoded by the family-owned Qwen3.5/Wan2.2 encoder
@@ -2197,6 +2198,17 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         from mirai.core.models.magi2_preview.expert_pruning import build_magi2_diet_calibration_targets
 
         return build_magi2_diet_calibration_targets(pipeline.transformer)
+
+    def supports_prototype_calibration(self, cfg: Any = None) -> bool:
+        return cfg is not None and str(cfg.model.params.expert_consolidation).strip().lower() == "hierarchical_output"
+
+    def build_prototype_calibration_targets(self, pipeline: Any):
+        from mirai.core.models.magi2_preview.expert_pruning import build_magi2_hierarchical_calibration_targets
+
+        return build_magi2_hierarchical_calibration_targets(pipeline.transformer)
+
+    def prototype_dense_source_fingerprint(self, pipeline: Any) -> str:
+        return "sha256:" + self.diet_dense_source_fingerprint(pipeline)
 
     def diet_dense_source_fingerprint(self, pipeline: Any) -> str:
         from mirai.core.models.magi2_preview.expert_pruning import magi2_diet_source_fingerprint

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 
-from mirai.core.moe.calibration.projection import ExpertProjectionSpec
+from mirai.core.moe.calibration.projection import ExpertProjectionSpec, PrototypeCalibrationTarget
 from mirai.core.moe.calibration.pruning import (
     DietCalibrationTarget,
     ExpertPruningCalibrationTarget,
@@ -270,6 +270,70 @@ def observe_magi2_hierarchical_merge_head(
         token_ids, slots = (routes == expert).nonzero(as_tuple=True)
         if token_ids.numel():
             accumulator.record(expert, weights[token_ids, slots], outputs[token_ids, expert])
+
+
+@dataclass(frozen=True)
+class _Magi2HeadProjections(_DenseMagi2ExpertProjections):
+    head: int
+
+    @property
+    def num_experts(self) -> int:
+        return self.layer.num_experts
+
+    def load_prototype_projection_block(self, name, start, stop, *, device, dtype):
+        offset = self.head * self.num_experts
+        return super().load_prototype_projection_block(name, offset + start, offset + stop, device=device, dtype=dtype)
+
+    def set_prototype_calibration_observer(self, observer) -> None:
+        callbacks = getattr(self.layer, "_mirai_prototype_callbacks", None)
+        if callbacks is None:
+            callbacks = {}
+            self.layer._mirai_prototype_callbacks = callbacks
+        if self.head in callbacks:
+            raise ValueError("MAGI-2 routing head already has a prototype calibration observer.")
+
+        def observe(tokens):
+            sampled = observer.shared_calibration_inputs(tokens[:, self.head])
+            if sampled.numel():
+                observe_magi2_hierarchical_merge_head(self.layer, self.head, sampled, observer)
+
+        callbacks[self.head] = observe
+
+    def clear_prototype_calibration_observer(self) -> None:
+        callbacks = self.layer._mirai_prototype_callbacks
+        del callbacks[self.head]
+        if not callbacks:
+            del self.layer._mirai_prototype_callbacks
+
+
+def build_magi2_hierarchical_calibration_targets(transformer: nn.Module) -> dict[str, PrototypeCalibrationTarget]:
+    targets = {}
+    for name, layer in _dense_pruning_layers(transformer).items():
+        _diet_head_topology(layer)
+        for head in range(layer.num_heads):
+            target_name = f"{name}.head.{head}"
+            source = _Magi2HeadProjections(layer, head)
+            targets[target_name] = PrototypeCalibrationTarget(target_name, source, source)
+    return targets
+
+
+def build_magi2_hierarchical_merge_plan_from_evidence(
+    transformer: nn.Module, evidence_path: str | Path, *, reduction_ratio: float,
+) -> Magi2ExpertConsolidationPlan:
+    from mirai.core.moe.calibration.prototypes import load_prototype_calibration_evidence
+
+    layers = _dense_pruning_layers(transformer)
+    evidence, _ = load_prototype_calibration_evidence(
+        evidence_path, expected_dense_source_fingerprint=_source_fingerprint(layers),
+    )
+    expected = {f"{name}.head.{head}" for name, layer in layers.items() for head in range(layer.num_heads)}
+    if set(evidence) != expected:
+        raise ValueError("Consolidation evidence must cover every MAGI-2 routing head.")
+    by_layer = {
+        name: tuple(evidence[f"{name}.head.{head}"] for head in range(layer.num_heads))
+        for name, layer in layers.items()
+    }
+    return build_magi2_hierarchical_merge_plan(transformer, by_layer, reduction_ratio=reduction_ratio)
 
 
 @torch.no_grad()

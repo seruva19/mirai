@@ -835,19 +835,23 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
         verify_magi2_pruning_source(transformer, plan)
 
 
-def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(tmp_path) -> None:
+def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(tmp_path, monkeypatch) -> None:
     from copy import deepcopy
     from dataclasses import replace
     import json
+    from types import SimpleNamespace
 
     from safetensors.torch import save_file
 
     from mirai.core.models.magi2_preview.expert_pruning import (
         Magi2ExpertConsolidationPlan, apply_magi2_hierarchical_merge,
         build_magi2_hierarchical_merge_plan, observe_magi2_hierarchical_merge_head,
+        build_magi2_hierarchical_merge_plan_from_evidence,
         stream_merge_magi2_experts,
     )
     from mirai.core.moe.calibration.prototypes import MeanExpertOutputAccumulator, PrototypeCalibrationEvidence
+    from mirai.core.models.magi2_preview.pipeline import Magi2PreviewModelFamilyProvider
+    from mirai.core.training.calibration import expert_prototypes
 
     layer = _reduced_moe(device=torch.device("cpu"), dtype=torch.float32)
     layer.router.expert_bias.copy_(layer.router.expert_bias_ema)
@@ -871,6 +875,30 @@ def test_magi2_hierarchical_merge_keeps_logical_routing_and_compacts_each_head(t
         observation = accumulator.evidence()
         torch.testing.assert_close(observation.selected_count, before[1][head].flatten().bincount(minlength=4))
         assert observation.distance_metric == "mean_output_euclidean"
+    provider = Magi2PreviewModelFamilyProvider()
+    monkeypatch.setattr(expert_prototypes, "get_model_family_provider", lambda _: provider)
+    monkeypatch.setattr(expert_prototypes, "resolve_step_sampling_context", lambda _: None)
+    monkeypatch.setattr(expert_prototypes, "_build_training_batch_factory", lambda **_: lambda step: tokens.flatten(1))
+    trainer = SimpleNamespace(
+        pipeline=SimpleNamespace(transformer=transformer), begin_validation=lambda: None,
+        end_validation=lambda _: None, compute_loss=lambda batch, **_: layer._forward_impl(batch),
+    )
+    session = SimpleNamespace(
+        trainer=trainer, manifest=SimpleNamespace(dataset_snapshot_id="data", model_snapshot_id="base", config_snapshot_id="config"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(type="magi2-preview", params=SimpleNamespace(expert_consolidation="hierarchical_output")),
+            memory=SimpleNamespace(frozen_weight_packed_state_path=""),
+        ),
+    )
+    evidence_path = tmp_path / "merge-evidence.safetensors"
+    report = expert_prototypes.run_prototype_calibration_session(
+        session, output_path=evidence_path, calibration_steps=1, max_block_elements=1,
+        max_output_tokens_per_observation=3,
+    )
+    assert all(item["output_tokens_per_expert"] == 3 for item in report.modules.values())
+    assert not hasattr(layer, "_mirai_prototype_callbacks")
+    calibrated = build_magi2_hierarchical_merge_plan_from_evidence(transformer, evidence_path, reduction_ratio=0.5)
+    assert calibrated.source_weight_fingerprint == plan.source_weight_fingerprint
     path = tmp_path / "merge.json"
     plan.save(path)
     restored = Magi2ExpertConsolidationPlan.load(path)

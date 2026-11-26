@@ -126,6 +126,10 @@ def run_prototype_calibration_session(
         session.trainer.pipeline
     )
     targets = _validate_targets(raw_targets)
+    dense_source = bool(getattr(provider, "prototype_calibration_dense_source", False))
+    dense_fingerprint = (
+        provider.prototype_dense_source_fingerprint(session.trainer.pipeline) if dense_source else ""
+    )
     if gate == "hierarchical_output":
         accumulators = {
             name: MeanExpertOutputAccumulator(
@@ -187,7 +191,9 @@ def run_prototype_calibration_session(
             evidence[name] = accumulators[name].evidence(distances)
     manifest = session.manifest
     packed_path = str(config.memory.frozen_weight_packed_state_path).strip()
-    if not packed_path:
+    if dense_source and packed_path:
+        raise ValueError("Dense-source expert consolidation requires a dense checkpoint.")
+    if not dense_source and not packed_path:
         raise ValueError(
             "Expert consolidation calibration requires "
             "memory.frozen_weight_packed_state_path."
@@ -198,7 +204,8 @@ def run_prototype_calibration_session(
         dataset_snapshot_id=str(manifest.dataset_snapshot_id),
         model_snapshot_id=str(manifest.model_snapshot_id),
         config_snapshot_id=str(manifest.config_snapshot_id),
-        packed_artifact_fingerprint=packed_artifact_fingerprint(packed_path),
+        packed_artifact_fingerprint=packed_artifact_fingerprint(packed_path) if packed_path else "",
+        dense_source_fingerprint=dense_fingerprint,
     )
     return PrototypeCalibrationRunReport(
         output=str(output),

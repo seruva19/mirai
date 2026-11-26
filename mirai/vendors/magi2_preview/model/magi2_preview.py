@@ -2833,6 +2833,10 @@ class CoreMultiHeadMoE(nn.Module):
             x_heads = ep_dispatch(x_heads, ep_group=ep_group)
 
         if self.has_real_moe_heads:
+            callbacks = getattr(self, "_mirai_prototype_callbacks", None)
+            if callbacks:
+                for observe in callbacks.values():
+                    observe(x_heads)
             topk_probs, topk_indices = self._route(x_heads)
             # Mirai edit: a configured expert-execution backend is the selected
             # path in every mode. The fused Triton kernel is the default only

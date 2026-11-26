@@ -156,6 +156,7 @@ class ModelFamilyProvider:
     esft_expert_selection: bool = False
     expert_pruning_calibration: bool = False
     diet_calibration_dense_source: bool = False
+    prototype_calibration_dense_source: bool = False
     diet_calibration_cfg_mode: str = "sequential"
     flexmoe_calibration: bool = False
     prototype_calibration: bool = False
@@ -501,6 +502,9 @@ class ModelFamilyProvider:
     ) -> dict[str, "PrototypeCalibrationTarget"]:
         _ = pipeline
         return {}
+
+    def prototype_dense_source_fingerprint(self, pipeline: Any) -> str:
+        raise ValueError(f"{self.model_type!r} does not support dense-source prototype calibration.")
 
     def supports_expert_pruning_calibration(
         self, cfg: "TrainingConfig | None" = None
