@@ -18,7 +18,7 @@ import os
 import re
 import urllib.request
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import numpy as np
 import torch
@@ -820,14 +820,11 @@ class Magi2InferenceEngine:
 # Text encoder cache
 # -----------------------------------------------------------------------------
 
-from typing import Literal, Optional
-
-import torch
-
-from mirai.vendors.magi2_preview.model.qwen35 import Qwen35TextEncoder
+if TYPE_CHECKING:
+    from mirai.vendors.magi2_preview.model.qwen35 import Qwen35TextEncoder
 
 
-_text_encoder_cache: Optional[Qwen35TextEncoder] = None
+_text_encoder_cache: Optional["Qwen35TextEncoder"] = None
 
 
 @torch.inference_mode()
@@ -850,6 +847,8 @@ def initialize_text_encoder(
 ) -> None:
     if txt_encoder_type != "qwen35":
         raise ValueError(f"Invalid text encoder type: {txt_encoder_type}")
+
+    from mirai.vendors.magi2_preview.model.qwen35 import Qwen35TextEncoder
 
     text_encoder = Qwen35TextEncoder(
         model_path=model_path,
