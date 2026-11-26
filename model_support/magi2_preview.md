@@ -326,6 +326,9 @@ inputs. Input gradients are approximate because backward reconstructs the
 saved activations. This experimental option is disabled by default and
 requires `expert_cpu_max_tokens = 0`. Compare gradient error, held-out loss,
 and peak memory with the same artifact and the option disabled.
+Set `model.params.family_params.expert_int8_checkpoint_offload = true` to
+store these codes and scales in pinned host memory. Separate CUDA streams
+copy the payload out and restore it for backward using stream events.
 
 For experimental LoRA training with a host-backed packed stream, a positive
 host cache, and `memory.expert_weight_access="active_group_dequant"`, set

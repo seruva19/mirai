@@ -1592,6 +1592,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         activation_backend: str = "torch",
         cpu_expert_max_tokens: int = 0,
         int8_expert_checkpoint: bool = False,
+        int8_expert_checkpoint_offload: bool = False,
     ) -> None:
         super().__init__(
             plan,
@@ -1601,6 +1602,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         self.expert_autograd = str(expert_autograd)
         self.cpu_expert_max_tokens = cpu_expert_max_tokens
         self.int8_expert_checkpoint = int8_expert_checkpoint
+        self.int8_expert_checkpoint_offload = int8_expert_checkpoint_offload
+        if int8_expert_checkpoint_offload and not int8_expert_checkpoint:
+            raise Magi2GroupedMoEPolicyError("Int8 expert checkpoint offload requires int8 checkpointing.")
         if int8_expert_checkpoint and (self.expert_autograd != "segmented_recompute" or cpu_expert_max_tokens):
             raise Magi2GroupedMoEPolicyError(
                 "MAGI-2 INT8 expert checkpointing requires segmented_recompute with CUDA expert execution."
@@ -1886,7 +1890,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         if self.int8_expert_checkpoint and torch.is_grad_enabled():
             from mirai.core.training.residency.activation_compression import int8_saved_rows_context
 
-            with int8_saved_rows_context():
+            with int8_saved_rows_context(offload=self.int8_expert_checkpoint_offload):
                 return operation.apply(*args)
         return operation.apply(*args)
 
@@ -1926,7 +1930,10 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
 
             group_rows = rows[start:stop]
             if torch.is_grad_enabled() and self.expert_autograd == "segmented_recompute":
-                context = int8_saved_rows_context() if self.int8_expert_checkpoint else nullcontext()
+                context = (
+                    int8_saved_rows_context(offload=self.int8_expert_checkpoint_offload)
+                    if self.int8_expert_checkpoint else nullcontext()
+                )
                 with context:
                     outputs.append(checkpoint(execute, group_rows, use_reentrant=False))
             else:

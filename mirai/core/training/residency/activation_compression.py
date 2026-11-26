@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import lru_cache, partial
 from typing import Any
 
 try:
@@ -30,9 +31,16 @@ class _Int8SavedRows:
     codes: Any
     scales: Any
     dtype: Any
+    device: Any = None
+    host_ready: Any = None
 
 
-def _pack_int8_saved_rows(tensor):
+@lru_cache(maxsize=None)
+def _activation_copy_streams(device):
+    return torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+
+
+def _pack_int8_saved_rows(tensor, *, offload=False):
     if tensor.ndim != 2 or tensor.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
         return tensor.detach()
     rows, width = tensor.shape
@@ -43,18 +51,44 @@ def _pack_int8_saved_rows(tensor):
         return tensor.detach()
     scales = (values.abs().amax(dim=1, keepdim=True) / 127).clamp_min_(torch.finfo(torch.float32).tiny)
     codes = (values / scales).round_().clamp_(-127, 127).to(torch.int8)
+    if offload and tensor.is_cuda:
+        device = tensor.device
+        d2h, _ = _activation_copy_streams(device)
+        d2h.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(d2h):
+            host_codes = torch.empty_like(codes, device="cpu", pin_memory=True)
+            host_scales = torch.empty_like(scales, device="cpu", pin_memory=True)
+            host_codes.copy_(codes, non_blocking=True)
+            host_scales.copy_(scales, non_blocking=True)
+            codes.record_stream(d2h)
+            scales.record_stream(d2h)
+            ready = d2h.record_event()
+        return _Int8SavedRows(host_codes, host_scales, tensor.dtype, device, ready)
     return _Int8SavedRows(codes, scales, tensor.dtype)
 
 
 def _unpack_int8_saved_rows(value):
     if not isinstance(value, _Int8SavedRows):
         return value
-    return (value.codes.float() * value.scales).to(value.dtype)
+    codes, scales = value.codes, value.scales
+    if value.host_ready is not None:
+        _, h2d = _activation_copy_streams(value.device)
+        compute = torch.cuda.current_stream(value.device)
+        with torch.cuda.stream(h2d):
+            h2d.wait_event(value.host_ready)
+            codes = codes.to(value.device, non_blocking=True)
+            scales = scales.to(value.device, non_blocking=True)
+            ready = h2d.record_event()
+        compute.wait_event(ready)
+        codes.record_stream(compute)
+        scales.record_stream(compute)
+    return (codes.float() * scales).to(value.dtype)
 
 
-def int8_saved_rows_context():
+def int8_saved_rows_context(*, offload=False):
     """Compress saved activation rows in a scope with no saved float weights."""
-    return torch.autograd.graph.saved_tensors_hooks(_pack_int8_saved_rows, _unpack_int8_saved_rows)
+    pack = partial(_pack_int8_saved_rows, offload=True) if offload else _pack_int8_saved_rows
+    return torch.autograd.graph.saved_tensors_hooks(pack, _unpack_int8_saved_rows)
 
 
 class LowRankActivationCompression:
