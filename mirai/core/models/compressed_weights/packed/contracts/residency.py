@@ -22,6 +22,34 @@ _GIB = 1024**3
 
 
 class PackedStateResidencyPolicyTests(unittest.TestCase):
+    def test_explicit_staging_budget_respects_pinned_cap_and_slot_rounding(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from safetensors.torch import save_file
+
+        from mirai.core.models.compressed_weights.packed import packed_stream
+
+        def pool(budget, *, slots=3):
+            return mock.Mock(pinned_bytes=slots * (1 << ((budget // slots).bit_length() - 1)))
+
+        with TemporaryDirectory() as directory:
+            shard = Path(directory) / "experts.safetensors"
+            save_file({"experts": torch.zeros(2)}, shard)
+            for cap, requested, slots, allocated in ((6, 6, 3, 6), (4, 6, 2, 4), (6, 0, 0, 0)):
+                with self.subTest(cap=cap, requested=requested), mock.patch.object(
+                    packed_stream, "_pin_budget_bytes", return_value=cap * _GIB,
+                ), mock.patch(
+                    "mirai.core.training.residency.tensor_residency.PinnedHostStagingPool", side_effect=pool,
+                ) as create:
+                    with packed_stream.StreamingPackedTensorMapping(shard, staging_capacity_bytes=requested * _GIB) as reader:
+                        reader._pinned_staging_pool()
+                        self.assertEqual(reader.snapshot()["pinned_in_flight_bytes"], allocated * _GIB)
+                        if slots:
+                            create.assert_called_once_with(min(cap, requested) * _GIB, slots=slots)
+                        else:
+                            create.assert_not_called()
+
     def test_prefetched_slot_waits_for_consumer_and_legacy_read_owns_a_copy(self) -> None:
         from mirai.core.models.compressed_weights.packed.packed_stream_prefetch import (
             PackedCudaSlotTransfer,

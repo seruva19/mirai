@@ -47,6 +47,7 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         *,
         read_workers: int = _DEFAULT_READ_WORKERS,
         cache_capacity_bytes: int = 0,
+        staging_capacity_bytes: int | None = None,
         backend: str = "staged",
         prefetch_depth: int = 0,
         tensor_aliases: Mapping[str, tuple[str, str]] | None = None,
@@ -57,6 +58,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._path = Path(path)
         self._regions, shard_paths = load_packed_regions(self._path, tensor_aliases=tensor_aliases)
         self._backend = _normalize_backend(backend)
+        if staging_capacity_bytes is not None and (staging_capacity_bytes < 0 or self._backend == "gds"):
+            raise ValueError("Packed staging capacity requires a nonnegative host-backed buffer budget.")
+        self._staging_capacity_bytes = staging_capacity_bytes
         depth = int(prefetch_depth)
         if depth < 0 or depth > 16:
             raise ValueError("Packed stream prefetch depth must be between 0 and 16.")
@@ -727,10 +731,15 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
     def _pinned_staging_pool(self):
         from mirai.core.training.residency.tensor_residency import PinnedHostStagingPool
 
-        budget = min(self._pin_cap_bytes, 3 * _MAX_RANGE_BYTES)
+        requested = self._staging_capacity_bytes
+        budget = min(self._pin_cap_bytes, 3 * _MAX_RANGE_BYTES if requested is None else requested)
         if self._staging_pool is None and budget >= 3 and not self._staging_unavailable:
             try:
-                self._staging_pool = PinnedHostStagingPool(budget)
+                if requested is not None:
+                    capacity = {slots: slots * (1 << ((budget // slots).bit_length() - 1)) for slots in (3, 2)}
+                    self._staging_pool = PinnedHostStagingPool(budget, slots=max(capacity, key=capacity.get))
+                else:
+                    self._staging_pool = PinnedHostStagingPool(budget)
             except (RuntimeError, MemoryError, OSError):
                 self._staging_unavailable = True
             else:

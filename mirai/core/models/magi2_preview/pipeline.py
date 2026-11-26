@@ -309,6 +309,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        staging_gib = family.get("expert_pinned_staging_gib")
+        if staging_gib is not None and (type(staging_gib) not in {int, float} or not 0 <= staging_gib <= 6):
+            raise ValueError("MAGI-2 expert_pinned_staging_gib must be between 0 and 6.")
+        if staging_gib is not None and (
+            not self._stream_expert_artifact or not self._packed_expert_state_path
+            or self._packed_stream_backend not in {"staged", "direct_io", "io_uring"}
+        ):
+            raise ValueError("MAGI-2 expert_pinned_staging_gib requires host-backed packed artifact streaming.")
+        self._packed_stream_staging_bytes = None if staging_gib is None else int(staging_gib * 1024**3)
         self._expert_prefetch_lookahead = family.get("expert_prefetch_lookahead", 0)
         if type(self._expert_prefetch_lookahead) is not int or self._expert_prefetch_lookahead not in (0, 1, 2):
             raise ValueError("MAGI-2 expert_prefetch_lookahead must be 0, 1, or 2.")
@@ -1036,6 +1045,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 else None
             ),
             stream_cache_bytes=getattr(self, "_packed_stream_cache_bytes", 0),
+            stream_staging_bytes=getattr(self, "_packed_stream_staging_bytes", None),
             stream_prefetch_depth=getattr(self, "_packed_stream_prefetch_depth", 0),
             require_native_nvfp4_layout=getattr(self, "_native_nvfp4_layout", False),
             expected_pruning_digest=pruning_digest, expected_consolidation_digest=consolidation_digest,
@@ -2571,6 +2581,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "nf4_fuse_gate_up",
         "expert_cpu_max_tokens",
         "expert_prefetch_lookahead",
+        "expert_pinned_staging_gib",
         "expert_compact_lora",
         "expert_int8_checkpoint",
         "expert_int8_checkpoint_offload",
@@ -2679,6 +2690,9 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         lookahead = params.get("expert_prefetch_lookahead", 0)
         if type(lookahead) is not int or lookahead not in (0, 1, 2):
             errors.append("MAGI-2 expert_prefetch_lookahead must be 0, 1, or 2.")
+        staging_gib = params.get("expert_pinned_staging_gib")
+        if staging_gib is not None and (type(staging_gib) not in {int, float} or not 0 <= staging_gib <= 6):
+            errors.append("MAGI-2 expert_pinned_staging_gib must be between 0 and 6.")
         if type(params.get("expert_compact_lora", False)) is not bool:
             errors.append("MAGI-2 expert_compact_lora must be a boolean.")
         if type(params.get("expert_int8_checkpoint", False)) is not bool:

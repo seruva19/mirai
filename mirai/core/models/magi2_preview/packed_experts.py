@@ -189,6 +189,7 @@ def load_magi2_nf4_packed_state(
     retain_mapped_buffers: bool = False,
     range_read_backend: str | None = None,
     stream_cache_bytes: int = 0,
+    stream_staging_bytes: int | None = None,
     stream_prefetch_depth: int = 0,
     require_native_nvfp4_layout: bool = False,
 ) -> dict[str, Magi2Nf4ExpertStore]:
@@ -374,6 +375,7 @@ def load_magi2_nf4_packed_state(
 
         reader = StreamingPackedTensorMapping(
             manifest_path, tensor_aliases=tensor_aliases, cache_capacity_bytes=stream_cache_bytes,
+            staging_capacity_bytes=stream_staging_bytes,
             prefetch_depth=stream_prefetch_depth, backend=range_read_backend, cache_expert_slices=True,
         )
         try:

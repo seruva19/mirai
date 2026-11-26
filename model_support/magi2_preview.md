@@ -330,6 +330,11 @@ path and require repacking from the source to use native GEMM.
 All expert layers share one range reader and one
 `memory.packed_stream_cache_gib` host-cache budget. The cache keeps individual
 packed expert slices, so overlapping route sets can reuse cached experts.
+Host-backed packed streams accept
+`model.params.family_params.expert_pinned_staging_gib` from 0 to 6 GiB.
+Omitting it keeps the small automatic pool. Set it to 4 or 6 for a larger
+ring, or 0 to disable pinned staging. The global pinned-memory cap and any
+registered io_uring buffer reduce the available budget.
 Staged CUDA uploads reuse a pinned host ring sized by the host pin budget
 and the reader's maximum transfer size.
 For segmented grouped linear and expert MLP execution,
