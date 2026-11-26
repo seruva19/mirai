@@ -1293,6 +1293,15 @@ def _segment_routed_projection(
     )
 
 
+def _prefetch_next_routed_segment(prefetch, segments, index, fused_gate_up):
+    if prefetch is not None and index + 1 < len(segments):
+        next_segment, _ = segments[index + 1]
+        prefetch(
+            MAGI2_FUSED_GATE_UP if fused_gate_up else "W_gate",
+            next_segment.group_start, next_segment.group_stop,
+        )
+
+
 class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
     """Routed BF16 projection over one transient NF4 segment at a time."""
 
@@ -1307,9 +1316,9 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
     ) -> torch.Tensor:
         segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
         outputs: list[torch.Tensor] = []
-        for segment, max_group_rows in segments:
-            if segment.row_count == 0:
-                continue
+        prefetch = _expert_projection_prefetch(store, x_rows.device)
+        segments = tuple((segment, rows) for segment, rows in segments if segment.row_count)
+        for index, (segment, max_group_rows) in enumerate(segments):
             local_offsets = (
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
@@ -1351,6 +1360,7 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                 "W_down", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=x_rows.device,
             )
+            _prefetch_next_routed_segment(prefetch, segments, index, store.has_fused_gate_up)
             outputs.append(_segment_routed_projection(
                 hidden, w_down, local_offsets, max_group_rows=max_group_rows
             ))
@@ -1372,9 +1382,9 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
         x_rows, offsets, sorted_rows = ctx.saved_tensors
         grad_input = torch.zeros_like(x_rows)
         store = ctx.store
-        for segment, max_group_rows in ctx.segments:
-            if segment.row_count == 0:
-                continue
+        prefetch = _expert_projection_prefetch(store, x_rows.device)
+        segments = ctx.segments
+        for index, (segment, max_group_rows) in enumerate(segments):
             local_offsets = (
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
@@ -1410,6 +1420,7 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
                 "W_down", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=x_rows.device,
             )
+            _prefetch_next_routed_segment(prefetch, segments, index, store.has_fused_gate_up)
             grad_hidden = _segment_routed_projection(
                 grad_rows, w_down.transpose(-2, -1), local_offsets,
                 max_group_rows=max_group_rows,
@@ -1555,9 +1566,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         store, offsets = _packed_expert_layout(self._store(module), offsets)
         output = x_rows.new_zeros((tokens * num_heads, d_head))
         segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
-        for segment, max_group_rows in segments:
-            if segment.row_count == 0:
-                continue
+        prefetch = _expert_projection_prefetch(store, x_rows.device)
+        segments = tuple((segment, rows) for segment, rows in segments if segment.row_count)
+        for index, (segment, max_group_rows) in enumerate(segments):
             local_offsets = (
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
@@ -1599,6 +1610,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                 "W_down", segment.group_start, segment.group_stop,
                 dtype=x_rows.dtype, device=device,
             )
+            _prefetch_next_routed_segment(prefetch, segments, index, store.has_fused_gate_up)
             output.add_(
                 routed_weighted_projection(
                     hidden,
