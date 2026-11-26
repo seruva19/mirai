@@ -217,6 +217,37 @@ def stream_factorize_magi2_shared_basis_experts(
     transformer: torch.nn.Module, *, checkpoint_dir: str, rank: int, factor_dtype: str = "bfloat16",
 ) -> dict[str, Magi2SharedBasisExpertStore]:
     """Build all stores from source shards before replacing any expert parameters."""
+    def read_projection(store, key, source, target, full_key):
+        store.factorize_projection_blocks(
+            key, lambda start, stop: source[start:stop],
+            shape=tuple(target.shape), source_dtype=target.dtype, rank=rank, factor_dtype=factor_dtype,
+        )
+
+    return _stream_basis_experts(
+        transformer, checkpoint_dir, Magi2SharedBasisExpertStore, read_projection,
+    )
+
+
+def stream_factorize_magi2_mixture_basis_experts(
+    transformer: torch.nn.Module, *, checkpoint_dir: str, rank: int,
+    basis_count: int, optimization_steps: int, down_format: str, blocksize: int,
+) -> dict[str, Magi2MixtureBasisExpertStore]:
+    def create_store(*, num_groups):
+        return Magi2MixtureBasisExpertStore(num_groups=num_groups, down_format=down_format, blocksize=blocksize)
+
+    def read_projection(store, key, source, target, full_key):
+        value = source[:]
+        if not value.is_floating_point():
+            raise ValueError(f"MAGI-2 mixture-basis projection {full_key!r} requires floating-point weights.")
+        store.factorize_projection(
+            key, value.to(dtype=target.dtype), rank=rank,
+            basis_count=basis_count, optimization_steps=optimization_steps,
+        )
+
+    return _stream_basis_experts(transformer, checkpoint_dir, create_store, read_projection)
+
+
+def _stream_basis_experts(transformer, checkpoint_dir, create_store, read_projection):
     from safetensors import safe_open
 
     from mirai.vendors.magi2_preview.infra.checkpoint.magi2_checkpointing import read_safetensors_weight_map
@@ -227,20 +258,17 @@ def stream_factorize_magi2_shared_basis_experts(
     weight_map = read_safetensors_weight_map(checkpoint_dir)
     stores = {}
     for name, layer in layers.items():
-        store = Magi2SharedBasisExpertStore(num_groups=layer.local_flatten_num_experts)
+        store = create_store(num_groups=layer.local_flatten_num_experts)
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:
             full_key = f"{name}.{key}"
             if full_key not in weight_map:
-                raise ValueError(f"MAGI-2 checkpoint is missing shared-basis projection {full_key!r}.")
+                raise ValueError(f"MAGI-2 checkpoint is missing factorization projection {full_key!r}.")
             target = layer._parameters[key]
             with safe_open(weight_map[full_key], framework="pt", device="cpu") as shard:
                 source = shard.get_slice(full_key)
                 if tuple(source.get_shape()) != target.shape:
-                    raise ValueError(f"MAGI-2 shared-basis projection {full_key!r} has incompatible shape or dtype.")
-                store.factorize_projection_blocks(
-                    key, lambda start, stop, shard_slice=source: shard_slice[start:stop],
-                    shape=tuple(target.shape), source_dtype=target.dtype, rank=rank, factor_dtype=factor_dtype,
-                )
+                    raise ValueError(f"MAGI-2 factorization projection {full_key!r} has incompatible shape.")
+                read_projection(store, key, source, target, full_key)
         stores[name] = store
     for name, layer in layers.items():
         for key in MAGI2_ROUTED_EXPERT_TENSOR_NAMES:

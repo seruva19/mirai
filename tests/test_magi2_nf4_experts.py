@@ -835,14 +835,30 @@ def test_aimer_pruning_ranks_dense_projections_within_each_head(tmp_path) -> Non
         verify_magi2_pruning_source(transformer, plan)
 
 
-def test_magi2_mixture_basis_preserves_packed_down_and_selected_group_order() -> None:
-    from mirai.core.models.magi2_preview.basis_experts import Magi2MixtureBasisExpertStore
+def test_magi2_mixture_basis_preserves_packed_down_and_selected_group_order(tmp_path) -> None:
+    from safetensors.torch import save_file
+
+    from mirai.core.models.magi2_preview.basis_experts import (
+        Magi2MixtureBasisExpertStore, stream_factorize_magi2_mixture_basis_experts,
+    )
     from mirai.core.models.magi2_preview.quantized_experts import MAGI2_NF4_STORE_ATTR
 
     layer = _reduced_moe(
         device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
         expert_intermediate_size=16, num_heads=1, num_experts=2, top_k=1,
     )
+    save_file(_container(layer).state_dict(), str(tmp_path / "model.safetensors"))
+    skeleton = _container(_reduced_moe(
+        device=torch.device("cpu"), dtype=torch.float32, hidden_size=16,
+        expert_intermediate_size=16, num_heads=1, num_experts=2, top_k=1,
+        routed_weight_device="meta",
+    ))
+    streamed = stream_factorize_magi2_mixture_basis_experts(
+        skeleton, checkpoint_dir=str(tmp_path), rank=2, basis_count=2,
+        optimization_steps=1, down_format="fp8", blocksize=64,
+    )["mlp.moe_mlp"]
+    assert streamed.is_fully_loaded()
+    assert not hasattr(skeleton.mlp.moe_mlp, "W_gate")
     store = Magi2MixtureBasisExpertStore(num_groups=2, down_format="fp8")
     for key in ("W_gate", "W_up", "W_down"):
         store.factorize_projection(

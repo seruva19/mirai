@@ -316,8 +316,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         self._expert_pruning_plan_path = str(family.get("expert_pruning_plan_path", "")).strip()
         self._expert_consolidation_plan_path = str(family.get("expert_consolidation_plan_path", "")).strip()
         self._expert_shared_basis_rank = family.get("expert_shared_basis_rank", 0)
+        self._expert_mixture_basis_rank = family.get("expert_mixture_basis_rank", 0)
+        self._expert_mixture_basis_count = family.get("expert_mixture_basis_count", 4)
+        self._expert_mixture_basis_steps = family.get("expert_mixture_basis_steps", 1000)
+        self._expert_mixture_basis_down_format = family.get("expert_mixture_basis_down_format", "fp8")
         if type(self._expert_shared_basis_rank) is not int or self._expert_shared_basis_rank < 0:
             raise ValueError("MAGI-2 expert_shared_basis_rank must be a non-negative integer.")
+        if type(self._expert_mixture_basis_rank) is not int or self._expert_mixture_basis_rank < 0:
+            raise ValueError("MAGI-2 expert_mixture_basis_rank must be a non-negative integer.")
+        if any(type(value) is not int or value < 1 for value in (self._expert_mixture_basis_count, self._expert_mixture_basis_steps)):
+            raise ValueError("MAGI-2 mixture-basis count and steps must be positive integers.")
+        if self._expert_mixture_basis_down_format not in MAGI2_PACKED_EXPERT_FORMATS:
+            raise ValueError("MAGI-2 mixture-basis down format must be a supported packed expert format.")
+        if self._expert_shared_basis_rank and self._expert_mixture_basis_rank:
+            raise ValueError("Choose either shared-basis or mixture-basis expert storage.")
         self._expert_pruning_adapter_source_plan_path = str(
             family.get("expert_pruning_adapter_source_plan_path", "") or ""
         ).strip()
@@ -338,13 +350,15 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             )
         ):
             raise ValueError("MAGI-2 hierarchical consolidation requires a dense source and no pruning plan.")
-        if self._expert_shared_basis_rank and (
+        if (self._expert_shared_basis_rank or self._expert_mixture_basis_rank) and (
             self._expert_pruning_plan_path or self._expert_pruning_adapter_source_plan_path
             or self._expert_consolidation_plan_path or self._expert_precision_plan_path
             or self._quantize_experts_on_load
             or self._frozen_weight_quantization not in {"", "none", "off", "disabled"}
         ):
-            raise ValueError("MAGI-2 shared-basis rank requires an original dense checkpoint and no other expert storage policy.")
+            raise ValueError("MAGI-2 basis factorization requires an original dense checkpoint and no other expert storage policy.")
+        if self._expert_mixture_basis_rank and self._packed_expert_state_path:
+            raise ValueError("MAGI-2 mixture-basis factors require building from the original checkpoint.")
         default_config = (
             Path(__file__).resolve().parents[3]
             / "vendors"
@@ -457,9 +471,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         pruning_plan_path = self._expert_pruning_plan_path
         consolidation_plan_path = getattr(self, "_expert_consolidation_plan_path", "")
         shared_basis_rank = getattr(self, "_expert_shared_basis_rank", 0)
+        mixture_basis_rank = getattr(self, "_expert_mixture_basis_rank", 0)
         transformer = (
             Transformer(config.arch_config, ep_size=1, routed_weight_device="meta")
-            if packed_experts or pruning_plan_path or consolidation_plan_path or shared_basis_rank
+            if packed_experts or pruning_plan_path or consolidation_plan_path or shared_basis_rank or mixture_basis_rank
             else Transformer(config.arch_config, ep_size=1)
         )
         mixed_stream = self._quantizes_experts_on_load() and self._expert_precision_plan_path
@@ -481,6 +496,14 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
                 self._expert_stores = stream_factorize_magi2_shared_basis_experts(
                     transformer, checkpoint_dir=str(checkpoint_dir), rank=shared_basis_rank,
                 )
+        elif mixture_basis_rank:
+            from mirai.core.models.magi2_preview.basis_experts import stream_factorize_magi2_mixture_basis_experts
+
+            self._expert_stores = stream_factorize_magi2_mixture_basis_experts(
+                transformer, checkpoint_dir=str(checkpoint_dir), rank=mixture_basis_rank,
+                basis_count=self._expert_mixture_basis_count, optimization_steps=self._expert_mixture_basis_steps,
+                down_format=self._expert_mixture_basis_down_format, blocksize=self._nf4_blocksize,
+            )
         elif consolidation_plan_path:
             from mirai.core.models.magi2_preview.expert_pruning import (
                 Magi2ExpertConsolidationPlan,
@@ -879,6 +902,8 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         *,
         metadata: dict[str, str] | None = None,
     ) -> Any:
+        if getattr(self, "_expert_mixture_basis_rank", 0):
+            raise ValueError("MAGI-2 mixture-basis factors currently load from the source checkpoint.")
         from mirai.core.models.magi2_preview.packed_experts import (
             save_magi2_nf4_packed_state,
         )
@@ -2191,6 +2216,10 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "expert_pruning_plan_path",
         "expert_consolidation_plan_path",
         "expert_shared_basis_rank",
+        "expert_mixture_basis_rank",
+        "expert_mixture_basis_count",
+        "expert_mixture_basis_steps",
+        "expert_mixture_basis_down_format",
         "expert_pruning_adapter_source_plan_path",
         "expert_rotation_group_size",
         "companion_weight_quantization",
@@ -2278,6 +2307,15 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         basis_rank = params.get("expert_shared_basis_rank", 0)
         if type(basis_rank) is not int or basis_rank < 0:
             errors.append("MAGI-2 expert_shared_basis_rank must be a non-negative integer.")
+        mixture_rank = params.get("expert_mixture_basis_rank", 0)
+        if type(mixture_rank) is not int or mixture_rank < 0:
+            errors.append("MAGI-2 expert_mixture_basis_rank must be a non-negative integer.")
+        for key in ("expert_mixture_basis_count", "expert_mixture_basis_steps"):
+            value = params.get(key, 4 if key.endswith("count") else 1000)
+            if type(value) is not int or value < 1:
+                errors.append(f"MAGI-2 {key} must be a positive integer.")
+        if params.get("expert_mixture_basis_down_format", "fp8") not in MAGI2_PACKED_EXPERT_FORMATS:
+            errors.append("MAGI-2 expert_mixture_basis_down_format must be a supported packed expert format.")
         if params.get("companion_weight_quantization", "none") not in MAGI2_COMPANION_FORMATS:
             errors.append("MAGI-2 companion_weight_quantization must be 'none', 'fp8', or 'nf4'.")
         if params.get("norm_weight_quantization", "none") not in MAGI2_NORM_FORMATS:

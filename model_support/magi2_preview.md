@@ -835,6 +835,13 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
   `memory.frozen_weight_packed_state_path`. Keep the original checkpoint
   available for the router and remaining weights. Restore checks the
   original checkpoint shard contents against the export fingerprint.
+- **MAGI-2 mixture-basis expert storage** — Set the family parameter
+  `expert_mixture_basis_rank` to a positive rank to fit gate and up projections
+  as the original checkpoint loads. Set `expert_mixture_basis_count` and
+  `expert_mixture_basis_steps` to control the fit. They default to four bases
+  and 1000 steps. `expert_mixture_basis_down_format` defaults to `fp8` and
+  controls packing of the down projection. The fitter processes one projection
+  at a time and uses a CPU FP32 copy of that projection.
 - **Mixed MAGI-2 expert precision** — Experimental per-projection,
   per-group packing from a lineage-bound version 2
   `memory.expert_precision_plan_path`. Use the flattened head-major group
