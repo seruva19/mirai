@@ -1641,7 +1641,19 @@ Offload a saved view's base storage once and reconstruct each logical view from 
 - **Default:** `False`
 - **Allowed / range:** mutually exclusive with activation CPU offload
 
-Compress eligible saved activation matrices with an online low-rank projection and reconstruct them during backward ([`activation_compression.py`](mirai/core/training/residency/activation_compression.py)).
+Compress eligible saved activations and reconstruct them during backward
+([`activation_compression.py`](mirai/core/training/residency/activation_compression.py)).
+
+### `activation_compression_codec`
+
+- **Type:** str
+- **Default:** `"low_rank"`
+- **Allowed / range:** `low_rank`, `int8`
+
+Choose randomized low-rank projection or use INT8 with one FP32 scale per
+256 values. INT8 applies to eligible non-leaf tensors above the size threshold
+and skips parameter views and frozen tensors. Backward uses approximated
+activations.
 
 ### `activation_compression_rank`
 

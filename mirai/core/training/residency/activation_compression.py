@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache, partial
+from math import prod
 from typing import Any
 
 try:
@@ -35,6 +36,69 @@ class _Int8SavedRows:
     host_ready: Any = None
     code_shape: tuple[int, ...] | None = None
     mask: Any = None
+
+
+@dataclass(frozen=True)
+class _Int8SavedBlocks:
+    codes: Any
+    scales: Any
+    shape: tuple[int, ...]
+    dtype: Any
+
+
+class Int8ActivationCompression:
+    """Compress non-leaf activations with per-block INT8 codes and FP32 scales."""
+
+    def __init__(self, *, min_bytes: int) -> None:
+        if min_bytes < 0:
+            raise ValueError("Activation compression minimum bytes must be non-negative.")
+        self.min_bytes = min_bytes
+        self.compressed_tensors = 0
+        self.original_bytes = 0
+        self.stored_bytes = 0
+
+    def _pack(self, tensor):
+        if (
+            not tensor.requires_grad or tensor.is_leaf or tensor.ndim < 2
+            or tensor.dtype not in {torch.float16, torch.bfloat16, torch.float32}
+            or tensor.layout != torch.strided or tensor.nbytes < self.min_bytes
+        ):
+            return tensor
+        base = tensor._base
+        if base is not None and base.is_leaf:
+            return tensor
+        block = 256
+        count = tensor.numel()
+        padded = count + (-count) % block
+        stored_bytes = padded + 4 * (padded // block)
+        if stored_bytes >= tensor.nbytes:
+            return tensor
+        values = torch.nn.functional.pad(tensor.detach().reshape(-1).float(), (0, padded - count)).view(-1, block)
+        finite = torch.where(torch.isfinite(values), values, 0.0)
+        scales = (finite.abs().amax(dim=1, keepdim=True) / 126).clamp_min_(torch.finfo(torch.float32).tiny)
+        codes = (finite / scales).round_().clamp_(-126, 126).to(torch.int8)
+        # Reserved codes preserve exceptional values without a device-to-host flag.
+        codes.masked_fill_(torch.isnan(values), -128)
+        codes.masked_fill_(torch.isneginf(values), -127)
+        codes.masked_fill_(torch.isposinf(values), 127)
+        self.compressed_tensors += 1
+        self.original_bytes += tensor.nbytes
+        self.stored_bytes += stored_bytes
+        return _Int8SavedBlocks(codes, scales, tuple(tensor.shape), tensor.dtype)
+
+    @staticmethod
+    def _unpack(value):
+        if not isinstance(value, _Int8SavedBlocks):
+            return value
+        codes = value.codes
+        decoded = codes.float() * value.scales
+        decoded.masked_fill_(codes == -128, float("nan"))
+        decoded.masked_fill_(codes == -127, -float("inf"))
+        decoded.masked_fill_(codes == 127, float("inf"))
+        return decoded.flatten()[:prod(value.shape)].view(value.shape).to(value.dtype)
+
+    def context(self):
+        return torch.autograd.graph.saved_tensors_hooks(self._pack, self._unpack)
 
 
 @lru_cache(maxsize=None)
@@ -205,9 +269,14 @@ def activation_compression_context(
     rank: int,
     min_bytes: int,
     seed: int = 0,
+    codec: str = "low_rank",
 ):
     if not enabled:
         return nullcontext()
+    if codec == "int8":
+        return Int8ActivationCompression(min_bytes=min_bytes).context()
+    if codec != "low_rank":
+        raise ValueError("Activation compression codec must be low_rank or int8.")
     return LowRankActivationCompression(
         rank=rank,
         min_bytes=min_bytes,

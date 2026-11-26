@@ -651,7 +651,11 @@ def validate_training_runtime_config(config: TrainingConfig) -> None:
         "training.activation_cpu_offload_pin_memory=true.",
     )
     _check(
-        int(config.training.activation_compression_rank) > 0,
+        config.training.activation_compression_codec in {"low_rank", "int8"},
+        "training.activation_compression_codec must be low_rank or int8.",
+    )
+    _check(
+        config.training.activation_compression_codec == "int8" or int(config.training.activation_compression_rank) > 0,
         "training.activation_compression_rank must be > 0.",
     )
     _check(

@@ -433,6 +433,7 @@ class TrainingSection:
     policy_modules: list[str] = field(default_factory=list)
     policy_options: dict[str, dict[str, Any]] = field(default_factory=dict)
     activation_compression: bool = False
+    activation_compression_codec: str = "low_rank"
     activation_compression_rank: int = 32
     activation_compression_min_mib: int = 8
 
@@ -1148,6 +1149,7 @@ class TrainingConfig:
             "activation_cpu_offload_prefetch_layers",
             "activation_cpu_offload_view_replay",
             "activation_compression",
+            "activation_compression_codec",
             "activation_compression_rank",
             "activation_compression_min_mib",
             "masked_loss",
@@ -2836,6 +2838,7 @@ class TrainingConfig:
             activation_compression=bool(
                 training_table.get("activation_compression", False)
             ),
+            activation_compression_codec=str(training_table.get("activation_compression_codec", "low_rank")).strip().lower(),
             activation_compression_rank=int(
                 training_table.get("activation_compression_rank", 32)
             ),

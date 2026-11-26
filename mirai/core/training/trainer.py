@@ -475,6 +475,7 @@ class Trainer:
                 rank=int(training.activation_compression_rank),
                 min_bytes=int(training.activation_compression_min_mib) * 1024**2,
                 seed=int(training.seed),
+                codec=str(training.activation_compression_codec),
             )
         return self._activation_offload_session.context()
 

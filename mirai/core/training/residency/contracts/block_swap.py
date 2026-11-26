@@ -35,6 +35,7 @@ from mirai.core.training.residency.activation_offload import (
     prepare_activation_offload,
 )
 from mirai.core.training.residency.activation_compression import (
+    Int8ActivationCompression,
     LowRankActivationCompression,
 )
 from mirai.core.training.trainer import Trainer
@@ -427,6 +428,43 @@ class BlockSwapPipelineIntegrationTests(unittest.TestCase):
         torch.testing.assert_close(
             weight.grad, reference_weight.grad, rtol=1e-3, atol=1e-3
         )
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class Int8ActivationCompressionTests(unittest.TestCase):
+    def test_adapter_backward_preserves_loss_and_bounds_gradient_error(self) -> None:
+        torch.manual_seed(22)
+        x = torch.randn(64, 32, dtype=torch.bfloat16)
+        lora_a = torch.randn(32, 16, dtype=x.dtype, requires_grad=True)
+        lora_b = torch.randn(16, 32, dtype=x.dtype, requires_grad=True)
+        compression = Int8ActivationCompression(min_bytes=0)
+        self.assertIs(compression._pack(lora_a), lora_a)
+        view = lora_a.T
+        self.assertIs(compression._pack(view), view)
+        frozen = torch.randn(16, 32, dtype=x.dtype)
+        self.assertIs(compression._pack(frozen), frozen)
+
+        def loss():
+            return ((x @ lora_a) @ lora_b).float().square().mean()
+
+        expected = loss()
+        reference_grads = torch.autograd.grad(expected, (lora_a, lora_b))
+        with compression.context():
+            actual = loss()
+        gradients = torch.autograd.grad(actual, (lora_a, lora_b))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertGreater(compression.compressed_tensors, 0)
+        self.assertLess(compression.stored_bytes, compression.original_bytes * 0.55)
+        for observed, reference in zip(gradients, reference_grads, strict=True):
+            relative_error = (observed.float() - reference.float()).norm() / reference.float().norm()
+            self.assertLess(relative_error, 0.02)
+
+    def test_nonfinite_values_survive_padding_and_reconstruction(self) -> None:
+        compression = Int8ActivationCompression(min_bytes=0)
+        source = torch.ones(17, 19, requires_grad=True)
+        activations = source * torch.tensor([float("nan"), -float("inf"), float("inf"), *([1.0] * 16)])
+        decoded = compression._unpack(compression._pack(activations))
+        torch.testing.assert_close(decoded, activations, rtol=0, atol=0, equal_nan=True)
 
 
 @unittest.skipIf(torch is None, "torch not installed")
