@@ -1593,6 +1593,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         cpu_expert_max_tokens: int = 0,
         int8_expert_checkpoint: bool = False,
         int8_expert_checkpoint_offload: bool = False,
+        int8_expert_checkpoint_lz4: bool = False,
     ) -> None:
         super().__init__(
             plan,
@@ -1603,6 +1604,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         self.cpu_expert_max_tokens = cpu_expert_max_tokens
         self.int8_expert_checkpoint = int8_expert_checkpoint
         self.int8_expert_checkpoint_offload = int8_expert_checkpoint_offload
+        self.int8_expert_checkpoint_lz4 = int8_expert_checkpoint_lz4
+        if int8_expert_checkpoint_lz4 and not int8_expert_checkpoint_offload:
+            raise Magi2GroupedMoEPolicyError("LZ4 expert checkpoints require int8 checkpoint offload.")
         if int8_expert_checkpoint_offload and not int8_expert_checkpoint:
             raise Magi2GroupedMoEPolicyError("Int8 expert checkpoint offload requires int8 checkpointing.")
         if int8_expert_checkpoint and (self.expert_autograd != "segmented_recompute" or cpu_expert_max_tokens):
@@ -1890,7 +1894,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         if self.int8_expert_checkpoint and torch.is_grad_enabled():
             from mirai.core.training.residency.activation_compression import int8_saved_rows_context
 
-            with int8_saved_rows_context(offload=self.int8_expert_checkpoint_offload):
+            with int8_saved_rows_context(
+                offload=self.int8_expert_checkpoint_offload, lz4=self.int8_expert_checkpoint_lz4,
+            ):
                 return operation.apply(*args)
         return operation.apply(*args)
 
@@ -1931,7 +1937,9 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
             group_rows = rows[start:stop]
             if torch.is_grad_enabled() and self.expert_autograd == "segmented_recompute":
                 context = (
-                    int8_saved_rows_context(offload=self.int8_expert_checkpoint_offload)
+                    int8_saved_rows_context(
+                        offload=self.int8_expert_checkpoint_offload, lz4=self.int8_expert_checkpoint_lz4,
+                    )
                     if self.int8_expert_checkpoint else nullcontext()
                 )
                 with context:

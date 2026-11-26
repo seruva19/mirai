@@ -331,6 +331,10 @@ store these codes and scales in pinned host memory. Separate CUDA streams
 copy the payload out and restore it for backward using stream events.
 Restoring activations and uploading streamed expert weights share the
 host-to-device stream. Gradient offload uses the device-to-host stream.
+Set `model.params.family_params.expert_int8_checkpoint_lz4 = true` to
+compress INT8 code buffers of at least 64 KiB on CUDA before copying them
+to RAM. The option requires NVIDIA nvCOMP and checkpoint offload. Buffers
+that do not shrink transfer as INT8. FP32 scales transfer unchanged.
 
 For experimental LoRA training with a host-backed packed stream, a positive
 host cache, and `memory.expert_weight_access="active_group_dequant"`, set

@@ -33,6 +33,7 @@ class _Int8SavedRows:
     dtype: Any
     device: Any = None
     host_ready: Any = None
+    code_shape: tuple[int, ...] | None = None
 
 
 @lru_cache(maxsize=None)
@@ -40,7 +41,7 @@ def training_cuda_copy_streams(device):
     return torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
 
 
-def _pack_int8_saved_rows(tensor, *, offload=False):
+def _pack_int8_saved_rows(tensor, *, offload=False, lz4=False):
     if tensor.ndim != 2 or tensor.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
         return tensor.detach()
     rows, width = tensor.shape
@@ -52,6 +53,14 @@ def _pack_int8_saved_rows(tensor, *, offload=False):
     scales = (values.abs().amax(dim=1, keepdim=True) / 127).clamp_min_(torch.finfo(torch.float32).tiny)
     codes = (values / scales).round_().clamp_(-127, 127).to(torch.int8)
     if offload and tensor.is_cuda:
+        code_shape = None
+        if lz4 and codes.numel() >= 65536:
+            from .nvcomp_lz4 import encode_cuda_lz4
+
+            encoded = encode_cuda_lz4(codes)
+            if encoded is not None:
+                code_shape = tuple(codes.shape)
+                codes = encoded
         device = tensor.device
         d2h, _ = training_cuda_copy_streams(device)
         d2h.wait_stream(torch.cuda.current_stream(device))
@@ -63,7 +72,7 @@ def _pack_int8_saved_rows(tensor, *, offload=False):
             codes.record_stream(d2h)
             scales.record_stream(d2h)
             ready = d2h.record_event()
-        return _Int8SavedRows(host_codes, host_scales, tensor.dtype, device, ready)
+        return _Int8SavedRows(host_codes, host_scales, tensor.dtype, device, ready, code_shape)
     return _Int8SavedRows(codes, scales, tensor.dtype)
 
 
@@ -82,12 +91,20 @@ def _unpack_int8_saved_rows(value):
         compute.wait_event(ready)
         codes.record_stream(compute)
         scales.record_stream(compute)
+    if value.code_shape is not None:
+        from .nvcomp_lz4 import decode_cuda_lz4
+
+        decoded = torch.empty(value.code_shape, device=value.device, dtype=torch.int8)
+        decode_cuda_lz4(codes, decoded)
+        codes = decoded
     return (codes.float() * scales).to(value.dtype)
 
 
-def int8_saved_rows_context(*, offload=False):
+def int8_saved_rows_context(*, offload=False, lz4=False):
     """Compress saved activation rows in a scope with no saved float weights."""
-    pack = partial(_pack_int8_saved_rows, offload=True) if offload else _pack_int8_saved_rows
+    if lz4 and not offload:
+        raise ValueError("LZ4 activation compression requires checkpoint offload.")
+    pack = partial(_pack_int8_saved_rows, offload=True, lz4=lz4) if offload else _pack_int8_saved_rows
     return torch.autograd.graph.saved_tensors_hooks(pack, _unpack_int8_saved_rows)
 
 

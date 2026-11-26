@@ -1999,6 +1999,19 @@ def test_int8_checkpoint_offload_preserves_reconstructed_rows() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="nvCOMP requires CUDA")
+def test_int8_checkpoint_lz4_reduces_transferred_bytes() -> None:
+    pytest.importorskip("nvidia.nvcomp")
+    from mirai.core.training.residency.activation_compression import _pack_int8_saved_rows, _unpack_int8_saved_rows
+
+    rows = torch.arange(16, device="cuda", dtype=torch.bfloat16).repeat(128, 64)
+    reference = _pack_int8_saved_rows(rows, offload=True)
+    compressed = _pack_int8_saved_rows(rows, offload=True, lz4=True)
+    assert compressed.code_shape == tuple(rows.shape)
+    assert compressed.codes.numel() < reference.codes.numel()
+    torch.testing.assert_close(_unpack_int8_saved_rows(compressed), _unpack_int8_saved_rows(reference), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("block_checkpoint", [False, True])
 def test_magi2_int8_checkpoint_saves_only_expert_activations(monkeypatch, block_checkpoint) -> None:
     from torch.utils.checkpoint import checkpoint
