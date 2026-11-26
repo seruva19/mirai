@@ -2168,6 +2168,47 @@ def test_magi2_release_base_transformer_ends_block_residency_binding() -> None:
     assert all(parameter.device.type == "cpu" for parameter in pipeline.parameters())
 
 
+def test_magi2_routed_swap_hooks_are_removed_when_residency_is_disabled(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    from mirai.core.models.magi2_preview import pipeline as pipeline_module
+
+    pipeline = _bare_pipeline()
+    experts = torch.nn.Identity()
+    layer = torch.nn.Sequential()
+    layer.add_module("attention", torch.nn.Identity())
+    layer.add_module("mlp", torch.nn.Sequential())
+    layer.mlp.add_module("moe_mlp", experts)
+    transformer = torch.nn.Module()
+    transformer.block = torch.nn.Module()
+    transformer.block.layers = torch.nn.ModuleList([layer])
+    pipeline.transformer = transformer
+    pipeline._block_hook_handles = []
+    pipeline._adapter_configured = True
+    manager = Mock(uses_routed_experts=True, block_swap_backward=False)
+    monkeypatch.setattr(pipeline_module, "BlockSwapManager", lambda **_: manager)
+    monkeypatch.setattr(pipeline_module, "move_trainable_tensors", Mock())
+    move_companions = Mock()
+    monkeypatch.setattr(pipeline_module, "move_tensors_outside_modules", move_companions)
+    pipeline.set_weight_residency_strategy(
+        strategy="block_swap", blocks_to_swap=1, mode="async",
+        block_swap_transfer_strategy="routed_experts", block_swap_backward=False,
+    )
+    pipeline.place_offloaded_modules(device="cuda", strategy="block_swap")
+    assert move_companions.call_args.kwargs["excluded_modules"] == [experts]
+    assert manager.bind.call_args.kwargs["routed_units"][0].entrypoint is experts
+    layer(torch.ones(1))
+    manager.before_block.assert_called_once_with(0)
+    manager.after_block.assert_called_once_with(0)
+
+    pipeline.set_weight_residency_strategy(strategy="disabled", blocks_to_swap=0, mode="async")
+    manager.release_device.assert_called_once_with()
+    assert pipeline._block_hook_handles == []
+    layer(torch.ones(1))
+    manager.before_block.assert_called_once_with(0)
+    manager.after_block.assert_called_once_with(0)
+
+
 def test_magi2_refiner_release_ends_block_residency_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -820,7 +820,7 @@ not `unipc`, or when a key belonging to another family's refiner is stated.
 
 - **Intra-block routed expert offload** — Set
   `memory.block_swap_transfer_strategy = "routed_experts"` with async CUDA
-  block swap. The denoiser starts transfers at block entry and waits before
+  RAM-backed block swap. The denoiser starts transfers at block entry and waits before
   the routed MoE call, keeping attention and shared experts resident.
   Training uses standard gradient checkpointing with backward swapping.
   Training previews reuse the training swap count. The dense Refiner uses

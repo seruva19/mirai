@@ -1565,7 +1565,6 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         ),
     ) -> None:
         phase = WeightResidencyExecutionMode.coerce(execution_mode)
-        self._weight_residency_execution_mode = phase
         resolved = str(strategy).strip().lower()
         enabled = resolved != "disabled" and int(blocks_to_swap) > 0
         # The adapter is what keeps the streamed base frozen under a training
@@ -1576,7 +1575,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             and not self._adapter_configured
         ):
             raise ValueError("MAGI-2 block residency requires a configured adapter.")
-        self._residency_request = Magi2ResidencyRequest(
+        request = Magi2ResidencyRequest(
             enabled=enabled,
             blocks_to_swap=int(blocks_to_swap),
             mode=str(mode),
@@ -1587,7 +1586,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             offload_dir=offload_dir if resolved == "stream_disk" else None,
         )
         count = len(self.transformer.block.layers)
-        self._block_swap_manager = BlockSwapManager(
+        manager = BlockSwapManager(
             total_blocks=count,
             blocks_to_swap=min(count, int(blocks_to_swap)),
             mode=mode,
@@ -1598,6 +1597,20 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             block_swap_transfer_strategy=block_swap_transfer_strategy,
             disk_offload_dir=offload_dir if resolved == "stream_disk" else None,
         ) if enabled else None
+        self._release_block_swap_binding()
+        self._weight_residency_execution_mode = phase
+        self._residency_request = request
+        self._block_swap_manager = manager
+
+    def _release_block_swap_binding(self) -> None:
+        handles = getattr(self, "_block_hook_handles", None)
+        if handles is not None:
+            for handle in handles:
+                handle.remove()
+            handles.clear()
+        manager = getattr(self, "_block_swap_manager", None)
+        if manager is not None:
+            manager.release_device()
 
     def validate_device_placement(self, *, device: Any) -> None:
         profile_path = str(
@@ -2055,11 +2068,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         current sampling session; the owning session restores its placement
         before the next generation.
         """
-        for handle in self._block_hook_handles:
-            handle.remove()
-        self._block_hook_handles.clear()
-        if self._block_swap_manager is not None:
-            self._block_swap_manager.release_device()
+        self._release_block_swap_binding()
         self.transformer.to(device=torch.device("cpu"))
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

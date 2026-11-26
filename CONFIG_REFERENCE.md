@@ -3683,6 +3683,7 @@ Block-swap residency plan ([`block_swap.py`](mirai/core/training/residency/block
 - **Allowed / range:** in [1, 4]
 
 Asynchronous prefetch ring depth ([`block_swap.py`](mirai/core/training/residency/block_swap.py)). `1` prefetches the next block. `N` permits N swap blocks of transfer lookahead with per-slot events and reserves storage for N resident swap blocks. Applies only to `async` mode and does not change model math.
+The `routed_experts` strategy starts the current block's transfer at block entry.
 
 ### `block_residency_priority`
 
