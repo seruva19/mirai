@@ -77,7 +77,10 @@ class KvikioGdsReader:
         try:
             self._compat_context = self._defaults.set("compat_mode", False)
             self._compat_context.__enter__()
-            self._driver.initialize()
+            try:
+                self._driver.initialize()
+            except (OSError, RuntimeError) as exc:
+                raise GdsUnavailableError("Could not initialize the cuFile driver.") from exc
             if not bool(self._driver.get("is_gds_available")):
                 raise GdsUnavailableError(
                     "cuFile reports that GPUDirect Storage is unavailable. "
@@ -96,6 +99,9 @@ class KvikioGdsReader:
                 except (OSError, ValueError) as exc:
                     raise GdsUnavailableError(str(exc)) from exc
                 handle = self._kvikio.CuFile(str(path), "r")
+                if not callable(getattr(handle, "raw_read_async", None)):
+                    handle.close()
+                    raise GdsUnavailableError("GPUDirect Storage requires KvikIO's raw_read_async API.")
                 if not bool(handle.is_direct_io_supported()):
                     handle.close()
                     raise GdsUnavailableError(
@@ -158,7 +164,6 @@ class KvikioGdsReader:
                 raise ValueError("GPUDirect Storage destination must be a contiguous CUDA byte range.")
             writable = torch.cuda.Event()
             writable.record(consumer)
-        read_async = getattr(handle, "raw_read_async", None)
         with self._acquire_slot(device_index) as (index, slot):
             if slot.stream is None:
                 slot.stream = torch.cuda.Stream(device=device_index)
@@ -168,17 +173,12 @@ class KvikioGdsReader:
                     slot.buffer = self._allocate_slot(index, target)
                 buffer = slot.buffer[:window.read_bytes]
                 try:
-                    if callable(read_async):
-                        # Keep the request arguments alive through local stream completion.
-                        pending = read_async(
-                            buffer, raw_stream=int(stream.cuda_stream),
-                            size=window.read_bytes, file_offset=window.file_offset,
-                        )
-                        count = int(pending.check_bytes_done())
-                    else:
-                        stream.synchronize()
-                        read_sync = getattr(handle, "raw_read", handle.read)
-                        count = int(read_sync(buffer, size=window.read_bytes, file_offset=window.file_offset))
+                    # Keep the request arguments alive through local stream completion.
+                    pending = handle.raw_read_async(
+                        buffer, raw_stream=int(stream.cuda_stream),
+                        size=window.read_bytes, file_offset=window.file_offset,
+                    )
+                    count = int(pending.check_bytes_done())
                 except BaseException:
                     stream.synchronize()
                     raise
@@ -204,7 +204,7 @@ class KvikioGdsReader:
         elapsed = time.perf_counter() - started
         with self._stats_lock:
             self._read_ops += 1
-            self._async_ops += int(callable(read_async))
+            self._async_ops += 1
             self._read_bytes += window.read_bytes
             self._requested_bytes += window.payload_bytes
             self._overread_bytes += window.overread_bytes
