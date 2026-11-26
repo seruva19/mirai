@@ -5,6 +5,43 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
+import json
+from pathlib import Path
+
+
+ROUTING_TIMESTEPS_KEY = "_routing_batch_timesteps"
+
+
+@dataclass(frozen=True)
+class RoutingBatchProfile:
+    cache_experts: int
+    timestep_bins: int
+    samples: dict[str, tuple[frozenset[int] | None, ...]]
+
+    @classmethod
+    def load(cls, path: str) -> RoutingBatchProfile:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("Routing batch profile must use schema_version 1.")
+        cache_experts, bins, samples = (payload.get(key) for key in ("cache_experts", "timestep_bins", "samples"))
+        if type(cache_experts) is not int or cache_experts < 0 or type(bins) is not int or bins < 1 or not isinstance(samples, dict):
+            raise ValueError("Routing batch profile requires cache_experts, timestep_bins, and a samples map.")
+        fitted = {}
+        for sample, routes in samples.items():
+            if not isinstance(routes, list) or len(routes) != bins:
+                raise ValueError(f"Routing batch profile sample {sample!r} must have {bins} timestep bins.")
+            if any(route is not None and (
+                not isinstance(route, list) or any(type(expert) is not int or expert < 0 for expert in route)
+            ) for route in routes):
+                raise ValueError(f"Routing batch profile sample {sample!r} has invalid expert IDs.")
+            fitted[sample] = tuple(None if route is None else frozenset(route) for route in routes)
+        return cls(cache_experts, bins, fitted)
+
+    def experts(self, sample: str, timestep: float) -> frozenset[int] | None:
+        routes = self.samples.get(sample)
+        if routes is None or not 0.0 <= timestep <= 1.0:
+            return None
+        return routes[min(int(timestep * self.timestep_bins), self.timestep_bins - 1)]
 
 
 @dataclass(frozen=True)

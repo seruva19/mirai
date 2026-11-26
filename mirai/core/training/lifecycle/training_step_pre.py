@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,8 @@ from mirai.core.training.optim.gradients import (
 )
 from mirai.core.training.control.live_control_actions import build_live_runtime_state_payload
 from mirai.core.training.data.online import build_temporal_groups
+from mirai.core.training.data.curriculum import record_training_task
+from mirai.core.training.data.routing_batches import ROUTING_TIMESTEPS_KEY, RoutingBatchItem, plan_routing_microbatches
 from mirai.core.training.runtime.execution import (
     accumulate_training_gradients,
     apply_optimizer_update,
@@ -309,6 +312,45 @@ def _sync_live_control(
         applied_control_holder.append(applied)
 
 
+def _plan_routing_window(session, profile, window):
+    import torch
+
+    sampler = deepcopy(session.trainer.timestep_sampler)
+    dtype = session.compute_dtype if session.compute_device.type != "cpu" else torch.float32
+    hint = torch.empty((), dtype=dtype)
+    sampled = [sampler.sample(len(batch), like=hint) for batch in window]
+    items = []
+    for records, timesteps in zip(window, sampled, strict=True):
+        group = []
+        for record, timestep in zip(records, timesteps.tolist(), strict=True):
+            latent_shape = getattr(record.get("latent"), "shape", None)
+            extras = record.get("extra_tensors", {})
+            extra_shapes = tuple((name, getattr(tensor, "shape", None)) for name, tensor in sorted(extras.items()))
+            compatibility = (
+                record.get("bucket_id"), record_training_task(record), record.get("source_type"),
+                tuple(latent_shape) if latent_shape is not None else (),
+                "clip_embed" in record, "loss_mask" in record, "source_loss_multiplier" in record,
+                extra_shapes,
+            )
+            experts = None
+            if latent_shape is not None and all(shape is not None for _, shape in extra_shapes):
+                experts = profile.experts(str(record.get("sample_id", "")), timestep)
+            group.append(RoutingBatchItem(compatibility, experts))
+        items.append(group)
+    positions = plan_routing_microbatches(items, cache_experts=profile.cache_experts)
+    flat_records = [record for batch in window for record in batch]
+    flat_timesteps = torch.cat(sampled)
+    result = []
+    start = 0
+    for indices in positions:
+        if indices == tuple(range(start, start + len(indices))):
+            result.append(([flat_records[index] for index in indices], None))
+        else:
+            result.append(([flat_records[index] for index in indices], flat_timesteps[list(indices)]))
+        start += len(indices)
+    return result
+
+
 def _build_training_batch_factory(
     *,
     session: Any,
@@ -317,17 +359,50 @@ def _build_training_batch_factory(
     config = session.config
     run_state = session.run_state
 
-    def _build_training_batch(micro_batch_index: int) -> dict[str, Any]:
-        global_batch_index = (
-            (int(run_state.global_step) * int(session.grad_accum))
-            + int(micro_batch_index)
-        )
+    def _global_index(micro_batch_index):
+        return int(run_state.global_step) * int(session.grad_accum) + micro_batch_index
+
+    def _candidate_records(global_batch_index):
         batch_records, _selected_task = session.curriculum.filter_records_for_batch(
             sampling_context.eligible_records,
             step=int(run_state.global_step),
             seed=int(config.training.seed),
             global_batch_index=global_batch_index,
         )
+        return batch_records
+
+    def _select_records(batch_records, global_batch_index):
+        chosen_records = session.trainer.training_policies.select_records(
+            RecordSelectionContext(
+                records=batch_records,
+                batch_size=int(config.training.batch_size),
+                base_seed=int(config.training.seed),
+                global_batch_index=global_batch_index,
+                step=int(run_state.global_step),
+            )
+        )
+        if chosen_records is None:
+            chosen_records, _ = select_deterministic_batch_records(
+                batch_records,
+                batch_size=int(config.training.batch_size),
+                base_seed=int(config.training.seed),
+                global_batch_index=global_batch_index,
+            )
+        return chosen_records
+
+    profile = getattr(session.trainer, "routing_batch_profile", None)
+    planned = None
+
+    def _build_training_batch(micro_batch_index: int) -> dict[str, Any]:
+        nonlocal planned
+        global_batch_index = _global_index(micro_batch_index)
+        if profile is not None and session.grad_accum > 1 and planned is None:
+            window = [
+                _select_records(_candidate_records(_global_index(index)), _global_index(index))
+                for index in range(session.grad_accum)
+            ]
+            planned = _plan_routing_window(session, profile, window)
+        batch_records = _candidate_records(global_batch_index) if planned is None else None
         if bool(config.dataset.online_temporal_resampling):
             temporal_base_ids = sampling_context.temporal_base_ids_step
             temporal_groups = sampling_context.temporal_groups_step
@@ -359,22 +434,11 @@ def _build_training_batch_factory(
                 device=session.compute_device,
                 dtype=session.compute_dtype,
             )
-        chosen_records = session.trainer.training_policies.select_records(
-            RecordSelectionContext(
-                records=batch_records,
-                batch_size=int(config.training.batch_size),
-                base_seed=int(config.training.seed),
-                global_batch_index=global_batch_index,
-                step=int(run_state.global_step),
-            )
-        )
-        if chosen_records is None:
-            chosen_records, _ = select_deterministic_batch_records(
-                batch_records,
-                batch_size=int(config.training.batch_size),
-                base_seed=int(config.training.seed),
-                global_batch_index=global_batch_index,
-            )
+        if planned is None:
+            chosen_records = _select_records(batch_records, global_batch_index)
+            timesteps = None
+        else:
+            chosen_records, timesteps = planned[micro_batch_index]
         batch = build_batch_from_records(
             chosen_records,
             masked_loss=bool(config.training.masked_loss),
@@ -389,6 +453,8 @@ def _build_training_batch_factory(
             training=True,
             global_batch_index=global_batch_index,
         )
+        if timesteps is not None:
+            batch[ROUTING_TIMESTEPS_KEY] = timesteps
         return move_batch_to_device(
             batch,
             device=session.compute_device,

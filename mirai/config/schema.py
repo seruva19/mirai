@@ -412,6 +412,7 @@ class TrainingSection:
     optimizer_cpu_offload: bool = False
     gradient_cpu_offload: bool = False
     gradient_cpu_offload_bitpack: bool = False
+    routing_batch_profile: str = ""
     activation_cpu_offload: bool = False
     activation_cpu_offload_min_mib: int = 8
     activation_cpu_offload_max_gib: float = 0.0
@@ -1138,6 +1139,7 @@ class TrainingConfig:
             "optimizer_cpu_offload",
             "gradient_cpu_offload",
             "gradient_cpu_offload_bitpack",
+            "routing_batch_profile",
             "activation_cpu_offload",
             "activation_cpu_offload_min_mib",
             "activation_cpu_offload_max_gib",
@@ -2807,6 +2809,9 @@ class TrainingConfig:
                 training_table.get("gradient_cpu_offload", False)
             ),
             gradient_cpu_offload_bitpack=bool(training_table.get("gradient_cpu_offload_bitpack", False)),
+            routing_batch_profile=_validate_no_control_path(
+                "training.routing_batch_profile", str(training_table.get("routing_batch_profile", "")),
+            ),
             activation_cpu_offload=bool(
                 training_table.get("activation_cpu_offload", False)
             ),

@@ -1566,6 +1566,19 @@ Pack CUDA gradients of at least 64 KiB using a one-bit mask and the values
 whose bit patterns are nonzero. The trainer uses this representation when it
 reduces the transfer size and restores the FP32 gradient on the host.
 
+### `routing_batch_profile`
+
+- **Type:** str
+- **Default:** `""`
+
+Optional path to a JSON profile for text-to-video flow matching with
+deterministic record selection. The profile contains `schema_version: 1`,
+`cache_experts`, `timestep_bins`, and a `samples` map keyed by cache sample
+ID. Each sample maps to a list of equally spaced normalized timestep bins,
+each holding the predicted expert IDs or `null`. IDs must be unique across
+layers and heads. The trainer can regroup compatible clip and timestep pairs
+within one gradient-accumulation window to reduce predicted cold reads.
+
 ### `activation_cpu_offload`
 
 - **Type:** bool

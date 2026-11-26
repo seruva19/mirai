@@ -141,6 +141,18 @@ class Trainer:
             mode_scale=config.training.timestep_sampling_mode_scale,
         )
         self.noise_generator = NoiseGenerator(seed=config.training.seed + 1)
+        self.routing_batch_profile = None
+        if config.training.routing_batch_profile:
+            from mirai.core.training.data.routing_batches import RoutingBatchProfile
+
+            if (
+                config.strategy.type != "text_to_video" or config.training.objective != "flow_matching"
+                or config.dataset.online_temporal_resampling or self.training_policies.active_names
+            ):
+                raise ValueError(
+                    "Routing batch profiles require text-to-video flow matching and deterministic record selection."
+                )
+            self.routing_batch_profile = RoutingBatchProfile.load(config.training.routing_batch_profile)
 
         model_errors = self.pipeline.validate_config(config)
         strategy_errors = self.strategy.validate_config()

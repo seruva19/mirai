@@ -8,6 +8,7 @@ from mirai.config.schema import StrategyConfig
 from mirai.core.models.base import BasePipeline
 from mirai.core.registry import register_strategy
 from mirai.core.tensors import is_torch_tensor
+from mirai.core.training.data.routing_batches import ROUTING_TIMESTEPS_KEY
 from mirai.core.training.objectives.sampling import NoiseGenerator, TimestepSampler
 from mirai.core.training.strategies.base import TrainingInputs, TrainingStrategy
 
@@ -87,6 +88,8 @@ class TextToVideoStrategy(TrainingStrategy):
             objective=objective, training=training,
         ) if callable(prepare) else None
         if prepared is not None:
+            if ROUTING_TIMESTEPS_KEY in batch:
+                raise ValueError("Routing batch profiles cannot override model-specific timestep preparation.")
             if not isinstance(prepared, TrainingInputs):
                 raise TypeError("prepare_training_inputs must return TrainingInputs or None.")
             if "t5" in prepared.text_embeds:
@@ -98,6 +101,9 @@ class TextToVideoStrategy(TrainingStrategy):
         latents = batch["latents"]
         batch_size = latents.shape[0] if is_torch_tensor(latents) else len(latents)
         timesteps = timestep_sampler.sample(batch_size, like=latents)
+        planned = batch.get(ROUTING_TIMESTEPS_KEY)
+        if planned is not None:
+            timesteps = planned.to(device=latents.device, dtype=timesteps.dtype)
         noise = noise_generator.sample(latents if is_torch_tensor(latents) else batch_size)
         if objective is not None:
             noisy_latents = objective.corrupt(
