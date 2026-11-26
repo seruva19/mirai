@@ -140,6 +140,10 @@ def flex_varlen_attention_with_sink(
         raise Magi2FlexAttentionUnsupported(
             "MAGI-2 flex attention key and value tensors must share shape."
         )
+    sink_logits = (
+        _sink_log_denominator(sink, heads=int(q.shape[1]))
+        if sink is not None and int(sink.numel()) > 0 else None
+    )
     device = q.device
     if compile_kernel is None:
         compile_kernel = device.type == "cuda"
@@ -192,8 +196,7 @@ def flex_varlen_attention_with_sink(
         return_lse=True,
     )
 
-    if sink is not None and int(sink.numel()) > 0:
-        sink_logits = _sink_log_denominator(sink, heads=int(query.shape[1]))
+    if sink_logits is not None:
         scale = torch.sigmoid(log_sum_exp.float() - sink_logits.view(1, -1, 1))
         attended = attended.float() * scale.unsqueeze(-1)
 
