@@ -100,14 +100,31 @@ class DirectPackedShardReader:
 
 
 class IoUringPackedShardReader(DirectPackedShardReader):
-    def __init__(self, path: Path) -> None:
+    _FIXED_BYTES = 2 * 1024 * 1024
+
+    @property
+    def fixed_buffer_bytes(self) -> int:
+        return self._FIXED_BYTES if self._fixed is not None else 0
+
+    def __init__(self, path: Path, *, shared: IoUringPackedShardReader | None = None) -> None:
         import ctypes
 
         super().__init__(path)
         try:
+            self._owns_ring = shared is None
+            if shared is not None:
+                self._bridge = shared._bridge
+                self._handle = shared._handle
+                self._ring_lock = shared._ring_lock
+                self._fixed = shared._fixed
+                self.mode = shared.mode
+                return
             library = os.environ.get("MIRAI_PACKED_IO_URING_LIBRARY")
             if not library:
                 raise RuntimeError("Set MIRAI_PACKED_IO_URING_LIBRARY to the compiled liburing bridge path.")
+            self.mode = os.environ.get("MIRAI_PACKED_IO_URING_MODE", "legacy")
+            if self.mode not in {"legacy", "fixed", "fixed_sqpoll", "fixed_sqpoll_hugepages"}:
+                raise ValueError(f"Unsupported MIRAI_PACKED_IO_URING_MODE {self.mode!r}.")
             self._bridge = ctypes.CDLL(library)
             self._bridge.mirai_uring_open.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
             self._bridge.mirai_uring_open.restype = ctypes.c_int
@@ -118,13 +135,68 @@ class IoUringPackedShardReader(DirectPackedShardReader):
             self._bridge.mirai_uring_close.argtypes = [ctypes.c_void_p]
             self._bridge.mirai_uring_close.restype = None
             self._handle = ctypes.c_void_p()
-            result = self._bridge.mirai_uring_open(ctypes.byref(self._handle))
-            if result < 0:
-                raise OSError(-result, f"io_uring initialization failed: {os.strerror(-result)}")
             self._ring_lock = threading.Lock()
+            self._fixed = None
+            if self.mode == "legacy":
+                result = self._bridge.mirai_uring_open(ctypes.byref(self._handle))
+            else:
+                try:
+                    open_fixed = self._bridge.mirai_uring_open_fixed
+                    fixed_buffer = self._bridge.mirai_uring_fixed_buffer
+                    read_fixed = self._bridge.mirai_uring_read_fixed
+                except AttributeError as exc:
+                    raise RuntimeError("Fixed io_uring mode requires a bridge with registered-buffer support.") from exc
+                open_fixed.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_int]
+                open_fixed.restype = ctypes.c_int
+                fixed_buffer.argtypes = [ctypes.c_void_p]
+                fixed_buffer.restype = ctypes.c_void_p
+                read_fixed.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint64]
+                read_fixed.restype = ctypes.c_int
+                result = open_fixed(
+                    ctypes.byref(self._handle), self.mode != "fixed",
+                    self.mode == "fixed_sqpoll_hugepages",
+                )
+                if result == 0:
+                    address = fixed_buffer(self._handle)
+                    if not address:
+                        raise RuntimeError("io_uring bridge returned no registered buffer.")
+                    self._fixed = (ctypes.c_ubyte * self._FIXED_BYTES).from_address(address)
+            if result < 0:
+                raise OSError(-result, f"io_uring {self.mode} initialization failed: {os.strerror(-result)}")
         except BaseException:
+            if self._owns_ring and getattr(self, "_handle", None):
+                self._bridge.mirai_uring_close(self._handle)
             super().close()
             raise
+
+    def readinto(self, buffer: memoryview, offset: int) -> int:
+        if self._fixed is None:
+            return super().readinto(buffer, offset)
+        from .packed_storage_alignment import plan_aligned_read
+
+        target = buffer.cast("B")
+        if not len(target):
+            return 0
+        window = plan_aligned_read(
+            offset=offset, nbytes=len(target), file_size=self.alignment.file_size,
+            alignment_bytes=self.alignment.alignment_bytes,
+        )
+        with self._ring_lock, memoryview(self._fixed).cast("B") as fixed:
+            payload_start = window.payload_offset
+            payload_end = payload_start + len(target)
+            for start in range(0, window.read_bytes, self._FIXED_BYTES):
+                length = min(self._FIXED_BYTES, window.read_bytes - start)
+                count = self._bridge.mirai_uring_read_fixed(
+                    self._handle, self.fd, length, window.file_offset + start,
+                )
+                if count < 0:
+                    raise OSError(-count, f"io_uring fixed read failed: {os.strerror(-count)}")
+                if count != length:
+                    raise EOFError(f"Packed io_uring fixed read returned {count} of {length} bytes.")
+                first = max(start, payload_start)
+                last = min(start + length, payload_end)
+                target[first - payload_start:last - payload_start] = fixed[first - start:last - start]
+        return window.read_bytes
 
     def _read_aligned(self, buffer: memoryview, offset: int) -> int:
         import ctypes
@@ -138,7 +210,8 @@ class IoUringPackedShardReader(DirectPackedShardReader):
 
     def close(self) -> None:
         with self._ring_lock:
-            self._bridge.mirai_uring_close(self._handle)
+            if self._owns_ring:
+                self._bridge.mirai_uring_close(self._handle)
             super().close()
 
 

@@ -235,6 +235,12 @@ For repeated runs, export the already-quantized stores once and set
 with `memory.packed_stream_backend="gds"`, `"direct_io"`, or `"io_uring"`
 align each shard file to 4096 bytes.
 `direct_io` uses Linux `O_DIRECT` reads into host memory.
+`io_uring` uses a liburing bridge selected by `MIRAI_PACKED_IO_URING_LIBRARY`.
+Set `MIRAI_PACKED_IO_URING_MODE` to `fixed`, `fixed_sqpoll`, or
+`fixed_sqpoll_hugepages` to share one registered 2 MiB buffer across the
+artifact's shards. The last mode also requires a reserved 2 MiB HugeTLB page
+and kernel support for SQPOLL. An unavailable requested mode fails at startup.
+The default `legacy` supports the bridge's original request path.
 With `stream_disk`, the GDS backend requires an aligned export and a CUDA
 target. It routes packed expert reads through the shared KvikIO reader. When
 KvikIO exposes stream-based cuFile reads, the reader waits on the issuing

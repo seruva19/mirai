@@ -64,9 +64,16 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         shard_reader = {"direct_io": DirectPackedShardReader, "io_uring": IoUringPackedShardReader}.get(
             self._backend, PackedShardReader,
         )
+        fixed_reader = None
         try:
             for name, shard_path in shard_paths.items():
-                self._shards[name] = shard_reader(shard_path)
+                if self._backend == "io_uring":
+                    reader = IoUringPackedShardReader(shard_path, shared=fixed_reader)
+                    if reader.mode != "legacy" and fixed_reader is None:
+                        fixed_reader = reader
+                else:
+                    reader = shard_reader(shard_path)
+                self._shards[name] = reader
         except Exception:
             for shard in self._shards.values():
                 shard.close()
@@ -108,7 +115,8 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
         self._prefetch: Any | None = None
         if depth:
             self._prefetch = PackedStreamPrefetchRing(depth)
-        self._pin_cap_bytes = _pin_budget_bytes()
+        self._uring_fixed_bytes = 0 if fixed_reader is None else fixed_reader.fixed_buffer_bytes
+        self._pin_cap_bytes = max(0, _pin_budget_bytes() - self._uring_fixed_bytes)
         self._staging_lock = threading.Lock()
         self._staging_pool = None
         self._staging_unavailable = False
@@ -354,6 +362,9 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             if self._backend in {"direct_io", "io_uring"}:
                 snapshot["direct_io_read_bytes"] = self._direct_io_read_bytes
                 snapshot["direct_io_overread_bytes"] = self._direct_io_read_bytes - self._read_bytes
+            if self._backend == "io_uring":
+                snapshot["io_uring_mode"] = next(iter(self._shards.values())).mode
+                snapshot["io_uring_fixed_buffer_bytes"] = self._uring_fixed_bytes
         snapshot.update(self._cache.snapshot())
         if self._gds is not None:
             snapshot.update(self._gds.snapshot())

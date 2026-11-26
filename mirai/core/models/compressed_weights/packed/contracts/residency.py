@@ -22,6 +22,34 @@ _GIB = 1024**3
 
 
 class PackedStateResidencyPolicyTests(unittest.TestCase):
+    def test_uring_fixed_window_reuses_one_buffer_across_chunks(self) -> None:
+        import ctypes
+        import threading
+        from types import SimpleNamespace
+
+        from mirai.core.models.compressed_weights.packed.packed_stream_io import IoUringPackedShardReader
+
+        reader = IoUringPackedShardReader.__new__(IoUringPackedShardReader)
+        reader._FIXED_BYTES = 4096
+        reader._fixed = (ctypes.c_ubyte * 4096)()
+        reader._ring_lock = threading.Lock()
+        reader._handle, reader.fd = 11, 7
+        reader.alignment = SimpleNamespace(file_size=16384, alignment_bytes=4096)
+        reader._bridge = mock.Mock()
+        source = (bytes(range(251)) * 66)[:16384]
+        calls = []
+
+        def read_fixed(handle, fd, length, offset):
+            calls.append((handle, fd, length, offset))
+            ctypes.memmove(reader._fixed, source[offset:offset + length], length)
+            return length
+
+        reader._bridge.mirai_uring_read_fixed.side_effect = read_fixed
+        output = bytearray(8195)
+        self.assertEqual(reader.readinto(memoryview(output), 4093), 12288)
+        self.assertEqual(output, source[4093:12288])
+        self.assertEqual(calls, [(11, 7, 4096, start) for start in (0, 4096, 8192)])
+
     def test_explicit_disk_mode_preserves_lazy_source_identity(self) -> None:
         source = {"experts": torch.arange(12).reshape(3, 4)}
 
