@@ -48,6 +48,9 @@ def _router_kernel():
         scores = tl.sigmoid(tl.load(logits + row * experts + lanes, valid, other=0.0))
         head = row // tokens
         selection = scores + tl.load(bias + head * experts + lanes, valid, other=0.0)
+        # Match descending Torch top-k's NaN ordering while retaining the
+        # original score in the output. NaN equality cannot select a lane.
+        selection = tl.where(selection != selection, float("inf"), selection)
         available = valid
         ranks = tl.arange(0, block_routes)
         chosen_scores = tl.full((block_routes,), 0, tl.float32)
@@ -61,7 +64,8 @@ def _router_kernel():
             chosen_indices = tl.where(ranks == rank, chosen, chosen_indices)
             available = available & (lanes != chosen)
         if normalize:
-            chosen_scores = chosen_scores / tl.maximum(tl.sum(chosen_scores, axis=0), 1.0e-12)
+            total = tl.sum(chosen_scores, axis=0)
+            chosen_scores = chosen_scores / tl.where(total < 1.0e-12, 1.0e-12, total)
         tl.store(probabilities + row * top_k + ranks, chosen_scores, ranks < top_k)
         tl.store(indices + row * top_k + ranks, chosen_indices, ranks < top_k)
 

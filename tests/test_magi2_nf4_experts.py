@@ -113,6 +113,7 @@ def test_triton_expert_router_matches_sigmoid_selection_and_normalization(normal
     bias = torch.randn(2, 127, device="cuda") * 0.1
     logits[:, 0].zero_()
     bias[:, :6] = 2
+    logits[0, 1, 90] = float("nan")
     # Equal logits and equal winning biases force deterministic index ordering.
     scores = logits.sigmoid()
     expected_ids = (scores + bias[:, None]).argsort(dim=-1, descending=True, stable=True)[..., :6]
@@ -121,7 +122,7 @@ def test_triton_expert_router_matches_sigmoid_selection_and_normalization(normal
         expected_probs = torch.nn.functional.normalize(expected_probs, p=1, dim=-1)
     probs, ids = sigmoid_topk(logits, bias, top_k=6, normalize=normalize)
     torch.testing.assert_close(ids, expected_ids)
-    torch.testing.assert_close(probs, expected_probs, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(probs, expected_probs, rtol=1e-5, atol=1e-6, equal_nan=True)
 
 
 # ---------------------------------------------------------------------------
