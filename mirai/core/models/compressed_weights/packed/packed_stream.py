@@ -303,6 +303,10 @@ class StreamingPackedTensorMapping(PackedStreamPrefetchHost, Mapping[str, Any]):
             with self._cuda_staging_arena(target, stream).lease(stream) as slot:
                 yield slot[:size].view(dtype).view(shape)
 
+    @property
+    def cuda_weight_slot_bytes(self) -> int:
+        return _MAX_RANGE_BYTES if self._raw_staging and not self.prefetch_enabled else 0
+
     @contextmanager
     def borrow_packed_fields(self, keys, indices, *, device):
         """Supply short-lived packed fields on the current CUDA stream."""

@@ -606,6 +606,16 @@ def test_active_groups_decode_only_routed_weights_and_preserve_backward(
     path = save_magi2_nf4_packed_state(tmp_path / "packed", model, fuse_gate_up=True)
     store = load_magi2_nf4_packed_state(path, model, blocksize=64, range_read_backend="staged")["layer"]
     assert store.has_fused_gate_up
+    from mirai.core.models.compressed_weights.packed import packed_stream
+
+    with monkeypatch.context() as arena:
+        _, rows, columns = store.expert_weight_shape("W_gate_up")
+        arena.setattr(packed_stream, "_MAX_RANGE_BYTES", 2 * rows * columns * 4 * 2)
+        arena.setattr(store._packed_range_reader.reader, "_raw_staging", True)
+        store.set_expert_weight_access_policy(expert_weight_access="full_dequant", expert_dequant_chunk_size=0)
+        assert store.cuda_arena_group_span(torch.float32) == 2
+        assert store.cuda_arena_group_span(torch.bfloat16) == 4
+        assert store.segment_group_span() == 5
     assert all(name.endswith(("_nf4_code", "_nf4_ncode")) for name, _ in store.named_buffers())
     assert not hasattr(store, "W_gate_nf4")
     materialize = store.materialize_segment

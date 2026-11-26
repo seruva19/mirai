@@ -1061,6 +1061,10 @@ class _ActiveExpertGroups:
     def segment_group_span(self) -> int:
         return self.store.segment_group_span()
 
+    def cuda_arena_group_span(self, dtype) -> int:
+        span = getattr(self.store, "cuda_arena_group_span", None)
+        return self.segment_group_span() if span is None else span(dtype)
+
     def expert_weight_shape(self, key: str) -> tuple[int, int, int]:
         _, rows, columns = self.store.expert_weight_shape(key)
         return self.group_ids.numel(), rows, columns
@@ -1189,7 +1193,7 @@ class _QuantizedGroupedExpertLinear(torch.autograd.Function):
         dx_backend: str,
     ) -> torch.Tensor:
         _groups, rows, cols = store.expert_weight_shape(key)
-        span = store.segment_group_span()
+        span = _expert_group_span(store, x_sorted)
         segments = tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=span))
         if forward_backend == "scaled_mm_fp4":
             output = _native_fp4_grouped_projection(x_sorted, offsets, store, key, cols)
@@ -1272,6 +1276,13 @@ def _expert_projection_prefetch(store, x):
     return lambda key, start, stop: store.prefetch_segment(key, start, stop, device=x.device, dtype=x.dtype)
 
 
+def _expert_group_span(store, rows):
+    arena_span = getattr(store, "cuda_arena_group_span", None)
+    if rows.is_cuda and arena_span is not None:
+        return arena_span(rows.dtype)
+    return store.segment_group_span()
+
+
 def _expert_weight_lease(store, key, start, stop, rows):
     borrow = getattr(store, "borrow_segment", None)
     if borrow is None:
@@ -1292,7 +1303,7 @@ class _SegmentedQuantizedExpertMlp(torch.autograd.Function):
         dx_backend: str,
         activation_backend: str,
     ) -> torch.Tensor:
-        span = store.segment_group_span()
+        span = _expert_group_span(store, x_sorted)
         segments = tuple(segment for segment, _ in _packed_group_segments(offsets, max_groups=span))
         output = run_segmented_grouped_expert_mlp(
             x_sorted,
@@ -1426,7 +1437,7 @@ class _SegmentedRoutedQuantizedExpertMlp(torch.autograd.Function):
         store: Magi2Nf4ExpertStore | _ActiveExpertGroups,
         activation_backend: str,
     ) -> torch.Tensor:
-        segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
+        segments = _packed_group_segments(offsets, max_groups=_expert_group_span(store, x_rows), routed=True)
         outputs: list[torch.Tensor] = []
         prefetch = _expert_projection_prefetch(store, x_rows)
         segments = tuple((segment, rows) for segment, rows in segments if segment.row_count)
@@ -1700,7 +1711,7 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
         x_rows = x_heads.reshape(tokens * num_heads, d_head)
         store, offsets = _packed_expert_layout(self._store(module), offsets)
         output = x_rows.new_zeros((tokens * num_heads, d_head))
-        segments = _packed_group_segments(offsets, max_groups=store.segment_group_span(), routed=True)
+        segments = _packed_group_segments(offsets, max_groups=_expert_group_span(store, x_rows), routed=True)
         prefetch = _expert_projection_prefetch(store, x_rows)
         segments = tuple((segment, rows) for segment, rows in segments if segment.row_count)
         for index, (segment, max_group_rows) in enumerate(segments):
@@ -1708,64 +1719,53 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                 offsets[segment.group_start : segment.group_stop] - segment.row_start
             ).contiguous()
             local_rows = sorted_rows[segment.row_start : segment.row_stop].contiguous()
+            start, stop = segment.group_start, segment.group_stop
             if store.has_fused_gate_up:
-                w_gate_up = store.materialize_segment(
-                    MAGI2_FUSED_GATE_UP, segment.group_start, segment.group_stop,
-                    dtype=x_rows.dtype, device=device,
-                )
-                if prefetch is not None:
-                    prefetch("W_down", segment.group_start, segment.group_stop)
-                gate, up = _segment_routed_projection(
-                    x_rows, w_gate_up, local_offsets, gather_rows=local_rows,
-                    max_group_rows=max_group_rows,
-                ).chunk(2, dim=-1)
+                with _expert_weight_lease(store, MAGI2_FUSED_GATE_UP, start, stop, x_rows) as w_gate_up:
+                    if prefetch is not None:
+                        prefetch("W_down", segment.group_start, segment.group_stop)
+                    gate, up = _segment_routed_projection(
+                        x_rows, w_gate_up, local_offsets, gather_rows=local_rows,
+                        max_group_rows=max_group_rows,
+                    ).chunk(2, dim=-1)
                 del w_gate_up
             else:
-                w_gate = store.materialize_segment(
-                    "W_gate", segment.group_start, segment.group_stop,
-                    dtype=x_rows.dtype, device=device,
-                )
-                if prefetch is not None:
-                    prefetch("W_up", segment.group_start, segment.group_stop)
-                gate = _segment_routed_projection(
-                    x_rows, w_gate, local_offsets, gather_rows=local_rows,
-                    max_group_rows=max_group_rows,
-                )
+                with _expert_weight_lease(store, "W_gate", start, stop, x_rows) as w_gate:
+                    if prefetch is not None:
+                        prefetch("W_up", segment.group_start, segment.group_stop)
+                    gate = _segment_routed_projection(
+                        x_rows, w_gate, local_offsets, gather_rows=local_rows,
+                        max_group_rows=max_group_rows,
+                    )
                 del w_gate
-                w_up = store.materialize_segment(
-                    "W_up", segment.group_start, segment.group_stop,
-                    dtype=x_rows.dtype, device=device,
-                )
-                if prefetch is not None:
-                    prefetch("W_down", segment.group_start, segment.group_stop)
-                up = _segment_routed_projection(
-                    x_rows, w_up, local_offsets, gather_rows=local_rows,
-                    max_group_rows=max_group_rows,
-                )
+                with _expert_weight_lease(store, "W_up", start, stop, x_rows) as w_up:
+                    if prefetch is not None:
+                        prefetch("W_down", segment.group_start, segment.group_stop)
+                    up = _segment_routed_projection(
+                        x_rows, w_up, local_offsets, gather_rows=local_rows,
+                        max_group_rows=max_group_rows,
+                    )
                 del w_up
             hidden = _swiglu7_forward(
                 gate, up, output_dtype=x_rows.dtype, backend=self.activation_backend
             )
             del gate, up
-            w_down = store.materialize_segment(
-                "W_down", segment.group_start, segment.group_stop,
-                dtype=x_rows.dtype, device=device,
-            )
-            _prefetch_next_routed_segment(prefetch, segments, index, store.has_fused_gate_up)
-            output.add_(
-                routed_weighted_projection(
-                    hidden,
-                    w_down,
-                    local_offsets,
-                    grouped_to_assignment=order[
-                        segment.row_start : segment.row_stop
-                    ].contiguous(),
-                    assignment_to_token=assignment_to_row,
-                    coefficients=topk_probs.reshape(-1),
-                    token_rows=tokens * num_heads,
-                    max_group_rows=max_group_rows,
+            with _expert_weight_lease(store, "W_down", start, stop, x_rows) as w_down:
+                _prefetch_next_routed_segment(prefetch, segments, index, store.has_fused_gate_up)
+                output.add_(
+                    routed_weighted_projection(
+                        hidden,
+                        w_down,
+                        local_offsets,
+                        grouped_to_assignment=order[
+                            segment.row_start : segment.row_stop
+                        ].contiguous(),
+                        assignment_to_token=assignment_to_row,
+                        coefficients=topk_probs.reshape(-1),
+                        token_rows=tokens * num_heads,
+                        max_group_rows=max_group_rows,
+                    )
                 )
-            )
             del hidden, w_down
         return output.view(tokens, num_heads, d_head)
 
@@ -1874,11 +1874,12 @@ class Magi2QuantizedGroupedMoEBackend(Magi2GroupedMoEBackend):
                 key, start, stop, dtype=x_sorted.dtype, device=x_sorted.device
             ),
             backend=forward_backend,
-            max_groups=store.segment_group_span(),
+            max_groups=_expert_group_span(store, x_sorted),
             output_columns=d_head,
             activation_backend=self.activation_backend,
             fused_gate_up=store.has_fused_gate_up,
             prefetch=_expert_projection_prefetch(store, x_sorted),
+            borrow=lambda key, start, stop: _expert_weight_lease(store, key, start, stop, x_sorted),
         )
 
     def _segmented_expert_apply(self, operation, *args):

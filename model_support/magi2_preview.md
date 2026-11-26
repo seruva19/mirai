@@ -254,8 +254,10 @@ streams use four fixed 32 MiB slots for packed fields and dense
 weights. With prefetch disabled,
 dequantization reads borrowed packed fields directly from a slot when the
 batch fits. GDS copies from its aligned read slot directly into the borrowed
-field within VRAM. A CUDA event orders reuse after the consumer finishes. Larger
-batches and prefetched reads use owning CUDA tensors. Eligible segmented
+field within VRAM. A CUDA event orders reuse after the consumer finishes.
+Grouped CUDA execution caps segment size to fit the dense slots, including
+scratch for fused gate/up. An individual projection larger than the slot,
+and prefetched reads, use owning CUDA tensors. Eligible segmented
 grouped projections can also write the dense weights into a second slot
 and hold it until the grouped matrix multiplication finishes. FP8 decodes
 one tile at a time into the slot. FP4 and GGUF use per-expert decode scratch.

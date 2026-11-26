@@ -111,6 +111,10 @@ class PackedExpertRangeView:
         borrow = getattr(self.reader, "borrow_cuda_weight", None)
         return nullcontext() if borrow is None else borrow(shape, dtype=dtype, device=device)
 
+    @property
+    def cuda_weight_slot_bytes(self) -> int:
+        return getattr(self.reader, "cuda_weight_slot_bytes", 0)
+
     def prefetch_slices_to_device(self, key, indices, **kwargs):
         return self.reader.prefetch_slices_to_device(self.prefix + key, indices, **kwargs)
 
@@ -195,6 +199,18 @@ class Magi2Nf4ExpertStore(nn.Module):
         if self.expert_weight_access != "full_dequant" and self.expert_dequant_chunk_size:
             return max(1, min(self.num_groups, int(self.expert_dequant_chunk_size)))
         return self.num_groups
+
+    def cuda_arena_group_span(self, dtype) -> int:
+        span = self.segment_group_span()
+        reader = getattr(self, "_packed_range_reader", None)
+        if reader is None or not reader.cuda_weight_slot_bytes:
+            return span
+        elements = max(rows * cols for _, rows, cols in self._shapes.values())
+        if self.has_fused_gate_up:
+            _, rows, cols = self.expert_weight_shape(MAGI2_FUSED_GATE_UP)
+            elements = max(elements, 2 * rows * cols)
+        element_bytes = torch.empty((), device="meta", dtype=dtype).element_size()
+        return max(1, min(span, reader.cuda_weight_slot_bytes // (elements * element_bytes)))
 
     @property
     def blocksize(self) -> int:
