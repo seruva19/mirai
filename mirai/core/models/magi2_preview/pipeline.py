@@ -309,6 +309,9 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         # exactly as the memory policy resolved it.
         self._expert_feature_cache: Any = None
         family = dict(getattr(model_config.params, "family_params", {}) or {})
+        self._expert_router_backend = family.get("expert_router_backend", "torch")
+        if self._expert_router_backend not in ("torch", "triton"):
+            raise ValueError("MAGI-2 expert_router_backend must be 'torch' or 'triton'.")
         staging_gib = family.get("expert_pinned_staging_gib")
         if staging_gib is not None and (type(staging_gib) not in {int, float} or not 0 <= staging_gib <= 6):
             raise ValueError("MAGI-2 expert_pinned_staging_gib must be between 0 and 6.")
@@ -748,6 +751,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             ):
                 raise ValueError("MAGI-2 expert lookahead requires uniformly packed expert stores.")
             attach_magi2_expert_lookahead(transformer, depth=lookahead_depth, max_experts=8)
+        if getattr(self, "_expert_router_backend", "torch") == "triton":
+            from .router_triton import attach_inference_router
+
+            attach_inference_router(transformer)
         transformer.train()
         self._configure_attention_backend(transformer)
         return config, transformer, Magi2DataProxy(config.evaluation_config.data_proxy_config)
@@ -2576,6 +2583,7 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         "nf4_fuse_gate_up",
         "expert_cpu_max_tokens",
         "expert_prefetch_lookahead",
+        "expert_router_backend",
         "expert_pinned_staging_gib",
         "expert_compact_lora",
         "expert_int8_checkpoint",
@@ -2683,6 +2691,8 @@ class Magi2PreviewModelFamilyProvider(ModelFamilyProvider):
         unknown = sorted(set(params) - self._ALLOWED_FAMILY_PARAMS)
         errors = [f"Unknown MAGI-2 family parameter '{name}'." for name in unknown]
         lookahead = params.get("expert_prefetch_lookahead", 0)
+        if params.get("expert_router_backend", "torch") not in ("torch", "triton"):
+            errors.append("MAGI-2 expert_router_backend must be 'torch' or 'triton'.")
         if type(lookahead) is not int or lookahead not in (0, 1, 2):
             errors.append("MAGI-2 expert_prefetch_lookahead must be 0, 1, or 2.")
         staging_gib = params.get("expert_pinned_staging_gib")

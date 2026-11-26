@@ -2759,13 +2759,19 @@ class CoreMultiHeadMoE(nn.Module):
             expert_bias = expert_bias.gather(1, candidates)
             candidates = candidates[:, None, :].expand(-1, router_logits.size(1), -1)
             router_logits = router_logits.gather(2, candidates)
-        topk_probs, topk_indices = _mh_moe_compute_topk(
-            router_logits=router_logits,
-            top_k=self.topk,
-            score_func=self.config.score_func,
-            expert_bias=expert_bias,
-            route_norm=self.config.route_norm,
-        )
+        fused_router = getattr(self, "_mirai_inference_router", None)
+        if fused_router is not None and router_logits.is_cuda and not self.training and not torch.is_grad_enabled():
+            topk_probs, topk_indices = fused_router(
+                router_logits, expert_bias, top_k=self.topk, normalize=self.config.route_norm,
+            )
+        else:
+            topk_probs, topk_indices = _mh_moe_compute_topk(
+                router_logits=router_logits,
+                top_k=self.topk,
+                score_func=self.config.score_func,
+                expert_bias=expert_bias,
+                route_norm=self.config.route_norm,
+            )
         if candidates is not None:
             topk_indices = candidates.gather(2, topk_indices)
         observer = getattr(self, "_mirai_expert_selection_observer", None)

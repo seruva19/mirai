@@ -64,6 +64,31 @@ _NF4 = _CUDA and _has_bitsandbytes()
 _requires_nf4 = pytest.mark.skipif(not _NF4, reason="NF4 storage requires CUDA and bitsandbytes")
 
 
+@pytest.mark.parametrize("normalize", [False, True])
+def test_triton_expert_router_matches_sigmoid_selection_and_normalization(normalize):
+    import sys
+
+    if sys.platform != "linux" or not torch.cuda.is_available():
+        pytest.skip("requires Linux CUDA Triton")
+    pytest.importorskip("triton")
+    from mirai.core.models.magi2_preview.router_triton import sigmoid_topk
+
+    torch.manual_seed(91)
+    logits = torch.randn(2, 19, 127, device="cuda")
+    bias = torch.randn(2, 127, device="cuda") * 0.1
+    logits[:, 0].zero_()
+    bias[:, :6] = 2
+    # Equal logits and equal winning biases force deterministic index ordering.
+    scores = logits.sigmoid()
+    expected_ids = (scores + bias[:, None]).argsort(dim=-1, descending=True, stable=True)[..., :6]
+    expected_probs = scores.gather(-1, expected_ids)
+    if normalize:
+        expected_probs = torch.nn.functional.normalize(expected_probs, p=1, dim=-1)
+    probs, ids = sigmoid_topk(logits, bias, top_k=6, normalize=normalize)
+    torch.testing.assert_close(ids, expected_ids)
+    torch.testing.assert_close(probs, expected_probs, rtol=1e-5, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Segmented grouped execution (device-independent reference parity)
 # ---------------------------------------------------------------------------
