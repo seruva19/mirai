@@ -1821,8 +1821,11 @@ def test_magi2_additional_packed_formats_round_trip_and_execute(tmp_path, fmt) -
         load_magi2_nf4_packed_state(artifact, model(), blocksize=64)
 
 
-def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path) -> None:
+def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path, monkeypatch) -> None:
     import json
+    from contextlib import contextmanager
+
+    import safetensors
 
     def model(*, heads=2, experts=2):
         return _container(_reduced_moe(
@@ -1835,7 +1838,35 @@ def test_packed_restore_rejects_head_layout_and_projection_mismatches(tmp_path) 
     artifact = save_magi2_nf4_packed_state(tmp_path / "packed", source, storage_alignment_bytes=4096)
     shard = artifact / "layer_000.safetensors"
     assert shard.stat().st_size % 4096 == 0
-    load_magi2_nf4_packed_state(artifact, model(), blocksize=64, quant_format="fp8")
+    references = {}
+    safe_open = safetensors.safe_open
+
+    @contextmanager
+    def record_open(*args, **kwargs):
+        with safe_open(*args, **kwargs) as handle:
+            class RecordingHandle:
+                def keys(self):
+                    return handle.keys()
+
+                def get_tensor(self, key):
+                    value = handle.get_tensor(key)
+                    references[key] = value
+                    return value
+
+            yield RecordingHandle()
+
+    monkeypatch.setattr(safetensors, "safe_open", record_open)
+    mapped = load_magi2_nf4_packed_state(
+        artifact, model(), blocksize=64, quant_format="fp8", retain_mapped_buffers=True,
+    )["mlp.moe_mlp"]
+    assert all(value.data_ptr() == references[name].data_ptr() for name, value in mapped.named_buffers())
+    expected = mapped.materialize_segment("W_gate", 1, 3, dtype=torch.float32, device="cpu")
+    resident = load_magi2_nf4_packed_state(artifact, model(), blocksize=64, quant_format="fp8")["mlp.moe_mlp"]
+    assert all(value.data_ptr() != references[name].data_ptr() for name, value in resident.named_buffers())
+    torch.testing.assert_close(
+        resident.materialize_segment("W_gate", 1, 3, dtype=torch.float32, device="cpu"),
+        expected, rtol=0, atol=0,
+    )
     target = model(heads=1, experts=4)
     with pytest.raises(ValueError, match="head topology"):
         load_magi2_nf4_packed_state(artifact, target, blocksize=64, quant_format="fp8")

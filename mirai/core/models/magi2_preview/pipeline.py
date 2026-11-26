@@ -268,6 +268,10 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
         super().__init__()
         self.model_config = model_config
         self._packed_stream_backend = getattr(memory_config, "packed_stream_backend", "auto")
+        self._retain_mapped_expert_buffers = (
+            getattr(memory_config, "weight_residency_strategy", "disabled") == "stream_disk"
+            and self._packed_stream_backend in {"auto", "staged"}
+        )
         # The frozen-weight storage decision is read before the checkpoint is
         # touched: packing the routed experts is only a host-memory saving if the
         # released BF16 stack is never materialized in the first place.
@@ -901,6 +905,7 @@ class Magi2PreviewPipeline(nn.Module, NativeVideoPipeline):
             quant_format=quant_format,
             expected_shared_basis_rank=shared_basis_rank,
             expected_mixture_basis=mixture_basis,
+            retain_mapped_buffers=getattr(self, "_retain_mapped_expert_buffers", False),
             expected_pruning_digest=pruning_digest, expected_consolidation_digest=consolidation_digest,
             expected_metadata=expected_metadata,
         )

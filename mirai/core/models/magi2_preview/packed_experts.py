@@ -175,6 +175,7 @@ def load_magi2_nf4_packed_state(
     expected_consolidation_digest: bytes | None = None,
     expected_shared_basis_rank: int | None = None,
     expected_mixture_basis: tuple[int, int, str] | None = None,
+    retain_mapped_buffers: bool = False,
 ) -> dict[str, Magi2Nf4ExpertStore]:
     """Restore NF4 stores directly and reject topology or schema mismatches."""
 
@@ -317,7 +318,7 @@ def load_magi2_nf4_packed_state(
                     raise Magi2PackedExpertStateError(
                         f"Packed MAGI-2 layer '{module_name}' is missing '{buffer_name}'."
                     ) from exc
-                restored_buffers[buffer_name] = value.clone().contiguous()
+                restored_buffers[buffer_name] = value if retain_mapped_buffers else value.clone().contiguous()
             if mixed:
                 try:
                     packed = Magi2MixedExpertStore.from_packed_state(
